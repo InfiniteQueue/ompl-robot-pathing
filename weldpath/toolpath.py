@@ -1,0 +1,191 @@
+"""Turn the manifest's ordered locators into planned, phased motion.
+
+Locators are visited in manifest order and one output segment is produced per consecutive
+pair, matching the sample output.
+
+Weld locators get a linear approach and depart of ``planning.linear_zone_mm``, so the gun
+slides onto and off the joint in a straight line instead of arriving on a curve.  Per the
+brief the gun is treated as stationary through the weld: the robot stops at the locator,
+the opening changes from ``gun_opening_arrive`` to ``gun_opening_leave``, and no motion is
+planned for the closing itself.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+
+from .cell import Cell
+from .manifest import Locator, Manifest
+from .planning import PlanningError, plan_freespace, plan_linear, validate
+
+AXES = {"+x": np.array([1.0, 0, 0]), "-x": np.array([-1.0, 0, 0]),
+        "+y": np.array([0, 1.0, 0]), "-y": np.array([0, -1.0, 0]),
+        "+z": np.array([0, 0, 1.0]), "-z": np.array([0, 0, -1.0])}
+
+
+PTP = "PTP"
+LIN = "LIN"
+
+
+@dataclass
+class Phase:
+    """A run of waypoints sharing one motion type and one gun state.
+
+    ``kind`` is internal bookkeeping for the run log; it is not serialised, because the
+    consumer's schema has no member for it.
+    """
+    kind: str                       # freespace | approach | weld | depart
+    motion: str                     # PTP | LIN
+    states: list[np.ndarray]
+    gun_opening_mm: float = 0.0
+    # True where the gun is deliberately up against a panel -- the weld itself and the
+    # linear moves on and off it. Freespace transits are not meant to touch anything.
+    contact_allowed: bool = False
+
+
+@dataclass
+class Segment:
+    source: str
+    target: str
+    phases: list[Phase] = field(default_factory=list)
+    error: str | None = None
+
+
+def retract_axis_tcp(man: Manifest, override: str | None = None) -> np.ndarray:
+    """Direction, in TCP coordinates, the robot retracts along when leaving a weld.
+
+    Derived from the gun's prismatic stroke axis: the throat opens along that axis, so a
+    move along its negation pulls the gun off the joint.  For the supplied cell this comes
+    out as tool -X.  Override with ``--approach-axis`` if a particular cell's tool frame
+    is set up differently -- the sample manifest contains no welds, so this default has
+    not been exercised against real weld data.
+    """
+    if override:
+        return AXES[override.lower()]
+    gun_axis = None
+    for dev in man.devices[1:]:
+        for j in dev.joints:
+            if j.is_prismatic:
+                gun_axis = np.array(j.axis_world, dtype=float)
+                break
+    if gun_axis is None:
+        return AXES["-z"]
+    n = np.linalg.norm(gun_axis)
+    if n < 1e-9:
+        return AXES["-z"]
+    R = np.array(man.tcp_world_pose, dtype=float)[:3, :3]
+    axis_tcp = R.T @ (gun_axis / n)
+    return -axis_tcp / np.linalg.norm(axis_tcp)
+
+
+def offset_pose(pose: np.ndarray, axis_tcp: np.ndarray, distance: float) -> np.ndarray:
+    """Shift ``pose`` along a direction expressed in its own frame."""
+    out = np.array(pose, dtype=float).copy()
+    out[:3, 3] = out[:3, 3] + out[:3, :3] @ (axis_tcp * distance)
+    return out
+
+
+class ToolpathPlanner:
+    def __init__(self, cell: Cell, man: Manifest, *, approach_axis: str | None = None,
+                 linear_step_mm: float = 50.0, ompl_attempts: int = 3,
+                 segment_length: float = 0.02, check_step_deg: float = 3.0, log=print):
+        self.cell = cell
+        self.man = man
+        self.log = log
+        self.axis = retract_axis_tcp(man, approach_axis)
+        self.linear_step_mm = linear_step_mm
+        self.ompl_attempts = ompl_attempts
+        self.segment_length = segment_length
+        self.check_step = np.deg2rad(check_step_deg)
+        self.start_q = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
+
+    # -- per-locator anchor states ------------------------------------------
+    def _solve_locator(self, loc: Locator, seed: np.ndarray) -> np.ndarray:
+        q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q])
+        if q is None:
+            raise PlanningError(f"no collision-free IK for locator '{loc.name}'")
+        return q
+
+    def _approach_pose(self, loc: Locator) -> np.ndarray:
+        return offset_pose(loc.pose_world, self.axis, self.man.linear_zone_mm)
+
+    # -- main ----------------------------------------------------------------
+    def run(self) -> list[Segment]:
+        man = self.man
+        locators = man.locators
+        if len(locators) < 2:
+            return []
+
+        anchors: dict[str, np.ndarray] = {}
+        seed = self.start_q
+        for loc in locators:
+            try:
+                anchors[loc.name] = self._solve_locator(loc, seed)
+                seed = anchors[loc.name]
+            except PlanningError as exc:
+                self.log(f"  ! {exc}")
+
+        segments: list[Segment] = []
+        for a, b in zip(locators, locators[1:]):
+            seg = Segment(a.name, b.name)
+            self.log(f"  segment {a.name} -> {b.name}")
+            try:
+                if a.name not in anchors:
+                    raise PlanningError(f"no reachable joint solution for '{a.name}'")
+                if b.name not in anchors:
+                    raise PlanningError(f"no reachable joint solution for '{b.name}'")
+                seg.phases = self._plan_pair(a, b, anchors)
+            except PlanningError as exc:
+                seg.error = str(exc)
+                self.log(f"    ! {exc}")
+            segments.append(seg)
+        return segments
+
+    def _plan_pair(self, a: Locator, b: Locator, anchors) -> list[Phase]:
+        # The path starts at the first locator, not at start_state. start_state is still
+        # used to seed inverse kinematics and as a known-clear pose to route a difficult
+        # transit through, but it never contributes a waypoint of its own.
+        phases: list[Phase] = []
+        qa, qb = anchors[a.name], anchors[b.name]
+        transit_start, transit_end = qa, qb
+
+        depart_states: list[np.ndarray] = []
+        approach_states: list[np.ndarray] = []
+
+        if a.is_weld and self.man.linear_zone_mm > 0:
+            depart_states = plan_linear(
+                self.cell, a.pose_world, self._approach_pose(a), qa,
+                step_mm=self.linear_step_mm)
+            transit_start = depart_states[-1]
+        if b.is_weld and self.man.linear_zone_mm > 0:
+            approach_states = plan_linear(
+                self.cell, self._approach_pose(b), b.pose_world, qb,
+                step_mm=self.linear_step_mm)
+            transit_end = approach_states[0]
+
+        # The robot holds still at a weld while the opening steps from arrive to leave, so
+        # that is a phase boundary: same pose, new gun state.
+        if a.is_weld:
+            phases.append(Phase("weld", LIN, [qa], a.gun_opening_leave, True))
+        if depart_states:
+            phases.append(Phase("depart", LIN, depart_states, a.gun_opening_leave, True))
+
+        transit = plan_freespace(
+            self.cell, transit_start, transit_end,
+            attempts=self.ompl_attempts, segment_length=self.segment_length,
+            check_step=self.check_step, fallback_via=[self.start_q], log=self.log)
+        opening = a.gun_opening_leave if a.is_weld else 0.0
+        phases.append(Phase("freespace", PTP, transit, opening, False))
+
+        if approach_states:
+            phases.append(Phase("approach", LIN, approach_states,
+                                b.gun_opening_arrive, True))
+
+        # The output is what the controller will execute, so check the reduced path
+        # rather than trusting that reduction preserved what the planner found.
+        full = [q for ph in phases for q in ph.states]
+        problem = validate(self.cell, full, max_step=self.check_step)
+        if problem:
+            raise PlanningError(f"planned path failed validation: {problem}")
+        return phases
