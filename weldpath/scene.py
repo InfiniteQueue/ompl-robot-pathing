@@ -46,9 +46,18 @@ def _xyz(v: np.ndarray) -> str:
 
 
 class SceneBuilder:
-    def __init__(self, man: Manifest, collision_meshes: dict[str, str]):
+    def __init__(self, man: Manifest, collision_meshes: dict[str, str],
+                 exact_links: set[str] | None = None):
+        """``exact_links`` take their collision geometry from the raw manifest mesh, kept
+        concave, instead of the prepared convex decomposition.  Used to re-measure a
+        contact against true geometry; far too slow to plan with."""
         self.man = man
         self.collision = collision_meshes
+        self.exact_links = set(exact_links or ())
+        self.raw_meshes = {l.name: man.mesh_path(l.mesh)
+                           for l in man.all_links() if l.mesh}
+        self.raw_meshes.update({s.name: man.mesh_path(s.mesh)
+                                for s in man.static_objects if s.mesh})
         self.scale = man.scale
         self.frame_origin: dict[str, np.ndarray] = {}
         self._compute_frames()
@@ -77,7 +86,17 @@ class SceneBuilder:
                 f'</geometry>\n'
                 f'    </visual>\n'
             )
-        if mesh_path:
+        if name in self.exact_links and name in self.raw_meshes:
+            # Raw manifest mesh: still in manifest units, and must not be hulled.
+            s = self.scale
+            parts.append(
+                f'    <collision>\n'
+                f'      <origin xyz="{_xyz(origin)}" rpy="0 0 0"/>\n'
+                f'      <geometry><mesh filename="{self.raw_meshes[name]}" '
+                f'tesseract:make_convex="false" scale="{s} {s} {s}"/></geometry>\n'
+                f'    </collision>\n'
+            )
+        elif mesh_path:
             # Prepared meshes are already in metres, hence no scale attribute.
             parts.append(
                 f'    <collision>\n'

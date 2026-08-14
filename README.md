@@ -30,11 +30,14 @@ The two generated directories are safe to delete; they are rebuilt on the next r
    configuration reproduces the manifest's TCP pose to sub-micron accuracy, which is the
    check that this convention is right.
 2. **Collision geometry** (`meshprep.py`). Meshes are convex-decomposed and cached.
-3. **Collision matrix** (`cell.py`). Adjacent pairs are disabled, plus any pair already
-   in contact in the start pose — reported in the run log.
+3. **Collision matrix** (`cell.py`). Adjacent pairs are disabled. Any pair that reads as
+   in contact in the start pose is then re-measured against the raw concave meshes: a
+   pair that merely grazes keeps its collision check under a corrected margin, and only a
+   genuine overlap is disabled. Both outcomes are reported in the run log.
 4. **Planning** (`planning.py`, `toolpath.py`). A direct joint move is tried first;
-   otherwise OMPL, and failing that a two-leg route through the start pose. Paths are
-   then reduced to the fewest waypoints that still traverse collision-free.
+   otherwise OMPL, and failing that a two-leg route through the start pose. The result is
+   then shortcut under the weighted joint metric, and reduced to the fewest waypoints that
+   still traverse collision-free.
 5. **Output** (`output.py`).
 
 ## Why the geometry is preprocessed
@@ -42,11 +45,15 @@ The two generated directories are safe to delete; they are rebuilt on the next r
 Three findings from the supplied study drive the design, and all three are things that
 make the difference between planning working and not working at all:
 
-* **The collision margin has to be negative.** `planning.contact_ok_distance_mm` is a
-  tolerance for contact, not a clearance requirement. The gun rests against the robot
-  base in the start pose. With Tesseract's default zero margin the start state is invalid
-  and every planner fails instantly — which is exactly the `freespace transit failed
-  (FreespacePipeline + OMPLPipeline)` in the study's original `waypoints.json`.
+* **The collision margin has to be negative — but only between the robot's own links.**
+  `planning.contact_ok_distance_mm` is a tolerance for contact, not a clearance
+  requirement. The gun rests against the robot base in the start pose, so with
+  Tesseract's default zero margin the start state is invalid and every planner fails
+  instantly — exactly the `freespace transit failed (FreespacePipeline + OMPLPipeline)` in
+  the study's original `waypoints.json`. That tolerance exists to absorb error in
+  approximating a link's *own* geometry, which is a self-collision concern, so it is
+  applied only to link-against-link pairs. **Against the panels and tooling the margin is
+  0**: the robot either clears the part or it hits it. Both figures are printed at load.
 * **Raw meshes are far too slow.** Checking the CAD meshes as concave geometry costs
   ~708 ms per discrete collision check, so the sampling planner exhausts its time budget
   having explored almost nothing. Convex geometry costs 1–2 ms.
@@ -221,10 +228,10 @@ because the gun state defines a phase this comes out as a phase boundary:
 No motion is planned for the closing itself. The approach ends and the depart begins on
 the locator pose, so the single-waypoint weld phase is where the opening changes.
 
-`contact_allowed` marks the phases where the gun is deliberately up against a panel. Note
-that the collision margin itself is global (`-contact_ok_distance_mm`), because that value
-is a tolerance for mesh approximation error rather than a per-phase permission — so this
-flag records intent, not a margin that varied during planning.
+`contact_allowed` marks the phases where the gun is deliberately up against a panel. It
+records intent: no margin is relaxed for those phases, and in particular the robot is
+held to **zero** tolerance against panels and tooling (see below), so a weld whose gun tip
+genuinely overlaps the panel geometry will fail to plan rather than be waved through.
 
 **The retract direction is a derived default.** It is taken from the gun's prismatic
 stroke axis expressed in the TCP frame, which for the supplied cell comes out as tool −X.
@@ -294,6 +301,11 @@ Exit code is 0 when every segment planned, 1 otherwise.
 * The Python OMPL bindings do not expose the planner's time budget, so difficulty is
   managed by making collision checks cheaper rather than by planning for longer.
 * Convex decomposition overstates penetration where a hull is a poor fit — on the sample
-  cell the gun/base pair reads 62 mm against ~13 mm on exact meshes. Those pairs are
-  disabled from the start pose and listed in the log rather than silently tolerated.
+  cell the gun/base pair reads 62.6 mm against 7.1 mm on the exact meshes. Such pairs get
+  a corrected pair margin rather than being disabled, so they are still checked, but the
+  correction is measured at the start pose only and hull inflation varies with
+  configuration. See below for why the geometry itself cannot currently be made tighter.
+* Shortcutting is randomised and time-boxed, so the emitted path still varies between
+  runs — just over a much lower and tighter range. It shortens; it does not find the
+  optimum, and a longer `--shortcut-seconds` keeps helping with diminishing returns.
 * Requires `tesseract-robotics` and `numpy`; both are already in `.venv`.

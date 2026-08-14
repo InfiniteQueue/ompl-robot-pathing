@@ -7,10 +7,13 @@ Two things here are load-bearing and were established by measurement rather than
   against the robot base in the start pose.  With Tesseract's default zero margin the
   start state is invalid and every planner fails immediately -- which is exactly the
   ``freespace transit failed`` recorded in the sample output.
-* **Pairs already in contact at the start state are disabled.**  Convex decomposition
-  over-estimates penetration for the gun/base pair (~62 mm against ~13 mm on the exact
-  meshes).  Rather than silently loosening the margin everywhere, those specific pairs go
-  into the generated collision matrix, and the run reports which ones it disabled.
+* **Pairs already in contact at the start state are re-measured before being trusted.**
+  Convex decomposition over-estimates penetration badly for non-convex castings: at the
+  start state the gun and robot base read ~62 mm of overlap against ~7 mm on the exact
+  meshes.  Taking that at face value disables the pair for the whole run, which is both
+  wrong and unsafe, so each tripped pair is re-checked against the raw concave geometry.
+  A pair that merely grazes keeps its collision check and gets a pair-specific margin
+  offsetting the measured hull inflation; only a genuine overlap is disabled outright.
 """
 from __future__ import annotations
 
@@ -22,7 +25,8 @@ from tesseract_robotics.tesseract_collision import (
     ContactRequest, ContactResultMap, ContactResultVector, ContactTestType_ALL,
     ContactTestType_FIRST)
 from tesseract_robotics.tesseract_common import (
-    FilesystemPath, GeneralResourceLocator, Isometry3d, ManipulatorInfo)
+    CollisionMarginPairData, CollisionMarginPairOverrideType_MODIFY, FilesystemPath,
+    GeneralResourceLocator, Isometry3d, ManipulatorInfo)
 from tesseract_robotics.tesseract_environment import (
     ChangeCollisionMarginsCommand, Environment)
 from tesseract_robotics.tesseract_kinematics import KinGroupIKInput, KinGroupIKInputs
@@ -40,6 +44,7 @@ class Cell:
         self.builder = builder
         self.env = env
         self.disabled_pairs = disabled_pairs
+        self.margin_overrides: dict[tuple[str, str], float] = {}
         self.joint_names = man.robot_joint_names
         self.kin = env.getKinematicGroup(GROUP)
         self.manip_info = ManipulatorInfo(GROUP, man.robot.base_link, TCP_LINK)
@@ -219,6 +224,137 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float,
                             hull_cell=hull_cell)
 
 
+# Probe distance for the exact re-measurement.  Generous on purpose: a pair the hulls
+# call a deep crash must come back with a real number, not "nothing found".
+EXACT_PROBE_MARGIN = 0.05
+
+
+def _geometry_extent(geom) -> np.ndarray:
+    """Bounding-box size, in metres, of a loaded collision geometry."""
+    meshes = geom.getMeshes() if hasattr(geom, "getMeshes") else [geom]
+    lo = np.full(3, np.inf)
+    hi = np.full(3, -np.inf)
+    for mesh in meshes:
+        verts = mesh.getVertices()
+        n = len(verts)
+        # Stride large meshes: this is a sanity check on scale, where the error being
+        # caught is a factor of 1000, not a few percent.
+        step = max(1, n // 2000)
+        pts = np.array([np.asarray(verts[i], dtype=float).ravel()
+                        for i in range(0, n, step)])
+        lo = np.minimum(lo, pts.min(axis=0))
+        hi = np.maximum(hi, pts.max(axis=0))
+    return hi - lo
+
+
+def _assert_scale(env: Environment, man: Manifest, name: str, rel_mesh: str) -> None:
+    """Confirm a link's loaded geometry matches its source OBJ in size.
+
+    A mesh authored in millimetres but loaded without a scale lands 1000x too large and
+    kilometres away, which reports a confident and completely wrong "no contact".  That
+    has burned this code once already, so the exact measurement refuses to run unless the
+    geometry it is about to trust is the size the OBJ says it should be.
+    """
+    from . import meshprep
+
+    verts, _ = meshprep.load_obj(man.mesh_path(rel_mesh))
+    want = (verts.max(axis=0) - verts.min(axis=0)) * man.scale
+    got = _geometry_extent(env.getLink(name).collision[0].geometry)
+    if np.linalg.norm(want) <= 0:
+        raise RuntimeError(f"source mesh for '{name}' is degenerate")
+    err = float(np.linalg.norm(got - want) / np.linalg.norm(want))
+    if err > 0.1:
+        raise RuntimeError(
+            f"exact geometry for '{name}' loaded at the wrong scale: "
+            f"extent {got} m against {want} m from the source mesh")
+
+
+def _exact_contacts(man: Manifest, collision: dict[str, str], out_dir: str,
+                    pairs: list[tuple[str, str]], q: np.ndarray,
+                    joint_names: list[str], log=print) -> dict[tuple[str, str], float]:
+    """Measure ``pairs`` at joint state ``q`` against the raw concave meshes.
+
+    Concave geometry is far too slow to plan with (~700 ms a check against ~3 ms), but
+    this runs once per tripped pair with every other object switched off, so the cost is
+    a few hundred milliseconds in total.  Returns the worst distance per pair, negative
+    for penetration; a pair absent from the result had no contact within the probe.
+    """
+    links = sorted({name for pair in pairs for name in pair})
+    builder = SceneBuilder(man, collision, exact_links=set(links))
+    ex_dir = os.path.join(out_dir, "exact_check")
+    os.makedirs(ex_dir, exist_ok=True)
+
+    paths = {}
+    for stem, text in (("cell.urdf", builder.urdf()),
+                       ("kinematics_plugins.yaml", builder.kinematics_plugins_yaml()),
+                       ("contact_managers_plugins.yaml", builder.contact_managers_yaml())):
+        paths[stem] = os.path.join(ex_dir, stem).replace("\\", "/")
+        with open(paths[stem], "w", encoding="utf-8") as fh:
+            fh.write(text)
+    paths["cell.srdf"] = os.path.join(ex_dir, "cell.srdf").replace("\\", "/")
+    with open(paths["cell.srdf"], "w", encoding="utf-8") as fh:
+        fh.write(builder.srdf(builder.adjacent_pairs(), paths["kinematics_plugins.yaml"],
+                              paths["contact_managers_plugins.yaml"]))
+
+    env = Environment()
+    if not env.init(FilesystemPath(paths["cell.urdf"]), FilesystemPath(paths["cell.srdf"]),
+                    GeneralResourceLocator()):
+        raise RuntimeError(f"failed to load the exact-geometry scene in {ex_dir}")
+    env.applyCommand(ChangeCollisionMarginsCommand(EXACT_PROBE_MARGIN))
+
+    raw = {l.name: l.mesh for l in man.all_links() if l.mesh}
+    raw.update({s.name: s.mesh for s in man.static_objects if s.mesh})
+    for name in links:
+        _assert_scale(env, man, name, raw[name])
+
+    cm = env.getDiscreteContactManager()
+    objects = list(cm.getCollisionObjects())
+    env.setState(joint_names, np.asarray(q, dtype=float))
+    state = env.getState()          # must outlive the transform call, see Cell.set_state
+
+    out: dict[tuple[str, str], float] = {}
+    for a, b in pairs:
+        for name in objects:
+            if name in (a, b):
+                cm.enableCollisionObject(name)
+            else:
+                cm.disableCollisionObject(name)
+        cm.setActiveCollisionObjects([a, b])
+        cm.setCollisionObjectsTransform(state.link_transforms)
+        res = ContactResultMap()
+        cm.contactTest(res, ContactRequest(ContactTestType_ALL))
+        vec = ContactResultVector()
+        res.flattenCopyResults(vec)
+        worst = min((float(c.distance) for c in vec), default=None)
+        if worst is not None:
+            out[(a, b)] = worst
+    return out
+
+
+def _obstacle_margins(man: Manifest) -> list[tuple[str, str]]:
+    """Every (moving link, static object) pair, i.e. the robot and gun against the cell.
+
+    ``contact_ok_distance_mm`` exists to absorb the error in approximating a link's own
+    geometry, which is a self-collision concern.  Against the panels and tooling there is
+    nothing to absorb: the robot either clears the part or it hits it.
+    """
+    statics = [s.name for s in man.static_objects]
+    return [(link.name, s) for link in man.all_links() if link.mesh for s in statics]
+
+
+def _apply_margins(env: Environment, man: Manifest, default: float,
+                   overrides: dict[tuple[str, str], float] | None = None) -> None:
+    """Set the default margin, then tighten obstacle pairs and apply any overrides."""
+    env.applyCommand(ChangeCollisionMarginsCommand(default))
+    pair_data = CollisionMarginPairData()
+    for a, b in _obstacle_margins(man):
+        pair_data.setCollisionMargin(a, b, 0.0)
+    for (a, b), m in (overrides or {}).items():
+        pair_data.setCollisionMargin(a, b, m)
+    env.applyCommand(ChangeCollisionMarginsCommand(
+        pair_data, CollisionMarginPairOverrideType_MODIFY))
+
+
 def build(man: Manifest, log=print, out_dir: str | None = None,
           min_shell_mm: float = 40.0, max_shells: int = 80,
           hull_cell_mm: float = 0.0) -> Cell:
@@ -252,29 +388,52 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
                     GeneralResourceLocator()):
         raise RuntimeError(f"Tesseract failed to load the generated scene in {out_dir}")
     margin = -man.contact_ok_distance_mm * man.scale
-    env.applyCommand(ChangeCollisionMarginsCommand(margin))
-    log(f"scene loaded; collision margin {margin * 1000:.1f} mm "
-        f"(contact_ok_distance_mm={man.contact_ok_distance_mm:g})")
+    _apply_margins(env, man, margin)
+    log(f"scene loaded; collision margin {margin * 1000:.1f} mm between the robot's own "
+        f"links (contact_ok_distance_mm={man.contact_ok_distance_mm:g}), "
+        f"0.0 mm against panels and tooling")
 
     cell = Cell(man, builder, env, pairs)
 
-    # -- collision matrix: disable pairs that are in contact in the start pose ----------
+    # -- pairs in contact at the start pose: re-measure, then loosen or disable ---------
     start = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
     always = cell.contact_pairs(start)
+    overrides: dict[tuple[str, str], float] = {}
     if always:
-        for (a, b), dist in sorted(always.items(), key=lambda kv: kv[1]):
-            log(f"  ACM: disabling {a} <-> {b} (in contact at start, {dist * 1000:.1f} mm)")
-        pairs = pairs + [(a, b, "InContactAtStart") for (a, b) in always]
+        exact = _exact_contacts(man, collision, out_dir, sorted(always), start,
+                                cell.joint_names, log)
+        obstacle = {tuple(sorted(p)) for p in _obstacle_margins(man)}
+        disable: list[tuple[str, str]] = []
+        for (a, b), hull in sorted(always.items(), key=lambda kv: kv[1]):
+            # A pair with no contact within the probe is treated as clear at the probe
+            # distance, which is the most conservative reading of "nothing found".
+            true_d = exact.get((a, b), EXACT_PROBE_MARGIN)
+            base = 0.0 if (a, b) in obstacle else margin
+            if true_d < base:
+                disable.append((a, b))
+                log(f"  ACM: disabling {a} <-> {b} (exact overlap {true_d * 1000:.1f} mm "
+                    f"exceeds the {-base * 1000:.0f} mm tolerance for this pair)")
+            else:
+                # The pair keeps its collision check; the margin is shifted by the hull
+                # inflation measured here, so it still trips at the same *true* overlap.
+                overrides[(a, b)] = base + (hull - true_d)
+                log(f"  margin: {a} <-> {b} set to {overrides[(a, b)] * 1000:.1f} mm "
+                    f"(hulls read {hull * 1000:.1f} mm, exact geometry "
+                    f"{true_d * 1000:.1f} mm)")
+
+        pairs = pairs + [(a, b, "InContactAtStart") for (a, b) in disable]
         write_srdf(pairs)
         env = Environment()
         if not env.init(FilesystemPath(urdf_path), FilesystemPath(srdf_path),
                         GeneralResourceLocator()):
             raise RuntimeError("failed to reload scene with generated collision matrix")
-        env.applyCommand(ChangeCollisionMarginsCommand(margin))
+        _apply_margins(env, man, margin, overrides)
         cell = Cell(man, builder, env, pairs)
+        cell.margin_overrides = overrides
 
     if cell.in_collision(start):
         remaining = cell.contact_pairs(start)
         raise RuntimeError(f"start state still in collision: {sorted(remaining)}")
-    log(f"start state is collision free ({len(pairs)} disabled pairs in generated SRDF)")
+    log(f"start state is collision free ({len(pairs)} disabled pairs in generated SRDF, "
+        f"{len(overrides)} pair margins adjusted)")
     return cell
