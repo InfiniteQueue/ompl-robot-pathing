@@ -203,7 +203,7 @@ class Cell:
 
 
 def _resolve_collision_meshes(man: Manifest, log, min_extent: float,
-                              max_shells: int) -> dict[str, str]:
+                              max_shells: int, hull_cell: float) -> dict[str, str]:
     from . import meshprep
 
     rel: dict[str, str] = {}
@@ -215,13 +215,15 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float,
             rel[s.name] = s.mesh
     log("preparing collision geometry (convex decomposition):")
     return meshprep.prepare(man.directory, rel, man.scale, log=log,
-                            min_extent=min_extent, max_shells=max_shells)
+                            min_extent=min_extent, max_shells=max_shells,
+                            hull_cell=hull_cell)
 
 
 def build(man: Manifest, log=print, out_dir: str | None = None,
-          min_shell_mm: float = 40.0, max_shells: int = 80) -> Cell:
+          min_shell_mm: float = 40.0, max_shells: int = 80,
+          hull_cell_mm: float = 0.0) -> Cell:
     """Prepare geometry, emit URDF/SRDF, load the environment and generate the ACM."""
-    collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells)
+    collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm)
     builder = SceneBuilder(man, collision)
 
     out_dir = out_dir or os.path.join(man.directory, "generated")

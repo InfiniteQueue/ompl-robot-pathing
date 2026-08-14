@@ -79,8 +79,84 @@ def connected_shells(V: np.ndarray, F: np.ndarray, weld_tol: float = 1e-6) -> np
     return roots[Fw[:, 0]]
 
 
+def is_watertight(tris: np.ndarray) -> bool:
+    """True when every edge is shared by exactly two triangles."""
+    if len(tris) == 0:
+        return False
+    e = np.vstack([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]])
+    e = np.sort(e, axis=1)
+    _, counts = np.unique(e, axis=0, return_counts=True)
+    return bool(np.all(counts == 2))
+
+
+def mesh_volume(V: np.ndarray, tris: np.ndarray) -> float:
+    """Enclosed volume by the divergence theorem.
+
+    Only meaningful for a closed surface: on an open one the sum is origin-dependent, and
+    since these meshes carry world coordinates metres from the origin it comes out
+    arbitrarily large.  Callers must check ``is_watertight`` first.
+    """
+    if len(tris) == 0:
+        return 0.0
+    P = V - V[np.unique(tris)].mean(axis=0)
+    a, b, c = P[tris[:, 0]], P[tris[:, 1]], P[tris[:, 2]]
+    return float(abs(np.einsum("ij,ij->i", a, np.cross(b, c)).sum()) / 6.0)
+
+
+def hull_fill(V: np.ndarray, tris: np.ndarray) -> float:
+    """How much of its own bounding box a shell fills, as a proxy for hull tightness.
+
+    A machined block fills nearly all of it and hulls faithfully.  A C-yoke or a casting
+    with a deep recess fills little, and its hull bridges the void -- which is what makes
+    a hulled ``robot_base`` read 62.6 mm of penetration where the real part grazes by 7.1.
+
+    Open shells get 0.0, i.e. "assume it needs refining": a surface encloses no volume, so
+    there is nothing to compare, and an unclosed sheet is exactly the case where a hull
+    over-claims the space behind it.
+    """
+    P = V[np.unique(tris)]
+    box = float(np.prod(P.max(axis=0) - P.min(axis=0)))
+    if box <= 0:
+        return 1.0                          # planar: a hull is already exact
+    if not is_watertight(tris):
+        return 0.0
+    return mesh_volume(V, tris) / box
+
+
+def split_by_grid(V: np.ndarray, tris: np.ndarray, cell: float,
+                  overlap: float = 0.25) -> list[np.ndarray]:
+    """Cut a shell into a grid of cells, each of which is hulled separately.
+
+    This is the whole reason a hull can be made more precise without a full convex
+    decomposition: a cell-sized piece of a curved or recessed part is nearly convex, so
+    the union of the cell hulls tracks the real surface to roughly the cell size instead
+    of bridging the part end to end.
+
+    Triangles are assigned by centroid, and also to any neighbouring cell within
+    ``overlap`` of a cell width.  Without that padding the hulls would meet edge to edge
+    with nothing spanning the seam, and a thin gap between two collision shapes is a hole
+    a planner will happily drive the gun through.
+    """
+    P = V[np.unique(tris)]
+    origin = P.min(axis=0)
+    pad = overlap * cell
+    a, b, c = V[tris[:, 0]], V[tris[:, 1]], V[tris[:, 2]]
+    centroid = (a + b + c) / 3.0
+
+    buckets: dict[tuple, list[int]] = {}
+    lo = np.floor((centroid - pad - origin) / cell).astype(np.int64)
+    hi = np.floor((centroid + pad - origin) / cell).astype(np.int64)
+    for t in range(len(tris)):
+        for ix in range(lo[t, 0], hi[t, 0] + 1):
+            for iy in range(lo[t, 1], hi[t, 1] + 1):
+                for iz in range(lo[t, 2], hi[t, 2] + 1):
+                    buckets.setdefault((ix, iy, iz), []).append(t)
+    return [tris[np.array(ids, dtype=np.int64)] for ids in buckets.values() if ids]
+
+
 def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
-                     min_extent: float = 40.0, max_shells: int = 80) -> dict:
+                     min_extent: float = 40.0, max_shells: int = 80,
+                     hull_cell: float = 0.0, fill_threshold: float = 0.75) -> dict:
     """Split ``src`` into connected shells and write them as ``o`` groups into ``dst``.
 
     Every shell becomes a convex hull, and each hull is a collision pair to test, so the
@@ -125,6 +201,25 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
         if max_shells and len(groups) >= max_shells:
             break
 
+    # Refine the shells a single hull represents badly.  Done after the cap, so the cap
+    # still means "this many parts" and refinement is priced separately.
+    split_shells = 0
+    if hull_cell > 0:
+        refined: list[tuple[np.ndarray, np.ndarray]] = []
+        for vids, tris in groups:
+            P = V[vids]
+            diagonal = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0)))
+            if diagonal <= hull_cell or hull_fill(V, tris) >= fill_threshold:
+                refined.append((vids, tris))
+                continue
+            pieces = split_by_grid(V, tris, hull_cell)
+            if len(pieces) < 2:
+                refined.append((vids, tris))
+                continue
+            split_shells += 1
+            refined.extend((np.unique(piece), piece) for piece in pieces)
+        groups = refined
+
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     with open(dst, "w", encoding="utf-8") as fh:
         fh.write("# weldpath convex-decomposition source=%s\n" % os.path.basename(src))
@@ -147,6 +242,7 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
         "shells": int(len(unique)),
         "shells_dropped_small": int(dropped_small),
         "shells_kept": len(groups),
+        "shells_refined": int(split_shells),
         "seconds": round(time.time() - t0, 2),
     }
 
@@ -160,13 +256,15 @@ def _signature(path: str) -> list:
 
 
 def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
-            log=print, min_extent: float = 40.0, max_shells: int = 80) -> dict[str, str]:
+            log=print, min_extent: float = 40.0, max_shells: int = 80,
+            hull_cell: float = 0.0) -> dict[str, str]:
     """Convex-decompose every mesh that needs it, reusing cached results.
 
     ``mesh_rel_paths`` maps link name -> mesh path relative to ``directory``.
     Returns link name -> absolute path of the prepared collision OBJ.
     """
-    settings = [round(float(min_extent), 4), int(max_shells), round(float(scale), 9)]
+    settings = [round(float(min_extent), 4), int(max_shells), round(float(scale), 9),
+                round(float(hull_cell), 4)]
     cache_dir = os.path.join(directory, CACHE_DIRNAME).replace("\\", "/")
     os.makedirs(cache_dir, exist_ok=True)
     index_path = os.path.join(cache_dir, "index.json")
@@ -193,10 +291,12 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             out[link] = dst
             continue
         stats = decompose_to_obj(src, dst, scale, min_extent=min_extent,
-                                 max_shells=max_shells)
-        log("  + %-22s %d tris, %d shells -> %d kept (%.1fs)"
+                                 max_shells=max_shells, hull_cell=hull_cell)
+        refined = (f", {stats['shells_refined']} refined" if stats["shells_refined"]
+                   else "")
+        log("  + %-22s %d tris, %d shells -> %d kept%s (%.1fs)"
             % (link, stats["triangles"], stats["shells"], stats["shells_kept"],
-               stats["seconds"]))
+               refined, stats["seconds"]))
         index[link] = {"sig": sig, "settings": settings, "stats": stats}
         out[link] = dst
 

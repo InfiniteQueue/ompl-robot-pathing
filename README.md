@@ -232,6 +232,39 @@ Every locator in the supplied manifest has `is_weld: false`, so this has never b
 exercised against real weld data — check it against a manifest that contains welds, and
 override with `--approach-axis` if a cell's tool frame is set up differently.
 
+## How precise the collision geometry can be made
+
+The false gun/base contact is a hull artifact, confirmed rather than assumed: the deepest
+reported contact point sits at world (−1551, 1897, 26), and a ray-parity test against the
+raw `robot_base` triangles puts that point **outside** the solid on every axis tried, with
+the nearest real material 7.8 mm away. The hull of `robot_base` shell 0 (5792 vertices
+collapsing to 39) bridges a void the gun tip is sitting in.
+
+Splitting on connected components cannot fix that — it separates *parts*, and this is one
+part that is not convex. `--hull-cell-mm` therefore adds a second stage: a shell whose mesh
+fills less than 75% of its bounding box is cut into cells of roughly that size and each
+cell hulled separately, with triangles padded into neighbouring cells so the hulls overlap
+instead of leaving a seam. Measured against the 7.1 mm ground truth:
+
+| `--hull-cell-mm` | shells | gun/base reads | check |
+| --- | --- | --- | --- |
+| 0 (off) | 306 | −62.6 mm | 3.8 ms |
+| 300 | 1749 | −62.6 mm | 17.7 ms |
+| 200 | 3094 | −62.6 mm | 20.6 ms |
+| 120 | 5816 | −62.0 mm | 59.8 ms |
+
+**It does not fix this cell, and the cost is severe.** The void being bridged is about
+8 mm across, so resolving it needs cells of that order — which would mean hundreds of
+thousands of hulls. At 300 mm the weld study already fails to plan at all, because the
+slower checks starve the sampling planner of its time budget. Leave it off unless a
+particular cell has a large open feature (a gun throat, a deep fixture pocket) that a
+single hull is closing off, which is the case it was built for.
+
+Genuinely tighter geometry needs a decomposition that cuts along concavity rather than on
+a grid — VHACD or CoACD. Neither ships with `tesseract-robotics`, and this venv has only
+numpy, so that would mean taking on a new dependency. Until then the pair-margin
+correction is what keeps the false contact from disabling a real collision check.
+
 ## Options
 
 | Flag | Default | Effect |
@@ -245,6 +278,7 @@ override with `--approach-axis` if a cell's tool frame is set up differently.
 | `--shortcut-seconds` | 3 | time budget for shortcutting each transit |
 | `--min-shell-mm` | 20 | drop collision shells smaller than this |
 | `--max-shells` | 200 | cap convex shells per link |
+| `--hull-cell-mm` | 0 | refine badly-hulled shells into cells this size; 0 disables |
 | `--joint-speed-deg-s` | 180 | peak joint speed behind the `time` field |
 | `--linear-speed-mm-s` | 250 | peak tool speed on `LIN` moves |
 | `--accel-blend` | 0.5 | 0 flat velocity … 1 bang-bang; see above |

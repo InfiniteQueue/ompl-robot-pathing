@@ -45,6 +45,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-shells", type=int, default=200,
                    help="keep at most this many convex shells per link; fewer is faster "
                         "but coarser (default: 200)")
+    p.add_argument("--hull-cell-mm", type=float, default=0.0, metavar="MM",
+                   help="split shells that a single convex hull fits badly into cells of "
+                        "roughly this size, hulling each one, so the collision geometry "
+                        "follows recesses instead of bridging them. Smaller is more "
+                        "accurate and slower; 0 disables (default: 0)")
     p.add_argument("--joint-speed-deg-s", type=float, default=180.0,
                    help="peak joint speed used to fill in waypoint times (default: 180)")
     p.add_argument("--linear-speed-mm-s", type=float, default=250.0,
@@ -90,7 +95,8 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         cell = cell_mod.build(man, log=log, min_shell_mm=args.min_shell_mm,
-                              max_shells=args.max_shells)
+                              max_shells=args.max_shells,
+                              hull_cell_mm=args.hull_cell_mm)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
