@@ -336,19 +336,25 @@ def _obstacle_margins(man: Manifest) -> list[tuple[str, str]]:
 
     ``contact_ok_distance_mm`` exists to absorb the error in approximating a link's own
     geometry, which is a self-collision concern.  Against the panels and tooling there is
-    nothing to absorb: the robot either clears the part or it hits it.
+    nothing to absorb, so these pairs are governed by ``obstacle_clearance`` instead.
     """
     statics = [s.name for s in man.static_objects]
     return [(link.name, s) for link in man.all_links() if link.mesh for s in statics]
 
 
 def _apply_margins(env: Environment, man: Manifest, default: float,
-                   overrides: dict[tuple[str, str], float] | None = None) -> None:
-    """Set the default margin, then tighten obstacle pairs and apply any overrides."""
+                   overrides: dict[tuple[str, str], float] | None = None,
+                   obstacle_clearance: float = 0.0) -> None:
+    """Set the default margin, then apply the obstacle clearance and any overrides.
+
+    A Tesseract margin is the distance at which a pair counts as colliding, so this one
+    number spans both intents: 0 means "touching is a collision", a positive value keeps
+    the robot that far clear of the parts, and a negative one tolerates that much overlap.
+    """
     env.applyCommand(ChangeCollisionMarginsCommand(default))
     pair_data = CollisionMarginPairData()
     for a, b in _obstacle_margins(man):
-        pair_data.setCollisionMargin(a, b, 0.0)
+        pair_data.setCollisionMargin(a, b, obstacle_clearance)
     for (a, b), m in (overrides or {}).items():
         pair_data.setCollisionMargin(a, b, m)
     env.applyCommand(ChangeCollisionMarginsCommand(
@@ -357,7 +363,7 @@ def _apply_margins(env: Environment, man: Manifest, default: float,
 
 def build(man: Manifest, log=print, out_dir: str | None = None,
           min_shell_mm: float = 40.0, max_shells: int = 80,
-          hull_cell_mm: float = 0.0) -> Cell:
+          hull_cell_mm: float = 0.0, obstacle_clearance_mm: float = 0.0) -> Cell:
     """Prepare geometry, emit URDF/SRDF, load the environment and generate the ACM."""
     collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm)
     builder = SceneBuilder(man, collision)
@@ -388,10 +394,11 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
                     GeneralResourceLocator()):
         raise RuntimeError(f"Tesseract failed to load the generated scene in {out_dir}")
     margin = -man.contact_ok_distance_mm * man.scale
-    _apply_margins(env, man, margin)
+    clearance = obstacle_clearance_mm * man.scale
+    _apply_margins(env, man, margin, obstacle_clearance=clearance)
     log(f"scene loaded; collision margin {margin * 1000:.1f} mm between the robot's own "
         f"links (contact_ok_distance_mm={man.contact_ok_distance_mm:g}), "
-        f"0.0 mm against panels and tooling")
+        f"{clearance * 1000:+.1f} mm against panels and tooling")
 
     cell = Cell(man, builder, env, pairs)
 
@@ -408,11 +415,21 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
             # A pair with no contact within the probe is treated as clear at the probe
             # distance, which is the most conservative reading of "nothing found".
             true_d = exact.get((a, b), EXACT_PROBE_MARGIN)
-            base = 0.0 if (a, b) in obstacle else margin
-            if true_d < base:
+            base = clearance if (a, b) in obstacle else margin
+            if true_d < 0.0:
+                # Real geometry genuinely interpenetrates: a modelling problem, not
+                # something a margin should paper over.
                 disable.append((a, b))
-                log(f"  ACM: disabling {a} <-> {b} (exact overlap {true_d * 1000:.1f} mm "
-                    f"exceeds the {-base * 1000:.0f} mm tolerance for this pair)")
+                log(f"  ACM: disabling {a} <-> {b} (exact overlap "
+                    f"{-true_d * 1000:.1f} mm)")
+            elif true_d < base:
+                # Clear, but by less than the requested clearance.  The start pose is a
+                # given, so the pair keeps its check at the distance actually available
+                # rather than making the whole run unplannable.
+                overrides[(a, b)] = hull - 1e-9
+                log(f"  ! {a} <-> {b} is only {true_d * 1000:.1f} mm apart at the start "
+                    f"pose, short of the {base * 1000:.1f} mm clearance; this pair is "
+                    f"held to {true_d * 1000:.1f} mm instead")
             else:
                 # The pair keeps its collision check; the margin is shifted by the hull
                 # inflation measured here, so it still trips at the same *true* overlap.
@@ -427,7 +444,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         if not env.init(FilesystemPath(urdf_path), FilesystemPath(srdf_path),
                         GeneralResourceLocator()):
             raise RuntimeError("failed to reload scene with generated collision matrix")
-        _apply_margins(env, man, margin, overrides)
+        _apply_margins(env, man, margin, overrides, obstacle_clearance=clearance)
         cell = Cell(man, builder, env, pairs)
         cell.margin_overrides = overrides
 

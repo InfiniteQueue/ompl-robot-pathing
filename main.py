@@ -36,20 +36,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-shortcut", dest="shortcut", action="store_false",
                    help="skip the shortcutting pass and emit the sampling planner's own "
                         "route, which is typically much longer")
-    p.add_argument("--shortcut-seconds", type=float, default=3.0, metavar="SECONDS",
+    p.add_argument("--shortcut-seconds", type=float, default=10.0, metavar="SECONDS",
                    help="time budget for shortcutting each freespace transit; longer "
-                        "budgets keep shortening with diminishing returns (default: 3)")
-    p.add_argument("--min-shell-mm", type=float, default=20.0,
+                        "budgets keep shortening with diminishing returns (default: 10)")
+    p.add_argument("--min-shell-mm", type=float, default=5.0,
                    help="drop collision shells smaller than this across their bounding "
-                        "box diagonal (default: 20)")
-    p.add_argument("--max-shells", type=int, default=200,
+                        "box diagonal (default: 5)")
+    p.add_argument("--max-shells", type=int, default=400,
                    help="keep at most this many convex shells per link; fewer is faster "
-                        "but coarser (default: 200)")
+                        "but coarser (default: 400)")
     p.add_argument("--hull-cell-mm", type=float, default=0.0, metavar="MM",
                    help="split shells that a single convex hull fits badly into cells of "
                         "roughly this size, hulling each one, so the collision geometry "
                         "follows recesses instead of bridging them. Smaller is more "
                         "accurate and slower; 0 disables (default: 0)")
+    p.add_argument("--obstacle-clearance-mm", type=float, default=0.0, metavar="MM",
+                   help="how close the robot and gun may come to the panels and tooling "
+                        "before it counts as a collision. Positive keeps that much clear "
+                        "air, 0 means touching collides, negative tolerates that much "
+                        "overlap (default: 0)")
     p.add_argument("--joint-speed-deg-s", type=float, default=180.0,
                    help="peak joint speed used to fill in waypoint times (default: 180)")
     p.add_argument("--linear-speed-mm-s", type=float, default=250.0,
@@ -96,7 +101,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         cell = cell_mod.build(man, log=log, min_shell_mm=args.min_shell_mm,
                               max_shells=args.max_shells,
-                              hull_cell_mm=args.hull_cell_mm)
+                              hull_cell_mm=args.hull_cell_mm,
+                              obstacle_clearance_mm=args.obstacle_clearance_mm)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
