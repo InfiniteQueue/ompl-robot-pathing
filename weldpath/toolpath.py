@@ -89,7 +89,8 @@ def offset_pose(pose: np.ndarray, axis_tcp: np.ndarray, distance: float) -> np.n
 class ToolpathPlanner:
     def __init__(self, cell: Cell, man: Manifest, *, approach_axis: str | None = None,
                  linear_step_mm: float = 50.0, ompl_attempts: int = 3,
-                 segment_length: float = 0.02, check_step_deg: float = 3.0, log=print):
+                 segment_length: float = 0.02, check_step_deg: float = 3.0,
+                 shortcut_seconds: float = 2.0, log=print):
         self.cell = cell
         self.man = man
         self.log = log
@@ -98,6 +99,7 @@ class ToolpathPlanner:
         self.ompl_attempts = ompl_attempts
         self.segment_length = segment_length
         self.check_step = np.deg2rad(check_step_deg)
+        self.shortcut_seconds = shortcut_seconds
         self.start_q = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
 
     # -- per-locator anchor states ------------------------------------------
@@ -174,7 +176,8 @@ class ToolpathPlanner:
         transit = plan_freespace(
             self.cell, transit_start, transit_end,
             attempts=self.ompl_attempts, segment_length=self.segment_length,
-            check_step=self.check_step, fallback_via=[self.start_q], log=self.log)
+            check_step=self.check_step, fallback_via=[self.start_q],
+            shortcut_seconds=self.shortcut_seconds, log=self.log)
         opening = a.gun_opening_leave if a.is_weld else 0.0
         phases.append(Phase("freespace", PTP, transit, opening, False))
 

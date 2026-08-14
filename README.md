@@ -137,6 +137,30 @@ KDL's solver is local and returns one solution per seed, so scattered extra seed
 to expose the other arm configurations rather than only the branch nearest the previous
 locator.
 
+## Shortening the route between locators
+
+Picking good endpoints is not enough. RRTConnect returns the *first* path it finds, and
+reducing waypoints cannot change a route — deleting a point that a straight move already
+bypasses leaves a wide arc exactly as wide. So a shortcutting pass runs before the
+reduction: it densifies the planner's path, then repeatedly picks two states on it and
+splices in the direct move between them whenever that move is collision free and cheaper
+under the same weighted metric. Every replacement is collision-checked before it is kept,
+so the result is traversable by construction.
+
+The weighting is what makes it cut the right thing — an excursion in J1 costs what it
+actually costs at the tool, instead of the same as a wrist rotation. On the sample study,
+emitted travel per segment:
+
+| Segment | Before | After | Direct move needs |
+| --- | --- | --- | --- |
+| via9 → via10 | 590° | 341° | 182° |
+| via10 → via11 | 860° | 212° | 190° |
+
+Repeating one segment four times each way, the medians were 1083° → 351° and 749° → 336°,
+with the worst single joint dropping from 426° to 124°. It costs 2–4 s per transit and
+usually adds a couple of waypoints, since a tighter route has more corners worth keeping.
+Turn it off with `--no-shortcut`.
+
 Point counts are kept low on purpose: a transit is reduced to the fewest waypoints that
 still traverse it collision-free, so a large sweeping motion costs a handful of points
 rather than dozens.
@@ -217,6 +241,8 @@ override with `--approach-axis` if a cell's tool frame is set up differently.
 | `--check-step-deg` | 3 | collision checking resolution along a move |
 | `--segment-length-rad` | 0.02 | collision resolution inside the sampling planner |
 | `--ompl-attempts` | 3 | freespace attempts before the fallback route |
+| `--no-shortcut` | off | emit the sampling planner's own route, unshortened |
+| `--shortcut-seconds` | 2 | time budget for shortcutting each transit |
 | `--min-shell-mm` | 40 | drop collision shells smaller than this |
 | `--max-shells` | 80 | cap convex shells per link |
 | `--joint-speed-deg-s` | 180 | peak joint speed behind the `time` field |

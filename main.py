@@ -33,6 +33,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: 0.02)")
     p.add_argument("--ompl-attempts", type=int, default=3,
                    help="freespace planning attempts per segment (default: 3)")
+    p.add_argument("--no-shortcut", dest="shortcut", action="store_false",
+                   help="skip the shortcutting pass and emit the sampling planner's own "
+                        "route, which is typically much longer")
+    p.add_argument("--shortcut-seconds", type=float, default=3.0, metavar="SECONDS",
+                   help="time budget for shortcutting each freespace transit; longer "
+                        "budgets keep shortening with diminishing returns (default: 3)")
     p.add_argument("--min-shell-mm", type=float, default=40.0,
                    help="drop collision shells smaller than this across their bounding "
                         "box diagonal (default: 40)")
@@ -97,6 +103,7 @@ def main(argv: list[str] | None = None) -> int:
         ompl_attempts=args.ompl_attempts,
         segment_length=args.segment_length_rad,
         check_step_deg=args.check_step_deg,
+        shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,
         log=log)
     segments = planner.run()
 

@@ -61,6 +61,68 @@ def simplify(cell: Cell, path: list[np.ndarray], max_step: float = 0.05
     return out
 
 
+def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.ndarray]:
+    """Points strictly between a and b, spaced no further apart than ``step``."""
+    n = max(1, int(np.ceil(float(np.max(np.abs(b - a))) / max(step, 1e-9))))
+    return [a + (b - a) * (k / n) for k in range(1, n)]
+
+
+def shortcut(cell: Cell, path: list[np.ndarray], *, time_budget: float = 2.0,
+             max_step: float = 0.05, rng: np.random.Generator | None = None,
+             log=None) -> list[np.ndarray]:
+    """Shorten a path by replacing detours with direct moves, under the weighted metric.
+
+    ``simplify`` can only delete waypoints that a straight move already bypasses, so it
+    never changes the route: a sampled path that swings the arm around the base to reach a
+    point beside it keeps that swing.  This pass repeatedly picks two states on the path
+    and, if the straight move between them is collision free *and* cheaper under the
+    cell's weighted joint metric, splices it in.  Because the metric counts how far the
+    tool actually travels, a wide J1 excursion is what gets cut first rather than a wrist
+    rotation that costs the same in raw joint space.
+
+    The path is densified first, so cuts can start and end between the planner's own
+    waypoints instead of only at them.  Work is bounded by ``time_budget`` seconds; the
+    result is always collision free, since every replacement is checked before it is kept.
+    """
+    if len(path) < 3 or time_budget <= 0:
+        return [np.asarray(p, dtype=float).copy() for p in path]
+
+    dense: list[np.ndarray] = [np.asarray(path[0], dtype=float)]
+    for a, b in zip(path, path[1:]):
+        dense.extend(_resample(cell, np.asarray(a, dtype=float),
+                               np.asarray(b, dtype=float), max_step))
+        dense.append(np.asarray(b, dtype=float))
+
+    def cost(points: list[np.ndarray]) -> float:
+        return sum(cell.distance(x, y) for x, y in zip(points, points[1:]))
+
+    rng = rng or np.random.default_rng(0)
+    before = cost(dense)
+    deadline = time.time() + time_budget
+    tried = kept = 0
+
+    while time.time() < deadline and len(dense) > 2:
+        i, j = sorted(rng.integers(0, len(dense), size=2))
+        if j - i < 2:
+            continue
+        tried += 1
+        span = cost(dense[i:j + 1])
+        direct = cell.distance(dense[i], dense[j])
+        if direct >= span - 1e-9:
+            continue
+        if cell.segment_collides(dense[i], dense[j], max_step=max_step):
+            continue
+        dense[i + 1:j] = _resample(cell, dense[i], dense[j], max_step)
+        kept += 1
+
+    if log:
+        after = cost(dense)
+        gain = 100.0 * (1.0 - after / before) if before > 0 else 0.0
+        log(f"      shortcut: {kept}/{tried} cuts kept, weighted path cost "
+            f"{before:.2f} -> {after:.2f} m ({gain:.0f}% shorter)")
+    return dense
+
+
 # ---------------------------------------------------------------------------
 # freespace
 # ---------------------------------------------------------------------------
@@ -117,6 +179,7 @@ def _extract(results) -> list[np.ndarray]:
 def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int = 3,
                    segment_length: float = 0.02, check_step: float = 0.05,
                    fallback_via: list[np.ndarray] | None = None,
+                   shortcut_seconds: float = 2.0,
                    log=print) -> list[np.ndarray]:
     """Collision-free joint path from ``qa`` to ``qb``.
 
@@ -127,7 +190,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
     """
     try:
         return _plan_direct(cell, qa, qb, attempts=attempts,
-                            segment_length=segment_length, check_step=check_step, log=log)
+                            segment_length=segment_length, check_step=check_step,
+                            shortcut_seconds=shortcut_seconds, log=log)
     except PlanningError:
         if not fallback_via:
             raise
@@ -139,18 +203,23 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
         try:
             first = _plan_direct(cell, qa, mid, attempts=attempts,
                                  segment_length=segment_length, check_step=check_step,
-                                 log=log)
+                                 shortcut_seconds=0.0, log=log)
             second = _plan_direct(cell, mid, qb, attempts=attempts,
                                   segment_length=segment_length, check_step=check_step,
-                                  log=log)
+                                  shortcut_seconds=0.0, log=log)
         except PlanningError:
             continue
-        return simplify(cell, first + second[1:], max_step=check_step)
+        # Shortcut the joined route rather than each leg: the detour through the fallback
+        # pose is exactly the kind of corner this pass exists to cut.
+        joined = shortcut(cell, first + second[1:], time_budget=shortcut_seconds,
+                          max_step=check_step, log=log)
+        return simplify(cell, joined, max_step=check_step)
     raise PlanningError("freespace transit failed, including via fallback poses")
 
 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
-                 segment_length: float, check_step: float, log) -> list[np.ndarray]:
+                 segment_length: float, check_step: float, shortcut_seconds: float,
+                 log) -> list[np.ndarray]:
     if not cell.segment_collides(qa, qb, max_step=check_step):
         return [qa, qb]
 
@@ -167,9 +236,12 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
         dt = time.time() - t0
         if response.successful:
             raw = _extract(response.results)
-            path = simplify(cell, raw, max_step=check_step)
-            log(f"      OMPL attempt {attempt}: solved in {dt:.1f}s "
-                f"({len(raw)} raw -> {len(path)} points)")
+            log(f"      OMPL attempt {attempt}: solved in {dt:.1f}s ({len(raw)} raw points)")
+            # Shortcut before reducing: the dense path gives the cuts somewhere to land.
+            cut = shortcut(cell, raw, time_budget=shortcut_seconds,
+                           max_step=check_step, log=log)
+            path = simplify(cell, cut, max_step=check_step)
+            log(f"      reduced to {len(path)} points")
             return path
         last = str(response.message)
         log(f"      OMPL attempt {attempt}: {last} ({dt:.1f}s)")
