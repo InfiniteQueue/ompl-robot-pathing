@@ -242,9 +242,9 @@ override with `--approach-axis` if a cell's tool frame is set up differently.
 | `--segment-length-rad` | 0.02 | collision resolution inside the sampling planner |
 | `--ompl-attempts` | 3 | freespace attempts before the fallback route |
 | `--no-shortcut` | off | emit the sampling planner's own route, unshortened |
-| `--shortcut-seconds` | 2 | time budget for shortcutting each transit |
-| `--min-shell-mm` | 40 | drop collision shells smaller than this |
-| `--max-shells` | 80 | cap convex shells per link |
+| `--shortcut-seconds` | 3 | time budget for shortcutting each transit |
+| `--min-shell-mm` | 20 | drop collision shells smaller than this |
+| `--max-shells` | 200 | cap convex shells per link |
 | `--joint-speed-deg-s` | 180 | peak joint speed behind the `time` field |
 | `--linear-speed-mm-s` | 250 | peak tool speed on `LIN` moves |
 | `--accel-blend` | 0.5 | 0 flat velocity … 1 bang-bang; see above |
