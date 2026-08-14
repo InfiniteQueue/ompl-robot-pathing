@@ -52,8 +52,9 @@ make the difference between planning working and not working at all:
   instantly — exactly the `freespace transit failed (FreespacePipeline + OMPLPipeline)` in
   the study's original `waypoints.json`. That tolerance exists to absorb error in
   approximating a link's *own* geometry, which is a self-collision concern, so it is
-  applied only to link-against-link pairs. **Against the panels and tooling the margin is
-  0**: the robot either clears the part or it hits it. Both figures are printed at load.
+  applied only to link-against-link pairs. Against the panels and tooling the margin is
+  `--obstacle-clearance-mm` instead, which defaults to 0 — the robot either clears the
+  part or it hits it. Both figures are printed at load.
 * **Raw meshes are far too slow.** Checking the CAD meshes as concave geometry costs
   ~708 ms per discrete collision check, so the sampling planner exhausts its time budget
   having explored almost nothing. Convex geometry costs 1–2 ms.
@@ -229,9 +230,28 @@ No motion is planned for the closing itself. The approach ends and the depart be
 the locator pose, so the single-waypoint weld phase is where the opening changes.
 
 `contact_allowed` marks the phases where the gun is deliberately up against a panel. It
-records intent: no margin is relaxed for those phases, and in particular the robot is
-held to **zero** tolerance against panels and tooling (see below), so a weld whose gun tip
-genuinely overlaps the panel geometry will fail to plan rather than be waved through.
+records intent: no margin is relaxed for those phases, so a weld whose gun tip genuinely
+overlaps the panel geometry will fail to plan rather than be waved through. On the
+re-exported sample study every weld locator does exactly that — the tip sits 24.9 to
+76.6 mm inside `Assy_ST240_RH` — so those locators need either a negative
+`--obstacle-clearance-mm` or a per-phase relaxation that does not yet exist.
+
+## Clearance from the parts
+
+`--obstacle-clearance-mm` sets how close the robot and gun may come to the static objects
+before it counts as a collision. It is a Tesseract pair margin, so one number covers all
+three intents: **positive** keeps that much clear air, **0** means touching collides, and
+**negative** tolerates that much overlap. Verified on the weld study by measuring the true
+closest approach along the emitted path — at 0 the route skims to 0.5 mm, at 25 it holds
+25.6 mm.
+
+Tightening it costs planning time and can make a transit impossible, since it shrinks the
+free space the sampler has to work with. It applies to every moving-link/static-object
+pair; self-collision continues to use `contact_ok_distance_mm`.
+
+If a pair is already closer than the requested clearance in the start pose, that pair is
+held to the distance actually available there and the run says so, rather than declaring
+the start state invalid and refusing to plan at all.
 
 **The retract direction is a derived default.** It is taken from the gun's prismatic
 stroke axis expressed in the TCP frame, which for the supplied cell comes out as tool −X.
@@ -286,6 +306,7 @@ correction is what keeps the false contact from disabling a real collision check
 | `--min-shell-mm` | 20 | drop collision shells smaller than this |
 | `--max-shells` | 200 | cap convex shells per link |
 | `--hull-cell-mm` | 0 | refine badly-hulled shells into cells this size; 0 disables |
+| `--obstacle-clearance-mm` | 0 | clear air to hold from panels and tooling; may be negative |
 | `--joint-speed-deg-s` | 180 | peak joint speed behind the `time` field |
 | `--linear-speed-mm-s` | 250 | peak tool speed on `LIN` moves |
 | `--accel-blend` | 0.5 | 0 flat velocity … 1 bang-bang; see above |
