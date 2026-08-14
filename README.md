@@ -120,6 +120,23 @@ after generation, with any deviation over 1 mm reported as a warning.
 known-clear pose to route a difficult transit through, but getting the robot from wherever
 it is onto the first locator is left to the caller.
 
+## Choosing a joint solution for a locator
+
+A TCP pose does not determine the arm configuration, and picking badly is expensive. Two
+things decide it:
+
+* **Joint wrapping.** J4 and J6 travel ±360°, so a pose usually has more than one legal
+  representation. On the sample cell the solver returned via11 at J6 = +155.5°, forcing a
+  325.1° spin; J6 = −204.5° is the identical pose to 3e-16 rad and needs 34.9°. Every
+  candidate is shifted onto its nearest legal turn before being judged.
+* **A weighted distance.** Solutions are ranked by how far the *tool* moves, using each
+  joint's measured TCP travel per radian (J3 ≈ 2239 mm/rad against J4 ≈ 624 mm/rad on this
+  cell), so a wide J1 swing is not treated as equivalent to a wrist twist.
+
+KDL's solver is local and returns one solution per seed, so scattered extra seeds are used
+to expose the other arm configurations rather than only the branch nearest the previous
+locator.
+
 Point counts are kept low on purpose: a transit is reduced to the fewest waypoints that
 still traverse it collision-free, so a large sweeping motion costs a handful of points
 rather than dozens.

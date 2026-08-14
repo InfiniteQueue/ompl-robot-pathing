@@ -48,6 +48,57 @@ class Cell:
         self._cm = env.getDiscreteContactManager()
         self._cm.setActiveCollisionObjects(env.getActiveLinkNames())
         self._state = None                      # keeps the SWIG state object alive
+        self._revolute = [j.type == "revolute" for j in man.robot.joints
+                          if j.type != "fixed"]
+        self.weights = self._joint_weights()
+
+    # -- joint metric --------------------------------------------------------
+    def _joint_weights(self, delta: float = 1e-4) -> np.ndarray:
+        """Millimetres of TCP travel per radian of each joint, at the start pose.
+
+        A radian of J1 swings the whole arm through metres while a radian of J6 barely
+        moves the tool, but a planner working in raw joint space treats them as equal --
+        which is how a transit ends up circling the base to save a wrist rotation.
+        Weighting distances by this makes "short" mean short in the cell, not in the
+        joint vector.
+        """
+        q = np.array([self.man.start_state[n] for n in self.joint_names], dtype=float)
+        base = self.fk(q)[:3, 3]
+        weights = np.ones(len(self.joint_names))
+        for i in range(len(self.joint_names)):
+            probe = q.copy()
+            probe[i] += delta
+            weights[i] = np.linalg.norm(self.fk(probe)[:3, 3] - base) / delta
+        # keep the wrist from collapsing to zero cost
+        floor = 0.02 * float(weights.max()) if weights.max() > 0 else 1.0
+        return np.maximum(weights, floor)
+
+    def distance(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Weighted joint distance: how far the tool travels, roughly, from a to b."""
+        return float(np.linalg.norm((np.asarray(b) - np.asarray(a)) * self.weights))
+
+    def wrap_towards(self, q: np.ndarray, reference: np.ndarray) -> np.ndarray:
+        """Shift each revolute joint by whole turns to sit as close to ``reference``.
+
+        A revolute joint at q and at q + 2*pi put the tool in exactly the same place, and
+        J4/J6 here have +/-360 deg of travel, so both representations are usually legal.
+        Picking the wrong one costs a full extra revolution of that joint for no gain.
+        Joints are independent under this transform, so choosing each one's nearest turn
+        is optimal rather than merely greedy.
+        """
+        out = np.array(q, dtype=float).copy()
+        for i in range(len(out)):
+            if not self._revolute[i]:
+                continue
+            best = out[i]
+            turns = int(np.ceil((self.upper[i] - self.lower[i]) / (2 * np.pi))) + 1
+            for k in range(-turns, turns + 1):
+                cand = out[i] + k * 2 * np.pi
+                if self.lower[i] - 1e-9 <= cand <= self.upper[i] + 1e-9:
+                    if abs(cand - reference[i]) < abs(best - reference[i]):
+                        best = cand
+            out[i] = best
+        return out
 
     # -- state / collision ---------------------------------------------------
     def set_state(self, q: np.ndarray) -> None:
@@ -117,18 +168,37 @@ class Cell:
                 for i in range(len(raw))]
 
     def solve_pose(self, pose_world_mm: np.ndarray, seeds: list[np.ndarray],
-                   require_collision_free: bool = True) -> np.ndarray | None:
-        """Best joint solution for a pose: in limits, collision free, closest to a seed."""
+                   require_collision_free: bool = True, branch_seeds: int = 8,
+                   rng: np.random.Generator | None = None) -> np.ndarray | None:
+        """Best joint solution for a pose: in limits, collision free, nearest the seed.
+
+        KDL's solver is a local method returning one solution per seed, so the branch it
+        lands on is whatever the seed was closest to.  Extra scattered seeds expose the
+        other arm configurations, every candidate is then wrapped onto its nearest
+        equivalent turn, and the winner is chosen by weighted distance so a solution is
+        only preferred if it genuinely moves the tool less.
+        """
+        reference = np.asarray(seeds[0], dtype=float)
+        rng = rng or np.random.default_rng(0)
+        all_seeds = list(seeds)
+        if branch_seeds:
+            span = self.upper - self.lower
+            for _ in range(branch_seeds):
+                all_seeds.append(np.clip(reference + rng.uniform(-0.35, 0.35) * span,
+                                         self.lower, self.upper))
+
         best, best_cost = None, np.inf
-        for seed in seeds:
+        for seed in all_seeds:
             for q in self.ik(pose_world_mm, seed):
+                q = self.wrap_towards(q, reference)
                 if not self.within_limits(q):
                     continue
+                cost = self.distance(reference, q)
+                if cost >= best_cost:
+                    continue                    # cheaper test before the collision check
                 if require_collision_free and self.in_collision(q):
                     continue
-                cost = float(np.linalg.norm(q - seeds[0]))
-                if cost < best_cost:
-                    best, best_cost = q, cost
+                best, best_cost = q, cost
         return best
 
 
