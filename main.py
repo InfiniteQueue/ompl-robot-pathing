@@ -42,9 +42,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-shell-mm", type=float, default=5.0,
                    help="drop collision shells smaller than this across their bounding "
                         "box diagonal (default: 5)")
-    p.add_argument("--max-shells", type=int, default=400,
+    p.add_argument("--max-shells", type=int, default=500,
                    help="keep at most this many convex shells per link; fewer is faster "
-                        "but coarser (default: 400)")
+                        "but coarser (default: 500)")
     p.add_argument("--hull-cell-mm", type=float, default=0.0, metavar="MM",
                    help="split shells that a single convex hull fits badly into cells of "
                         "roughly this size, hulling each one, so the collision geometry "
@@ -55,6 +55,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "before it counts as a collision. Positive keeps that much clear "
                         "air, 0 means touching collides, negative tolerates that much "
                         "overlap (default: 0)")
+    p.add_argument("--weld-clearance-mm", type=float, default=2.0, metavar="MM",
+                   help="obstacle clearance used instead of --obstacle-clearance-mm on "
+                        "any move starting or ending at a weld locator, where the gun "
+                        "has to reach the panel (default: 2)")
+    p.add_argument("--weld-shift-mm", type=float, default=-5.0, metavar="MM",
+                   help="move every weld locator this far along its own z axis before "
+                        "planning, backing the tool off a pose authored on the panel "
+                        "surface. Negative retreats along -z (default: -5)")
     p.add_argument("--joint-speed-deg-s", type=float, default=180.0,
                    help="peak joint speed used to fill in waypoint times (default: 180)")
     p.add_argument("--linear-speed-mm-s", type=float, default=250.0,
@@ -94,6 +102,11 @@ def main(argv: list[str] | None = None) -> int:
 
     log(f"loaded manifest: {len(man.locators)} locators, "
         f"{len(man.static_objects)} static objects, units={man.units}")
+
+    moved = manifest_mod.shift_weld_locators(man, args.weld_shift_mm)
+    if moved:
+        log(f"shifted {moved} weld locators by {args.weld_shift_mm:+g} mm along their "
+            f"own z axis")
     if not man.locators:
         print("error: manifest defines no locators, nothing to plan", file=sys.stderr)
         return 1
@@ -116,6 +129,7 @@ def main(argv: list[str] | None = None) -> int:
         segment_length=args.segment_length_rad,
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,
+        weld_clearance_mm=args.weld_clearance_mm,
         log=log)
     segments = planner.run()
 

@@ -59,10 +59,20 @@ class StaticObject:
 @dataclass
 class Locator:
     name: str
-    pose_world: np.ndarray          # 4x4, translation in mm
+    pose_world: np.ndarray          # 4x4, translation in mm -- the pose planned against
     is_weld: bool
     gun_opening_arrive: float       # mm
     gun_opening_leave: float        # mm
+    pose_world_import: np.ndarray | None = None   # set when pose_world has been shifted
+
+    @property
+    def export_pose(self) -> np.ndarray:
+        """Where this locator belongs in the output: as imported, not as planned.
+
+        A weld may be planned against a pose backed off from the panel, but the exported
+        program has to name the weld where the study put it.
+        """
+        return self.pose_world if self.pose_world_import is None else self.pose_world_import
 
 
 @dataclass
@@ -114,6 +124,35 @@ class Manifest:
     def obstacle_names(self) -> list[str]:
         """Static objects that the robot must avoid."""
         return [s.name for s in self.static_objects if s.mesh]
+
+
+def shift_weld_locators(man: Manifest, distance: float) -> int:
+    """Move every weld locator along its own z axis by ``distance`` manifest units.
+
+    A weld locator is authored on the panel surface, which puts the gun tip inside the
+    sheet once the gun geometry is taken into account -- so the pose as exported can be
+    unreachable without allowing the tool to interpenetrate the part.  Backing the
+    locator off along its own approach axis restores a pose the robot can actually hold,
+    and doing it here means the planner, the collision checks and the emitted
+    ``tcp_world_mm`` all agree on where the weld is.
+
+    The pose as imported is kept on the locator, because that is the one the exported
+    program must name -- the shift exists to make the pose plannable, not to move the weld.
+
+    Returns the number of locators moved.
+    """
+    if not distance:
+        return 0
+    moved = 0
+    for loc in man.locators:
+        if not loc.is_weld:
+            continue
+        loc.pose_world_import = loc.pose_world
+        shifted = loc.pose_world.copy()
+        shifted[:3, 3] += shifted[:3, 2] * distance
+        loc.pose_world = shifted
+        moved += 1
+    return moved
 
 
 def _mat(v: Any) -> np.ndarray:

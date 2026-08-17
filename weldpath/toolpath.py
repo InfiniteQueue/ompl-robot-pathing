@@ -90,7 +90,8 @@ class ToolpathPlanner:
     def __init__(self, cell: Cell, man: Manifest, *, approach_axis: str | None = None,
                  linear_step_mm: float = 50.0, ompl_attempts: int = 3,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
-                 shortcut_seconds: float = 2.0, log=print):
+                 shortcut_seconds: float = 2.0, weld_clearance_mm: float | None = None,
+                 log=print):
         self.cell = cell
         self.man = man
         self.log = log
@@ -100,11 +101,26 @@ class ToolpathPlanner:
         self.segment_length = segment_length
         self.check_step = np.deg2rad(check_step_deg)
         self.shortcut_seconds = shortcut_seconds
+        # None means "no separate weld rule", i.e. the cell's own clearance throughout.
+        self.weld_clearance = (None if weld_clearance_mm is None
+                               else weld_clearance_mm * man.scale)
         self.start_q = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
+
+    def _clearance_for(self, *locators: Locator):
+        """Clearance context for work that touches these locators.
+
+        A move with a weld at either end is governed by the weld clearance: the gun has to
+        be able to reach the panel it is welding, while a transit between two ordinary
+        vias has no reason to be that permissive.
+        """
+        if self.weld_clearance is not None and any(l.is_weld for l in locators):
+            return self.cell.clearance(self.weld_clearance)
+        return self.cell.clearance(self.cell.obstacle_clearance)
 
     # -- per-locator anchor states ------------------------------------------
     def _solve_locator(self, loc: Locator, seed: np.ndarray) -> np.ndarray:
-        q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q])
+        with self._clearance_for(loc):
+            q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q])
         if q is None:
             raise PlanningError(f"no collision-free IK for locator '{loc.name}'")
         return q
@@ -137,7 +153,8 @@ class ToolpathPlanner:
                     raise PlanningError(f"no reachable joint solution for '{a.name}'")
                 if b.name not in anchors:
                     raise PlanningError(f"no reachable joint solution for '{b.name}'")
-                seg.phases = self._plan_pair(a, b, anchors)
+                with self._clearance_for(a, b):
+                    seg.phases = self._plan_pair(a, b, anchors)
             except PlanningError as exc:
                 seg.error = str(exc)
                 self.log(f"    ! {exc}")
@@ -191,4 +208,29 @@ class ToolpathPlanner:
         problem = validate(self.cell, full, max_step=self.check_step)
         if problem:
             raise PlanningError(f"planned path failed validation: {problem}")
+
+        # Planning may have used a weld pose backed off from the panel; the program has to
+        # name the weld where the study put it, so those waypoints go back.  Done after
+        # validation because this last step is the gun deliberately closing on the part.
+        self._restore_weld_poses(a, b, phases, qa, qb)
         return phases
+
+    def _restore_weld_poses(self, a: Locator, b: Locator, phases: list[Phase],
+                            qa: np.ndarray, qb: np.ndarray) -> None:
+        """Put the waypoints that sit *at* a weld back onto its imported pose."""
+        for loc, anchor, which in ((a, qa, "first"), (b, qb, "last")):
+            if not loc.is_weld or loc.pose_world_import is None:
+                continue
+            # Seeded from the planned anchor, so this stays on the same arm configuration;
+            # collision checking is off because contact with the panel is the point.
+            q = self.cell.solve_pose(loc.export_pose, [anchor],
+                                     require_collision_free=False, branch_seeds=0)
+            if q is None:
+                self.log(f"    ! cannot reach the imported pose of '{loc.name}'; "
+                         f"leaving it at the shifted pose")
+                continue
+            for ph in phases:
+                if which == "first" and ph.name in ("weld", "depart"):
+                    ph.states[0] = q          # the weld itself, and where depart begins
+                elif which == "last" and ph.name == "approach":
+                    ph.states[-1] = q

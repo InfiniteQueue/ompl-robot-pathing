@@ -17,6 +17,7 @@ Two things here are load-bearing and were established by measurement rather than
 """
 from __future__ import annotations
 
+import contextlib
 import os
 
 import numpy as np
@@ -45,6 +46,8 @@ class Cell:
         self.env = env
         self.disabled_pairs = disabled_pairs
         self.margin_overrides: dict[tuple[str, str], float] = {}
+        self.margin = 0.0                       # default (self-collision) margin
+        self.obstacle_clearance = 0.0           # margin against the static objects
         self.joint_names = man.robot_joint_names
         self.kin = env.getKinematicGroup(GROUP)
         self.manip_info = ManipulatorInfo(GROUP, man.robot.base_link, TCP_LINK)
@@ -104,6 +107,35 @@ class Cell:
                         best = cand
             out[i] = best
         return out
+
+    # -- clearance -----------------------------------------------------------
+    def _set_obstacle_clearance(self, value: float) -> None:
+        _apply_margins(self.env, self.man, self.margin, self.margin_overrides,
+                       obstacle_clearance=value)
+        self.obstacle_clearance = value
+        # The cached manager was built under the old margins, so take a fresh one.
+        self._cm = self.env.getDiscreteContactManager()
+        self._cm.setActiveCollisionObjects(self.env.getActiveLinkNames())
+        self._state = None
+
+    @contextlib.contextmanager
+    def clearance(self, value: float):
+        """Temporarily plan against a different clearance from the static objects.
+
+        Welding is the case that needs this: the gun is meant to close on the panel, so
+        the clearance that keeps transits honest would reject the weld itself.  Planners
+        read their margins from the environment, so this swaps them there and puts the
+        previous value back afterwards.
+        """
+        previous = self.obstacle_clearance
+        if value == previous:
+            yield
+            return
+        self._set_obstacle_clearance(value)
+        try:
+            yield
+        finally:
+            self._set_obstacle_clearance(previous)
 
     # -- state / collision ---------------------------------------------------
     def set_state(self, q: np.ndarray) -> None:
@@ -401,6 +433,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         f"{clearance * 1000:+.1f} mm against panels and tooling")
 
     cell = Cell(man, builder, env, pairs)
+    cell.margin, cell.obstacle_clearance = margin, clearance
 
     # -- pairs in contact at the start pose: re-measure, then loosen or disable ---------
     start = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
@@ -446,6 +479,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
             raise RuntimeError("failed to reload scene with generated collision matrix")
         _apply_margins(env, man, margin, overrides, obstacle_clearance=clearance)
         cell = Cell(man, builder, env, pairs)
+        cell.margin, cell.obstacle_clearance = margin, clearance
         cell.margin_overrides = overrides
 
     if cell.in_collision(start):

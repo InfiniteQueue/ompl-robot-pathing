@@ -119,8 +119,11 @@ def check_endpoints(document: dict, man: Manifest, tol_mm: float = 1.0) -> list[
     The consumer relies on the end of a segment being its ``to`` locator, and the path is
     required to begin at the first locator rather than at the robot's start pose, so both
     ends are worth asserting rather than assuming.
+
+    Welds are checked against their *imported* pose, which is what the file claims and what
+    the consumer will place back in the cell -- not the shifted pose used for planning.
     """
-    poses = {loc.name: np.array(loc.pose_world, dtype=float) for loc in man.locators}
+    poses = {loc.name: np.array(loc.export_pose, dtype=float) for loc in man.locators}
     problems = []
 
     def position(waypoint) -> np.ndarray:
