@@ -63,6 +63,25 @@ def build_parser() -> argparse.ArgumentParser:
                    help="move every weld locator this far along its own z axis before "
                         "planning, backing the tool off a pose authored on the panel "
                         "surface. Negative retreats along -z (default: -5)")
+    p.add_argument("--no-clearance-penalty", dest="clearance_penalty",
+                   action="store_false",
+                   help="do not penalise routes that run close to the panels and "
+                        "tooling; only hard collisions are avoided")
+    p.add_argument("--clearance-penalty-max-mm", type=float, default=300.0, metavar="MM",
+                   help="clearance at and above which there is no penalty; the curve "
+                        "starts here (default: 300)")
+    p.add_argument("--clearance-penalty-min-mm", type=float, default=10.0, metavar="MM",
+                   help="clearance at and below which the penalty is at its peak "
+                        "(default: 3)")
+    p.add_argument("--clearance-penalty-multiplier", type=float, default=500.0,
+                   metavar="N",
+                   help="peak penalty: a second spent at the minimum clearance costs as "
+                        "much as N seconds in open space (default: 50)")
+    p.add_argument("--clearance-penalty-cutoff-mm", type=float, default=0.0, metavar="MM",
+                   help="ignore clearances beyond this, so the proximity query looks no "
+                        "further and planning runs faster. Truncates the shallow end of "
+                        "the curve without reshaping the rest, so the penalty steps "
+                        "abruptly at this distance; 0 uses the maximum (default: 0)")
     p.add_argument("--joint-speed-deg-s", type=float, default=180.0,
                    help="peak joint speed used to fill in waypoint times (default: 180)")
     p.add_argument("--linear-speed-mm-s", type=float, default=250.0,
@@ -90,6 +109,7 @@ def main(argv: list[str] | None = None) -> int:
     from weldpath import cell as cell_mod
     from weldpath import manifest as manifest_mod
     from weldpath import output as output_mod
+    from weldpath.penalty import ClearancePenalty
     from weldpath.profile import MotionProfile
     from weldpath.toolpath import ToolpathPlanner
 
@@ -112,10 +132,23 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     try:
+        penalty = ClearancePenalty(
+            max_mm=args.clearance_penalty_max_mm,
+            min_mm=args.clearance_penalty_min_mm,
+            multiplier=args.clearance_penalty_multiplier,
+            cutoff_mm=args.clearance_penalty_cutoff_mm,
+            enabled=args.clearance_penalty)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+    log(penalty.describe())
+
+    try:
         cell = cell_mod.build(man, log=log, min_shell_mm=args.min_shell_mm,
                               max_shells=args.max_shells,
                               hull_cell_mm=args.hull_cell_mm,
-                              obstacle_clearance_mm=args.obstacle_clearance_mm)
+                              obstacle_clearance_mm=args.obstacle_clearance_mm,
+                              penalty=penalty)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1

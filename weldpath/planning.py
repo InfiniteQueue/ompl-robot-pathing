@@ -47,15 +47,41 @@ def simplify(cell: Cell, path: list[np.ndarray], max_step: float = 0.05
 
     A sampled path wanders and the controller does not need the wandering, so this is
     also what keeps the output down to the handful of points a FANUC program wants.
+
+    Where a clearance penalty is in force this also refuses reductions that push the route
+    nearer the parts.  Without that check this pass runs last and would quietly undo the
+    standoff the shortcut pass just bought: the chord across a corner the robot took wide
+    is shorter, collision free, and hard against the panel.
     """
     if len(path) < 3:
         return [p.copy() for p in path]
+    penalised = cell.penalty is not None and cell.penalty.enabled
+    factors: dict[int, float] = {}
+
+    def factor(k: int) -> float:
+        if k not in factors:
+            factors[k] = cell.penalty_factor(path[k])
+        return factors[k]
+
+    def polyline_cost(i: int, j: int) -> float:
+        return sum(cell.distance(path[k], path[k + 1]) * max(factor(k), factor(k + 1))
+                   for k in range(i, j))
+
     out = [path[0]]
     i = 0
     while i < len(path) - 1:
         j = len(path) - 1
-        while j > i + 1 and cell.segment_collides(path[i], path[j], max_step=max_step):
-            j -= 1
+        while j > i + 1:
+            if cell.segment_collides(path[i], path[j], max_step=max_step):
+                j -= 1
+                continue
+            if penalised:
+                chord = cell.segment_cost(path[i], path[j], max_step=max_step,
+                                          fa=factor(i), fb=factor(j))
+                if chord > polyline_cost(i, j) + 1e-9:
+                    j -= 1
+                    continue
+            break
         out.append(path[j])
         i = j
     return out
@@ -70,19 +96,29 @@ def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.
 def shortcut(cell: Cell, path: list[np.ndarray], *, time_budget: float = 2.0,
              max_step: float = 0.05, rng: np.random.Generator | None = None,
              log=None) -> list[np.ndarray]:
-    """Shorten a path by replacing detours with direct moves, under the weighted metric.
+    """Improve a path under the weighted metric, penalised for running close to the parts.
 
     ``simplify`` can only delete waypoints that a straight move already bypasses, so it
     never changes the route: a sampled path that swings the arm around the base to reach a
-    point beside it keeps that swing.  This pass repeatedly picks two states on the path
-    and, if the straight move between them is collision free *and* cheaper under the
-    cell's weighted joint metric, splices it in.  Because the metric counts how far the
-    tool actually travels, a wide J1 excursion is what gets cut first rather than a wrist
-    rotation that costs the same in raw joint space.
+    point beside it keeps that swing.  This pass reshapes the route instead, using two
+    moves that between them can both shorten and stand off:
 
-    The path is densified first, so cuts can start and end between the planner's own
-    waypoints instead of only at them.  Work is bounded by ``time_budget`` seconds; the
-    result is always collision free, since every replacement is checked before it is kept.
+    * **cut** -- replace a stretch of path with the straight move between its ends, when
+      that move is collision free and cheaper.  This is what removes gross detours, but it
+      can only ever remove path, so on its own it cannot move away from an obstacle.
+    * **relocate** -- displace a single waypoint and keep it if both neighbouring moves
+      stay clear and the pair gets cheaper.  This is what gives the clearance penalty
+      teeth: pushing a waypoint away from a panel costs a little travel and saves a lot of
+      penalty, so it wins.  Every waypoint is eligible except the two endpoints, which are
+      the states handed in and belong to the locators either side.
+
+    Cost counts how far the tool actually travels, so a wide J1 excursion is cut before a
+    wrist rotation that costs the same in raw joint space, and time spent near a panel is
+    multiplied by :class:`~weldpath.penalty.ClearancePenalty`.
+
+    The path is densified first, so changes can land between the planner's own waypoints
+    instead of only at them.  Work is bounded by ``time_budget`` seconds; the result is
+    always collision free, since every replacement is checked before it is kept.
     """
     if len(path) < 3 or time_budget <= 0:
         return [np.asarray(p, dtype=float).copy() for p in path]
@@ -93,34 +129,108 @@ def shortcut(cell: Cell, path: list[np.ndarray], *, time_budget: float = 2.0,
                                np.asarray(b, dtype=float), max_step))
         dense.append(np.asarray(b, dtype=float))
 
-    def cost(points: list[np.ndarray]) -> float:
-        return sum(cell.distance(x, y) for x, y in zip(points, points[1:]))
+    # One clearance query per waypoint, cached: the geometry query dominates, so scoring a
+    # candidate has to be arithmetic over remembered factors rather than fresh queries.
+    penalised = cell.penalty is not None and cell.penalty.enabled
+    fac = [cell.penalty_factor(p) if penalised else 1.0 for p in dense]
+
+    def step_cost(x: np.ndarray, y: np.ndarray, fx: float, fy: float) -> float:
+        return cell.distance(x, y) * max(fx, fy)
+
+    def span_cost(i: int, j: int) -> float:
+        return sum(step_cost(dense[k], dense[k + 1], fac[k], fac[k + 1])
+                   for k in range(i, j))
 
     rng = rng or np.random.default_rng(0)
-    before = cost(dense)
+    before = span_cost(0, len(dense) - 1)
     deadline = time.time() + time_budget
-    tried = kept = 0
+    tried = cuts = moves = 0
 
     while time.time() < deadline and len(dense) > 2:
-        i, j = sorted(rng.integers(0, len(dense), size=2))
-        if j - i < 2:
-            continue
         tried += 1
-        span = cost(dense[i:j + 1])
-        direct = cell.distance(dense[i], dense[j])
-        if direct >= span - 1e-9:
-            continue
-        if cell.segment_collides(dense[i], dense[j], max_step=max_step):
-            continue
-        dense[i + 1:j] = _resample(cell, dense[i], dense[j], max_step)
-        kept += 1
+        if rng.random() < 0.5:
+            cuts += _try_cut(cell, dense, fac, rng, max_step, penalised, span_cost)
+        else:
+            moves += _try_relocate(cell, dense, fac, rng, max_step, penalised, step_cost)
 
     if log:
-        after = cost(dense)
+        after = span_cost(0, len(dense) - 1)
         gain = 100.0 * (1.0 - after / before) if before > 0 else 0.0
-        log(f"      shortcut: {kept}/{tried} cuts kept, weighted path cost "
-            f"{before:.2f} -> {after:.2f} m ({gain:.0f}% shorter)")
+        detail = "penalised cost" if penalised else "weighted path cost"
+        log(f"      shortcut: {cuts} cuts and {moves} relocations kept from {tried} "
+            f"attempts, {detail} {before:.2f} -> {after:.2f} m ({gain:.0f}% better)")
     return dense
+
+
+def _try_cut(cell: Cell, dense, fac, rng, max_step, penalised, span_cost) -> int:
+    """Replace dense[i..j] with the straight move between the ends, if that is cheaper."""
+    i, j = sorted(rng.integers(0, len(dense), size=2))
+    if j - i < 2:
+        return 0
+    span = span_cost(i, j)
+    # Every factor is at least 1, so the unpenalised length is a valid lower bound on what
+    # the replacement can cost.  Rejecting on that first keeps the expensive checks off
+    # the many candidates that were never going to win.
+    if cell.distance(dense[i], dense[j]) >= span - 1e-9:
+        return 0
+    if cell.segment_collides(dense[i], dense[j], max_step=max_step):
+        return 0
+    points = _resample(cell, dense[i], dense[j], max_step)
+    if penalised:
+        factors = [cell.penalty_factor(p) for p in points]
+        chain = [dense[i]] + points + [dense[j]]
+        chain_f = [fac[i]] + factors + [fac[j]]
+        direct = sum(cell.distance(x, y) * max(fx, fy)
+                     for x, y, fx, fy in zip(chain, chain[1:], chain_f, chain_f[1:]))
+        if direct >= span - 1e-9:
+            return 0
+    else:
+        factors = [1.0] * len(points)
+    dense[i + 1:j] = points
+    fac[i + 1:j] = factors
+    return 1
+
+
+def _try_relocate(cell: Cell, dense, fac, rng, max_step, penalised, step_cost) -> int:
+    """Displace one interior waypoint and keep the move if it lowers the local cost.
+
+    The displacement is drawn in joint space but scaled by the cell's joint weights, so a
+    given attempt moves the tool about as far whichever joints it uses -- otherwise almost
+    every sample would be a wrist twiddle that changes nothing.
+    """
+    if len(dense) < 3:
+        return 0
+    k = int(rng.integers(1, len(dense) - 1))        # endpoints are fixed by the caller
+    target = float(rng.uniform(0.005, 0.15))        # metres of tool travel
+    direction = rng.normal(size=len(dense[k]))
+    reach = float(np.linalg.norm(direction * cell.weights))
+    if reach <= 0.0:
+        return 0
+    candidate = dense[k] + direction * (target / reach)
+    candidate = np.clip(candidate, cell.lower, cell.upper)
+    if not cell.within_limits(candidate):
+        return 0
+
+    before = (step_cost(dense[k - 1], dense[k], fac[k - 1], fac[k])
+              + step_cost(dense[k], dense[k + 1], fac[k], fac[k + 1]))
+    # Cheapest possible replacement, ignoring any penalty, as an early reject.
+    floor = (cell.distance(dense[k - 1], candidate)
+             + cell.distance(candidate, dense[k + 1]))
+    if floor >= before - 1e-9:
+        return 0
+    if cell.segment_collides(dense[k - 1], candidate, max_step=max_step):
+        return 0
+    if cell.segment_collides(candidate, dense[k + 1], max_step=max_step):
+        return 0
+
+    f = cell.penalty_factor(candidate) if penalised else 1.0
+    after = (step_cost(dense[k - 1], candidate, fac[k - 1], f)
+             + step_cost(candidate, dense[k + 1], f, fac[k + 1]))
+    if after >= before - 1e-9:
+        return 0
+    dense[k] = candidate
+    fac[k] = f
+    return 1
 
 
 # ---------------------------------------------------------------------------
@@ -310,7 +420,26 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
                  segment_length: float, check_step: float, shortcut_seconds: float,
                  log) -> list[np.ndarray]:
     if not cell.segment_collides(qa, qb, max_step=check_step):
-        return [qa, qb]
+        # A clear straight line is normally the best answer there is, and a sampling
+        # planner asked to improve on it would only return it again.  But "clear" and
+        # "sensible" part company when the line grazes a panel, so when the penalty says
+        # this one does, the same pass that stands other routes off is given a chance to
+        # bow it away -- there is nothing for OMPL to do here, but plenty for relocation.
+        raw = cell.distance(qa, qb)
+        if not (cell.penalty is not None and cell.penalty.enabled) or shortcut_seconds <= 0:
+            return [qa, qb]
+        cost = cell.segment_cost(qa, qb, max_step=check_step)
+        if cost <= raw * 1.05:
+            return [qa, qb]
+        log(f"      direct move is clear but runs close to the parts "
+            f"(cost {cost:.2f} m against {raw:.2f} m of travel); standing it off")
+        # Densified here rather than left to shortcut: a two-point path has no interior
+        # waypoint, and relocation is the only move that can help.
+        seeded = [qa] + _resample(cell, np.asarray(qa, dtype=float),
+                                  np.asarray(qb, dtype=float), check_step) + [qb]
+        improved = shortcut(cell, seeded, time_budget=shortcut_seconds,
+                            max_step=check_step, log=log)
+        return simplify(cell, improved, max_step=check_step)
 
     last = ""
     for attempt in range(1, attempts + 1):

@@ -68,6 +68,9 @@ class Cell:
         if self.gun_joint_name:
             self._state_names.append(self.gun_joint_name)
             self.gun_value = float(man.start_state.get(self.gun_joint_name, 0.0))
+
+        self.penalty = None                     # set by attach_penalty
+        self._pm = None                         # proximity manager, only if penalised
         self.weights = self._joint_weights()
 
     # -- joint metric --------------------------------------------------------
@@ -123,9 +126,11 @@ class Cell:
         _apply_margins(self.env, self.man, self.margin, self.margin_overrides,
                        obstacle_clearance=value)
         self.obstacle_clearance = value
-        # The cached manager was built under the old margins, so take a fresh one.
+        # The cached manager was built under the old margins, so take a fresh one -- and
+        # the proximity manager is a clone of it, so that has to be rebuilt too.
         self._cm = self.env.getDiscreteContactManager()
         self._cm.setActiveCollisionObjects(self.env.getActiveLinkNames())
+        self.attach_penalty(self.penalty)
         self._state = None
 
     @contextlib.contextmanager
@@ -180,12 +185,71 @@ class Cell:
             return q
         return np.concatenate([q, [self.gun_value]])
 
+    # -- proximity -----------------------------------------------------------
+    def attach_penalty(self, penalty) -> None:
+        """Give the cell a second contact manager dedicated to measuring clearance.
+
+        Margins decide what a manager will even report, and the planning manager's are set
+        so that *contact* is the event of interest -- it cannot see a panel 40 mm away.
+        Rather than widen those and have every near miss read as a collision, this clones
+        the manager and widens only the clone, and only for the robot-against-cell pairs.
+        The clone's default margin is driven hugely negative so self-collision pairs stay
+        silent and the query cost is confined to the pairs that matter.
+        """
+        self.penalty = penalty
+        self._pm = None
+        if penalty is None or not penalty.enabled:
+            return
+        probe = penalty.probe_mm * self.man.scale
+        pm = self._cm.clone()
+        pm.setDefaultCollisionMargin(-1.0)
+        for a, b in _obstacle_margins(self.man):
+            pm.setCollisionMarginPair(a, b, probe)
+        pm.setActiveCollisionObjects(self.env.getActiveLinkNames())
+        self._pm = pm
+
+    def clearance_mm(self, q: np.ndarray) -> float:
+        """Closest approach between the robot or gun and the static objects, in mm.
+
+        Returns the probe distance when nothing is within it, which is all the penalty
+        needs: beyond that the cost is flat, so the exact figure does not matter.
+        """
+        if self._pm is None:
+            return float("inf")
+        # Deliberately not set_state: refreshing the planning manager's transforms costs as
+        # much as the query itself and nothing here is going to ask it anything.
+        self._load_state(q)
+        return self._clearance_now()
+
+    def _clearance_now(self) -> float:
+        """Clearance at the state already loaded.  Assumes ``set_state`` has just run."""
+        self._pm.setCollisionObjectsTransform(self._state.link_transforms)
+        res = ContactResultMap()
+        self._pm.contactTest(res, ContactRequest(ContactTestType_ALL))
+        if res.size() == 0:
+            return self.penalty.probe_mm
+        vec = ContactResultVector()
+        res.flattenCopyResults(vec)
+        worst = min((float(c.distance) for c in vec), default=None)
+        if worst is None:
+            return self.penalty.probe_mm
+        return worst / self.man.scale
+
+    def penalty_factor(self, q: np.ndarray) -> float:
+        """Cost multiplier for standing where ``q`` puts the robot."""
+        if self._pm is None:
+            return 1.0
+        return self.penalty.factor(self.clearance_mm(q))
+
     # -- state / collision ---------------------------------------------------
-    def set_state(self, q: np.ndarray) -> None:
+    def _load_state(self, q: np.ndarray) -> None:
         self.env.setState(self._state_names, self._state_values(q))
         # Must hold a reference: passing env.getState().link_transforms inline lets the
         # temporary die and the binding then reads freed memory.
         self._state = self.env.getState()
+
+    def set_state(self, q: np.ndarray) -> None:
+        self._load_state(q)
         self._cm.setCollisionObjectsTransform(self._state.link_transforms)
 
     def in_collision(self, q: np.ndarray) -> bool:
@@ -214,6 +278,35 @@ class Cell:
             if self.in_collision(a + t * (b - a)):
                 return True
         return False
+
+    def segment_cost(self, a: np.ndarray, b: np.ndarray, max_step: float = 0.05,
+                     fa: float | None = None, fb: float | None = None) -> float:
+        """Penalised length of the segment a->b, assuming it is already known clear.
+
+        Loading a joint state and refreshing the collision transforms costs far more than
+        the geometry query on top of it, so the interior samples are walked once and the
+        clearance is read off the state that is already loaded.  ``fa``/``fb`` let a caller
+        that has already measured the endpoints avoid paying for them twice, which is the
+        common case when a path is being rescored.
+        """
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        raw = self.distance(a, b)
+        if self._pm is None or raw <= 0.0:
+            return raw
+        n = max(2, int(np.ceil(np.max(np.abs(b - a)) / max_step)) + 1)
+        factors = []
+        for k, t in enumerate(np.linspace(0.0, 1.0, n)):
+            if k == 0 and fa is not None:
+                factors.append(fa)
+            elif k == n - 1 and fb is not None:
+                factors.append(fb)
+            else:
+                factors.append(self.penalty_factor(a + t * (b - a)))
+        # Each sub-step is charged at the worse of the states it runs between, so a dip
+        # towards the panel is never averaged away by the clear air on either side.
+        step = raw / (n - 1)
+        return sum(step * max(x, y) for x, y in zip(factors, factors[1:]))
 
     def within_limits(self, q: np.ndarray) -> bool:
         return bool(np.all(q >= self.lower - 1e-9) and np.all(q <= self.upper + 1e-9))
@@ -459,7 +552,8 @@ def _log_gun(man: Manifest, log) -> None:
 
 def build(man: Manifest, log=print, out_dir: str | None = None,
           min_shell_mm: float = 40.0, max_shells: int = 80,
-          hull_cell_mm: float = 0.0, obstacle_clearance_mm: float = 0.0) -> Cell:
+          hull_cell_mm: float = 0.0, obstacle_clearance_mm: float = 0.0,
+          penalty=None) -> Cell:
     """Prepare geometry, emit URDF/SRDF, load the environment and generate the ACM."""
     collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm)
     builder = SceneBuilder(man, collision)
@@ -498,6 +592,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
 
     cell = Cell(man, builder, env, pairs)
     cell.margin, cell.obstacle_clearance = margin, clearance
+    cell.attach_penalty(penalty)
     _log_gun(man, log)
 
     # -- pairs in contact at the start pose: re-measure, then loosen or disable ---------
@@ -546,6 +641,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         cell = Cell(man, builder, env, pairs)
         cell.margin, cell.obstacle_clearance = margin, clearance
         cell.margin_overrides = overrides
+        cell.attach_penalty(penalty)
 
     if cell.in_collision(start):
         remaining = cell.contact_pairs(start)
