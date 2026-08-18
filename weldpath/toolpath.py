@@ -52,31 +52,19 @@ class Segment:
     error: str | None = None
 
 
-def retract_axis_tcp(man: Manifest, override: str | None = None) -> np.ndarray:
-    """Direction, in TCP coordinates, the robot retracts along when leaving a weld.
+def retract_axis(override: str | None = None) -> np.ndarray:
+    """Direction, in a weld locator's own frame, that the robot retracts along.
 
-    Derived from the gun's prismatic stroke axis: the throat opens along that axis, so a
-    move along its negation pulls the gun off the joint.  For the supplied cell this comes
-    out as tool -X.  Override with ``--approach-axis`` if a particular cell's tool frame
-    is set up differently -- the sample manifest contains no welds, so this default has
-    not been exercised against real weld data.
+    The locator carries its own orientation, and its z axis is the one authored against the
+    joint, so the retract is defined relative to that rather than derived from the tool.
+    Deriving it from the gun's stroke -- as this did while the gun was prismatic -- made
+    the direction a property of the machine instead of the weld, and gave no answer at all
+    once the gun became angular.
+
+    The default is ``-z``, matching ``--weld-shift-mm``: the shift backs the tool off the
+    panel along the locator's -z, so the 300 mm linear retract has to travel the same way.
     """
-    if override:
-        return AXES[override.lower()]
-    gun_axis = None
-    for dev in man.devices[1:]:
-        for j in dev.joints:
-            if j.is_prismatic:
-                gun_axis = np.array(j.axis_world, dtype=float)
-                break
-    if gun_axis is None:
-        return AXES["-z"]
-    n = np.linalg.norm(gun_axis)
-    if n < 1e-9:
-        return AXES["-z"]
-    R = np.array(man.tcp_world_pose, dtype=float)[:3, :3]
-    axis_tcp = R.T @ (gun_axis / n)
-    return -axis_tcp / np.linalg.norm(axis_tcp)
+    return AXES[override.lower()] if override else AXES["-z"]
 
 
 def offset_pose(pose: np.ndarray, axis_tcp: np.ndarray, distance: float) -> np.ndarray:
@@ -95,7 +83,7 @@ class ToolpathPlanner:
         self.cell = cell
         self.man = man
         self.log = log
-        self.axis = retract_axis_tcp(man, approach_axis)
+        self.axis = retract_axis(approach_axis)
         self.linear_step_mm = linear_step_mm
         self.ompl_attempts = ompl_attempts
         self.segment_length = segment_length

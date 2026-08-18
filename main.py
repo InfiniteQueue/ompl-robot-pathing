@@ -20,8 +20,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("directory",
                    help="study directory containing manifest.json and meshes/")
     p.add_argument("--approach-axis", choices=["+x", "-x", "+y", "-y", "+z", "-z"],
-                   help="TCP-frame direction to retract along when leaving a weld "
-                        "(default: derived from the gun's stroke axis)")
+                   help="direction in a weld locator's own frame to retract along when "
+                        "leaving it (default: -z, matching --weld-shift-mm)")
     p.add_argument("--linear-step-mm", type=float, default=50.0,
                    help="spacing of points along linear approach/depart moves "
                         "(default: 50)")
