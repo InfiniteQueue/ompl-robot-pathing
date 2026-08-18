@@ -176,12 +176,11 @@ def _extract(results) -> list[np.ndarray]:
     return out
 
 
-def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int = 3,
-                   segment_length: float = 0.02, check_step: float = 0.05,
-                   fallback_via: list[np.ndarray] | None = None,
-                   shortcut_seconds: float = 2.0,
-                   log=print) -> list[np.ndarray]:
-    """Collision-free joint path from ``qa`` to ``qb``.
+def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
+                     segment_length: float, check_step: float,
+                     fallback_via: list[np.ndarray] | None,
+                     shortcut_seconds: float, log) -> list[np.ndarray]:
+    """Collision-free joint path from ``qa`` to ``qb`` at the gun's current opening.
 
     If the direct transit cannot be found, the move is retried in two legs through each
     of ``fallback_via`` -- normally the cell's start pose.  Routing a difficult transit
@@ -215,6 +214,96 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
                           max_step=check_step, log=log)
         return simplify(cell, joined, max_step=check_step)
     raise PlanningError("freespace transit failed, including via fallback poses")
+
+
+def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int = 3,
+                   segment_length: float = 0.02, check_step: float = 0.05,
+                   fallback_via: list[np.ndarray] | None = None,
+                   shortcut_seconds: float = 2.0,
+                   openings: list[float] | None = None,
+                   log=print) -> list[tuple[list[np.ndarray], float | None]]:
+    """Plan a transit, choosing a gun opening for it when the natural one will not do.
+
+    Some destinations simply cannot be reached at the opening the robot arrives with: the
+    tip is 200 mm of swing, so an opening that clears a fixture on the way out fouls it on
+    the way back.  ``openings`` lists the openings to consider, most preferred first --
+    normally the opening carried over from the previous locator, then closed, then wide.
+
+    Returns one ``(path, opening)`` leg per output phase.  A single leg is always
+    preferred, and a two-leg answer is only produced when no single opening works: the
+    gun then changes at the intermediate pose, where the robot is stationary and the
+    change costs no motion.
+    """
+    def attempt(opening, a, b, budget):
+        with cell.gun_opening(opening):
+            return _plan_at_opening(cell, a, b, attempts=attempts,
+                                    segment_length=segment_length,
+                                    check_step=check_step, fallback_via=fallback_via,
+                                    shortcut_seconds=budget, log=log)
+
+    candidates = _opening_candidates(cell, openings)
+
+    # One opening for the whole transit, in preference order: changing the gun is a real
+    # operation on the machine, so it is a last resort rather than a free parameter.
+    last = None
+    for n, opening in enumerate(candidates):
+        try:
+            if n:
+                log(f"      retrying with the gun at {opening:g} mm")
+            return [(attempt(opening, qa, qb, shortcut_seconds), opening)]
+        except PlanningError as exc:
+            last = exc
+
+    if len(candidates) < 2 or not fallback_via:
+        raise last or PlanningError("freespace transit failed")
+
+    # No single opening reaches: split the move and change the gun partway, at a pose the
+    # robot is already passing through and stationary at.
+    for i, mid in enumerate(fallback_via):
+        for first_open in candidates:
+            with cell.gun_opening(first_open):
+                if cell.in_collision(mid):
+                    continue
+            try:
+                first = attempt(first_open, qa, mid, 0.0)
+            except PlanningError:
+                continue
+            for second_open in candidates:
+                if second_open == first_open:
+                    continue                    # already ruled out as a single opening
+                try:
+                    second = attempt(second_open, mid, qb, 0.0)
+                except PlanningError:
+                    continue
+                log(f"      no single gun opening reaches; changing from "
+                    f"{first_open:g} mm to {second_open:g} mm at fallback pose {i + 1}")
+                with cell.gun_opening(first_open):
+                    first = simplify(cell, shortcut(cell, first,
+                                                    time_budget=shortcut_seconds,
+                                                    max_step=check_step, log=log),
+                                     max_step=check_step)
+                with cell.gun_opening(second_open):
+                    second = simplify(cell, shortcut(cell, second,
+                                                     time_budget=shortcut_seconds,
+                                                     max_step=check_step, log=log),
+                                      max_step=check_step)
+                return [(first, first_open), (second, second_open)]
+    raise last or PlanningError("freespace transit failed at every gun opening")
+
+
+def _opening_candidates(cell: Cell, openings: list[float] | None) -> list[float | None]:
+    """Openings to try for a transit, most preferred first and without duplicates."""
+    if not cell.gun_joint_name:
+        return [None]
+    widest = cell.man.gun_opening_max
+    wanted = list(openings or [])
+    wanted += [0.0, widest, widest / 2.0]
+    out: list[float] = []
+    for value in wanted:
+        value = float(min(max(value, 0.0), widest))
+        if not any(abs(value - seen) < 1e-6 for seen in out):
+            out.append(value)
+    return out
 
 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,

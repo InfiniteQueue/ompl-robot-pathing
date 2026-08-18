@@ -93,6 +93,8 @@ class ToolpathPlanner:
         self.weld_clearance = (None if weld_clearance_mm is None
                                else weld_clearance_mm * man.scale)
         self.start_q = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
+        # Gun opening each locator turned out to be reachable at, filled in by run().
+        self.openings: dict[str, float] = {}
 
     def _clearance_for(self, *locators: Locator):
         """Clearance context for work that touches these locators.
@@ -106,15 +108,47 @@ class ToolpathPlanner:
         return self.cell.clearance(self.cell.obstacle_clearance)
 
     # -- per-locator anchor states ------------------------------------------
-    def _solve_locator(self, loc: Locator, seed: np.ndarray) -> np.ndarray:
-        with self._clearance_for(loc):
-            q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q])
-        if q is None:
-            raise PlanningError(f"no collision-free IK for locator '{loc.name}'")
-        return q
+    def _locator_openings(self, loc: Locator) -> list[float]:
+        """Gun openings worth trying when reaching this locator, most preferred first.
+
+        A weld's openings are process data: the gun has to be where the weld schedule says,
+        so if the robot cannot reach the pose at that opening the answer is a failure, not
+        a wider gun.  An ordinary via carries no such requirement -- its declared opening is
+        simply zero -- so if the tip fouls something there, opening or closing it is a
+        legitimate way through and is tried.
+        """
+        declared = loc.gun_opening_arrive if loc.is_weld else 0.0
+        if loc.is_weld or not self.cell.gun_joint_name:
+            return [declared]
+        widest = self.man.gun_opening_max
+        return [declared, widest, widest / 2.0]
+
+    def _solve_locator(self, loc: Locator, seed: np.ndarray) -> tuple[np.ndarray, float]:
+        """Joint solution for a locator, plus the gun opening it was reached at."""
+        problems = []
+        for opening in self._locator_openings(loc):
+            with self._clearance_for(loc), self.cell.gun_opening(opening):
+                q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q])
+            if q is not None:
+                if opening:
+                    self.log(f"    '{loc.name}' needs the gun at {opening:g} mm to be "
+                             f"reachable")
+                return q, opening
+            problems.append(opening)
+        raise PlanningError(
+            f"no collision-free IK for locator '{loc.name}' at any gun opening "
+            f"({', '.join(f'{o:g} mm' for o in problems)})")
 
     def _approach_pose(self, loc: Locator) -> np.ndarray:
         return offset_pose(loc.pose_world, self.axis, self.man.linear_zone_mm)
+
+    def _leave_opening(self, loc: Locator) -> float:
+        """Gun opening in force as the robot leaves this locator."""
+        return loc.gun_opening_leave if loc.is_weld else self.openings.get(loc.name, 0.0)
+
+    def _arrive_opening(self, loc: Locator) -> float:
+        """Gun opening the robot must be holding as it reaches this locator."""
+        return loc.gun_opening_arrive if loc.is_weld else self.openings.get(loc.name, 0.0)
 
     # -- main ----------------------------------------------------------------
     def run(self) -> list[Segment]:
@@ -127,7 +161,7 @@ class ToolpathPlanner:
         seed = self.start_q
         for loc in locators:
             try:
-                anchors[loc.name] = self._solve_locator(loc, seed)
+                anchors[loc.name], self.openings[loc.name] = self._solve_locator(loc, seed)
                 seed = anchors[loc.name]
             except PlanningError as exc:
                 self.log(f"  ! {exc}")
@@ -159,41 +193,57 @@ class ToolpathPlanner:
 
         depart_states: list[np.ndarray] = []
         approach_states: list[np.ndarray] = []
+        leave_open, arrive_open = self._leave_opening(a), self._arrive_opening(b)
 
+        # Each stretch of motion is planned with the tip where it will actually be. The gun
+        # is 200 mm of swinging geometry, so a linear retract that clears with it closed can
+        # foul with it open, and planning both against one arbitrary opening proves nothing.
         if a.is_weld and self.man.linear_zone_mm > 0:
-            depart_states = plan_linear(
-                self.cell, a.pose_world, self._approach_pose(a), qa,
-                step_mm=self.linear_step_mm)
+            with self.cell.gun_opening(leave_open):
+                depart_states = plan_linear(
+                    self.cell, a.pose_world, self._approach_pose(a), qa,
+                    step_mm=self.linear_step_mm)
             transit_start = depart_states[-1]
         if b.is_weld and self.man.linear_zone_mm > 0:
-            approach_states = plan_linear(
-                self.cell, self._approach_pose(b), b.pose_world, qb,
-                step_mm=self.linear_step_mm)
+            with self.cell.gun_opening(arrive_open):
+                approach_states = plan_linear(
+                    self.cell, self._approach_pose(b), b.pose_world, qb,
+                    step_mm=self.linear_step_mm)
             transit_end = approach_states[0]
 
         # The robot holds still at a weld while the opening steps from arrive to leave, so
-        # that is a phase boundary: same pose, new gun state.
+        # that is a phase boundary: same pose, new gun state.  That gun motion is not
+        # simulated -- the robot is stationary and the tip's own travel is clear by
+        # inspection, and not simulating it is what keeps the weld from needing the panel
+        # collisions switched off.
         if a.is_weld:
-            phases.append(Phase("weld", LIN, [qa], a.gun_opening_leave, True))
+            phases.append(Phase("weld", LIN, [qa], leave_open, True))
         if depart_states:
-            phases.append(Phase("depart", LIN, depart_states, a.gun_opening_leave, True))
+            phases.append(Phase("depart", LIN, depart_states, leave_open, True))
 
-        transit = plan_freespace(
+        legs = plan_freespace(
             self.cell, transit_start, transit_end,
             attempts=self.ompl_attempts, segment_length=self.segment_length,
             check_step=self.check_step, fallback_via=[self.start_q],
-            shortcut_seconds=self.shortcut_seconds, log=self.log)
-        opening = a.gun_opening_leave if a.is_weld else 0.0
-        phases.append(Phase("freespace", PTP, transit, opening, False))
+            shortcut_seconds=self.shortcut_seconds,
+            openings=[leave_open, arrive_open], log=self.log)
+        for path, opening in legs:
+            phases.append(Phase("freespace", PTP, path,
+                                0.0 if opening is None else opening, False))
 
         if approach_states:
-            phases.append(Phase("approach", LIN, approach_states,
-                                b.gun_opening_arrive, True))
+            phases.append(Phase("approach", LIN, approach_states, arrive_open, True))
 
-        # The output is what the controller will execute, so check the reduced path
-        # rather than trusting that reduction preserved what the planner found.
-        full = [q for ph in phases for q in ph.states]
-        problem = validate(self.cell, full, max_step=self.check_step)
+        # The output is what the controller will execute, so check the reduced path rather
+        # than trusting that reduction preserved what the planner found.  Checked per phase,
+        # under that phase's own gun opening: a single sweep at one opening would validate a
+        # tip position the robot never holds.
+        for ph in phases:
+            with self.cell.gun_opening(ph.gun_opening_mm):
+                problem = validate(self.cell, ph.states, max_step=self.check_step)
+            if problem:
+                raise PlanningError(f"planned {ph.kind} failed validation: {problem}")
+        problem = self._validate_junctions(phases)
         if problem:
             raise PlanningError(f"planned path failed validation: {problem}")
 
@@ -202,6 +252,28 @@ class ToolpathPlanner:
         # validation because this last step is the gun deliberately closing on the part.
         self._restore_weld_poses(a, b, phases, qa, qb)
         return phases
+
+    def _validate_junctions(self, phases: list[Phase]) -> str | None:
+        """Check the handover between consecutive phases.
+
+        By construction each phase begins at the state the previous one ended on, so a
+        junction is normally the gun changing while the robot stands still -- deliberately
+        not simulated.  Where the states are *not* identical the robot really does move
+        across the boundary, and that move is checked at both openings, since which one is
+        in force during it is a matter for the controller rather than this planner.
+        """
+        for first, second in zip(phases, phases[1:]):
+            if not first.states or not second.states:
+                continue
+            end, start = first.states[-1], second.states[0]
+            if np.allclose(end, start, atol=1e-9):
+                continue
+            for opening in {first.gun_opening_mm, second.gun_opening_mm}:
+                with self.cell.gun_opening(opening):
+                    if self.cell.segment_collides(end, start, max_step=self.check_step):
+                        return (f"the move from {first.kind} into {second.kind} is not "
+                                f"collision free with the gun at {opening:g} mm")
+        return None
 
     def _restore_weld_poses(self, a: Locator, b: Locator, phases: list[Phase],
                             qa: np.ndarray, qb: np.ndarray) -> None:

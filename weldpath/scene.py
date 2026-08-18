@@ -250,4 +250,31 @@ class SceneBuilder:
         for i in range(len(names)):
             for k in range(i + 1, len(names)):
                 pairs.append((names[i], names[k], "Never"))
+        pairs += self.gun_tip_pairs()
         return pairs
+
+    def gun_tip_pairs(self) -> list[tuple[str, str, str]]:
+        """Contacts the moving electrode makes with its own machinery, which are expected.
+
+        Swinging the tip through 200 mm of travel inevitably brings it close to the rest of
+        the gun and to the wrist it hangs off.  Those readings say nothing about whether a
+        move is safe, and leaving them in would make the gun uncloseable in most poses, so
+        they are excluded and the tip is checked against everything else.
+
+        The wrist links are found by walking up from the link the gun is bolted to, rather
+        than by matching names, so this holds for any manifest.
+        """
+        moving = [n for n in self.man.gun_moving_links]
+        if not moving:
+            return []
+        ignore: set[str] = set()
+        for dev in self.man.devices[1:]:            # the rest of the gun
+            ignore.update(l.name for l in dev.links)
+        for parent, _child in self.man.attachments:  # the wrist, and the link before it
+            ignore.add(parent)
+            for dev in self.man.devices:
+                for j in dev.joints:
+                    if j.child_link == parent:
+                        ignore.add(j.parent_link)
+        return [(m, other, "GunTipTravel")
+                for m in moving for other in sorted(ignore) if other != m]

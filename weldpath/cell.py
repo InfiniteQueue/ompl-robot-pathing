@@ -58,6 +58,16 @@ class Cell:
         self._state = None                      # keeps the SWIG state object alive
         self._revolute = [j.type == "revolute" for j in man.robot.joints
                           if j.type != "fixed"]
+
+        # The gun joint branches off the kinematic chain at the wrist, so it is not an IK
+        # variable -- but it is very much a state variable, and leaving it out is what made
+        # the tip sit permanently closed regardless of what any phase asked for.
+        self.gun_joint_name = man.gun_joint_name
+        self.gun_value = 0.0                    # environment units (radians here)
+        self._state_names = list(self.joint_names)
+        if self.gun_joint_name:
+            self._state_names.append(self.gun_joint_name)
+            self.gun_value = float(man.start_state.get(self.gun_joint_name, 0.0))
         self.weights = self._joint_weights()
 
     # -- joint metric --------------------------------------------------------
@@ -137,9 +147,42 @@ class Cell:
         finally:
             self._set_obstacle_clearance(previous)
 
+    # -- gun opening ---------------------------------------------------------
+    def set_gun_opening(self, opening_mm: float) -> None:
+        """Place the moving electrode for the opening the current phase will hold."""
+        if not self.gun_joint_name:
+            return
+        self.gun_value = self.man.gun_joint_value(opening_mm)
+        self._state = None
+
+    @contextlib.contextmanager
+    def gun_opening(self, opening_mm: float | None):
+        """Plan a stretch of motion with the gun held at a given opening.
+
+        The tip is 145k triangles of geometry swinging through 200 mm, so where it sits
+        decides what the robot can fit through -- a transit that is blocked with the gun
+        closed can be clear with it open, and the reverse.  ``None`` leaves it alone.
+        """
+        if opening_mm is None or not self.gun_joint_name:
+            yield
+            return
+        previous = self.gun_value
+        self.set_gun_opening(opening_mm)
+        try:
+            yield
+        finally:
+            self.gun_value = previous
+            self._state = None
+
+    def _state_values(self, q: np.ndarray) -> np.ndarray:
+        q = np.asarray(q, dtype=float)
+        if not self.gun_joint_name:
+            return q
+        return np.concatenate([q, [self.gun_value]])
+
     # -- state / collision ---------------------------------------------------
     def set_state(self, q: np.ndarray) -> None:
-        self.env.setState(self.joint_names, np.asarray(q, dtype=float))
+        self.env.setState(self._state_names, self._state_values(q))
         # Must hold a reference: passing env.getState().link_transforms inline lets the
         # temporary die and the binding then reads freed memory.
         self._state = self.env.getState()
@@ -177,7 +220,7 @@ class Cell:
 
     # -- kinematics ----------------------------------------------------------
     def fk(self, q: np.ndarray, link: str = TCP_LINK) -> np.ndarray:
-        self.env.setState(self.joint_names, np.asarray(q, dtype=float))
+        self.env.setState(self._state_names, self._state_values(q))
         self._state = self.env.getState()
         return np.array(self.env.getLinkTransform(link).matrix(), dtype=float)
 
@@ -393,6 +436,27 @@ def _apply_margins(env: Environment, man: Manifest, default: float,
         pair_data, CollisionMarginPairOverrideType_MODIFY))
 
 
+def _log_gun(man: Manifest, log) -> None:
+    """Report the gun's travel in the units the manifest states openings in.
+
+    The joint is an angle and every opening in the manifest is a length, so the conversion
+    between them is worth printing: if the stroke shown here does not match the real gun,
+    the lever arm has been measured off the wrong point and every opening will be wrong.
+    """
+    j = man.gun_joint
+    if j is None:
+        log("no gun joint in the manifest; the tool is treated as rigid")
+        return
+    if j.is_prismatic:
+        log(f"gun joint '{j.name}' is prismatic, opening maps directly to travel "
+            f"({man.gun_opening_max:.1f} mm)")
+        return
+    lo, hi = j.limits
+    log(f"gun joint '{j.name}' is angular: {abs(lo if abs(lo) > abs(hi) else hi):.4f} rad "
+        f"about a {man.gun_lever_arm:.1f} mm arm, giving {man.gun_opening_max:.1f} mm of "
+        f"electrode opening")
+
+
 def build(man: Manifest, log=print, out_dir: str | None = None,
           min_shell_mm: float = 40.0, max_shells: int = 80,
           hull_cell_mm: float = 0.0, obstacle_clearance_mm: float = 0.0) -> Cell:
@@ -434,6 +498,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
 
     cell = Cell(man, builder, env, pairs)
     cell.margin, cell.obstacle_clearance = margin, clearance
+    _log_gun(man, log)
 
     # -- pairs in contact at the start pose: re-measure, then loosen or disable ---------
     start = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)

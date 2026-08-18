@@ -34,10 +34,32 @@ class Joint:
     axis_world: np.ndarray
     limits: tuple[float, float]
     captured_value: float = 0.0
+    # ``measured`` marks a joint whose axis and anchor were recovered from the geometry
+    # rather than declared.  ``measured_slide`` is the residual slide along the axis from
+    # that recovery, which the scene build cancels anyway (see :mod:`weldpath.scene`), so
+    # both are carried for traceability and neither changes the kinematics.
+    measured: bool = False
+    measured_slide: float = 0.0
 
     @property
     def is_prismatic(self) -> bool:
         return self.type == "prismatic"
+
+    @property
+    def unit_axis(self) -> np.ndarray:
+        axis = np.array(self.axis_world, dtype=float)
+        n = float(np.linalg.norm(axis))
+        return axis / n if n > 0 else np.array([0.0, 0.0, 1.0])
+
+    @property
+    def open_sign(self) -> float:
+        """Which way off the closed position this joint is free to travel.
+
+        The gun's limits sit entirely on one side of zero, so the sign of the reachable
+        travel is a property of the manifest rather than something to assume.
+        """
+        lo, hi = self.limits
+        return -1.0 if abs(lo) > abs(hi) else 1.0
 
 
 @dataclass
@@ -106,11 +128,86 @@ class Manifest:
         return [j.name for j in self.robot.joints if j.type != "fixed"]
 
     @property
-    def gun_joint_name(self) -> str | None:
+    def gun_joint(self) -> Joint | None:
         for d in self.devices[1:]:
             for j in d.joints:
-                return j.name
+                return j
         return None
+
+    @property
+    def gun_joint_name(self) -> str | None:
+        j = self.gun_joint
+        return j.name if j else None
+
+    @property
+    def gun_lever_arm(self) -> float:
+        """Distance from the gun's rotation axis to the electrode gap, in manifest units.
+
+        The TCP of a weld gun sits at the electrode faces, so it is the point whose travel
+        *is* the opening.  Measuring the arm from the manifest rather than hardcoding it
+        means a different gun needs no code change; for the supplied cell it comes out at
+        515 mm, giving a 205 mm stroke over the joint's 0.40 rad of travel.
+
+        Two approximations are known and deliberately accepted here.  A quoted opening is
+        really the TCP-to-tip distance measured *along the TCP's z axis*, down to the tip's
+        lowest point -- which the rounding of the tip puts below its end -- whereas this
+        treats it as the chord swept by the TCP itself.  Measured against the tip mesh the
+        two disagree by about 0.5%: 0.26 mm at a 50 mm opening, 1.1 mm at full stroke.  That
+        is far inside the error already present in the convex collision geometry, which runs
+        to tens of millimetres, so it is not worth modelling the tip profile to remove.
+        """
+        j = self.gun_joint
+        if j is None:
+            return 0.0
+        axis = j.unit_axis
+        d = np.array(self.tcp_world_pose, dtype=float)[:3, 3] - np.array(j.anchor_world,
+                                                                        dtype=float)
+        return float(np.linalg.norm(d - np.dot(d, axis) * axis))
+
+    def gun_joint_value(self, opening: float) -> float:
+        """Joint value, in *environment* units, that opens the gun by ``opening``.
+
+        The manifest states openings as a length while the joint is now an angle, so this
+        is the conversion between them.  The electrode gap is the straight-line distance
+        between the moving electrode and its closed position, i.e. the chord of the arc
+        rather than the arc itself -- a 1.3% difference at full travel, but the chord is
+        the one that is physically the gap.  A prismatic gun keeps the direct mapping.
+        """
+        j = self.gun_joint
+        if j is None:
+            return 0.0
+        if j.is_prismatic:
+            # Prismatic limits are scaled into metres when the URDF is written.
+            lo, hi = sorted((j.limits[0] * self.scale, j.limits[1] * self.scale))
+            return min(hi, max(lo, j.open_sign * abs(opening) * self.scale))
+        radius = self.gun_lever_arm
+        if radius <= 0.0:
+            return 0.0
+        ratio = min(1.0, max(-1.0, abs(opening) / (2.0 * radius)))
+        value = j.open_sign * 2.0 * float(np.arcsin(ratio))
+        # An opening at or beyond full travel converts to a hair past the limit, and an
+        # over-wide opening from the manifest would land well past it.  Clamped here so the
+        # environment is never handed a joint value it would refuse or silently truncate.
+        lo, hi = sorted(j.limits)
+        return min(hi, max(lo, value))
+
+    def gun_opening(self, joint_value: float) -> float:
+        """Inverse of :meth:`gun_joint_value`: the opening a joint value corresponds to."""
+        j = self.gun_joint
+        if j is None:
+            return 0.0
+        if j.is_prismatic:
+            return abs(joint_value) / self.scale
+        return 2.0 * self.gun_lever_arm * float(np.sin(abs(joint_value) / 2.0))
+
+    @property
+    def gun_opening_max(self) -> float:
+        """Widest opening the gun can reach, in manifest units."""
+        j = self.gun_joint
+        if j is None:
+            return 0.0
+        lo, hi = j.limits
+        return self.gun_opening(lo if abs(lo) > abs(hi) else hi)
 
     def all_links(self) -> list[Link]:
         out: list[Link] = []
@@ -179,6 +276,8 @@ def load(directory: str) -> Manifest:
                 axis_world=_mat(j["axis_world"]),
                 limits=(float(j["limits"][0]), float(j["limits"][1])),
                 captured_value=float(j.get("captured_value", 0.0)),
+                measured=bool(j.get("measured", False)),
+                measured_slide=float(j.get("measured_slide_mm", 0.0)),
             )
             for j in d.get("joints", [])
         ]
