@@ -35,8 +35,11 @@ The two generated directories are safe to delete; they are rebuilt on the next r
    pair that merely grazes keeps its collision check under a corrected margin, and only a
    genuine overlap is disabled. Both outcomes are reported in the run log.
 4. **Planning** (`planning.py`, `toolpath.py`). A direct joint move is tried first;
-   otherwise OMPL, and failing that a two-leg route through the start pose. The result is
-   then shortcut under the weighted joint metric, and reduced to the fewest waypoints that
+   otherwise OMPL, and failing that a two-leg route through the start pose. Each stretch of
+   motion is planned with the gun tip where that phase will hold it, and a transit that no
+   single opening gets through is split so the gun can change partway. The result is then
+   improved under the weighted joint metric — penalised for running close to the parts, by
+   cutting detours and relocating waypoints — and reduced to the fewest waypoints that
    still traverse collision-free.
 5. **Output** (`output.py`).
 
@@ -65,9 +68,11 @@ make the difference between planning working and not working at all:
   own `o` group makes Tesseract build one convex hull per shell, keeping the throat open.
 
 Shells smaller than `--min-shell-mm` are dropped and only the `--max-shells` largest are
-kept, because every shell is a collision pair to test. On the sample cell this takes the
-gun from 948 shells to 80 and a check from 2.8 ms to 1.6 ms — the difference between the
-freespace transit timing out and solving in a few seconds.
+kept, because every shell is a collision pair to test. Measured on an earlier study whose
+gun was one link, this took it from 948 shells to 80 and a check from 2.8 ms to 1.6 ms — the
+difference between the freespace transit timing out and solving in a few seconds. The
+current cell splits the gun into a body (46 shells) and a moving tip (159), and a discrete
+check costs about 1.0 ms.
 
 ## Output format
 
@@ -116,6 +121,12 @@ Three details of the contract are easy to get wrong and are worth restating:
   straight back into the cell with no transformation.
 * **`gun_opening_mm` and `contact_allowed` belong to the phase**, since a phase is a run
   of waypoints sharing one motion type and one gun state.
+
+A segment may contain **more than one `PTP` phase**. That happens when no single gun opening
+gets the robot through the transit, so the move is split and the gun changes at the join —
+where the robot is stationary. The consumer has to drive the gun to each phase's
+`gun_opening_mm` before executing that phase, which was already implied by the schema
+carrying one opening per phase.
 
 `time` comes from the velocity profile described below, reset to zero at the start of each
 phase. It is a plausible schedule for the consumer to read, not a controller-verified one.
@@ -168,6 +179,16 @@ Repeating one segment four times each way, the medians were 1083° → 351° and
 with the worst single joint dropping from 426° to 124°. It costs 2–4 s per transit and
 usually adds a couple of waypoints, since a tighter route has more corners worth keeping.
 Turn it off with `--no-shortcut`.
+
+Cutting alone can only ever *remove* path, so it cannot move away from an obstacle. A
+second move runs in the same loop and same budget: **relocation** displaces a single
+waypoint and keeps it when both neighbouring moves stay clear and the pair gets cheaper.
+Displacements are drawn in joint space but scaled by the joint weights, so an attempt moves
+the tool about as far whichever joints it uses — otherwise nearly every sample would be a
+wrist twiddle that changes nothing. Every waypoint is eligible except the two endpoints,
+which are the states handed in and belong to the locators either side. Relocation is what
+gives the clearance penalty below any teeth: standing a waypoint off a panel costs a little
+travel and saves a lot of penalty, so it wins.
 
 Point counts are kept low on purpose: a transit is reduced to the fewest waypoints that
 still traverse it collision-free, so a large sweeping motion costs a handful of points
@@ -224,7 +245,7 @@ because the gun state defines a phase this comes out as a phase boundary:
 | approach onto the joint | `LIN` | true | `gun_opening_arrive` |
 | the weld itself — one waypoint, robot stationary | `LIN` | true | `gun_opening_leave` |
 | depart along the same line | `LIN` | true | `gun_opening_leave` |
-| transit to the next locator | `PTP` | false | `gun_opening_leave` |
+| transit to the next locator | `PTP` | false | chosen; `gun_opening_leave` preferred |
 
 No motion is planned for the closing itself. The approach ends and the depart begins on
 the locator pose, so the single-waypoint weld phase is where the opening changes.
@@ -235,6 +256,52 @@ overlaps the panel geometry will fail to plan rather than be waved through. On t
 re-exported sample study every weld locator does exactly that — the tip sits 24.9 to
 76.6 mm inside `Assy_ST240_RH` — so those locators need either a negative
 `--obstacle-clearance-mm` or a per-phase relaxation that does not yet exist.
+
+## The moving gun tip
+
+The gun's joint is **angular**, not a linear stroke: 0.4005 rad about an axis 515 mm from
+the TCP, giving 205 mm of electrode opening. Openings in the manifest are quoted in
+millimetres, so every opening is converted through that lever arm, which is measured from
+the manifest rather than hardcoded — the TCP sits 3.3 mm from both the fixed and the moving
+electrode mesh, confirming it is the electrode gap and the right point to measure from.
+
+Two approximations are accepted. A quoted opening is really the TCP-to-tip distance measured
+along the TCP's z axis, down to the tip's lowest point — which the rounding of the tip puts
+below its end — whereas this treats it as the chord swept by the TCP. Measured against the
+tip mesh the two disagree by 0.5%: 0.26 mm at a 50 mm opening, 1.1 mm at full stroke, which
+is far inside the tens of millimetres of error already present in the convex geometry.
+Openings are clamped to the joint's travel, since an opening at full stroke converts to a
+hair past the limit.
+
+**The tip is a state variable, not an IK variable.** The gun joint branches off the chain at
+the wrist, so it is not part of the kinematic group and inverse kinematics cannot touch it —
+but it is set alongside the robot joints on every state, and each phase is planned with the
+tip where that phase will actually hold it. Before this it sat permanently closed regardless
+of what any phase asked for.
+
+Where the tip sits genuinely decides what the robot can do. Sampling 600 random poses, 16
+changed collision state with the gun — **in both directions**: some are blocked closed and
+clear wide open, others the reverse. So a destination can be unreachable at the opening the
+robot arrives with, and the transit planner searches openings for one that works: the
+opening carried over from the previous locator first, then closed, then wide, then half.
+Changing the gun is a real operation on the machine, so a single opening for the whole
+transit is always preferred; only when none works is the move split into two legs with the
+gun changing at the intermediate pose, where the robot is stationary anyway.
+
+A weld's openings are process data and are never overridden — if the robot cannot reach the
+pose at the opening the weld schedule states, that is a failure, not a wider gun. An
+ordinary via carries no such requirement, so opening or closing the tip to get there is
+legitimate and is tried.
+
+The tip's contacts with the rest of the gun and with J5 and J6 are excluded from collision
+checking. Swinging through 200 mm of travel inevitably brings it against its own machinery,
+those readings say nothing about whether a move is safe, and leaving them in makes the gun
+uncloseable in most poses. The wrist links are found by walking up from the link the gun is
+bolted to rather than by matching names.
+
+The gun's motion **during** a weld is deliberately not simulated. The robot is stationary
+while the opening steps from arrive to leave, the tip's own travel is clear by inspection,
+and not simulating it is what keeps the weld from needing the panel collisions switched off.
 
 ## Clearance from the parts
 
@@ -253,11 +320,61 @@ If a pair is already closer than the requested clearance in the start pose, that
 held to the distance actually available there and the run says so, rather than declaring
 the start state invalid and refusing to plan at all.
 
-**The retract direction is a derived default.** It is taken from the gun's prismatic
-stroke axis expressed in the TCP frame, which for the supplied cell comes out as tool −X.
-Every locator in the supplied manifest has `is_weld: false`, so this has never been
-exercised against real weld data — check it against a manifest that contains welds, and
-override with `--approach-axis` if a cell's tool frame is set up differently.
+**The retract direction is relative to the weld locator, not the tool.** A weld retracts
+along the locator's own −z, matching `--weld-shift-mm`: the shift backs the tool off the
+panel along −z, so the 300 mm linear retract has to travel the same way. This used to be
+derived from the gun's prismatic stroke axis, which made the direction a property of the
+machine rather than of the weld — and stopped yielding any answer at all once the gun became
+angular, silently falling back to tool −z. Override with `--approach-axis`, interpreted in
+the locator's frame. Every locator in the supplied manifest has `is_weld: false`, so this
+has still not been exercised against real weld data.
+
+### Penalising low clearance
+
+A collision check is a hard yes/no, so a move clearing a panel by half a millimetre is as
+legal as one clearing it by half a metre — and the shortest route almost always hugs the
+obstacle. The clearance penalty turns proximity into cost instead, applied to *time*: at
+`--clearance-penalty-max-mm` and beyond there is no penalty, and at
+`--clearance-penalty-min-mm` and below a second costs as much as
+`--clearance-penalty-multiplier` seconds in open air. Between them it follows `x²` on
+`[0, 1]`, stretched to fit, so cost climbs slowly at first and sharply as the gun closes in:
+
+| Clearance | 50 mm | 40 mm | 26.5 mm | 20 mm | 10 mm | ≤ 3 mm |
+| --- | --- | --- | --- | --- | --- | --- |
+| Factor | 1.0× | 3.2× | 13.3× | 21.0× | 36.5× | 50× |
+
+It saturates at the minimum rather than continuing to climb; without that the pass would
+spend its whole budget fighting over the last millimetre of a clearance already as bad as
+it is allowed to get. The penalty is a *preference*, not a safety mechanism — what the robot
+is forbidden to do is still set by `--obstacle-clearance-mm`. The two are complementary: a
+hard clearance makes poses illegal and quickly makes a cell unplannable, whereas the penalty
+makes them expensive, which is the better tool for "prefer standoff".
+
+Measured on the sample study at a 5 s shortcut budget, sampling the executed path every 1°:
+
+| | Closest approach | Samples inside 50 mm | Travel |
+| --- | --- | --- | --- |
+| `--no-clearance-penalty` | 0.02 mm / −7.58 mm | 116/406 and 68/115 | 7.45 m / 3.22 m |
+| default penalty | 42.9 mm / 48.8 mm | 5/413 and 2/172 | 6.91 m / 4.74 m |
+
+The cost is throughput: a clearance query is cheap in isolation (0.24 ms against 1.04 ms for
+a collision check, because only the 18 robot-against-cell pairs are ever considered) but it
+is paid per sample, and scoring candidates roughly halves the number of shortcut attempts
+that fit in a budget. Raise `--shortcut-seconds` to compensate.
+
+`--clearance-penalty-cutoff-mm` truncates the shallow end of the curve so the query looks no
+further, leaving the rest of the shape unchanged. That necessarily introduces a
+discontinuity — with the defaults a 20 mm cutoff steps the factor straight from 1× to 21×
+at 20 mm — which is inherent to the request rather than a defect. On this cell it saved
+nothing measurable, since the query is already dominated by fixed overhead rather than by
+how many pairs fall inside the margin.
+
+Implementation note: the clearance query runs on a **clone** of the planning contact
+manager, whose default margin is driven to −1 m and whose robot-against-static pairs are
+widened to the probe distance. Widening the planning manager's own margins instead would
+make every near miss read as a collision. The clone was checked against an independent
+measurement — a hard 60 mm obstacle clearance, which makes the planning manager itself
+report distances — and the two agree to 0.01 mm from 5.6 mm out to 29.6 mm.
 
 ## How precise the collision geometry can be made
 
@@ -296,17 +413,24 @@ correction is what keeps the false contact from disabling a real collision check
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--approach-axis` | derived | TCP-frame retract direction at welds |
+| `--approach-axis` | `-z` | retract direction at welds, in the locator's own frame |
 | `--linear-step-mm` | 50 | point spacing on linear approach/depart |
 | `--check-step-deg` | 3 | collision checking resolution along a move |
 | `--segment-length-rad` | 0.02 | collision resolution inside the sampling planner |
 | `--ompl-attempts` | 3 | freespace attempts before the fallback route |
 | `--no-shortcut` | off | emit the sampling planner's own route, unshortened |
-| `--shortcut-seconds` | 3 | time budget for shortcutting each transit |
-| `--min-shell-mm` | 20 | drop collision shells smaller than this |
-| `--max-shells` | 200 | cap convex shells per link |
+| `--shortcut-seconds` | 10 | time budget for shortcutting each transit |
+| `--min-shell-mm` | 5 | drop collision shells smaller than this |
+| `--max-shells` | 500 | cap convex shells per link |
 | `--hull-cell-mm` | 0 | refine badly-hulled shells into cells this size; 0 disables |
 | `--obstacle-clearance-mm` | 0 | clear air to hold from panels and tooling; may be negative |
+| `--weld-clearance-mm` | 2 | clearance used instead on moves to or from a weld |
+| `--weld-shift-mm` | −5 | shift weld locators along their own z before planning |
+| `--no-clearance-penalty` | off | avoid only hard collisions, ignoring proximity |
+| `--clearance-penalty-max-mm` | 50 | clearance at and above which there is no penalty |
+| `--clearance-penalty-min-mm` | 3 | clearance at and below which the penalty peaks |
+| `--clearance-penalty-multiplier` | 50 | peak penalty factor |
+| `--clearance-penalty-cutoff-mm` | 0 | ignore clearances beyond this; 0 uses the maximum |
 | `--joint-speed-deg-s` | 180 | peak joint speed behind the `time` field |
 | `--linear-speed-mm-s` | 250 | peak tool speed on `LIN` moves |
 | `--accel-blend` | 0.5 | 0 flat velocity … 1 bang-bang; see above |
@@ -329,4 +453,15 @@ Exit code is 0 when every segment planned, 1 otherwise.
 * Shortcutting is randomised and time-boxed, so the emitted path still varies between
   runs — just over a much lower and tighter range. It shortens; it does not find the
   optimum, and a longer `--shortcut-seconds` keeps helping with diminishing returns.
+* **Discrete collision checking can miss thin penetrations.** Moves are checked by sampling
+  the straight joint-space segment every `--check-step-deg`, so anything thinner than the
+  sample spacing goes unseen. At the default 3° a path on the sample study passed validation
+  while actually reaching 7.6 mm *inside* a panel; the same path fails at 2° and finer. A
+  positive `--obstacle-clearance-mm` or the clearance penalty both hide this by keeping the
+  route away from surfaces, but neither fixes it. The real fix is a swept check — the scene
+  already configures `BulletCastBVHManager` as its continuous plugin and nothing uses it.
+* The gun opening search covers a handful of candidate openings rather than treating the
+  opening as a continuous dimension, so a transit that needs some specific intermediate
+  opening will not be found. The manifest supplies no gun speed, so an opening change is
+  costed as "avoid unless necessary" rather than in seconds.
 * Requires `tesseract-robotics` and `numpy`; both are already in `.venv`.
