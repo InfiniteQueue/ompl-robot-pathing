@@ -77,6 +77,7 @@ def offset_pose(pose: np.ndarray, axis_tcp: np.ndarray, distance: float) -> np.n
 class ToolpathPlanner:
     def __init__(self, cell: Cell, man: Manifest, *, approach_axis: str | None = None,
                  linear_step_mm: float = 50.0, ompl_attempts: int = 3,
+                 ompl_runs: int = 1,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
                  shortcut_seconds: float = 2.0, weld_clearance_mm: float | None = None,
                  log=print):
@@ -86,6 +87,7 @@ class ToolpathPlanner:
         self.axis = retract_axis(approach_axis)
         self.linear_step_mm = linear_step_mm
         self.ompl_attempts = ompl_attempts
+        self.ompl_runs = ompl_runs
         self.segment_length = segment_length
         self.check_step = np.deg2rad(check_step_deg)
         self.shortcut_seconds = shortcut_seconds
@@ -223,7 +225,8 @@ class ToolpathPlanner:
 
         legs = plan_freespace(
             self.cell, transit_start, transit_end,
-            attempts=self.ompl_attempts, segment_length=self.segment_length,
+            attempts=self.ompl_attempts, runs=self.ompl_runs,
+            segment_length=self.segment_length,
             check_step=self.check_step, fallback_via=[self.start_q],
             shortcut_seconds=self.shortcut_seconds,
             openings=[leave_open, arrive_open], log=self.log)

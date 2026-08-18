@@ -236,6 +236,28 @@ def _try_relocate(cell: Cell, dense, fac, rng, max_step, penalised, step_cost) -
 # ---------------------------------------------------------------------------
 # freespace
 # ---------------------------------------------------------------------------
+def _path_cost(cell: Cell, path: list[np.ndarray], max_step: float
+               ) -> tuple[float, float]:
+    """Penalised length of a whole path, and its plain weighted travel.
+
+    With no penalty in force the two are equal, so ranking on the first still ranks on
+    length and the choice degrades to "shortest raw solution" rather than to nothing.
+    Endpoint factors are threaded from one segment to the next so each waypoint costs one
+    clearance query rather than two.
+    """
+    if len(path) < 2:
+        return 0.0, 0.0
+    penalised = cell.penalty is not None and cell.penalty.enabled
+    total = travel = 0.0
+    prev_f = cell.penalty_factor(path[0]) if penalised else None
+    for a, b in zip(path, path[1:]):
+        next_f = cell.penalty_factor(b) if penalised else None
+        total += cell.segment_cost(a, b, max_step=max_step, fa=prev_f, fb=next_f)
+        travel += cell.distance(a, b)
+        prev_f = next_f
+    return total, travel
+
+
 def _make_program(cell: Cell, qa: np.ndarray, qb: np.ndarray) -> cl.CompositeInstruction:
     program = cl.CompositeInstruction("DEFAULT")
     program.setManipulatorInfo(cell.manip_info)
@@ -287,7 +309,7 @@ def _extract(results) -> list[np.ndarray]:
 
 
 def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
-                     segment_length: float, check_step: float,
+                     runs: int, segment_length: float, check_step: float,
                      fallback_via: list[np.ndarray] | None,
                      shortcut_seconds: float, log) -> list[np.ndarray]:
     """Collision-free joint path from ``qa`` to ``qb`` at the gun's current opening.
@@ -298,7 +320,7 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
     a long detour around the panels into two easy problems.
     """
     try:
-        return _plan_direct(cell, qa, qb, attempts=attempts,
+        return _plan_direct(cell, qa, qb, attempts=attempts, runs=runs,
                             segment_length=segment_length, check_step=check_step,
                             shortcut_seconds=shortcut_seconds, log=log)
     except PlanningError:
@@ -310,10 +332,10 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
             continue
         log(f"      retrying via fallback pose {i + 1}")
         try:
-            first = _plan_direct(cell, qa, mid, attempts=attempts,
+            first = _plan_direct(cell, qa, mid, attempts=attempts, runs=runs,
                                  segment_length=segment_length, check_step=check_step,
                                  shortcut_seconds=0.0, log=log)
-            second = _plan_direct(cell, mid, qb, attempts=attempts,
+            second = _plan_direct(cell, mid, qb, attempts=attempts, runs=runs,
                                   segment_length=segment_length, check_step=check_step,
                                   shortcut_seconds=0.0, log=log)
         except PlanningError:
@@ -327,7 +349,8 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
 
 
 def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int = 3,
-                   segment_length: float = 0.02, check_step: float = 0.05,
+                   runs: int = 1, segment_length: float = 0.02,
+                   check_step: float = 0.05,
                    fallback_via: list[np.ndarray] | None = None,
                    shortcut_seconds: float = 2.0,
                    openings: list[float] | None = None,
@@ -346,7 +369,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
     """
     def attempt(opening, a, b, budget):
         with cell.gun_opening(opening):
-            return _plan_at_opening(cell, a, b, attempts=attempts,
+            return _plan_at_opening(cell, a, b, attempts=attempts, runs=runs,
                                     segment_length=segment_length,
                                     check_step=check_step, fallback_via=fallback_via,
                                     shortcut_seconds=budget, log=log)
@@ -417,8 +440,8 @@ def _opening_candidates(cell: Cell, openings: list[float] | None) -> list[float 
 
 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
-                 segment_length: float, check_step: float, shortcut_seconds: float,
-                 log) -> list[np.ndarray]:
+                 runs: int, segment_length: float, check_step: float,
+                 shortcut_seconds: float, log) -> list[np.ndarray]:
     if not cell.segment_collides(qa, qb, max_step=check_step):
         # A clear straight line is normally the best answer there is, and a sampling
         # planner asked to improve on it would only return it again.  But "clear" and
@@ -441,8 +464,15 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
                             max_step=check_step, log=log)
         return simplify(cell, improved, max_step=check_step)
 
+    # RRTConnect returns the first path it finds, and which homotopy class that lands in
+    # is luck -- one run goes over the fixture, the next threads behind it.  The
+    # optimisation pass afterwards can shorten a route and stand it off, but it cannot move
+    # it to the other side of an obstacle, so whichever class arrives here is the one that
+    # ships.  Sampling several solutions and keeping the best-scoring one is therefore the
+    # only stage that can make that choice at all.
+    candidates: list[tuple[float, float, list[np.ndarray]]] = []
     last = ""
-    for attempt in range(1, attempts + 1):
+    for attempt in range(1, max(runs, attempts) + 1):
         profiles = ProfileDictionary()
         profiles.addProfile(OMPL_NAMESPACE, "DEFAULT", _ompl_profile(segment_length))
         request = PlannerRequest()
@@ -454,16 +484,33 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
         dt = time.time() - t0
         if response.successful:
             raw = _extract(response.results)
-            log(f"      OMPL attempt {attempt}: solved in {dt:.1f}s ({len(raw)} raw points)")
-            # Shortcut before reducing: the dense path gives the cuts somewhere to land.
-            cut = shortcut(cell, raw, time_budget=shortcut_seconds,
-                           max_step=check_step, log=log)
-            path = simplify(cell, cut, max_step=check_step)
-            log(f"      reduced to {len(path)} points")
-            return path
-        last = str(response.message)
-        log(f"      OMPL attempt {attempt}: {last} ({dt:.1f}s)")
-    raise PlanningError(f"freespace transit failed after {attempts} attempts: {last}")
+            cost, travel = _path_cost(cell, raw, check_step)
+            candidates.append((cost, travel, raw))
+            log(f"      OMPL run {attempt}: solved in {dt:.1f}s ({len(raw)} raw points, "
+                f"cost {cost:.2f} m over {travel:.2f} m of travel)")
+        else:
+            last = str(response.message)
+            log(f"      OMPL run {attempt}: {last} ({dt:.1f}s)")
+        # The minimum is a floor, not a cap: keep going past it only while nothing at all
+        # has solved, up to the attempts limit.
+        if attempt >= runs and candidates:
+            break
+
+    if not candidates:
+        raise PlanningError(
+            f"freespace transit failed after {max(runs, attempts)} attempts: {last}")
+
+    cost, travel, raw = min(candidates, key=lambda c: c[0])
+    if len(candidates) > 1:
+        worst = max(c[0] for c in candidates)
+        log(f"      keeping the best of {len(candidates)} solutions: cost {cost:.2f} m "
+            f"against {worst:.2f} m for the worst")
+    # Shortcut before reducing: the dense path gives the cuts somewhere to land.
+    cut = shortcut(cell, raw, time_budget=shortcut_seconds,
+                   max_step=check_step, log=log)
+    path = simplify(cell, cut, max_step=check_step)
+    log(f"      reduced to {len(path)} points")
+    return path
 
 
 def validate(cell: Cell, path: list[np.ndarray], max_step: float = 0.05) -> str | None:

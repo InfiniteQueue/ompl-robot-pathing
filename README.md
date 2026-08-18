@@ -158,6 +158,26 @@ locator.
 
 ## Shortening the route between locators
 
+### Choosing which solution to optimise
+
+RRTConnect returns whichever route it stumbles on first, and which side of a fixture that
+lands on is luck. Nothing downstream can correct it: cutting and relocation reshape a route
+but cannot move it into a different homotopy class, so whichever one arrives is the one that
+ships. `--ompl-min-runs` therefore samples several solutions per transit and keeps the one
+with the lowest penalised cost before handing it to the optimiser.
+
+The spread is large enough to matter. On one `via10 -> via11` transit, four runs came back at
+243.85 m, 178.83 m, 32.16 m and 238.13 m of penalised cost — a factor of 7.6 between best and
+worst. Note that the winner was not the shortest: it covered 12.09 m of travel against the
+7.60 m of the run costing 178.83 m, so it bought a long way clear of the panels with a little
+extra distance. Ranking on penalised cost rather than length is what makes that choice.
+
+The minimum is a floor rather than a cap. Once it is met and at least one solution exists,
+planning moves on; if nothing has solved, runs continue up to `--ompl-attempts`. Each run is
+a full solve of several seconds, so this is the most expensive knob in the tool — it is also
+the only one that can change the route's basic shape. With `--no-clearance-penalty` the score
+degrades to plain weighted travel, so it still picks the shortest of the sampled solutions.
+
 Picking good endpoints is not enough. RRTConnect returns the *first* path it finds, and
 reducing waypoints cannot change a route — deleting a point that a straight move already
 bypasses leaves a wide arc exactly as wide. So a shortcutting pass runs before the
@@ -417,7 +437,8 @@ correction is what keeps the false contact from disabling a real collision check
 | `--linear-step-mm` | 50 | point spacing on linear approach/depart |
 | `--check-step-deg` | 3 | collision checking resolution along a move |
 | `--segment-length-rad` | 0.02 | collision resolution inside the sampling planner |
-| `--ompl-attempts` | 3 | freespace attempts before the fallback route |
+| `--ompl-attempts` | 3 | most freespace attempts before the fallback route |
+| `--ompl-min-runs` | 3 | sample this many solutions and keep the cheapest |
 | `--no-shortcut` | off | emit the sampling planner's own route, unshortened |
 | `--shortcut-seconds` | 10 | time budget for shortcutting each transit |
 | `--min-shell-mm` | 5 | drop collision shells smaller than this |

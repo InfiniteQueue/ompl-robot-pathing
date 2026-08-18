@@ -31,12 +31,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--segment-length-rad", type=float, default=0.02,
                    help="collision checking resolution for the sampling planner "
                         "(default: 0.02)")
-    p.add_argument("--ompl-attempts", type=int, default=3,
-                   help="freespace planning attempts per segment (default: 3)")
+    p.add_argument("--ompl-attempts", type=int, default=20,
+                   help="most freespace planning attempts per segment, used to retry a "
+                        "transit that keeps failing (default: 3)")
+    p.add_argument("--ompl-min-runs", type=int, default=10, metavar="N",
+                   help="always run the sampling planner at least this many times per "
+                        "transit and keep the lowest-penalty solution, rather than taking "
+                        "the first one that works. The planner returns whichever route it "
+                        "stumbles on first, and no later pass can move a route to the "
+                        "other side of an obstacle, so this is the only stage that can "
+                        "choose between them. Costs a full solve per run (default: 3)")
     p.add_argument("--no-shortcut", dest="shortcut", action="store_false",
                    help="skip the shortcutting pass and emit the sampling planner's own "
                         "route, which is typically much longer")
-    p.add_argument("--shortcut-seconds", type=float, default=30.0, metavar="SECONDS",
+    p.add_argument("--shortcut-seconds", type=float, default=45.0, metavar="SECONDS",
                    help="time budget for shortcutting each freespace transit; longer "
                         "budgets keep shortening with diminishing returns (default: 30)")
     p.add_argument("--min-shell-mm", type=float, default=5.0,
@@ -72,11 +80,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "starts here (default: 300)")
     p.add_argument("--clearance-penalty-min-mm", type=float, default=10.0, metavar="MM",
                    help="clearance at and below which the penalty is at its peak "
-                        "(default: 3)")
-    p.add_argument("--clearance-penalty-multiplier", type=float, default=500.0,
+                        "(default: 10)")
+    p.add_argument("--clearance-penalty-multiplier", type=float, default=5.0,
                    metavar="N",
                    help="peak penalty: a second spent at the minimum clearance costs as "
-                        "much as N seconds in open space (default: 50)")
+                        "much as N seconds in open space (default: 5)")
     p.add_argument("--clearance-penalty-cutoff-mm", type=float, default=0.0, metavar="MM",
                    help="ignore clearances beyond this, so the proximity query looks no "
                         "further and planning runs faster. Truncates the shallow end of "
@@ -159,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
         approach_axis=args.approach_axis,
         linear_step_mm=args.linear_step_mm,
         ompl_attempts=args.ompl_attempts,
+        ompl_runs=args.ompl_min_runs,
         segment_length=args.segment_length_rad,
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,
