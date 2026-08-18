@@ -230,7 +230,7 @@ class ToolpathPlanner:
                          f"leaving it at the shifted pose")
                 continue
             for ph in phases:
-                if which == "first" and ph.name in ("weld", "depart"):
+                if which == "first" and ph.kind in ("weld", "depart"):
                     ph.states[0] = q          # the weld itself, and where depart begins
-                elif which == "last" and ph.name == "approach":
+                elif which == "last" and ph.kind == "approach":
                     ph.states[-1] = q
