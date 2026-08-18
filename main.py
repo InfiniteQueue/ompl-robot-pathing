@@ -36,9 +36,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-shortcut", dest="shortcut", action="store_false",
                    help="skip the shortcutting pass and emit the sampling planner's own "
                         "route, which is typically much longer")
-    p.add_argument("--shortcut-seconds", type=float, default=10.0, metavar="SECONDS",
+    p.add_argument("--shortcut-seconds", type=float, default=30.0, metavar="SECONDS",
                    help="time budget for shortcutting each freespace transit; longer "
-                        "budgets keep shortening with diminishing returns (default: 10)")
+                        "budgets keep shortening with diminishing returns (default: 30)")
     p.add_argument("--min-shell-mm", type=float, default=5.0,
                    help="drop collision shells smaller than this across their bounding "
                         "box diagonal (default: 5)")
