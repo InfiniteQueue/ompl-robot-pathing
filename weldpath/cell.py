@@ -29,7 +29,8 @@ from tesseract_robotics.tesseract_common import (
     CollisionMarginPairData, CollisionMarginPairOverrideType_MODIFY, FilesystemPath,
     GeneralResourceLocator, Isometry3d, ManipulatorInfo)
 from tesseract_robotics.tesseract_environment import (
-    ChangeCollisionMarginsCommand, Environment)
+    ChangeCollisionMarginsCommand, ChangeJointAccelerationLimitsCommand,
+    ChangeJointVelocityLimitsCommand, Environment)
 from tesseract_robotics.tesseract_kinematics import KinGroupIKInput, KinGroupIKInputs
 
 from .manifest import Manifest
@@ -550,13 +551,34 @@ def _log_gun(man: Manifest, log) -> None:
         f"electrode opening")
 
 
+def _apply_joint_limits(env: Environment, names: list[str], dynamics, log) -> None:
+    """Push the real velocity and acceleration limits into the environment.
+
+    Tesseract synthesises limits it was not given -- this cell came up with +/-1.5 rad/s^2
+    on every joint, which nobody specified and which is far off the real machine.  Anything
+    reading limits from the environment would otherwise be working from invented numbers.
+    """
+    if dynamics is None:
+        return
+    for i, name in enumerate(names):
+        if i >= len(dynamics.velocity):
+            break
+        env.applyCommand(ChangeJointVelocityLimitsCommand(name, float(dynamics.velocity[i])))
+        env.applyCommand(
+            ChangeJointAccelerationLimitsCommand(name, float(dynamics.acceleration[i])))
+    log(dynamics.describe(names))
+
+
 def build(man: Manifest, log=print, out_dir: str | None = None,
           min_shell_mm: float = 40.0, max_shells: int = 80,
           hull_cell_mm: float = 0.0, obstacle_clearance_mm: float = 0.0,
-          penalty=None) -> Cell:
+          penalty=None, dynamics=None) -> Cell:
     """Prepare geometry, emit URDF/SRDF, load the environment and generate the ACM."""
     collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm)
-    builder = SceneBuilder(man, collision)
+    velocity = {}
+    if dynamics is not None:
+        velocity = {n: float(v) for n, v in zip(man.robot_joint_names, dynamics.velocity)}
+    builder = SceneBuilder(man, collision, joint_velocity=velocity)
 
     out_dir = out_dir or os.path.join(man.directory, "generated")
     os.makedirs(out_dir, exist_ok=True)
@@ -583,6 +605,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
     if not env.init(FilesystemPath(urdf_path), FilesystemPath(srdf_path),
                     GeneralResourceLocator()):
         raise RuntimeError(f"Tesseract failed to load the generated scene in {out_dir}")
+    _apply_joint_limits(env, man.robot_joint_names, dynamics, log)
     margin = -man.contact_ok_distance_mm * man.scale
     clearance = obstacle_clearance_mm * man.scale
     _apply_margins(env, man, margin, obstacle_clearance=clearance)
@@ -637,6 +660,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         if not env.init(FilesystemPath(urdf_path), FilesystemPath(srdf_path),
                         GeneralResourceLocator()):
             raise RuntimeError("failed to reload scene with generated collision matrix")
+        _apply_joint_limits(env, man.robot_joint_names, dynamics, lambda *a: None)
         _apply_margins(env, man, margin, overrides, obstacle_clearance=clearance)
         cell = Cell(man, builder, env, pairs)
         cell.margin, cell.obstacle_clearance = margin, clearance

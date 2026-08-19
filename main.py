@@ -63,7 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "before it counts as a collision. Positive keeps that much clear "
                         "air, 0 means touching collides, negative tolerates that much "
                         "overlap (default: 0)")
-    p.add_argument("--weld-clearance-mm", type=float, default=2.0, metavar="MM",
+    p.add_argument("--weld-clearance-mm", type=float, default=0.0, metavar="MM",
                    help="obstacle clearance used instead of --obstacle-clearance-mm on "
                         "any move starting or ending at a weld locator, where the gun "
                         "has to reach the panel (default: 2)")
@@ -90,16 +90,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "further and planning runs faster. Truncates the shallow end of "
                         "the curve without reshaping the rest, so the penalty steps "
                         "abruptly at this distance; 0 uses the maximum (default: 0)")
-    p.add_argument("--joint-speed-deg-s", type=float, default=180.0,
-                   help="peak joint speed used to fill in waypoint times (default: 180)")
+    p.add_argument("--joint-max-velocity", metavar="V1,V2,...",
+                   help="per-joint velocity limits in rad/s, comma separated in joint "
+                        "order; a single value applies to every joint "
+                        "(default: 2pi/3 for j1-j5, 11pi/9 for j6)")
+    p.add_argument("--joint-max-acceleration", metavar="A1,A2,...",
+                   help="per-joint acceleration limits in rad/s^2, comma separated in "
+                        "joint order; a single value applies to every joint "
+                        "(default: 2.5 for j1-j5, 11 for j6)")
     p.add_argument("--linear-speed-mm-s", type=float, default=250.0,
-                   help="peak tool speed on linear moves, used to fill in waypoint "
-                        "times (default: 250)")
-    p.add_argument("--accel-blend", type=float, default=0.5, metavar="0..1",
-                   help="share of each move spent accelerating or decelerating: 0 is "
-                        "flat velocity, 1 is bang-bang (accelerate then decelerate, no "
-                        "cruise). Shapes the trapezoidal velocity profile behind the "
-                        "waypoint times (default: 0.5)")
+                   help="commanded tool speed cap on linear moves; the joint limits still "
+                        "govern whenever they are slower (default: 250)")
     p.add_argument("--quiet", action="store_true", help="only print the final summary")
     return p
 
@@ -118,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
     from weldpath import manifest as manifest_mod
     from weldpath import output as output_mod
     from weldpath.penalty import ClearancePenalty
-    from weldpath.profile import MotionProfile
+    from weldpath import profile as profile_mod
     from weldpath.toolpath import ToolpathPlanner
 
     t0 = time.time()
@@ -139,6 +140,19 @@ def main(argv: list[str] | None = None) -> int:
         print("error: manifest defines no locators, nothing to plan", file=sys.stderr)
         return 1
 
+    n = len(man.robot_joint_names)
+    try:
+        dynamics = profile_mod.JointDynamics(
+            profile_mod.parse_limits(args.joint_max_velocity, n,
+                                     profile_mod.default_velocity(n),
+                                     "--joint-max-velocity"),
+            profile_mod.parse_limits(args.joint_max_acceleration, n,
+                                     profile_mod.default_acceleration(n),
+                                     "--joint-max-acceleration"))
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
     try:
         penalty = ClearancePenalty(
             max_mm=args.clearance_penalty_max_mm,
@@ -156,7 +170,7 @@ def main(argv: list[str] | None = None) -> int:
                               max_shells=args.max_shells,
                               hull_cell_mm=args.hull_cell_mm,
                               obstacle_clearance_mm=args.obstacle_clearance_mm,
-                              penalty=penalty)
+                              penalty=penalty, dynamics=dynamics)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
@@ -175,16 +189,7 @@ def main(argv: list[str] | None = None) -> int:
         log=log)
     segments = planner.run()
 
-    try:
-        profile = MotionProfile(args.accel_blend)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
-    log(f"velocity profile: {profile.blend:g} blend "
-        f"({100 * profile.ramp:.0f}% of each move ramping up, same again down, "
-        f"mean speed {100 * profile.duty:.0f}% of peak)")
-
-    timing = output_mod.Timing(args.joint_speed_deg_s, args.linear_speed_mm_s, profile)
+    timing = output_mod.Timing(dynamics, args.linear_speed_mm_s)
     document = output_mod.build_document(cell, man, segments, timing)
 
     for problem in output_mod.check_endpoints(document, man):

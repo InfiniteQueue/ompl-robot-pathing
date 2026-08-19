@@ -47,13 +47,18 @@ def _xyz(v: np.ndarray) -> str:
 
 class SceneBuilder:
     def __init__(self, man: Manifest, collision_meshes: dict[str, str],
-                 exact_links: set[str] | None = None):
+                 exact_links: set[str] | None = None,
+                 joint_velocity: dict[str, float] | None = None):
         """``exact_links`` take their collision geometry from the raw manifest mesh, kept
         concave, instead of the prepared convex decomposition.  Used to re-measure a
         contact against true geometry; far too slow to plan with."""
         self.man = man
         self.collision = collision_meshes
         self.exact_links = set(exact_links or ())
+        # Per-joint velocity limits, so the emitted scene describes the real machine rather
+        # than a placeholder. Acceleration has no URDF attribute and is applied to the
+        # environment directly instead -- see weldpath.cell.
+        self.joint_velocity = dict(joint_velocity or {})
         self.raw_meshes = {l.name: man.mesh_path(l.mesh)
                            for l in man.all_links() if l.mesh}
         self.raw_meshes.update({s.name: man.mesh_path(s.mesh)
@@ -116,13 +121,14 @@ class SceneBuilder:
         lo, hi = j.limits
         if j.is_prismatic:                      # prismatic limits are a length
             lo, hi = lo * self.scale, hi * self.scale
+        velocity = self.joint_velocity.get(j.name, 3.0)
         return (
             f'  <joint name="{j.name}" type="{j.type}">\n'
             f'    <parent link="{parent}"/>\n'
             f'    <child link="{child}"/>\n'
             f'    <origin xyz="{_xyz(origin)}" rpy="0 0 0"/>\n'
             f'    <axis xyz="{_xyz(axis)}"/>\n'
-            f'    <limit lower="{lo:.9g}" upper="{hi:.9g}" effort="0" velocity="3"/>\n'
+            f'    <limit lower="{lo:.9g}" upper="{hi:.9g}" effort="0" velocity="{velocity:.9g}"/>\n'
             f'  </joint>\n'
         )
 

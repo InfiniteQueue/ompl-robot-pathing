@@ -1,92 +1,133 @@
-"""Trapezoidal velocity profile used to schedule waypoints in time.
+"""Per-joint motion limits, and the time a move takes under them.
 
-A move ramps velocity up, holds it, then ramps it down, so displacement follows an S
-curve. ``blend`` selects the shape:
+Each joint runs bang-bang: it accelerates at its limit until it either reaches its velocity
+limit or has to start braking.  So the velocity profile is a **triangle** for a short move
+and becomes a **trapezoid** only once the velocity limit is actually reached, at
+``d = v^2 / a``::
 
-* ``0`` -- flat velocity: no ramps, constant speed for the whole move.
-* ``1`` -- bang-bang: no cruise at all, accelerating then decelerating throughout, which
-  makes the velocity profile a triangle.
+    t = 2 * sqrt(d / a)        d <= v^2 / a     (triangular, never reaches v)
+        d / v + v / a          d >  v^2 / a     (trapezoidal, cruises at v)
 
-``blend`` is the share of the move spent accelerating or decelerating, so each individual
-ramp occupies ``blend / 2`` of the total time and the cruise occupies ``1 - blend``.
+The two agree at the crossover, both giving ``2v/a``.
 
-Normalising time to ``tau = t / T`` and velocity to its peak, with ``a = blend / 2``::
+The consequence that matters for path quality is that **time is not linear in distance**.
+Splitting one move into two costs an extra ``v/a`` when both halves still reach cruise, and
+up to 41% more when they do not -- a triangular move of ``d`` takes ``2*sqrt(d/a)``, so two
+moves of ``d/2`` take ``2*sqrt(2)`` times ``sqrt(d/a)`` against ``2*sqrt(d/a)`` for one.
+Every waypoint is a full stop, and short hops are where that hurts most.
 
-    v(tau) = tau / a           0     <= tau <= a        (ramp up)
-             1                 a     <= tau <= 1 - a    (cruise)
-             (1 - tau) / a     1 - a <= tau <= 1        (ramp down)
-
-Integrating gives a mean velocity of ``1 - a`` times the peak, which is why adding ramps
-makes a move take longer for the same commanded speed. The displacement fraction is::
-
-    sigma(tau) = tau^2 / A                 tau <= a
-                 (tau - a/2) / (1 - a)     a <= tau <= 1 - a
-                 1 - (1 - tau)^2 / A       tau >= 1 - a
-
-with ``A = 2a(1 - a)``. Scheduling a waypoint means going the other way -- the waypoint
-sits at a known fraction of the path, and we need the time at which the profile reaches
-it -- so :meth:`MotionProfile.time_fraction` inverts that piecewise.
+Joint 3 is coupled to joint 2
+-----------------------------
+The arm holds link 3 at a fixed angle to the floor as joint 2 moves, so the value joint 3 is
+actually commanded with is not the relative rotation the URDF models.  Measured against this
+cell's own kinematics, holding ``q3 - q2`` constant leaves link 3's orientation unchanged to
+0.000 degrees across +/-0.3 rad of joint 2, whereas holding ``q3`` itself constant swings it
+by 17 degrees.  So the commanded value is ``q3 - q2``, and that is what the motion profile is
+computed against -- which keeps joint 3's profile consistent with every other joint, since it
+is the quantity the mechanism actually drives.
 """
 from __future__ import annotations
 
 import math
 
+import numpy as np
 
-class MotionProfile:
-    """Maps position along a move to time along a trapezoidal velocity profile."""
+# Defaults quoted per joint number: joint 6 is the fast wrist axis, everything else is
+# the base figure.
+DEFAULT_VELOCITY = 2.0 * math.pi / 3.0          # rad/s  (120 deg/s)
+DEFAULT_VELOCITY_LAST = 11.0 * math.pi / 9.0    # rad/s  (220 deg/s)
+DEFAULT_ACCELERATION = 2.5                      # rad/s^2
+DEFAULT_ACCELERATION_LAST = 11.0                # rad/s^2
 
-    def __init__(self, blend: float = 0.5):
-        if not 0.0 <= blend <= 1.0:
-            raise ValueError(f"profile blend must be within [0, 1], got {blend}")
-        self.blend = float(blend)
-        self.ramp = self.blend / 2.0          # each ramp, as a fraction of total time
+# The coupled pair, as joint numbers: joint 3's commanded value is measured against joint 2.
+COUPLED_JOINT = 3
+COUPLING_SOURCE = 2
 
-    def __repr__(self) -> str:
-        return (f"MotionProfile(blend={self.blend:g}, ramp={self.ramp:g}, "
-                f"duty={self.duty:g})")
 
-    @property
-    def duty(self) -> float:
-        """Mean velocity as a fraction of peak velocity."""
-        return 1.0 - self.ramp
+def default_velocity(n: int) -> list[float]:
+    out = [DEFAULT_VELOCITY] * n
+    if n >= 6:
+        out[5] = DEFAULT_VELOCITY_LAST
+    return out
 
-    def duration(self, distance: float, peak_speed: float) -> float:
-        """Time to cover ``distance`` when ``peak_speed`` is the commanded maximum."""
-        if distance <= 0.0 or peak_speed <= 0.0:
-            return 0.0
-        return distance / (peak_speed * self.duty)
 
-    def time_fraction(self, travelled: float) -> float:
-        """Fraction of the total time at which ``travelled`` of the distance is covered.
+def default_acceleration(n: int) -> list[float]:
+    out = [DEFAULT_ACCELERATION] * n
+    if n >= 6:
+        out[5] = DEFAULT_ACCELERATION_LAST
+    return out
 
-        ``travelled`` is a fraction in [0, 1]; the result is a fraction in [0, 1].
-        """
-        sigma = min(1.0, max(0.0, float(travelled)))
-        a = self.ramp
-        if a <= 0.0:                           # flat velocity: time tracks distance
-            return sigma
-        area = 2.0 * a * (1.0 - a)
-        sigma_ramp = a * a / area              # distance covered by the end of the ramp
-        if sigma <= sigma_ramp:
-            return math.sqrt(sigma * area)
-        if sigma >= 1.0 - sigma_ramp:
-            return 1.0 - math.sqrt((1.0 - sigma) * area)
-        return sigma * (1.0 - a) + a / 2.0
 
-    def schedule(self, distances: list[float], peak_speed: float) -> list[float]:
-        """Times for a run of waypoints separated by ``distances``.
+def parse_limits(text: str | None, n: int, defaults: list[float], label: str) -> np.ndarray:
+    """Read a comma-separated per-joint limit list.
 
-        ``distances`` holds the step between consecutive waypoints, so the result is one
-        longer than the input: the first waypoint is at time zero. The profile spans the
-        whole run, starting and finishing at rest.
-        """
-        total = float(sum(distances))
-        if total <= 0.0:
-            return [0.0] * (len(distances) + 1)
-        span = self.duration(total, peak_speed)
-        times = [0.0]
-        travelled = 0.0
-        for step in distances:
-            travelled += step
-            times.append(span * self.time_fraction(travelled / total))
-        return times
+    Accepts nothing (use the defaults), a single value applied to every joint, or exactly
+    one value per joint in joint order.
+    """
+    if text is None or not str(text).strip():
+        return np.array(defaults, dtype=float)
+    parts = [p.strip() for p in str(text).split(",") if p.strip()]
+    try:
+        values = [float(p) for p in parts]
+    except ValueError as exc:
+        raise ValueError(f"{label}: {exc}") from None
+    if len(values) == 1:
+        values = values * n
+    if len(values) != n:
+        raise ValueError(
+            f"{label}: expected 1 or {n} comma-separated values, got {len(values)}")
+    if any(v <= 0.0 for v in values):
+        raise ValueError(f"{label}: every value must be positive")
+    return np.array(values, dtype=float)
+
+
+class JointDynamics:
+    """Velocity and acceleration limits per joint, and the move times they imply."""
+
+    def __init__(self, velocity, acceleration, coupled: bool = True):
+        self.velocity = np.asarray(velocity, dtype=float)
+        self.acceleration = np.asarray(acceleration, dtype=float)
+        if self.velocity.shape != self.acceleration.shape:
+            raise ValueError("velocity and acceleration limits must cover the same joints")
+        if np.any(self.velocity <= 0) or np.any(self.acceleration <= 0):
+            raise ValueError("velocity and acceleration limits must be positive")
+        # Coupling only applies to an arm that actually has the joints involved.
+        self.coupled = bool(coupled) and len(self.velocity) >= COUPLED_JOINT
+        self.target = COUPLED_JOINT - 1
+        self.source = COUPLING_SOURCE - 1
+
+    def command(self, q: np.ndarray) -> np.ndarray:
+        """Kinematic joint values as the values the machine is actually commanded with."""
+        out = np.array(q, dtype=float)
+        if self.coupled:
+            out[self.target] = out[self.target] - out[self.source]
+        return out
+
+    def joint_times(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        """Time each joint needs to make this move on its own."""
+        d = np.abs(self.command(np.asarray(b, dtype=float))
+                   - self.command(np.asarray(a, dtype=float)))
+        v, acc = self.velocity, self.acceleration
+        cruise = v * v / acc                     # distance at which the trapezoid starts
+        triangular = 2.0 * np.sqrt(np.maximum(d, 0.0) / acc)
+        trapezoid = d / v + v / acc
+        return np.where(d <= cruise, triangular, trapezoid)
+
+    def move_time(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Time for a coordinated move: the slowest joint governs, all starting together."""
+        t = self.joint_times(a, b)
+        return float(np.max(t)) if t.size else 0.0
+
+    def slowest_joint(self, a: np.ndarray, b: np.ndarray) -> int:
+        return int(np.argmax(self.joint_times(a, b)))
+
+    def describe(self, names: list[str] | None = None) -> str:
+        names = names or [f"j{i + 1}" for i in range(len(self.velocity))]
+        parts = ", ".join(
+            f"{n} {v:.3f} rad/s, {a:g} rad/s^2"
+            for n, v, a in zip(names, self.velocity, self.acceleration))
+        out = f"joint limits: {parts}"
+        if self.coupled:
+            out += (f"; {names[self.target]} is commanded as "
+                    f"{names[self.target]} - {names[self.source]} (held to the floor)")
+        return out

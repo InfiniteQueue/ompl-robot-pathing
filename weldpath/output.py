@@ -22,50 +22,47 @@ import numpy as np
 
 from .cell import Cell
 from .manifest import Manifest
-from .profile import MotionProfile
+from .profile import JointDynamics
 from .toolpath import LIN, Segment
 
 OUTPUT_NAME = "waypoints.json"
 
-# Nominal peak speeds behind the per-waypoint `time` field. They are commanded maxima, not
-# averages: with a trapezoidal profile the ramps mean the mean speed is lower, so a move
-# takes correspondingly longer.
-DEFAULT_JOINT_SPEED_DEG_S = 180.0
+# Cartesian speed cap on LIN moves. The joint limits in weldpath.profile govern every move;
+# this is an additional commanded ceiling on tool speed, not a second dynamics model.
 DEFAULT_LINEAR_SPEED_MM_S = 250.0
 
 
 class Timing:
-    """Schedules each phase's waypoints along a trapezoidal velocity profile.
+    """Schedules waypoints under the robot's real per-joint velocity and acceleration.
 
-    The profile spans a whole phase, starting and finishing at rest, which is what the
-    schema's per-phase ``time`` origin implies: each phase is its own motion block.
-    Waypoint positions are untouched -- only the times they are reached change.
+    Every waypoint is a full stop, so each move is its own bang-bang profile and the times
+    simply accumulate -- unlike the old model, which spread one profile across a whole phase
+    and therefore made a move's duration exactly linear in its distance. That linearity is
+    why splitting a move used to cost nothing; it now costs a real ramp, which is what makes
+    surplus waypoints expensive.
 
-    Distance along a phase is measured in the metric that governs the move: for ``LIN``
-    that is tool travel in millimetres, and for ``PTP`` it is the largest joint excursion
-    of each step, so every step is timed by whichever joint has furthest to go.
+    A ``LIN`` move is additionally capped by the commanded tool speed. No Cartesian
+    acceleration is modelled, because the manifest supplies none -- the cap is a floor on
+    the move's duration, and the joint profile still governs whenever it is slower.
     """
 
-    def __init__(self, joint_speed_deg_s: float = DEFAULT_JOINT_SPEED_DEG_S,
-                 linear_speed_mm_s: float = DEFAULT_LINEAR_SPEED_MM_S,
-                 profile: MotionProfile | None = None):
-        self.joint_speed = np.deg2rad(max(joint_speed_deg_s, 1e-6))
+    def __init__(self, dynamics: JointDynamics,
+                 linear_speed_mm_s: float = DEFAULT_LINEAR_SPEED_MM_S):
+        self.dynamics = dynamics
         self.linear_speed = max(linear_speed_mm_s, 1e-6)
-        self.profile = profile or MotionProfile()
 
     def phase_times(self, motion: str, states: list[np.ndarray],
                     positions: list[np.ndarray]) -> list[float]:
         if len(states) < 2:
             return [0.0] * len(states)
-        if motion == LIN:
-            steps = [float(np.linalg.norm(positions[i + 1] - positions[i]))
-                     for i in range(len(positions) - 1)]
-            speed = self.linear_speed
-        else:
-            steps = [float(np.max(np.abs(states[i + 1] - states[i])))
-                     for i in range(len(states) - 1)]
-            speed = self.joint_speed
-        return self.profile.schedule(steps, speed)
+        times = [0.0]
+        for i in range(len(states) - 1):
+            dt = self.dynamics.move_time(states[i], states[i + 1])
+            if motion == LIN:
+                travel = float(np.linalg.norm(positions[i + 1] - positions[i]))
+                dt = max(dt, travel / self.linear_speed)
+            times.append(times[-1] + dt)
+        return times
 
 
 def _pose_rows(cell: Cell, q: np.ndarray) -> list[list[float]]:
@@ -76,8 +73,7 @@ def _pose_rows(cell: Cell, q: np.ndarray) -> list[list[float]]:
 
 
 def build_document(cell: Cell, man: Manifest, segments: list[Segment],
-                   timing: Timing | None = None) -> dict:
-    timing = timing or Timing()
+                   timing: Timing) -> dict:
     out_segments = []
 
     for seg in segments:

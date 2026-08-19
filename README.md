@@ -219,40 +219,63 @@ is still written and the process exits non-zero.
 
 ## Velocity profile
 
-Waypoints are scheduled along a trapezoidal velocity profile, so displacement follows an S
-curve rather than a straight line. `--accel-blend` sets the share of a move spent
-accelerating or decelerating:
+Every waypoint is a full stop, and each move runs **bang-bang**: each joint accelerates at
+its limit until it either reaches its velocity limit or has to start braking. So the profile
+is a triangle for a short move and becomes a trapezoid only once the velocity limit is
+actually reached, at `d = v²/a`:
 
-| `--accel-blend` | Shape | Each ramp | Cruise | Mean speed | Duration |
-| --- | --- | --- | --- | --- | --- |
-| 0 | flat velocity | — | 100% | peak | `D / v` |
-| 0.5 (default) | trapezoid | 25% | 50% | 75% of peak | `1.33 × D / v` |
-| 1 | bang-bang | 50% | — | 50% of peak | `2 × D / v` |
+```
+t = 2·√(d/a)      d ≤ v²/a     triangular, never reaches v
+    d/v + v/a     d > v²/a     trapezoidal, cruises at v
+```
 
-`--joint-speed-deg-s` and `--linear-speed-mm-s` are **peak** speeds, not averages, so
-adding ramps makes a move take longer: mean speed is `1 - blend/2` of peak and duration
-scales as `1 / (1 - blend/2)`. `--accel-blend 0` reproduces the old constant-velocity
-timing exactly.
+Both give `2v/a` at the crossover, so the two branches meet continuously. A move is
+coordinated — all joints start and stop together — so its duration is the slowest joint's.
 
-The profile spans a **phase**, starting and ending at rest. That follows from the schema
-resetting `time` to zero per phase — each phase is its own motion block, and phase
-boundaries are where the gun state or motion type changes, which is where the robot would
-stop anyway. All joints share one time base, so a coordinated move stays coordinated: each
-joint's displacement follows the same S curve scaled by its own excursion.
+Limits are set with `--joint-max-velocity` and `--joint-max-acceleration`, each taking
+comma-separated values in joint order, or a single value applied to every joint. Defaults
+are 2π/3 rad/s and 2.5 rad/s² for J1–J5, and 11π/9 rad/s and 11 rad/s² for J6.
 
-Distance is measured in whatever governs the move — tool travel in mm for `LIN`, and for
-`PTP` the largest joint excursion of each step, so each step is timed by whichever joint
-has furthest to go.
+**Time is no longer linear in distance**, which is the point. The previous model spread one
+trapezoid across a whole phase with the ramps as a fixed *fraction* of each move, which
+implied acceleration scaling with move length and made splitting a move free. Now splitting
+costs real time — for a triangular move, √2 per doubling:
 
-Only the times change; **waypoint positions are untouched**. With `--accel-blend 0.5` on a
-7-point 300 mm linear move at 250 mm/s the deltas come out `0.4, 0.2, 0.2, 0.2, 0.2, 0.4` —
-the cruise steps run at peak speed and only the ramp steps stretch.
+| 1.0 rad split into | 1 move | 2 | 4 | 10 |
+| --- | --- | --- | --- | --- |
+| Duration | 1.265 s | 1.789 s | 2.530 s | 4.000 s |
 
-One consequence worth knowing: a phase reduced to just two waypoints carries the profile
-only through its total duration, since there are no intermediate points for the shape to
-show up in. Multi-point phases (a linear approach, or a transit that needed a detour) show
-it directly. Adding points purely to express the curve would work against keeping the
-program short, so it is not done.
+Expect emitted times to roughly triple against the old model. On the sample study the two
+transits went from 1.398 s and 1.341 s to 3.886 s and 3.192 s — 2.58× overall. The old
+figures were optimistic because they charged nothing for stopping.
+
+`--linear-speed-mm-s` remains as a commanded tool-speed cap on `LIN` moves; the joint limits
+still govern whenever they are slower. No Cartesian acceleration is modelled, because the
+manifest supplies none.
+
+### Joint 3 is coupled to joint 2
+
+The arm holds link 3 at a fixed angle to the floor as joint 2 moves, so the value joint 3 is
+actually commanded with is not the relative rotation a URDF models. Measured against this
+cell's own kinematics, holding `q3 − q2` constant leaves link 3's orientation unchanged to
+**0.000°** across ±0.3 rad of joint 2, while holding `q3` itself constant swings it by 17°.
+So the commanded value is `q3 − q2`, and that is what the motion profile is computed
+against — which is what keeps joint 3's profile consistent with every other joint, since it
+is the quantity the mechanism actually drives.
+
+A consequence worth being explicit about: moving J2 and q3 together by the same amount is
+*free* for joint 3, because its drive does not turn at all.
+
+### Limits in the environment
+
+The same figures are pushed into the Tesseract environment with
+`ChangeJointVelocityLimitsCommand` and `ChangeJointAccelerationLimitsCommand`, and the
+per-joint velocity is written into the URDF. This matters because Tesseract **synthesises
+limits it was not given** — this cell previously came up with ±1.5 rad/s² on every joint,
+which nobody specified and which is nowhere near the real machine. Anything reading limits
+from the environment (a time parameteriser, say) would otherwise be working from invented
+numbers. The gun joint keeps its placeholder velocity, since the manifest describes no
+dynamics for it.
 
 ## Welds
 
@@ -452,9 +475,9 @@ correction is what keeps the false contact from disabling a real collision check
 | `--clearance-penalty-min-mm` | 3 | clearance at and below which the penalty peaks |
 | `--clearance-penalty-multiplier` | 50 | peak penalty factor |
 | `--clearance-penalty-cutoff-mm` | 0 | ignore clearances beyond this; 0 uses the maximum |
-| `--joint-speed-deg-s` | 180 | peak joint speed behind the `time` field |
-| `--linear-speed-mm-s` | 250 | peak tool speed on `LIN` moves |
-| `--accel-blend` | 0.5 | 0 flat velocity … 1 bang-bang; see above |
+| `--joint-max-velocity` | 2π/3, J6 11π/9 | per-joint velocity limits, rad/s, comma separated |
+| `--joint-max-acceleration` | 2.5, J6 11 | per-joint acceleration limits, rad/s², comma separated |
+| `--linear-speed-mm-s` | 250 | tool speed cap on `LIN` moves |
 | `--quiet` | off | print only the summary |
 
 Exit code is 0 when every segment planned, 1 otherwise.
