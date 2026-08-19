@@ -95,7 +95,7 @@ declares are written.
      "gun_opening_mm": 0.0,     // one gun state per phase, not per waypoint
      "waypoints": [
       {
-       "joints": {"robot_j1": -112.00412, "...": 0.0},
+       "joints": {"robot_j1": -1.9547943, "...": 0.0},
        "tcp_world_mm": [[0.1736, 0.0, -0.9848, 1002.711],
                         [0.0, -1.0, 0.0, 2136.612],
                         [-0.9848, 0.0, -0.1736, 1215.386],
@@ -113,9 +113,10 @@ declares are written.
 
 Three details of the contract are easy to get wrong and are worth restating:
 
-* **`joints` values are in the units `units` declares** — degrees for revolute joints, mm
-  for prismatic — and they are the **robot's register values, not the planner's**. Those
-  differ for joint 3, whose linkage holds it against the floor; see
+* **`joints` values are radians** for revolute joints and mm for prismatic, despite
+  `units` reading `"mm/deg"` — the comment in the `.vb` is explicit that joint values are in
+  the planner's native units. They are the **robot's register values, not the planner's**,
+  which differ for joint 3, whose linkage holds it against the floor; see
   [Joint 3 is coupled to joint 2](#joint-3-is-coupled-to-joint-2). `joint_names` lists the
   six robot joints, matching the study's own sample; the gun is reported through
   `gun_opening_mm`.
@@ -333,7 +334,8 @@ robot's J3 register carries is not the relative rotation a URDF models. Measured
 this cell's own kinematics, link 3's elevation is a function of `q3 − q2` alone: it reads
 the same at `(q2, q3)` of `(−0.3, −0.3)`, `(0, 0)` and `(0.3, 0.3)`, and rises from −22.9°
 to +35.2° as `q3 − q2` runs from −0.6 to +0.6 rad. So the register reads `q3 − q2`,
-increasing as the arm points up, and that is the value written to `waypoints.json`.
+increasing as the arm points up, and that is the value written to `waypoints.json` — in
+radians, like every other joint there.
 
 **Timing is a separate question.** The drive still moves joint 3 through the URDF's own
 relative rotation, so its motion profile runs on `q3` unmodified, exactly like every other

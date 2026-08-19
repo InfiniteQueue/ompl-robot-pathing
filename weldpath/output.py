@@ -3,9 +3,10 @@
 The schema is fixed by the consumer (``TesseractWaypoints.vb``), and two details of it are
 easy to get wrong:
 
-* ``joints`` is a name -> value map in the units ``units`` declares: degrees for revolute
-  joints, millimetres for prismatic.  The values are the robot's *register* values, not the
-  planner's -- which differ for joint 3, whose linkage holds it against the floor.  See
+* ``joints`` is a name -> value map in the *planner's* angular units -- radians for
+  revolute joints, millimetres for prismatic -- even though ``units`` reads ``"mm/deg"``.
+  The values are the robot's *register* values rather than the planner's, which differ for
+  joint 3, whose linkage holds it against the floor.  See
   :func:`weldpath.profile.commanded`.
 * ``tcp_world_mm`` is the full 4x4 row-major world pose with the translation in
   millimetres in the fourth column, in the same frame as the manifest's
@@ -69,13 +70,14 @@ class Timing:
 
 
 def _joint_scales(cell: Cell, man: Manifest) -> np.ndarray:
-    """Factor turning each joint's planner value into the unit ``units`` declares.
+    """Factor turning each joint's planner value into the unit the output is written in.
 
-    Revolute joints are planned in radians and written in degrees; prismatic ones are
-    planned in metres and written in the manifest's own length unit.
+    Revolute joints are written in radians, as planned, which the consumer expects despite
+    ``units`` reading ``"mm/deg"``.  Prismatic ones are planned in metres and written in the
+    manifest's own length unit, so those do get converted.
     """
     prismatic = {j.name: j.is_prismatic for d in man.devices for j in d.joints}
-    return np.array([1.0 / man.scale if prismatic.get(name) else np.degrees(1.0)
+    return np.array([1.0 / man.scale if prismatic.get(name) else 1.0
                      for name in cell.joint_names], dtype=float)
 
 
@@ -105,7 +107,7 @@ def build_document(cell: Cell, man: Manifest, segments: list[Segment],
             times = timing.phase_times(ph.motion, ph.states, positions)
             waypoints = [
                 {
-                    "joints": {name: round(float(value), 6)
+                    "joints": {name: round(float(value), 9)
                                for name, value
                                in zip(cell.joint_names, commanded(q) * scales)},
                     "tcp_world_mm": rows,
