@@ -83,6 +83,7 @@ class ToolpathPlanner:
                  linear_step_mm: float = 50.0, ompl_attempts: int = 3,
                  ompl_runs: int = 1,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
+                 ompl_seconds: float = 5.0,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                  weld_clearance_mm: float | None = None,
                  keep_unrefined: bool = False, log=print):
@@ -93,6 +94,7 @@ class ToolpathPlanner:
         self.linear_step_mm = linear_step_mm
         self.ompl_attempts = ompl_attempts
         self.ompl_runs = ompl_runs
+        self.ompl_seconds = ompl_seconds
         self.segment_length = segment_length
         self.check_step = np.deg2rad(check_step_deg)
         self.shortcut_seconds = shortcut_seconds
@@ -242,7 +244,7 @@ class ToolpathPlanner:
             segment_length=self.segment_length,
             check_step=self.check_step, fallback_via=[self.start_q],
             shortcut_seconds=self.shortcut_seconds,
-            polish_seconds=self.polish_seconds,
+            polish_seconds=self.polish_seconds, planning_time=self.ompl_seconds,
             openings=[leave_open, arrive_open], record=raw_legs, log=self.log)
         for i, (path, opening) in enumerate(legs):
             opening_mm = 0.0 if opening is None else opening

@@ -41,10 +41,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "stumbles on first, and no later pass can move a route to the "
                         "other side of an obstacle, so this is the only stage that can "
                         "choose between them. Costs a full solve per run (default: 3)")
+    p.add_argument("--ompl-seconds", type=float, default=5.0, metavar="SECONDS",
+                   help="how long one sampling-planner run may search before giving up. Raise it for a transit that keeps failing, where restarting the search wastes the tree built so far; every run costs this long in the worst case, so it multiplies with --ompl-min-runs (default: 5)")
     p.add_argument("--no-shortcut", dest="shortcut", action="store_false",
                    help="skip the shortcutting pass and emit the sampling planner's own "
                         "route, which is typically much longer")
-    p.add_argument("--shortcut-seconds", type=float, default=45.0, metavar="SECONDS",
+    p.add_argument("--shortcut-seconds", type=float, default=15.0, metavar="SECONDS",
                    help="time budget for shortcutting each freespace transit; longer "
                         "budgets keep shortening with diminishing returns (default: 30)")
     p.add_argument("--polish-seconds", type=float, default=5.0, metavar="SECONDS",
@@ -194,6 +196,7 @@ def main(argv: list[str] | None = None) -> int:
         linear_step_mm=args.linear_step_mm,
         ompl_attempts=args.ompl_attempts,
         ompl_runs=args.ompl_min_runs,
+        ompl_seconds=args.ompl_seconds,
         segment_length=args.segment_length_rad,
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,

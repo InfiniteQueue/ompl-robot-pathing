@@ -12,6 +12,8 @@ planner usable here; it stays well inside the manifest's contact tolerance.
 """
 from __future__ import annotations
 
+import ctypes
+import struct
 import time
 
 import numpy as np
@@ -409,9 +411,69 @@ def _make_program(cell: Cell, qa: np.ndarray, qb: np.ndarray) -> cl.CompositeIns
     return program
 
 
-def _ompl_profile(segment_length: float) -> OMPLRealVectorMoveProfile:
+# How long one OMPL solve may run.  Tesseract's own default, and what this used to be
+# stuck with; see _set_planning_time for why changing it is awkward.
+DEFAULT_PLANNING_TIME = 5.0
+# The rest of OMPLSolverConfig's documented defaults, used to recognise the struct.
+_SOLVER_SIGNATURE = (10, 0, 1)          # max_solutions, simplify, optimize
+_planning_time_warned = False
+
+
+def _set_planning_time(profile: OMPLRealVectorMoveProfile, seconds: float) -> bool:
+    """Set the solver's per-run time limit.  Returns False if it could not be done.
+
+    ``OMPLSolverConfig`` is **not wrapped** by these bindings.  ``profile.solver_config``
+    comes back as a bare ``SwigPyObject`` -- a typed pointer with no members exposed -- and
+    the module defines no constructor, accessor or factory for the type, so there is no
+    supported way to reach ``planning_time`` from Python.  Nor is there a way round it:
+    ``OMPLMotionPlanner.terminate()`` exists but only ever *shortens* a solve, and the
+    binding's own warning says even that is unimplemented.
+
+    So this writes the field through the pointer, and earns the right to by proving it is
+    the right field first.  Rather than trusting a hard-coded offset, it scans for the
+    documented default layout -- ``planning_time`` immediately followed by
+    ``max_solutions=10``, ``simplify=false``, ``optimize=true`` -- and refuses to write
+    unless exactly one candidate matches.  It then reads the value back.  A build that
+    reorders the struct or changes its defaults produces no match, so the failure mode is
+    "declines to act", not "corrupts the neighbouring field".
+    """
+    try:
+        address = int(profile.solver_config)
+    except Exception:
+        return False
+
+    blob = ctypes.string_at(address, 128)
+    matches = []
+    for offset in range(0, len(blob) - 16, 8):
+        value = struct.unpack_from("<d", blob, offset)[0]
+        if abs(value - DEFAULT_PLANNING_TIME) > 1e-12:
+            continue
+        rest = (struct.unpack_from("<i", blob, offset + 8)[0],
+                blob[offset + 12], blob[offset + 13])
+        if rest == _SOLVER_SIGNATURE:
+            matches.append(offset)
+    if len(matches) != 1:
+        return False
+
+    ctypes.memmove(address + matches[0], struct.pack("<d", float(seconds)), 8)
+    # Re-fetch the pointer rather than reusing it: this also confirms the write landed on
+    # the profile's own member and not on a temporary copy handed out by the getter.
+    check = ctypes.string_at(int(profile.solver_config) + matches[0], 8)
+    return abs(struct.unpack("<d", check)[0] - float(seconds)) < 1e-12
+
+
+def _ompl_profile(segment_length: float,
+                  planning_time: float = DEFAULT_PLANNING_TIME,
+                  log=None) -> OMPLRealVectorMoveProfile:
+    global _planning_time_warned
     profile = OMPLRealVectorMoveProfile()
     profile.collision_check_config.longest_valid_segment_length = segment_length
+    if abs(planning_time - DEFAULT_PLANNING_TIME) > 1e-12:
+        if not _set_planning_time(profile, planning_time) and not _planning_time_warned:
+            _planning_time_warned = True
+            (log or print)(
+                f"      ! cannot set the OMPL time limit with this build of the bindings; "
+                f"runs will use {DEFAULT_PLANNING_TIME:g}s, not {planning_time:g}s")
     return profile
 
 
@@ -461,7 +523,8 @@ def _capture(record: list | None, path: list[np.ndarray]) -> list[np.ndarray]:
 def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
                      runs: int, segment_length: float, check_step: float,
                      fallback_via: list[np.ndarray] | None,
-                     shortcut_seconds: float, polish_seconds: float, log,
+                     shortcut_seconds: float, polish_seconds: float,
+                     planning_time: float = DEFAULT_PLANNING_TIME, log=print,
                      record: list | None = None) -> list[np.ndarray]:
     """Collision-free joint path from ``qa`` to ``qb`` at the gun's current opening.
 
@@ -474,7 +537,8 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
         return _plan_direct(cell, qa, qb, attempts=attempts, runs=runs,
                             segment_length=segment_length, check_step=check_step,
                             shortcut_seconds=shortcut_seconds,
-                            polish_seconds=polish_seconds, log=log, record=record)
+                            polish_seconds=polish_seconds,
+                            planning_time=planning_time, log=log, record=record)
     except PlanningError:
         if not fallback_via:
             raise
@@ -489,12 +553,12 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
         try:
             first = _plan_direct(cell, qa, mid, attempts=attempts, runs=runs,
                                  segment_length=segment_length, check_step=check_step,
-                                 shortcut_seconds=0.0, polish_seconds=0.0, log=log,
-                                 record=halves)
+                                 shortcut_seconds=0.0, polish_seconds=0.0,
+                                 planning_time=planning_time, log=log, record=halves)
             second = _plan_direct(cell, mid, qb, attempts=attempts, runs=runs,
                                   segment_length=segment_length, check_step=check_step,
-                                  shortcut_seconds=0.0, polish_seconds=0.0, log=log,
-                                  record=halves)
+                                  shortcut_seconds=0.0, polish_seconds=0.0,
+                                  planning_time=planning_time, log=log, record=halves)
         except PlanningError:
             continue
         if len(halves) == 2:
@@ -511,6 +575,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
                    check_step: float = 0.05,
                    fallback_via: list[np.ndarray] | None = None,
                    shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
+                   planning_time: float = DEFAULT_PLANNING_TIME,
                    openings: list[float] | None = None,
                    record: list | None = None,
                    log=print) -> list[tuple[list[np.ndarray], float | None]]:
@@ -537,7 +602,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
                                     check_step=check_step, fallback_via=fallback_via,
                                     shortcut_seconds=budget,
                                     polish_seconds=polish_seconds if budget else 0.0,
-                                    log=log, record=into)
+                                    planning_time=planning_time, log=log, record=into)
 
     candidates = _opening_candidates(cell, openings)
 
@@ -612,7 +677,8 @@ def _opening_candidates(cell: Cell, openings: list[float] | None) -> list[float 
 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
                  runs: int, segment_length: float, check_step: float,
-                 shortcut_seconds: float, polish_seconds: float, log,
+                 shortcut_seconds: float, polish_seconds: float,
+                 planning_time: float = DEFAULT_PLANNING_TIME, log=print,
                  record: list | None = None) -> list[np.ndarray]:
     if not cell.segment_collides(qa, qb, max_step=check_step):
         # A clear straight line is normally the best answer there is, and a sampling
@@ -647,7 +713,8 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
     last = ""
     for attempt in range(1, max(runs, attempts) + 1):
         profiles = ProfileDictionary()
-        profiles.addProfile(OMPL_NAMESPACE, "DEFAULT", _ompl_profile(segment_length))
+        profiles.addProfile(OMPL_NAMESPACE, "DEFAULT",
+                            _ompl_profile(segment_length, planning_time, log))
         request = PlannerRequest()
         request.env = cell.env
         request.instructions = _make_program(cell, qa, qb)

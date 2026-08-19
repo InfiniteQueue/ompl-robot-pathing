@@ -177,6 +177,35 @@ rather than raw time genuinely reorders them: the 2.88 s run is quicker unpenali
 2.62 s one (1.88 s against 2.15 s), and loses because it spends that time closer to the
 panels.
 
+### How long each run may search
+
+`--ompl-seconds` caps a single solve. It matters independently of the run count: restarting
+throws away the search tree, so a transit through a genuinely tight gap is better served by
+one long run than by several short ones. On the sample study the `via9 -> via10` direct
+transit never once solved at the 5 s default and always fell back to a two-leg route through
+the start pose; at 20 s it solves directly.
+
+| `--ompl-seconds` | wall clock | solved? |
+| --- | --- | --- |
+| 5 | 6.25 s | no |
+| 12 | 13.80 s | no |
+| 20 | 20.40 s | **yes** |
+
+Budget for it multiplying: worst case is `--ompl-seconds x --ompl-min-runs` per transit.
+
+> **This one reaches past the bindings.** Tesseract's `OMPLSolverConfig` is not wrapped by
+> `tesseract_robotics` — `profile.solver_config` comes back as a bare `SwigPyObject` with no
+> members exposed, and the module defines no constructor, accessor or factory for the type,
+> so `planning_time` cannot be set through any supported call. (`OMPLMotionPlanner.terminate()`
+> exists, but only ever *shortens* a solve, and the binding warns it is unimplemented.) The
+> value is therefore written straight into the C++ struct. To earn that, the code does not
+> trust a hard-coded offset: it scans for the documented default layout — `planning_time`
+> immediately followed by `max_solutions=10`, `simplify=false`, `optimize=true` — refuses to
+> write unless exactly one candidate matches, and reads the value back afterwards. A build
+> that reorders the struct or changes its defaults produces no match, so it declines and
+> warns rather than corrupting a neighbouring field. Leaving the flag at its 5 s default
+> touches nothing at all.
+
 The minimum is a floor rather than a cap. Once it is met and at least one solution exists,
 planning moves on; if nothing has solved, runs continue up to `--ompl-attempts`. Each run is
 a full solve of several seconds, so this is the most expensive knob in the tool — it is also
@@ -538,6 +567,7 @@ correction is what keeps the false contact from disabling a real collision check
 | `--segment-length-rad` | 0.02 | collision resolution inside the sampling planner |
 | `--ompl-attempts` | 3 | most freespace attempts before the fallback route |
 | `--ompl-min-runs` | 3 | sample this many solutions and keep the cheapest |
+| `--ompl-seconds` | 5 | how long one sampling-planner run may search |
 | `--no-shortcut` | off | emit the sampling planner's own route, unshortened |
 | `--shortcut-seconds` | 10 | time budget for shortcutting each transit |
 | `--polish-seconds` | 5 | time budget for the final pass over the emitted waypoints |
