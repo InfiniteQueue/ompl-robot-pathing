@@ -474,6 +474,14 @@ If a pair is already closer than the requested clearance in the start pose, that
 held to the distance actually available there and the run says so, rather than declaring
 the start state invalid and refusing to plan at all.
 
+The re-measurement is done one pair at a time, in a scene holding only the two links
+involved, and the probe distance backs off from 50 mm to 10 mm to 2 mm if Bullet cannot
+allocate for it — raw concave meshes run to millions of triangles here, and a mesh-against-mesh
+test at a wide probe builds a contact manifold per candidate triangle pair. Narrowing the
+probe only ever makes the answer more conservative, since a pair nothing is found near is
+treated as clear at the probe used. If no probe succeeds the pair keeps its default margin
+and the start-state check has the final say, rather than a distance being invented for it.
+
 **The retract direction is relative to the weld locator, not the tool.** A weld leads in
 and out along the locator's own **−x**. This used to be derived from the gun's prismatic
 stroke axis, which made the direction a property of the machine rather than of the weld —

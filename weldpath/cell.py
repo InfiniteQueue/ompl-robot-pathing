@@ -452,6 +452,10 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float,
 # Probe distance for the exact re-measurement.  Generous on purpose: a pair the hulls
 # call a deep crash must come back with a real number, not "nothing found".
 EXACT_PROBE_MARGIN = 0.05
+# Probe distances to try, widest first. Narrowing costs accuracy but never safety: a pair
+# nothing is found near is treated as clear at the probe used, so a smaller probe claims
+# less clearance, not more.
+EXACT_PROBE_STEPS = (EXACT_PROBE_MARGIN, 0.01, 0.002)
 
 
 def _geometry_extent(geom) -> np.ndarray:
@@ -499,12 +503,45 @@ def _exact_contacts(man: Manifest, collision: dict[str, str], out_dir: str,
                     joint_names: list[str], log=print) -> dict[tuple[str, str], float]:
     """Measure ``pairs`` at joint state ``q`` against the raw concave meshes.
 
-    Concave geometry is far too slow to plan with (~700 ms a check against ~3 ms), but
-    this runs once per tripped pair with every other object switched off, so the cost is
-    a few hundred milliseconds in total.  Returns the worst distance per pair, negative
-    for penetration; a pair absent from the result had no contact within the probe.
+    One pair at a time, and each pair's scene holds only the two links involved.  Loading
+    every tripped pair's geometry at once is what made this fall over on a cell with a
+    1.6M-triangle fixture: raw concave meshes are enormous, and Bullet's mesh-against-mesh
+    test at a wide probe generates a contact manifold per candidate triangle pair, so the
+    allocation grows with both mesh size and probe distance.
+
+    The probe is therefore also allowed to back off.  Narrowing it only ever makes the
+    answer more conservative -- a pair the probe cannot see is treated as clear at the
+    probe distance, so a smaller probe claims *less* clearance than a larger one -- which
+    makes retrying at 50, 10 and 2 mm a safe escalation rather than a compromise.
+
+    Returns the worst distance per pair, negative for penetration.  A pair absent from the
+    result was not measurable: either nothing lay within the probe, or the measurement
+    could not be made at all, and the caller decides what to do about that.
     """
-    links = sorted({name for pair in pairs for name in pair})
+    out: dict[tuple[str, str], float] = {}
+    for a, b in pairs:
+        for probe in EXACT_PROBE_STEPS:
+            try:
+                worst = _exact_pair(man, collision, out_dir, a, b, q, joint_names, probe)
+            except Exception as exc:                # SystemError: bad allocation, etc.
+                log(f"  ! exact re-measurement of {a} <-> {b} ran out of room at a "
+                    f"{probe * 1000:.0f} mm probe ({type(exc).__name__}); retrying closer")
+                continue
+            # Measured cleanly but found nothing: the pair is clear by at least the probe
+            # used, which is all that can honestly be claimed.
+            out[(a, b)] = worst if worst is not None else probe
+            break
+        else:
+            log(f"  ! cannot re-measure {a} <-> {b} against the raw meshes at any probe "
+                f"distance; leaving the pair on its default margin")
+    return out
+
+
+def _exact_pair(man: Manifest, collision: dict[str, str], out_dir: str,
+                a: str, b: str, q: np.ndarray, joint_names: list[str],
+                probe: float) -> float | None:
+    """Worst raw-geometry distance between two links, or None if nothing is within probe."""
+    links = sorted({a, b})
     builder = SceneBuilder(man, collision, exact_links=set(links))
     ex_dir = os.path.join(out_dir, "exact_check")
     os.makedirs(ex_dir, exist_ok=True)
@@ -525,7 +562,7 @@ def _exact_contacts(man: Manifest, collision: dict[str, str], out_dir: str,
     if not env.init(FilesystemPath(paths["cell.urdf"]), FilesystemPath(paths["cell.srdf"]),
                     GeneralResourceLocator()):
         raise RuntimeError(f"failed to load the exact-geometry scene in {ex_dir}")
-    env.applyCommand(ChangeCollisionMarginsCommand(EXACT_PROBE_MARGIN))
+    env.applyCommand(ChangeCollisionMarginsCommand(probe))
 
     raw = {l.name: l.mesh for l in man.all_links() if l.mesh}
     raw.update({s.name: s.mesh for s in man.static_objects if s.mesh})
@@ -533,27 +570,20 @@ def _exact_contacts(man: Manifest, collision: dict[str, str], out_dir: str,
         _assert_scale(env, man, name, raw[name])
 
     cm = env.getDiscreteContactManager()
-    objects = list(cm.getCollisionObjects())
+    for name in cm.getCollisionObjects():
+        if name in (a, b):
+            cm.enableCollisionObject(name)
+        else:
+            cm.disableCollisionObject(name)
+    cm.setActiveCollisionObjects([a, b])
     env.setState(joint_names, np.asarray(q, dtype=float))
     state = env.getState()          # must outlive the transform call, see Cell.set_state
-
-    out: dict[tuple[str, str], float] = {}
-    for a, b in pairs:
-        for name in objects:
-            if name in (a, b):
-                cm.enableCollisionObject(name)
-            else:
-                cm.disableCollisionObject(name)
-        cm.setActiveCollisionObjects([a, b])
-        cm.setCollisionObjectsTransform(state.link_transforms)
-        res = ContactResultMap()
-        cm.contactTest(res, ContactRequest(ContactTestType_ALL))
-        vec = ContactResultVector()
-        res.flattenCopyResults(vec)
-        worst = min((float(c.distance) for c in vec), default=None)
-        if worst is not None:
-            out[(a, b)] = worst
-    return out
+    cm.setCollisionObjectsTransform(state.link_transforms)
+    res = ContactResultMap()
+    cm.contactTest(res, ContactRequest(ContactTestType_ALL))
+    vec = ContactResultVector()
+    res.flattenCopyResults(vec)
+    return min((float(c.distance) for c in vec), default=None)
 
 
 def _obstacle_margins(man: Manifest) -> list[tuple[str, str]]:
@@ -691,9 +721,12 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         obstacle = {tuple(sorted(p)) for p in _obstacle_margins(man)}
         disable: list[tuple[str, str]] = []
         for (a, b), hull in sorted(always.items(), key=lambda kv: kv[1]):
-            # A pair with no contact within the probe is treated as clear at the probe
-            # distance, which is the most conservative reading of "nothing found".
-            true_d = exact.get((a, b), EXACT_PROBE_MARGIN)
+            if (a, b) not in exact:
+                # Unmeasurable, already reported. Inventing a distance here would either
+                # disable a real collision or hand the pair a margin nothing justifies, so
+                # the pair keeps its default and the start-state check has the final say.
+                continue
+            true_d = exact[(a, b)]
             base = clearance if (a, b) in obstacle else margin
             if true_d < 0.0:
                 # Real geometry genuinely interpenetrates: a modelling problem, not
