@@ -20,8 +20,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("directory",
                    help="study directory containing manifest.json and meshes/")
     p.add_argument("--approach-axis", choices=["+x", "-x", "+y", "-y", "+z", "-z"],
-                   help="direction in a weld locator's own frame to retract along when "
-                        "leaving it (default: -z, matching --weld-shift-mm)")
+                   help="direction in a weld locator's own frame that the straight "
+                        "lead-in and lead-out travel along (default: -x)")
+    p.add_argument("--no-linear-zone", dest="linear_zone", action="store_false",
+                   help="do not lead into or out of a weld in a straight line. Every "
+                        "millimetre of the manifest's linear_zone_mm has to be clear "
+                        "along one fixed direction, which a weld set deep in panelling "
+                        "may have no room for; without it the transit runs weld to weld "
+                        "and is free to curve away immediately, at the cost of the gun "
+                        "arriving on a curve rather than sliding on straight")
     p.add_argument("--linear-step-mm", type=float, default=50.0,
                    help="spacing of points along linear approach/depart moves "
                         "(default: 50)")
@@ -34,22 +41,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ompl-attempts", type=int, default=20,
                    help="most freespace planning attempts per segment, used to retry a "
                         "transit that keeps failing (default: 3)")
-    p.add_argument("--ompl-min-runs", type=int, default=10, metavar="N",
+    p.add_argument("--ompl-min-runs", type=int, default=7, metavar="N",
                    help="always run the sampling planner at least this many times per "
                         "transit and keep the lowest-penalty solution, rather than taking "
                         "the first one that works. The planner returns whichever route it "
                         "stumbles on first, and no later pass can move a route to the "
                         "other side of an obstacle, so this is the only stage that can "
                         "choose between them. Costs a full solve per run (default: 3)")
-    p.add_argument("--ompl-seconds", type=float, default=5.0, metavar="SECONDS",
+    p.add_argument("--ompl-seconds", type=float, default=7.0, metavar="SECONDS",
                    help="how long one sampling-planner run may search before giving up. Raise it for a transit that keeps failing, where restarting the search wastes the tree built so far; every run costs this long in the worst case, so it multiplies with --ompl-min-runs (default: 5)")
     p.add_argument("--no-shortcut", dest="shortcut", action="store_false",
                    help="skip the shortcutting pass and emit the sampling planner's own "
                         "route, which is typically much longer")
-    p.add_argument("--shortcut-seconds", type=float, default=15.0, metavar="SECONDS",
+    p.add_argument("--shortcut-seconds", type=float, default=20.0, metavar="SECONDS",
                    help="time budget for shortcutting each freespace transit; longer "
                         "budgets keep shortening with diminishing returns (default: 30)")
-    p.add_argument("--polish-seconds", type=float, default=5.0, metavar="SECONDS",
+    p.add_argument("--polish-seconds", type=float, default=20.0, metavar="SECONDS",
                    help="time budget for the final pass over each transit's emitted "
                         "waypoints, which removes and relocates them under the full "
                         "stop-to-stop time the robot really pays for each one. The "
@@ -59,10 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-shell-mm", type=float, default=5.0,
                    help="drop collision shells smaller than this across their bounding "
                         "box diagonal (default: 5)")
-    p.add_argument("--max-shells", type=int, default=500,
+    p.add_argument("--max-shells", type=int, default=1500,
                    help="keep at most this many convex shells per link; fewer is faster "
                         "but coarser (default: 500)")
-    p.add_argument("--hull-cell-mm", type=float, default=0.0, metavar="MM",
+    p.add_argument("--hull-cell-mm", type=float, default=25.0, metavar="MM",
                    help="split shells that a single convex hull fits badly into cells of "
                         "roughly this size, hulling each one, so the collision geometry "
                         "follows recesses instead of bridging them. Smaller is more "
@@ -72,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "before it counts as a collision. Positive keeps that much clear "
                         "air, 0 means touching collides, negative tolerates that much "
                         "overlap (default: 0)")
-    p.add_argument("--weld-clearance-mm", type=float, default=0.0, metavar="MM",
+    p.add_argument("--weld-clearance-mm", type=float, default=-12.0, metavar="MM",
                    help="obstacle clearance used instead of --obstacle-clearance-mm on "
                         "any move starting or ending at a weld locator, where the gun "
                         "has to reach the panel (default: 2)")
@@ -197,6 +204,7 @@ def main(argv: list[str] | None = None) -> int:
         ompl_attempts=args.ompl_attempts,
         ompl_runs=args.ompl_min_runs,
         ompl_seconds=args.ompl_seconds,
+        linear_zone=args.linear_zone,
         segment_length=args.segment_length_rad,
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,

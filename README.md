@@ -391,7 +391,7 @@ dynamics for it.
 ## Welds
 
 At a weld locator the robot runs a straight `linear_zone_mm` approach, stops, and departs
-along the same line. Per the brief the gun is treated as stationary through the weld, and
+along the same line (unless `--no-linear-zone` is given, which removes both). Per the brief the gun is treated as stationary through the weld, and
 because the gun state defines a phase this comes out as a phase boundary:
 
 | Phase | motion | contact_allowed | gun_opening_mm |
@@ -474,14 +474,23 @@ If a pair is already closer than the requested clearance in the start pose, that
 held to the distance actually available there and the run says so, rather than declaring
 the start state invalid and refusing to plan at all.
 
-**The retract direction is relative to the weld locator, not the tool.** A weld retracts
-along the locator's own −z, matching `--weld-shift-mm`: the shift backs the tool off the
-panel along −z, so the 300 mm linear retract has to travel the same way. This used to be
-derived from the gun's prismatic stroke axis, which made the direction a property of the
-machine rather than of the weld — and stopped yielding any answer at all once the gun became
-angular, silently falling back to tool −z. Override with `--approach-axis`, interpreted in
-the locator's frame. Every locator in the supplied manifest has `is_weld: false`, so this
-has still not been exercised against real weld data.
+**The retract direction is relative to the weld locator, not the tool.** A weld leads in
+and out along the locator's own **−x**. This used to be derived from the gun's prismatic
+stroke axis, which made the direction a property of the machine rather than of the weld —
+and stopped yielding any answer at all once the gun became angular, silently falling back to
+tool −z. Override with `--approach-axis`, interpreted in the locator's frame.
+
+Note that `--weld-shift-mm` still backs the tool off along the locator's **z**, so the shift
+and the retract are no longer the same axis. If z is not the panel normal for these welds
+then the shift is sliding the tool along the surface rather than off it, and wants revisiting
+too.
+
+**The linear zone can be turned off** with `--no-linear-zone`. Every millimetre of
+`linear_zone_mm` has to be clear along one fixed direction with no freedom to curve, which a
+weld set deep in panelling may simply have no room for — the symptom is a segment failing
+partway along a 300 mm linear move. Without it the transit runs weld to weld and can curve
+away from the panel immediately, at the cost of the gun arriving on a curve rather than
+sliding on straight.
 
 ### Penalising low clearance
 
@@ -567,7 +576,8 @@ correction is what keeps the false contact from disabling a real collision check
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--approach-axis` | `-z` | retract direction at welds, in the locator's own frame |
+| `--approach-axis` | `-x` | lead-in/lead-out direction at welds, in the locator's own frame |
+| `--no-linear-zone` | off | skip the straight lead-in and lead-out at welds entirely |
 | `--linear-step-mm` | 50 | point spacing on linear approach/depart |
 | `--check-step-deg` | 3 | collision checking resolution along a move |
 | `--segment-length-rad` | 0.02 | collision resolution inside the sampling planner |

@@ -65,10 +65,10 @@ def retract_axis(override: str | None = None) -> np.ndarray:
     the direction a property of the machine instead of the weld, and gave no answer at all
     once the gun became angular.
 
-    The default is ``-z``, matching ``--weld-shift-mm``: the shift backs the tool off the
-    panel along the locator's -z, so the 300 mm linear retract has to travel the same way.
+    The default is ``-x``.  Note that ``--weld-shift-mm`` still backs the tool off along the
+    locator's **z**, so the two are no longer the same direction; see the README.
     """
-    return AXES[override.lower()] if override else AXES["-z"]
+    return AXES[override.lower()] if override else AXES["-x"]
 
 
 def offset_pose(pose: np.ndarray, axis_tcp: np.ndarray, distance: float) -> np.ndarray:
@@ -83,7 +83,7 @@ class ToolpathPlanner:
                  linear_step_mm: float = 50.0, ompl_attempts: int = 3,
                  ompl_runs: int = 1,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
-                 ompl_seconds: float = 5.0,
+                 ompl_seconds: float = 5.0, linear_zone: bool = True,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                  weld_clearance_mm: float | None = None,
                  keep_unrefined: bool = False, log=print):
@@ -91,6 +91,9 @@ class ToolpathPlanner:
         self.man = man
         self.log = log
         self.axis = retract_axis(approach_axis)
+        # 0 turns the straight lead-in and lead-out off entirely: the transit then runs
+        # weld to weld, free to curve away from the panel from the first millimetre.
+        self.linear_zone_mm = man.linear_zone_mm if linear_zone else 0.0
         self.linear_step_mm = linear_step_mm
         self.ompl_attempts = ompl_attempts
         self.ompl_runs = ompl_runs
@@ -177,7 +180,7 @@ class ToolpathPlanner:
                             f"{detail}{hint}")
 
     def _approach_pose(self, loc: Locator) -> np.ndarray:
-        return offset_pose(loc.pose_world, self.axis, self.man.linear_zone_mm)
+        return offset_pose(loc.pose_world, self.axis, self.linear_zone_mm)
 
     def _leave_opening(self, loc: Locator) -> float:
         """Gun opening in force as the robot leaves this locator."""
@@ -236,13 +239,13 @@ class ToolpathPlanner:
         # Each stretch of motion is planned with the tip where it will actually be. The gun
         # is 200 mm of swinging geometry, so a linear retract that clears with it closed can
         # foul with it open, and planning both against one arbitrary opening proves nothing.
-        if a.is_weld and self.man.linear_zone_mm > 0:
+        if a.is_weld and self.linear_zone_mm > 0:
             with self.cell.gun_opening(leave_open):
                 depart_states = plan_linear(
                     self.cell, a.pose_world, self._approach_pose(a), qa,
                     step_mm=self.linear_step_mm)
             transit_start = depart_states[-1]
-        if b.is_weld and self.man.linear_zone_mm > 0:
+        if b.is_weld and self.linear_zone_mm > 0:
             with self.cell.gun_opening(arrive_open):
                 approach_states = plan_linear(
                     self.cell, self._approach_pose(b), b.pose_world, qb,
