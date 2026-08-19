@@ -47,6 +47,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--shortcut-seconds", type=float, default=45.0, metavar="SECONDS",
                    help="time budget for shortcutting each freespace transit; longer "
                         "budgets keep shortening with diminishing returns (default: 30)")
+    p.add_argument("--polish-seconds", type=float, default=5.0, metavar="SECONDS",
+                   help="time budget for the final pass over each transit's emitted "
+                        "waypoints, which removes and relocates them under the full "
+                        "stop-to-stop time the robot really pays for each one. The "
+                        "earlier passes work on a densified path where a waypoint is a "
+                        "sampling artefact rather than a stop; this one does not "
+                        "(default: 5)")
     p.add_argument("--min-shell-mm", type=float, default=5.0,
                    help="drop collision shells smaller than this across their bounding "
                         "box diagonal (default: 5)")
@@ -190,6 +197,7 @@ def main(argv: list[str] | None = None) -> int:
         segment_length=args.segment_length_rad,
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,
+        polish_seconds=args.polish_seconds if args.shortcut else 0.0,
         weld_clearance_mm=args.weld_clearance_mm,
         keep_unrefined=args.unrefined_output,
         log=log)

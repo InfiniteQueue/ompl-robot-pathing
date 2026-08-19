@@ -39,9 +39,9 @@ The two generated directories are safe to delete; they are rebuilt on the next r
    otherwise OMPL, and failing that a two-leg route through the start pose. Each stretch of
    motion is planned with the gun tip where that phase will hold it, and a transit that no
    single opening gets through is split so the gun can change partway. The result is then
-   improved under the weighted joint metric — penalised for running close to the parts, by
-   cutting detours and relocating waypoints — and reduced to the fewest waypoints that
-   still traverse collision-free.
+   improved under a **time** metric — the same bang-bang joint dynamics the output is
+   scheduled with, penalised for running close to the parts — by cutting detours,
+   relocating waypoints and dropping the ones that are not worth stopping at.
 5. **Output** (`output.py`).
 
 ## Why the geometry is preprocessed
@@ -169,17 +169,18 @@ but cannot move it into a different homotopy class, so whichever one arrives is 
 ships. `--ompl-min-runs` therefore samples several solutions per transit and keeps the one
 with the lowest penalised cost before handing it to the optimiser.
 
-The spread is large enough to matter. On one `via10 -> via11` transit, four runs came back at
-243.85 m, 178.83 m, 32.16 m and 238.13 m of penalised cost — a factor of 7.6 between best and
-worst. Note that the winner was not the shortest: it covered 12.09 m of travel against the
-7.60 m of the run costing 178.83 m, so it bought a long way clear of the panels with a little
-extra distance. Ranking on penalised cost rather than length is what makes that choice.
+The spread is large enough to matter. On one `via10 -> via11` transit, five runs came back at
+3.48 s, 2.88 s, 2.53 s, 3.33 s and 2.62 s of penalised cost — a 38% spread between best and
+worst, all of them valid, all found within a second of each other. Ranking on the penalty
+rather than raw time genuinely reorders them: the 2.88 s run is quicker unpenalised than the
+2.62 s one (1.88 s against 2.15 s), and loses because it spends that time closer to the
+panels.
 
 The minimum is a floor rather than a cap. Once it is met and at least one solution exists,
 planning moves on; if nothing has solved, runs continue up to `--ompl-attempts`. Each run is
 a full solve of several seconds, so this is the most expensive knob in the tool — it is also
 the only one that can change the route's basic shape. With `--no-clearance-penalty` the score
-degrades to plain weighted travel, so it still picks the shortest of the sampled solutions.
+degrades to plain cruise time, so it still picks the quickest of the sampled solutions.
 
 ### Seeing what the refinement changed
 
@@ -190,21 +191,22 @@ approach and depart phases are identical in both, since nothing optimises those.
 route that was actually kept is recorded; solutions the run discarded leave nothing behind.
 
 The two files line up waypoint-for-waypoint at their ends, so a segment can be replayed
-either way and compared. On a two-segment sample: 4 raw waypoints against 8 refined for the
-first transit, 4 against 5 for the second — the refined paths carry *more* points here
-because reduction runs on a densified path, while the penalised cost fell 43% and 46%.
+either way and compared. On a two-segment sample the point counts came out the same either
+way — 4 and 3 — while the emitted schedule fell from 3.65 s to 3.30 s and from 2.99 s to
+2.50 s. Refinement is not mainly a waypoint-count story: the sampling planner returns few
+points to begin with, and what the passes buy is a better route between them.
 
 Picking good endpoints is not enough. RRTConnect returns the *first* path it finds, and
 reducing waypoints cannot change a route — deleting a point that a straight move already
 bypasses leaves a wide arc exactly as wide. So a shortcutting pass runs before the
 reduction: it densifies the planner's path, then repeatedly picks two states on it and
-splices in the direct move between them whenever that move is collision free and cheaper
-under the same weighted metric. Every replacement is collision-checked before it is kept,
-so the result is traversable by construction.
+splices in the direct move between them whenever that move is collision free and quicker.
+Every replacement is collision-checked before it is kept, so the result is traversable by
+construction.
 
-The weighting is what makes it cut the right thing — an excursion in J1 costs what it
-actually costs at the tool, instead of the same as a wrist rotation. On the sample study,
-emitted travel per segment:
+Timing it under the real joint limits is what makes it cut the right thing — a J1 excursion
+costs what it actually costs, instead of the same as a wrist rotation covering the same
+angle several times faster. On the sample study, emitted travel per segment:
 
 | Segment | Before | After | Direct move needs |
 | --- | --- | --- | --- |
@@ -225,6 +227,61 @@ wrist twiddle that changes nothing. Every waypoint is eligible except the two en
 which are the states handed in and belong to the locators either side. Relocation is what
 gives the clearance penalty below any teeth: standing a waypoint off a panel costs a little
 travel and saves a lot of penalty, so it wins.
+
+### What the cost actually is
+
+Cost is **time**, under the same bang-bang joint limits the output is scheduled with, and
+time near a panel is multiplied by the clearance penalty. That is the currency the penalty
+was specified in — *a second at the minimum clearance costs as much as N seconds in open
+space* — so the two halves finally compose.
+
+The reason this matters more than swapping one distance for another is that **time is not
+additive and distance is**. Splitting a move in two costs an extra pair of ramps, so a
+waypoint that buys nothing is now visibly expensive; under a distance metric it was exactly
+free, which is why paths came back with points clustered a few degrees apart. The measure is
+applied at two scopes, and the distinction is load-bearing:
+
+| Pass | Works on | Measure |
+| --- | --- | --- |
+| shortcut | densified path | **cruise** time — ramps excluded |
+| simplify | dense → emitted | full stop-to-stop time |
+| polish | emitted waypoints | full stop-to-stop time |
+
+A point on the densified path is a sampling artefact, not a stop the robot will make.
+Charging it a full ramp would score a route by how finely it happened to be sampled and make
+every cut look good regardless of where it went. Cruise time (`max |Δq| / v` per joint) is
+unchanged by subdivision, so shortcutting judges the route's *shape* while the later passes
+judge how many stops it needs. The two agree to one constant `v/a` per move in the
+trapezoidal regime, so cruise time is a genuine lower bound rather than a different
+currency.
+
+### Polishing the emitted waypoints
+
+`--polish-seconds` runs a final pass over the waypoints that will actually be written. Both
+its moves are judged on full stop-to-stop penalised time:
+
+* **remove** a waypoint when going straight past it beats stopping at it. Ignoring the
+  penalty this is always true — the direct move is no further on any joint and pays one pair
+  of ramps instead of two — so what it really tests is whether the corner was bought for
+  clearance or is just left over.
+* **relocate** a waypoint when the pair of moves through it gets quicker. This is the move
+  `simplify` cannot make, and it is what unpicks a cluster: shifting a point away from a
+  panel is often what makes its neighbour droppable, so a removal sweep follows every
+  accepted relocation.
+
+Measured against the previous distance-based optimiser on **identical raw solutions**, same
+random seed and same budgets:
+
+| Segment | Waypoints | Emitted time | Closest approach |
+| --- | --- | --- | --- |
+| via9 → via10 | 12 → **4** | 6.13 s → **3.27 s** | 188 mm → 103 mm |
+| via10 → via11 | 11 → **4** | 5.44 s → **3.05 s** | 76 mm → 41 mm |
+
+Roughly a third of the waypoints and a 45% shorter cycle. Note the third column: the routes
+run **closer to the parts** than they used to. That is the trade being made on purpose —
+standoff now competes against time instead of being free — and both figures stay far above
+the 10 mm the penalty peaks at. Raise `--clearance-penalty-multiplier` to buy the distance
+back at the cost of cycle time.
 
 Point counts are kept low on purpose: a transit is reduced to the fewest waypoints that
 still traverse it collision-free, so a large sweeping motion costs a handful of points
@@ -481,6 +538,7 @@ correction is what keeps the false contact from disabling a real collision check
 | `--ompl-min-runs` | 3 | sample this many solutions and keep the cheapest |
 | `--no-shortcut` | off | emit the sampling planner's own route, unshortened |
 | `--shortcut-seconds` | 10 | time budget for shortcutting each transit |
+| `--polish-seconds` | 5 | time budget for the final pass over the emitted waypoints |
 | `--min-shell-mm` | 5 | drop collision shells smaller than this |
 | `--max-shells` | 500 | cap convex shells per link |
 | `--hull-cell-mm` | 0 | refine badly-hulled shells into cells this size; 0 disables |

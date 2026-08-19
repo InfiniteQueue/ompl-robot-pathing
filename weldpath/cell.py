@@ -72,6 +72,7 @@ class Cell:
 
         self.penalty = None                     # set by attach_penalty
         self._pm = None                         # proximity manager, only if penalised
+        self.dynamics = None                    # set by attach_dynamics
         self.weights = self._joint_weights()
 
     # -- joint metric --------------------------------------------------------
@@ -98,6 +99,42 @@ class Cell:
     def distance(self, a: np.ndarray, b: np.ndarray) -> float:
         """Weighted joint distance: how far the tool travels, roughly, from a to b."""
         return float(np.linalg.norm((np.asarray(b) - np.asarray(a)) * self.weights))
+
+    # -- time ----------------------------------------------------------------
+    def attach_dynamics(self, dynamics) -> None:
+        """Give the cell the joint limits that decide how long a move takes."""
+        self.dynamics = dynamics
+
+    def move_time(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Seconds to go straight from ``a`` to ``b``, starting and ending at rest.
+
+        This is what the robot really does between two emitted waypoints, so it is the
+        measure to judge an emitted waypoint by.  Its defining property is that it is
+        **not additive**: splitting a move in two costs an extra ramp, and up to 41% more
+        again when neither half reaches cruise.  That is exactly the cost of a surplus
+        waypoint, and it is invisible to any distance metric.
+        """
+        if self.dynamics is None:
+            return self.distance(a, b)
+        return self.dynamics.move_time(a, b)
+
+    def cruise_time(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Seconds for ``a`` to ``b`` counting cruise only, ignoring the ramps.
+
+        The ramp-free part of :meth:`move_time`, and the useful thing about it is that it
+        **is** additive: subdividing a move leaves it unchanged.  That is what makes it
+        the right measure on a densified path, where the intermediate points are an
+        artefact of the sampling rather than stops the robot will really make -- scoring
+        those with :meth:`move_time` would charge a full ramp every few degrees and value
+        the path by how finely it happened to be sampled.
+
+        The two agree in the trapezoidal regime up to one constant ``v/a`` per move, so
+        this is a genuine lower bound on the real time rather than a different currency.
+        """
+        if self.dynamics is None:
+            return self.distance(a, b)
+        d = np.abs(np.asarray(b, dtype=float) - np.asarray(a, dtype=float))
+        return float(np.max(d / self.dynamics.velocity)) if d.size else 0.0
 
     def wrap_towards(self, q: np.ndarray, reference: np.ndarray) -> np.ndarray:
         """Shift each revolute joint by whole turns to sit as close to ``reference``.
@@ -281,8 +318,18 @@ class Cell:
         return False
 
     def segment_cost(self, a: np.ndarray, b: np.ndarray, max_step: float = 0.05,
-                     fa: float | None = None, fb: float | None = None) -> float:
-        """Penalised length of the segment a->b, assuming it is already known clear.
+                     fa: float | None = None, fb: float | None = None,
+                     stops: bool = False) -> float:
+        """Penalised time for the segment a->b, assuming it is already known clear.
+
+        Time near a panel is charged at :class:`~weldpath.penalty.ClearancePenalty`'s
+        multiplier, which is what the penalty was specified in: a second at the minimum
+        clearance costs as much as N seconds in open space.
+
+        ``stops`` picks which time this is.  False measures cruise only, for a move that is
+        one step of a densified path the robot will not really stop along; True measures
+        the full move, ramps included, for a move between two waypoints that will be
+        emitted.  See :meth:`move_time` and :meth:`cruise_time`.
 
         Loading a joint state and refreshing the collision transforms costs far more than
         the geometry query on top of it, so the interior samples are walked once and the
@@ -292,7 +339,7 @@ class Cell:
         """
         a = np.asarray(a, dtype=float)
         b = np.asarray(b, dtype=float)
-        raw = self.distance(a, b)
+        raw = self.move_time(a, b) if stops else self.cruise_time(a, b)
         if self._pm is None or raw <= 0.0:
             return raw
         n = max(2, int(np.ceil(np.max(np.abs(b - a)) / max_step)) + 1)
@@ -305,7 +352,11 @@ class Cell:
             else:
                 factors.append(self.penalty_factor(a + t * (b - a)))
         # Each sub-step is charged at the worse of the states it runs between, so a dip
-        # towards the panel is never averaged away by the clear air on either side.
+        # towards the panel is never averaged away by the clear air on either side.  The
+        # move's time is spread evenly over the sub-steps rather than following the ramps,
+        # which slightly under-charges the ends of a move; where the route is close to the
+        # parts it is close for a stretch, not at a single instant, so the shape of the
+        # penalty across a move matters much less than its total.
         step = raw / (n - 1)
         return sum(step * max(x, y) for x, y in zip(factors, factors[1:]))
 
@@ -616,6 +667,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
     cell = Cell(man, builder, env, pairs)
     cell.margin, cell.obstacle_clearance = margin, clearance
     cell.attach_penalty(penalty)
+    cell.attach_dynamics(dynamics)
     _log_gun(man, log)
 
     # -- pairs in contact at the start pose: re-measure, then loosen or disable ---------
@@ -666,6 +718,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         cell.margin, cell.obstacle_clearance = margin, clearance
         cell.margin_overrides = overrides
         cell.attach_penalty(penalty)
+        cell.attach_dynamics(dynamics)
 
     if cell.in_collision(start):
         remaining = cell.contact_pairs(start)

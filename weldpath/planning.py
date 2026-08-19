@@ -48,14 +48,18 @@ def simplify(cell: Cell, path: list[np.ndarray], max_step: float = 0.05
     A sampled path wanders and the controller does not need the wandering, so this is
     also what keeps the output down to the handful of points a FANUC program wants.
 
-    Where a clearance penalty is in force this also refuses reductions that push the route
-    nearer the parts.  Without that check this pass runs last and would quietly undo the
+    Every point kept is a point the robot comes to a full stop at, so the comparison is
+    made in **penalised time under the real joint dynamics**: keeping ``i..j`` costs the
+    sum of the individual bang-bang moves between them, against one move from ``i`` to
+    ``j``.  Deleting is always the faster of the two -- the direct move is no further on
+    any joint than the detour, and it pays one pair of ramps instead of many -- so what
+    decides it is the clearance penalty.  Reductions that push the route nearer the parts
+    are refused, which is what stops this pass, running last, from quietly undoing the
     standoff the shortcut pass just bought: the chord across a corner the robot took wide
-    is shorter, collision free, and hard against the panel.
+    is quicker, collision free, and hard against the panel.
     """
     if len(path) < 3:
         return [p.copy() for p in path]
-    penalised = cell.penalty is not None and cell.penalty.enabled
     factors: dict[int, float] = {}
 
     def factor(k: int) -> float:
@@ -64,7 +68,9 @@ def simplify(cell: Cell, path: list[np.ndarray], max_step: float = 0.05
         return factors[k]
 
     def polyline_cost(i: int, j: int) -> float:
-        return sum(cell.distance(path[k], path[k + 1]) * max(factor(k), factor(k + 1))
+        # Each retained hop is its own stop-to-stop move.  The hops are short, so the
+        # endpoint factors describe them well enough without sampling their interiors.
+        return sum(cell.move_time(path[k], path[k + 1]) * max(factor(k), factor(k + 1))
                    for k in range(i, j))
 
     out = [path[0]]
@@ -75,16 +81,133 @@ def simplify(cell: Cell, path: list[np.ndarray], max_step: float = 0.05
             if cell.segment_collides(path[i], path[j], max_step=max_step):
                 j -= 1
                 continue
-            if penalised:
-                chord = cell.segment_cost(path[i], path[j], max_step=max_step,
-                                          fa=factor(i), fb=factor(j))
-                if chord > polyline_cost(i, j) + 1e-9:
-                    j -= 1
-                    continue
+            chord = cell.segment_cost(path[i], path[j], max_step=max_step,
+                                      fa=factor(i), fb=factor(j), stops=True)
+            if chord > polyline_cost(i, j) + 1e-9:
+                j -= 1
+                continue
             break
         out.append(path[j])
         i = j
     return out
+
+
+def _hop(cell: Cell, a: np.ndarray, b: np.ndarray, fa: float, fb: float,
+         max_step: float) -> float:
+    """Penalised time of one emitted move: full bang-bang, ramps included."""
+    return cell.segment_cost(a, b, max_step=max_step, fa=fa, fb=fb, stops=True)
+
+
+def polish(cell: Cell, path: list[np.ndarray], *, time_budget: float = 5.0,
+           max_step: float = 0.05, rng: np.random.Generator | None = None,
+           log=None) -> list[np.ndarray]:
+    """Remove and relocate waypoints of the reduced path, judged on penalised time.
+
+    The passes before this one work on a densified path, where a point is a sampling
+    artefact and the honest measure of a change is cruise time.  Here every point is one
+    the robot will really stop at, so the measure is the full stop-to-stop time, ramps
+    included -- and a waypoint that buys nothing is now visibly expensive rather than free.
+    Two moves, applied to interior waypoints only, since the endpoints belong to the
+    locators either side:
+
+    * **remove** -- drop a waypoint when going straight past it is quicker under the
+      penalty than stopping at it.  Ignoring the penalty this is always true, so what it
+      really tests is whether the corner was bought for clearance or is just left over.
+    * **relocate** -- displace a waypoint and keep it if the pair of moves through it gets
+      quicker.  This is the move that can unpick a cluster the removal test alone cannot:
+      shifting a point away from a panel can be what makes its neighbour droppable, so a
+      removal sweep follows every accepted relocation.
+
+    ``simplify`` already applies the same removal test greedily, so this is a second,
+    non-greedy opinion on it rather than the first -- what is new here is the relocation,
+    and the sweep that follows it.  Every replacement is collision checked before it is
+    kept, so the result stays traversable.
+    """
+    if len(path) < 3 or time_budget <= 0:
+        return [np.asarray(p, dtype=float).copy() for p in path]
+
+    rng = rng or np.random.default_rng(1)
+    pts = [np.asarray(p, dtype=float).copy() for p in path]
+    fac = [cell.penalty_factor(p) for p in pts]
+    costs = [_hop(cell, pts[i], pts[i + 1], fac[i], fac[i + 1], max_step)
+             for i in range(len(pts) - 1)]
+    before = sum(costs)
+    deadline = time.time() + time_budget
+    dropped = moved = tried = 0
+
+    def drop_sweep() -> None:
+        nonlocal dropped
+        k = 1
+        while k < len(pts) - 1 and time.time() < deadline:
+            if cell.segment_collides(pts[k - 1], pts[k + 1], max_step=max_step):
+                k += 1
+                continue
+            direct = _hop(cell, pts[k - 1], pts[k + 1], fac[k - 1], fac[k + 1], max_step)
+            if direct >= costs[k - 1] + costs[k] - 1e-9:
+                k += 1
+                continue
+            del pts[k], fac[k]
+            costs[k - 1:k + 1] = [direct]
+            dropped += 1
+            # Deliberately not advancing: the point that has just moved into k is now next
+            # to a different neighbour and deserves its own test.
+
+    drop_sweep()
+    while time.time() < deadline and len(pts) > 2:
+        tried += 1
+        k = int(rng.integers(1, len(pts) - 1))
+        # Drawn in joint space but scaled through the cell's joint weights, so an attempt
+        # moves the tool about as far whichever joints it happens to use.
+        direction = rng.normal(size=len(pts[k]))
+        reach = float(np.linalg.norm(direction * cell.weights))
+        if reach <= 0.0:
+            continue
+        candidate = np.clip(pts[k] + direction * (float(rng.uniform(0.005, 0.15)) / reach),
+                            cell.lower, cell.upper)
+        if not cell.within_limits(candidate):
+            continue
+        # Unpenalised time is a lower bound on penalised time, so this rejects most
+        # candidates before paying for a collision check or a clearance query.
+        budget = costs[k - 1] + costs[k]
+        if (cell.move_time(pts[k - 1], candidate)
+                + cell.move_time(candidate, pts[k + 1])) >= budget - 1e-9:
+            continue
+        if cell.segment_collides(pts[k - 1], candidate, max_step=max_step):
+            continue
+        if cell.segment_collides(candidate, pts[k + 1], max_step=max_step):
+            continue
+        f = cell.penalty_factor(candidate)
+        first = _hop(cell, pts[k - 1], candidate, fac[k - 1], f, max_step)
+        second = _hop(cell, candidate, pts[k + 1], f, fac[k + 1], max_step)
+        if first + second >= budget - 1e-9:
+            continue
+        pts[k], fac[k] = candidate, f
+        costs[k - 1], costs[k] = first, second
+        moved += 1
+        drop_sweep()
+
+    if log:
+        after = sum(costs)
+        gain = 100.0 * (1.0 - after / before) if before > 0 else 0.0
+        log(f"      polish: dropped {dropped} and relocated {moved} waypoints from "
+            f"{tried} attempts, penalised time {before:.2f} -> {after:.2f} s "
+            f"({gain:.0f}% better), {len(pts)} points")
+    return pts
+
+
+def _refine(cell: Cell, path: list[np.ndarray], *, shortcut_seconds: float,
+            polish_seconds: float, check_step: float, log) -> list[np.ndarray]:
+    """The whole post-processing chain, in the order the three passes need to run.
+
+    Shortcutting reshapes the route while it is still dense, reduction picks which of those
+    points are actually worth stopping at, and polishing then judges those stops under the
+    time they really cost.
+    """
+    improved = shortcut(cell, path, time_budget=shortcut_seconds,
+                        max_step=check_step, log=log)
+    reduced = simplify(cell, improved, max_step=check_step)
+    return polish(cell, reduced, time_budget=polish_seconds,
+                  max_step=check_step, log=log)
 
 
 def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.ndarray]:
@@ -96,7 +219,7 @@ def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.
 def shortcut(cell: Cell, path: list[np.ndarray], *, time_budget: float = 2.0,
              max_step: float = 0.05, rng: np.random.Generator | None = None,
              log=None) -> list[np.ndarray]:
-    """Improve a path under the weighted metric, penalised for running close to the parts.
+    """Reshape a path to take less time, penalised for running close to the parts.
 
     ``simplify`` can only delete waypoints that a straight move already bypasses, so it
     never changes the route: a sampled path that swings the arm around the base to reach a
@@ -112,13 +235,21 @@ def shortcut(cell: Cell, path: list[np.ndarray], *, time_budget: float = 2.0,
       penalty, so it wins.  Every waypoint is eligible except the two endpoints, which are
       the states handed in and belong to the locators either side.
 
-    Cost counts how far the tool actually travels, so a wide J1 excursion is cut before a
-    wrist rotation that costs the same in raw joint space, and time spent near a panel is
-    multiplied by :class:`~weldpath.penalty.ClearancePenalty`.
+    Cost is **time**, under the same joint velocity limits the output is scheduled with, so
+    a wide J1 excursion is cut before a wrist rotation that covers the same angle far
+    faster; time spent near a panel is multiplied by
+    :class:`~weldpath.penalty.ClearancePenalty`.
 
     The path is densified first, so changes can land between the planner's own waypoints
-    instead of only at them.  Work is bounded by ``time_budget`` seconds; the result is
-    always collision free, since every replacement is checked before it is kept.
+    instead of only at them -- which is also why this pass counts *cruise* time and leaves
+    the ramps to :func:`simplify`.  A densified point is a sampling artefact, not a stop
+    the robot will make, so charging it a full acceleration ramp would score the route by
+    how finely it happened to be sampled and make every cut look good regardless of where
+    it went.  Cruise time is unchanged by subdivision, so this pass judges the route's
+    shape and ``simplify`` judges how many stops it needs.
+
+    Work is bounded by ``time_budget`` seconds; the result is always collision free, since
+    every replacement is checked before it is kept.
     """
     if len(path) < 3 or time_budget <= 0:
         return [np.asarray(p, dtype=float).copy() for p in path]
@@ -135,7 +266,7 @@ def shortcut(cell: Cell, path: list[np.ndarray], *, time_budget: float = 2.0,
     fac = [cell.penalty_factor(p) if penalised else 1.0 for p in dense]
 
     def step_cost(x: np.ndarray, y: np.ndarray, fx: float, fy: float) -> float:
-        return cell.distance(x, y) * max(fx, fy)
+        return cell.cruise_time(x, y) * max(fx, fy)
 
     def span_cost(i: int, j: int) -> float:
         return sum(step_cost(dense[k], dense[k + 1], fac[k], fac[k + 1])
@@ -156,9 +287,9 @@ def shortcut(cell: Cell, path: list[np.ndarray], *, time_budget: float = 2.0,
     if log:
         after = span_cost(0, len(dense) - 1)
         gain = 100.0 * (1.0 - after / before) if before > 0 else 0.0
-        detail = "penalised cost" if penalised else "weighted path cost"
+        detail = "penalised cruise time" if penalised else "cruise time"
         log(f"      shortcut: {cuts} cuts and {moves} relocations kept from {tried} "
-            f"attempts, {detail} {before:.2f} -> {after:.2f} m ({gain:.0f}% better)")
+            f"attempts, {detail} {before:.2f} -> {after:.2f} s ({gain:.0f}% better)")
     return dense
 
 
@@ -168,10 +299,11 @@ def _try_cut(cell: Cell, dense, fac, rng, max_step, penalised, span_cost) -> int
     if j - i < 2:
         return 0
     span = span_cost(i, j)
-    # Every factor is at least 1, so the unpenalised length is a valid lower bound on what
-    # the replacement can cost.  Rejecting on that first keeps the expensive checks off
-    # the many candidates that were never going to win.
-    if cell.distance(dense[i], dense[j]) >= span - 1e-9:
+    # Every factor is at least 1 and cruise time is additive, so the unpenalised cruise
+    # time of the direct move is a valid lower bound on what the replacement can cost.
+    # Rejecting on that first keeps the expensive checks off the many candidates that
+    # were never going to win.
+    if cell.cruise_time(dense[i], dense[j]) >= span - 1e-9:
         return 0
     if cell.segment_collides(dense[i], dense[j], max_step=max_step):
         return 0
@@ -180,7 +312,7 @@ def _try_cut(cell: Cell, dense, fac, rng, max_step, penalised, span_cost) -> int
         factors = [cell.penalty_factor(p) for p in points]
         chain = [dense[i]] + points + [dense[j]]
         chain_f = [fac[i]] + factors + [fac[j]]
-        direct = sum(cell.distance(x, y) * max(fx, fy)
+        direct = sum(cell.cruise_time(x, y) * max(fx, fy)
                      for x, y, fx, fy in zip(chain, chain[1:], chain_f, chain_f[1:]))
         if direct >= span - 1e-9:
             return 0
@@ -214,8 +346,8 @@ def _try_relocate(cell: Cell, dense, fac, rng, max_step, penalised, step_cost) -
     before = (step_cost(dense[k - 1], dense[k], fac[k - 1], fac[k])
               + step_cost(dense[k], dense[k + 1], fac[k], fac[k + 1]))
     # Cheapest possible replacement, ignoring any penalty, as an early reject.
-    floor = (cell.distance(dense[k - 1], candidate)
-             + cell.distance(candidate, dense[k + 1]))
+    floor = (cell.cruise_time(dense[k - 1], candidate)
+             + cell.cruise_time(candidate, dense[k + 1]))
     if floor >= before - 1e-9:
         return 0
     if cell.segment_collides(dense[k - 1], candidate, max_step=max_step):
@@ -238,24 +370,29 @@ def _try_relocate(cell: Cell, dense, fac, rng, max_step, penalised, step_cost) -
 # ---------------------------------------------------------------------------
 def _path_cost(cell: Cell, path: list[np.ndarray], max_step: float
                ) -> tuple[float, float]:
-    """Penalised length of a whole path, and its plain weighted travel.
+    """Penalised time for a whole path, and its plain time.
 
-    With no penalty in force the two are equal, so ranking on the first still ranks on
-    length and the choice degrades to "shortest raw solution" rather than to nothing.
+    Cruise time, not stop-to-stop time: this scores a raw sampling-planner solution, whose
+    waypoint count is an artefact of how the tree happened to grow rather than a decision
+    anyone made.  Ranking solutions on stop-to-stop time would mostly rank them on how many
+    nodes each one took, which says nothing about the route.
+
+    With no penalty in force the two figures are equal, so ranking on the first still ranks
+    on time and the choice degrades to "quickest raw solution" rather than to nothing.
     Endpoint factors are threaded from one segment to the next so each waypoint costs one
     clearance query rather than two.
     """
     if len(path) < 2:
         return 0.0, 0.0
     penalised = cell.penalty is not None and cell.penalty.enabled
-    total = travel = 0.0
+    total = plain = 0.0
     prev_f = cell.penalty_factor(path[0]) if penalised else None
     for a, b in zip(path, path[1:]):
         next_f = cell.penalty_factor(b) if penalised else None
         total += cell.segment_cost(a, b, max_step=max_step, fa=prev_f, fb=next_f)
-        travel += cell.distance(a, b)
+        plain += cell.cruise_time(a, b)
         prev_f = next_f
-    return total, travel
+    return total, plain
 
 
 def _make_program(cell: Cell, qa: np.ndarray, qb: np.ndarray) -> cl.CompositeInstruction:
@@ -324,7 +461,7 @@ def _capture(record: list | None, path: list[np.ndarray]) -> list[np.ndarray]:
 def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
                      runs: int, segment_length: float, check_step: float,
                      fallback_via: list[np.ndarray] | None,
-                     shortcut_seconds: float, log,
+                     shortcut_seconds: float, polish_seconds: float, log,
                      record: list | None = None) -> list[np.ndarray]:
     """Collision-free joint path from ``qa`` to ``qb`` at the gun's current opening.
 
@@ -336,7 +473,8 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
     try:
         return _plan_direct(cell, qa, qb, attempts=attempts, runs=runs,
                             segment_length=segment_length, check_step=check_step,
-                            shortcut_seconds=shortcut_seconds, log=log, record=record)
+                            shortcut_seconds=shortcut_seconds,
+                            polish_seconds=polish_seconds, log=log, record=record)
     except PlanningError:
         if not fallback_via:
             raise
@@ -351,19 +489,20 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
         try:
             first = _plan_direct(cell, qa, mid, attempts=attempts, runs=runs,
                                  segment_length=segment_length, check_step=check_step,
-                                 shortcut_seconds=0.0, log=log, record=halves)
+                                 shortcut_seconds=0.0, polish_seconds=0.0, log=log,
+                                 record=halves)
             second = _plan_direct(cell, mid, qb, attempts=attempts, runs=runs,
                                   segment_length=segment_length, check_step=check_step,
-                                  shortcut_seconds=0.0, log=log, record=halves)
+                                  shortcut_seconds=0.0, polish_seconds=0.0, log=log,
+                                  record=halves)
         except PlanningError:
             continue
         if len(halves) == 2:
             _capture(record, halves[0] + halves[1][1:])
-        # Shortcut the joined route rather than each leg: the detour through the fallback
-        # pose is exactly the kind of corner this pass exists to cut.
-        joined = shortcut(cell, first + second[1:], time_budget=shortcut_seconds,
-                          max_step=check_step, log=log)
-        return simplify(cell, joined, max_step=check_step)
+        # Refine the joined route rather than each leg: the detour through the fallback
+        # pose is exactly the kind of corner these passes exist to cut.
+        return _refine(cell, first + second[1:], shortcut_seconds=shortcut_seconds,
+                       polish_seconds=polish_seconds, check_step=check_step, log=log)
     raise PlanningError("freespace transit failed, including via fallback poses")
 
 
@@ -371,7 +510,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
                    runs: int = 1, segment_length: float = 0.02,
                    check_step: float = 0.05,
                    fallback_via: list[np.ndarray] | None = None,
-                   shortcut_seconds: float = 2.0,
+                   shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                    openings: list[float] | None = None,
                    record: list | None = None,
                    log=print) -> list[tuple[list[np.ndarray], float | None]]:
@@ -396,7 +535,9 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
             return _plan_at_opening(cell, a, b, attempts=attempts, runs=runs,
                                     segment_length=segment_length,
                                     check_step=check_step, fallback_via=fallback_via,
-                                    shortcut_seconds=budget, log=log, record=into)
+                                    shortcut_seconds=budget,
+                                    polish_seconds=polish_seconds if budget else 0.0,
+                                    log=log, record=into)
 
     candidates = _opening_candidates(cell, openings)
 
@@ -443,15 +584,13 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
                 log(f"      no single gun opening reaches; changing from "
                     f"{first_open:g} mm to {second_open:g} mm at fallback pose {i + 1}")
                 with cell.gun_opening(first_open):
-                    first = simplify(cell, shortcut(cell, first,
-                                                    time_budget=shortcut_seconds,
-                                                    max_step=check_step, log=log),
-                                     max_step=check_step)
+                    first = _refine(cell, first, shortcut_seconds=shortcut_seconds,
+                                    polish_seconds=polish_seconds,
+                                    check_step=check_step, log=log)
                 with cell.gun_opening(second_open):
-                    second = simplify(cell, shortcut(cell, second,
-                                                     time_budget=shortcut_seconds,
-                                                     max_step=check_step, log=log),
-                                      max_step=check_step)
+                    second = _refine(cell, second, shortcut_seconds=shortcut_seconds,
+                                     polish_seconds=polish_seconds,
+                                     check_step=check_step, log=log)
                 return [(first, first_open), (second, second_open)]
     raise last or PlanningError("freespace transit failed at every gun opening")
 
@@ -473,7 +612,7 @@ def _opening_candidates(cell: Cell, openings: list[float] | None) -> list[float 
 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
                  runs: int, segment_length: float, check_step: float,
-                 shortcut_seconds: float, log,
+                 shortcut_seconds: float, polish_seconds: float, log,
                  record: list | None = None) -> list[np.ndarray]:
     if not cell.segment_collides(qa, qb, max_step=check_step):
         # A clear straight line is normally the best answer there is, and a sampling
@@ -481,23 +620,22 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
         # "sensible" part company when the line grazes a panel, so when the penalty says
         # this one does, the same pass that stands other routes off is given a chance to
         # bow it away -- there is nothing for OMPL to do here, but plenty for relocation.
-        raw = cell.distance(qa, qb)
+        raw = cell.move_time(qa, qb)
         if not (cell.penalty is not None and cell.penalty.enabled) or shortcut_seconds <= 0:
             return _capture(record, [qa, qb])
-        cost = cell.segment_cost(qa, qb, max_step=check_step)
+        cost = cell.segment_cost(qa, qb, max_step=check_step, stops=True)
         if cost <= raw * 1.05:
             return _capture(record, [qa, qb])
         log(f"      direct move is clear but runs close to the parts "
-            f"(cost {cost:.2f} m against {raw:.2f} m of travel); standing it off")
+            f"(cost {cost:.2f} s against {raw:.2f} s unpenalised); standing it off")
         # Densified here rather than left to shortcut: a two-point path has no interior
         # waypoint, and relocation is the only move that can help.  The unrefined route is
         # still the bare straight line; the densification is part of the refinement.
         _capture(record, [qa, qb])
         seeded = [qa] + _resample(cell, np.asarray(qa, dtype=float),
                                   np.asarray(qb, dtype=float), check_step) + [qb]
-        improved = shortcut(cell, seeded, time_budget=shortcut_seconds,
-                            max_step=check_step, log=log)
-        return simplify(cell, improved, max_step=check_step)
+        return _refine(cell, seeded, shortcut_seconds=shortcut_seconds,
+                       polish_seconds=polish_seconds, check_step=check_step, log=log)
 
     # RRTConnect returns the first path it finds, and which homotopy class that lands in
     # is luck -- one run goes over the fixture, the next threads behind it.  The
@@ -519,10 +657,10 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
         dt = time.time() - t0
         if response.successful:
             raw = _extract(response.results)
-            cost, travel = _path_cost(cell, raw, check_step)
-            candidates.append((cost, travel, raw))
+            cost, plain = _path_cost(cell, raw, check_step)
+            candidates.append((cost, plain, raw))
             log(f"      OMPL run {attempt}: solved in {dt:.1f}s ({len(raw)} raw points, "
-                f"cost {cost:.2f} m over {travel:.2f} m of travel)")
+                f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
         else:
             last = str(response.message)
             log(f"      OMPL run {attempt}: {last} ({dt:.1f}s)")
@@ -535,16 +673,15 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
         raise PlanningError(
             f"freespace transit failed after {max(runs, attempts)} attempts: {last}")
 
-    cost, travel, raw = min(candidates, key=lambda c: c[0])
+    cost, plain, raw = min(candidates, key=lambda c: c[0])
     _capture(record, raw)
     if len(candidates) > 1:
         worst = max(c[0] for c in candidates)
-        log(f"      keeping the best of {len(candidates)} solutions: cost {cost:.2f} m "
-            f"against {worst:.2f} m for the worst")
+        log(f"      keeping the best of {len(candidates)} solutions: cost {cost:.2f} s "
+            f"against {worst:.2f} s for the worst")
     # Shortcut before reducing: the dense path gives the cuts somewhere to land.
-    cut = shortcut(cell, raw, time_budget=shortcut_seconds,
-                   max_step=check_step, log=log)
-    path = simplify(cell, cut, max_step=check_step)
+    path = _refine(cell, raw, shortcut_seconds=shortcut_seconds,
+                   polish_seconds=polish_seconds, check_step=check_step, log=log)
     log(f"      reduced to {len(path)} points")
     return path
 
