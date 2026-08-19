@@ -16,6 +16,7 @@ writes `<directory>/waypoints.json`. Filenames are fixed.
 | `<dir>/manifest.json` | input: kinematics, geometry, locators, start state |
 | `<dir>/meshes/*.obj` | input: geometry referenced by the manifest |
 | `<dir>/waypoints.json` | **output** |
+| `<dir>/waypoints-unrefined.json` | output, only with `--unrefined-output`: the same motion before shortcutting and reduction |
 | `<dir>/convex_cache/` | generated: convex collision geometry, reused between runs |
 | `<dir>/generated/` | generated: the URDF/SRDF and plugin configs actually loaded |
 
@@ -94,7 +95,7 @@ declares are written.
      "gun_opening_mm": 0.0,     // one gun state per phase, not per waypoint
      "waypoints": [
       {
-       "joints": {"robot_j1": -1.9547943, "...": 0.0},
+       "joints": {"robot_j1": -112.00412, "...": 0.0},
        "tcp_world_mm": [[0.1736, 0.0, -0.9848, 1002.711],
                         [0.0, -1.0, 0.0, 2136.612],
                         [-0.9848, 0.0, -0.1736, 1215.386],
@@ -112,10 +113,12 @@ declares are written.
 
 Three details of the contract are easy to get wrong and are worth restating:
 
-* **`joints` values are radians**, not degrees, despite `units` reading `"mm/deg"` — the
-  comment in the `.vb` is explicit that joint values are in the planner's native units
-  (radians for revolute, mm for prismatic). `joint_names` lists the six robot joints,
-  matching the study's own sample; the gun is reported through `gun_opening_mm`.
+* **`joints` values are in the units `units` declares** — degrees for revolute joints, mm
+  for prismatic — and they are the **robot's register values, not the planner's**. Those
+  differ for joint 3, whose linkage holds it against the floor; see
+  [Joint 3 is coupled to joint 2](#joint-3-is-coupled-to-joint-2). `joint_names` lists the
+  six robot joints, matching the study's own sample; the gun is reported through
+  `gun_opening_mm`.
 * **`tcp_world_mm` is the full 4×4 row-major world pose**, translation in mm in the
   fourth column, in the same frame as the manifest's `locators[].pose_world`, so it drops
   straight back into the cell with no transformation.
@@ -177,6 +180,19 @@ planning moves on; if nothing has solved, runs continue up to `--ompl-attempts`.
 a full solve of several seconds, so this is the most expensive knob in the tool — it is also
 the only one that can change the route's basic shape. With `--no-clearance-penalty` the score
 degrades to plain weighted travel, so it still picks the shortest of the sampled solutions.
+
+### Seeing what the refinement changed
+
+`--unrefined-output` writes a second file, `waypoints-unrefined.json`, holding each transit
+exactly as the sampling planner returned the solution that was chosen — before shortcutting
+and before waypoint reduction. It uses the same schema as `waypoints.json`, and the linear
+approach and depart phases are identical in both, since nothing optimises those. Only the
+route that was actually kept is recorded; solutions the run discarded leave nothing behind.
+
+The two files line up waypoint-for-waypoint at their ends, so a segment can be replayed
+either way and compared. On a two-segment sample: 4 raw waypoints against 8 refined for the
+first transit, 4 against 5 for the second — the refined paths carry *more* points here
+because reduction runs on a densified path, while the penalised cost fell 43% and 46%.
 
 Picking good endpoints is not enough. RRTConnect returns the *first* path it finds, and
 reducing waypoints cannot change a route — deleting a point that a straight move already
@@ -245,9 +261,9 @@ costs real time — for a triangular move, √2 per doubling:
 | --- | --- | --- | --- | --- |
 | Duration | 1.265 s | 1.789 s | 2.530 s | 4.000 s |
 
-Expect emitted times to roughly triple against the old model. On the sample study the two
-transits went from 1.398 s and 1.341 s to 3.886 s and 3.192 s — 2.58× overall. The old
-figures were optimistic because they charged nothing for stopping.
+Expect emitted times to roughly double against the old model. Scheduling one sample study's
+two transits both ways, they went from 1.940 s and 1.907 s to 4.604 s and 3.773 s — 2.18×
+overall. The old figures were optimistic because they charged nothing for stopping.
 
 `--linear-speed-mm-s` remains as a commanded tool-speed cap on `LIN` moves; the joint limits
 still govern whenever they are slower. No Cartesian acceleration is modelled, because the
@@ -255,16 +271,17 @@ manifest supplies none.
 
 ### Joint 3 is coupled to joint 2
 
-The arm holds link 3 at a fixed angle to the floor as joint 2 moves, so the value joint 3 is
-actually commanded with is not the relative rotation a URDF models. Measured against this
-cell's own kinematics, holding `q3 − q2` constant leaves link 3's orientation unchanged to
-**0.000°** across ±0.3 rad of joint 2, while holding `q3` itself constant swings it by 17°.
-So the commanded value is `q3 − q2`, and that is what the motion profile is computed
-against — which is what keeps joint 3's profile consistent with every other joint, since it
-is the quantity the mechanism actually drives.
+A linkage holds link 3 at a fixed angle to the floor as joint 2 moves, so the number the
+robot's J3 register carries is not the relative rotation a URDF models. Measured against
+this cell's own kinematics, link 3's elevation is a function of `q3 − q2` alone: it reads
+the same at `(q2, q3)` of `(−0.3, −0.3)`, `(0, 0)` and `(0.3, 0.3)`, and rises from −22.9°
+to +35.2° as `q3 − q2` runs from −0.6 to +0.6 rad. So the register reads `q3 − q2`,
+increasing as the arm points up, and that is the value written to `waypoints.json`.
 
-A consequence worth being explicit about: moving J2 and q3 together by the same amount is
-*free* for joint 3, because its drive does not turn at all.
+**Timing is a separate question.** The drive still moves joint 3 through the URDF's own
+relative rotation, so its motion profile runs on `q3` unmodified, exactly like every other
+joint. Only the output value is converted — planning, collision checking and timing all work
+in the kinematic values throughout.
 
 ### Limits in the environment
 
@@ -478,6 +495,7 @@ correction is what keeps the false contact from disabling a real collision check
 | `--joint-max-velocity` | 2π/3, J6 11π/9 | per-joint velocity limits, rad/s, comma separated |
 | `--joint-max-acceleration` | 2.5, J6 11 | per-joint acceleration limits, rad/s², comma separated |
 | `--linear-speed-mm-s` | 250 | tool speed cap on `LIN` moves |
+| `--unrefined-output` | off | also write `waypoints-unrefined.json`, pre-optimisation |
 | `--quiet` | off | print only the summary |
 
 Exit code is 0 when every segment planned, 1 otherwise.

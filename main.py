@@ -101,6 +101,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--linear-speed-mm-s", type=float, default=250.0,
                    help="commanded tool speed cap on linear moves; the joint limits still "
                         "govern whenever they are slower (default: 250)")
+    p.add_argument("--unrefined-output", action="store_true",
+                   help="also write waypoints-unrefined.json, holding each transit as the "
+                        "sampling planner returned it, before shortcutting and waypoint "
+                        "reduction. Same schema as waypoints.json, for comparing what the "
+                        "optimisation passes actually changed (default: off)")
     p.add_argument("--quiet", action="store_true", help="only print the final summary")
     return p
 
@@ -186,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,
         weld_clearance_mm=args.weld_clearance_mm,
+        keep_unrefined=args.unrefined_output,
         log=log)
     segments = planner.run()
 
@@ -194,6 +200,10 @@ def main(argv: list[str] | None = None) -> int:
 
     for problem in output_mod.check_endpoints(document, man):
         print(f"warning: {problem}", file=sys.stderr)
+
+    if args.unrefined_output:
+        raw = output_mod.build_document(cell, man, segments, timing, unrefined=True)
+        log(f"wrote {output_mod.write(directory, raw, output_mod.UNREFINED_NAME)}")
 
     path = output_mod.write(directory, document)
     print(output_mod.summarise(document, segments))

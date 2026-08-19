@@ -50,6 +50,10 @@ class Segment:
     target: str
     phases: list[Phase] = field(default_factory=list)
     error: str | None = None
+    # The same motion with each freespace transit as the sampling planner returned it,
+    # before shortcutting and reduction. The linear phases are shared with ``phases``,
+    # since nothing optimises those. Only populated when it is asked for.
+    raw_phases: list[Phase] = field(default_factory=list)
 
 
 def retract_axis(override: str | None = None) -> np.ndarray:
@@ -80,7 +84,7 @@ class ToolpathPlanner:
                  ompl_runs: int = 1,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
                  shortcut_seconds: float = 2.0, weld_clearance_mm: float | None = None,
-                 log=print):
+                 keep_unrefined: bool = False, log=print):
         self.cell = cell
         self.man = man
         self.log = log
@@ -91,6 +95,7 @@ class ToolpathPlanner:
         self.segment_length = segment_length
         self.check_step = np.deg2rad(check_step_deg)
         self.shortcut_seconds = shortcut_seconds
+        self.keep_unrefined = keep_unrefined
         # None means "no separate weld rule", i.e. the cell's own clearance throughout.
         self.weld_clearance = (None if weld_clearance_mm is None
                                else weld_clearance_mm * man.scale)
@@ -178,14 +183,15 @@ class ToolpathPlanner:
                 if b.name not in anchors:
                     raise PlanningError(f"no reachable joint solution for '{b.name}'")
                 with self._clearance_for(a, b):
-                    seg.phases = self._plan_pair(a, b, anchors)
+                    seg.phases, seg.raw_phases = self._plan_pair(a, b, anchors)
             except PlanningError as exc:
                 seg.error = str(exc)
                 self.log(f"    ! {exc}")
             segments.append(seg)
         return segments
 
-    def _plan_pair(self, a: Locator, b: Locator, anchors) -> list[Phase]:
+    def _plan_pair(self, a: Locator, b: Locator, anchors
+                   ) -> tuple[list[Phase], list[Phase]]:
         # The path starts at the first locator, not at start_state. start_state is still
         # used to seed inverse kinematics and as a known-clear pose to route a difficult
         # transit through, but it never contributes a waypoint of its own.
@@ -223,19 +229,29 @@ class ToolpathPlanner:
         if depart_states:
             phases.append(Phase("depart", LIN, depart_states, leave_open, True))
 
+        # Phases up to here are shared with the unrefined copy: nothing optimises a linear
+        # move, so it is the same motion in both files.
+        raw_phases: list[Phase] = list(phases) if self.keep_unrefined else []
+
+        raw_legs: list | None = [] if self.keep_unrefined else None
         legs = plan_freespace(
             self.cell, transit_start, transit_end,
             attempts=self.ompl_attempts, runs=self.ompl_runs,
             segment_length=self.segment_length,
             check_step=self.check_step, fallback_via=[self.start_q],
             shortcut_seconds=self.shortcut_seconds,
-            openings=[leave_open, arrive_open], log=self.log)
-        for path, opening in legs:
-            phases.append(Phase("freespace", PTP, path,
-                                0.0 if opening is None else opening, False))
+            openings=[leave_open, arrive_open], record=raw_legs, log=self.log)
+        for i, (path, opening) in enumerate(legs):
+            opening_mm = 0.0 if opening is None else opening
+            phases.append(Phase("freespace", PTP, path, opening_mm, False))
+            if raw_legs is not None and i < len(raw_legs):
+                raw_phases.append(Phase("freespace", PTP, raw_legs[i], opening_mm, False))
 
         if approach_states:
-            phases.append(Phase("approach", LIN, approach_states, arrive_open, True))
+            approach = Phase("approach", LIN, approach_states, arrive_open, True)
+            phases.append(approach)
+            if self.keep_unrefined:
+                raw_phases.append(approach)
 
         # The output is what the controller will execute, so check the reduced path rather
         # than trusting that reduction preserved what the planner found.  Checked per phase,
@@ -253,8 +269,10 @@ class ToolpathPlanner:
         # Planning may have used a weld pose backed off from the panel; the program has to
         # name the weld where the study put it, so those waypoints go back.  Done after
         # validation because this last step is the gun deliberately closing on the part.
+        # This only rewrites the weld, depart and approach phases, which the unrefined copy
+        # holds by reference rather than by value, so it lands on both at once.
         self._restore_weld_poses(a, b, phases, qa, qb)
-        return phases
+        return phases, raw_phases
 
     def _validate_junctions(self, phases: list[Phase]) -> str | None:
         """Check the handover between consecutive phases.

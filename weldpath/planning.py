@@ -308,10 +308,24 @@ def _extract(results) -> list[np.ndarray]:
     return out
 
 
+def _capture(record: list | None, path: list[np.ndarray]) -> list[np.ndarray]:
+    """Note the route a leg started from, before any of it is optimised away.
+
+    The refinement passes rewrite a route heavily -- shortcutting bows it away from the
+    parts and reduction throws most of its waypoints out -- so the sampling planner's own
+    answer is gone by the time anything downstream sees it.  Keeping it is what lets the
+    two be compared.
+    """
+    if record is not None:
+        record.append([np.array(q, dtype=float) for q in path])
+    return path
+
+
 def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
                      runs: int, segment_length: float, check_step: float,
                      fallback_via: list[np.ndarray] | None,
-                     shortcut_seconds: float, log) -> list[np.ndarray]:
+                     shortcut_seconds: float, log,
+                     record: list | None = None) -> list[np.ndarray]:
     """Collision-free joint path from ``qa`` to ``qb`` at the gun's current opening.
 
     If the direct transit cannot be found, the move is retried in two legs through each
@@ -322,7 +336,7 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
     try:
         return _plan_direct(cell, qa, qb, attempts=attempts, runs=runs,
                             segment_length=segment_length, check_step=check_step,
-                            shortcut_seconds=shortcut_seconds, log=log)
+                            shortcut_seconds=shortcut_seconds, log=log, record=record)
     except PlanningError:
         if not fallback_via:
             raise
@@ -331,15 +345,20 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
         if cell.in_collision(mid):
             continue
         log(f"      retrying via fallback pose {i + 1}")
+        # The halves are recorded jointly below: this is still one leg of the output, and
+        # the fallback pose is an implementation detail of how it was found.
+        halves: list[list[np.ndarray]] = []
         try:
             first = _plan_direct(cell, qa, mid, attempts=attempts, runs=runs,
                                  segment_length=segment_length, check_step=check_step,
-                                 shortcut_seconds=0.0, log=log)
+                                 shortcut_seconds=0.0, log=log, record=halves)
             second = _plan_direct(cell, mid, qb, attempts=attempts, runs=runs,
                                   segment_length=segment_length, check_step=check_step,
-                                  shortcut_seconds=0.0, log=log)
+                                  shortcut_seconds=0.0, log=log, record=halves)
         except PlanningError:
             continue
+        if len(halves) == 2:
+            _capture(record, halves[0] + halves[1][1:])
         # Shortcut the joined route rather than each leg: the detour through the fallback
         # pose is exactly the kind of corner this pass exists to cut.
         joined = shortcut(cell, first + second[1:], time_budget=shortcut_seconds,
@@ -354,6 +373,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
                    fallback_via: list[np.ndarray] | None = None,
                    shortcut_seconds: float = 2.0,
                    openings: list[float] | None = None,
+                   record: list | None = None,
                    log=print) -> list[tuple[list[np.ndarray], float | None]]:
     """Plan a transit, choosing a gun opening for it when the natural one will not do.
 
@@ -366,13 +386,17 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
     preferred, and a two-leg answer is only produced when no single opening works: the
     gun then changes at the intermediate pose, where the robot is stationary and the
     change costs no motion.
+
+    ``record``, if given, is extended with each leg's route as the sampling planner
+    returned it, one entry per returned leg and in the same order.  Failed attempts leave
+    nothing behind: only the openings that were actually used contribute.
     """
-    def attempt(opening, a, b, budget):
+    def attempt(opening, a, b, budget, into=None):
         with cell.gun_opening(opening):
             return _plan_at_opening(cell, a, b, attempts=attempts, runs=runs,
                                     segment_length=segment_length,
                                     check_step=check_step, fallback_via=fallback_via,
-                                    shortcut_seconds=budget, log=log)
+                                    shortcut_seconds=budget, log=log, record=into)
 
     candidates = _opening_candidates(cell, openings)
 
@@ -383,7 +407,11 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
         try:
             if n:
                 log(f"      retrying with the gun at {opening:g} mm")
-            return [(attempt(opening, qa, qb, shortcut_seconds), opening)]
+            raw: list = []
+            leg = attempt(opening, qa, qb, shortcut_seconds, raw)
+            if record is not None:
+                record.extend(raw)
+            return [(leg, opening)]
         except PlanningError as exc:
             last = exc
 
@@ -397,17 +425,21 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
             with cell.gun_opening(first_open):
                 if cell.in_collision(mid):
                     continue
+            raw_first: list = []
             try:
-                first = attempt(first_open, qa, mid, 0.0)
+                first = attempt(first_open, qa, mid, 0.0, raw_first)
             except PlanningError:
                 continue
             for second_open in candidates:
                 if second_open == first_open:
                     continue                    # already ruled out as a single opening
+                raw_second: list = []
                 try:
-                    second = attempt(second_open, mid, qb, 0.0)
+                    second = attempt(second_open, mid, qb, 0.0, raw_second)
                 except PlanningError:
                     continue
+                if record is not None:
+                    record.extend(raw_first + raw_second)
                 log(f"      no single gun opening reaches; changing from "
                     f"{first_open:g} mm to {second_open:g} mm at fallback pose {i + 1}")
                 with cell.gun_opening(first_open):
@@ -441,7 +473,8 @@ def _opening_candidates(cell: Cell, openings: list[float] | None) -> list[float 
 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
                  runs: int, segment_length: float, check_step: float,
-                 shortcut_seconds: float, log) -> list[np.ndarray]:
+                 shortcut_seconds: float, log,
+                 record: list | None = None) -> list[np.ndarray]:
     if not cell.segment_collides(qa, qb, max_step=check_step):
         # A clear straight line is normally the best answer there is, and a sampling
         # planner asked to improve on it would only return it again.  But "clear" and
@@ -450,14 +483,16 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
         # bow it away -- there is nothing for OMPL to do here, but plenty for relocation.
         raw = cell.distance(qa, qb)
         if not (cell.penalty is not None and cell.penalty.enabled) or shortcut_seconds <= 0:
-            return [qa, qb]
+            return _capture(record, [qa, qb])
         cost = cell.segment_cost(qa, qb, max_step=check_step)
         if cost <= raw * 1.05:
-            return [qa, qb]
+            return _capture(record, [qa, qb])
         log(f"      direct move is clear but runs close to the parts "
             f"(cost {cost:.2f} m against {raw:.2f} m of travel); standing it off")
         # Densified here rather than left to shortcut: a two-point path has no interior
-        # waypoint, and relocation is the only move that can help.
+        # waypoint, and relocation is the only move that can help.  The unrefined route is
+        # still the bare straight line; the densification is part of the refinement.
+        _capture(record, [qa, qb])
         seeded = [qa] + _resample(cell, np.asarray(qa, dtype=float),
                                   np.asarray(qb, dtype=float), check_step) + [qb]
         improved = shortcut(cell, seeded, time_budget=shortcut_seconds,
@@ -501,6 +536,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
             f"freespace transit failed after {max(runs, attempts)} attempts: {last}")
 
     cost, travel, raw = min(candidates, key=lambda c: c[0])
+    _capture(record, raw)
     if len(candidates) > 1:
         worst = max(c[0] for c in candidates)
         log(f"      keeping the best of {len(candidates)} solutions: cost {cost:.2f} m "
