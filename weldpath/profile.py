@@ -18,13 +18,16 @@ Every waypoint is a full stop, and short hops are where that hurts most.
 
 Joint 3 is coupled to joint 2
 -----------------------------
-The arm holds link 3 at a fixed angle to the floor as joint 2 moves, so the value joint 3 is
-actually commanded with is not the relative rotation the URDF models.  Measured against this
-cell's own kinematics, holding ``q3 - q2`` constant leaves link 3's orientation unchanged to
-0.000 degrees across +/-0.3 rad of joint 2, whereas holding ``q3`` itself constant swings it
-by 17 degrees.  So the commanded value is ``q3 - q2``, and that is what the motion profile is
-computed against -- which keeps joint 3's profile consistent with every other joint, since it
-is the quantity the mechanism actually drives.
+A linkage holds link 3 at a fixed angle to the floor as joint 2 moves, so the number the
+robot's J3 register carries is not the relative rotation the URDF models.  Measured against
+this cell's own kinematics, link 3's elevation is a function of ``q3 - q2`` alone: it reads
+the same at ``(q2, q3)`` of ``(-0.3, -0.3)``, ``(0, 0)`` and ``(0.3, 0.3)``, and rises from
+-22.9 to +35.2 degrees as ``q3 - q2`` runs from -0.6 to +0.6 rad.  So the register reads
+``q3 - q2``, increasing as the arm points up, and that is what :func:`commanded` converts to
+for the output file.
+
+Timing is a separate question.  The drive still moves joint 3 through the URDF's own relative
+rotation, so its motion profile runs on ``q3`` unmodified, exactly like every other joint.
 """
 from __future__ import annotations
 
@@ -39,9 +42,23 @@ DEFAULT_VELOCITY_LAST = 11.0 * math.pi / 9.0    # rad/s  (220 deg/s)
 DEFAULT_ACCELERATION = 2.5                      # rad/s^2
 DEFAULT_ACCELERATION_LAST = 11.0                # rad/s^2
 
-# The coupled pair, as joint numbers: joint 3's commanded value is measured against joint 2.
+# The coupled pair, as joint numbers: joint 3's register value is measured against joint 2.
 COUPLED_JOINT = 3
 COUPLING_SOURCE = 2
+
+
+def commanded(q: np.ndarray, coupled: bool = True) -> np.ndarray:
+    """Kinematic joint values as the robot's own registers read them.
+
+    Only joint 3 differs: its register is measured against the floor rather than against
+    link 2, so it reads ``q3 - q2``.  See the module docstring for the measurement.  This is
+    a presentation step for the output file -- planning, collision checking and timing all
+    work in the kinematic values, which are what the URDF describes.
+    """
+    out = np.array(q, dtype=float)
+    if coupled and len(out) >= COUPLED_JOINT:
+        out[COUPLED_JOINT - 1] = out[COUPLED_JOINT - 1] - out[COUPLING_SOURCE - 1]
+    return out
 
 
 def default_velocity(n: int) -> list[float]:
@@ -84,29 +101,21 @@ def parse_limits(text: str | None, n: int, defaults: list[float], label: str) ->
 class JointDynamics:
     """Velocity and acceleration limits per joint, and the move times they imply."""
 
-    def __init__(self, velocity, acceleration, coupled: bool = True):
+    def __init__(self, velocity, acceleration):
         self.velocity = np.asarray(velocity, dtype=float)
         self.acceleration = np.asarray(acceleration, dtype=float)
         if self.velocity.shape != self.acceleration.shape:
             raise ValueError("velocity and acceleration limits must cover the same joints")
         if np.any(self.velocity <= 0) or np.any(self.acceleration <= 0):
             raise ValueError("velocity and acceleration limits must be positive")
-        # Coupling only applies to an arm that actually has the joints involved.
-        self.coupled = bool(coupled) and len(self.velocity) >= COUPLED_JOINT
-        self.target = COUPLED_JOINT - 1
-        self.source = COUPLING_SOURCE - 1
-
-    def command(self, q: np.ndarray) -> np.ndarray:
-        """Kinematic joint values as the values the machine is actually commanded with."""
-        out = np.array(q, dtype=float)
-        if self.coupled:
-            out[self.target] = out[self.target] - out[self.source]
-        return out
 
     def joint_times(self, a: np.ndarray, b: np.ndarray) -> np.ndarray:
-        """Time each joint needs to make this move on its own."""
-        d = np.abs(self.command(np.asarray(b, dtype=float))
-                   - self.command(np.asarray(a, dtype=float)))
+        """Time each joint needs to make this move on its own.
+
+        Every joint, joint 3 included, is timed on the rotation the URDF gives it: the J2
+        linkage changes what joint 3's register *reads*, not how far its drive turns.
+        """
+        d = np.abs(np.asarray(b, dtype=float) - np.asarray(a, dtype=float))
         v, acc = self.velocity, self.acceleration
         cruise = v * v / acc                     # distance at which the trapezoid starts
         triangular = 2.0 * np.sqrt(np.maximum(d, 0.0) / acc)
@@ -126,8 +135,4 @@ class JointDynamics:
         parts = ", ".join(
             f"{n} {v:.3f} rad/s, {a:g} rad/s^2"
             for n, v, a in zip(names, self.velocity, self.acceleration))
-        out = f"joint limits: {parts}"
-        if self.coupled:
-            out += (f"; {names[self.target]} is commanded as "
-                    f"{names[self.target]} - {names[self.source]} (held to the floor)")
-        return out
+        return f"joint limits: {parts}"

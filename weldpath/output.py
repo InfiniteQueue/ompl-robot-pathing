@@ -3,8 +3,10 @@
 The schema is fixed by the consumer (``TesseractWaypoints.vb``), and two details of it are
 easy to get wrong:
 
-* ``joints`` is a name -> value map in the *planner's* units -- radians for revolute
-  joints, millimetres for prismatic -- even though ``units`` reads ``"mm/deg"``.
+* ``joints`` is a name -> value map in the units ``units`` declares: degrees for revolute
+  joints, millimetres for prismatic.  The values are the robot's *register* values, not the
+  planner's -- which differ for joint 3, whose linkage holds it against the floor.  See
+  :func:`weldpath.profile.commanded`.
 * ``tcp_world_mm`` is the full 4x4 row-major world pose with the translation in
   millimetres in the fourth column, in the same frame as the manifest's
   ``locators[].pose_world``, so the consumer can place it back in the cell untransformed.
@@ -22,10 +24,11 @@ import numpy as np
 
 from .cell import Cell
 from .manifest import Manifest
-from .profile import JointDynamics
+from .profile import JointDynamics, commanded
 from .toolpath import LIN, Segment
 
 OUTPUT_NAME = "waypoints.json"
+UNREFINED_NAME = "waypoints-unrefined.json"
 
 # Cartesian speed cap on LIN moves. The joint limits in weldpath.profile govern every move;
 # this is an additional commanded ceiling on tool speed, not a second dynamics model.
@@ -65,6 +68,17 @@ class Timing:
         return times
 
 
+def _joint_scales(cell: Cell, man: Manifest) -> np.ndarray:
+    """Factor turning each joint's planner value into the unit ``units`` declares.
+
+    Revolute joints are planned in radians and written in degrees; prismatic ones are
+    planned in metres and written in the manifest's own length unit.
+    """
+    prismatic = {j.name: j.is_prismatic for d in man.devices for j in d.joints}
+    return np.array([1.0 / man.scale if prismatic.get(name) else np.degrees(1.0)
+                     for name in cell.joint_names], dtype=float)
+
+
 def _pose_rows(cell: Cell, q: np.ndarray) -> list[list[float]]:
     """World TCP pose as 4x4 row-major, translation in manifest units (mm)."""
     T = cell.fk(q).copy()
@@ -73,19 +87,27 @@ def _pose_rows(cell: Cell, q: np.ndarray) -> list[list[float]]:
 
 
 def build_document(cell: Cell, man: Manifest, segments: list[Segment],
-                   timing: Timing) -> dict:
+                   timing: Timing, unrefined: bool = False) -> dict:
+    """Serialise the planned motion.
+
+    ``unrefined`` writes each segment's raw phases instead -- the sampling planner's own
+    output, before shortcutting and waypoint reduction -- in the same schema, so the two
+    files can be diffed or replayed against each other.
+    """
     out_segments = []
+    scales = _joint_scales(cell, man)
 
     for seg in segments:
         phases = []
-        for ph in seg.phases:
+        for ph in (seg.raw_phases if unrefined else seg.phases):
             poses = [_pose_rows(cell, q) for q in ph.states]
             positions = [np.array([r[0][3], r[1][3], r[2][3]]) for r in poses]
             times = timing.phase_times(ph.motion, ph.states, positions)
             waypoints = [
                 {
-                    "joints": {name: round(float(value), 9)
-                               for name, value in zip(cell.joint_names, q)},
+                    "joints": {name: round(float(value), 6)
+                               for name, value
+                               in zip(cell.joint_names, commanded(q) * scales)},
                     "tcp_world_mm": rows,
                     "time": round(t, 6),
                 }
@@ -139,8 +161,8 @@ def check_endpoints(document: dict, man: Manifest, tol_mm: float = 1.0) -> list[
     return problems
 
 
-def write(directory: str, document: dict) -> str:
-    path = os.path.join(directory, OUTPUT_NAME)
+def write(directory: str, document: dict, name: str = OUTPUT_NAME) -> str:
+    path = os.path.join(directory, name)
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(document, fh, indent=1)
     return path
