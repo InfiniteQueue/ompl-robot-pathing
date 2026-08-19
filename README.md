@@ -139,6 +139,12 @@ Every segment runs from the pose of the locator named in `from` to the pose of t
 named in `to`, so the path starts at the manifest's first locator. Both ends are checked
 after generation, with any deviation over 1 mm reported as a warning.
 
+`start_state`'s gun entry is an **opening in millimetres**, like every other opening in the
+manifest — the key is named `..._mm` — and is converted to a joint angle on load. Reading it
+as a raw joint value put the start state hundreds of radians out and left the tip wherever
+that landed. The opening it resolves to is printed at load, along with a note if the manifest
+asked for more than the gun has.
+
 `start_state` never contributes a waypoint. It is used to seed inverse kinematics and as a
 known-clear pose to route a difficult transit through, but getting the robot from wherever
 it is onto the first locator is left to the caller.

@@ -68,7 +68,12 @@ class Cell:
         self._state_names = list(self.joint_names)
         if self.gun_joint_name:
             self._state_names.append(self.gun_joint_name)
-            self.gun_value = float(man.start_state.get(self.gun_joint_name, 0.0))
+            # The manifest states the gun's start position as an opening in millimetres,
+            # like every other opening in the file -- the key is even named ..._mm -- while
+            # the joint itself is now an angle.  Reading it as a raw joint value put the
+            # start state 500-odd radians out and left the tip wherever that landed.
+            self.gun_value = man.gun_joint_value(
+                float(man.start_state.get(self.gun_joint_name, 0.0)))
 
         self.penalty = None                     # set by attach_penalty
         self._pm = None                         # proximity manager, only if penalised
@@ -600,6 +605,12 @@ def _log_gun(man: Manifest, log) -> None:
     log(f"gun joint '{j.name}' is angular: {abs(lo if abs(lo) > abs(hi) else hi):.4f} rad "
         f"about a {man.gun_lever_arm:.1f} mm arm, giving {man.gun_opening_max:.1f} mm of "
         f"electrode opening")
+    # The start opening is worth printing next to the maximum: a manifest asking for more
+    # than the gun has is clamped rather than refused, and that is easy to miss.
+    asked = float(man.start_state.get(j.name, 0.0))
+    got = man.gun_opening(man.gun_joint_value(asked))
+    note = "" if abs(abs(asked) - got) < 0.05 else f"  (clamped from {abs(asked):.1f} mm)"
+    log(f"start state opens the gun to {got:.1f} mm{note}")
 
 
 def _apply_joint_limits(env: Environment, names: list[str], dynamics, log) -> None:

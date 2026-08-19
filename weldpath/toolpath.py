@@ -134,21 +134,47 @@ class ToolpathPlanner:
         widest = self.man.gun_opening_max
         return [declared, widest, widest / 2.0]
 
+    def _diagnose(self, loc: Locator, seed: np.ndarray) -> str:
+        """Why the pose was rejected.  Call inside the clearance and gun-opening context.
+
+        Worth the extra solve: "no solution" and "solution rejected by the collision check"
+        need completely different fixes -- a reachability problem against a geometry one --
+        and a message that covers both sends the reader after the wrong one.  Naming the
+        blocking pair and its depth turns a modelling artefact into something obvious,
+        since convex hulls over-report contact badly on the C-shaped castings here.
+        """
+        q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q],
+                                 require_collision_free=False)
+        if q is None:
+            return "no inverse-kinematics solution inside the joint limits"
+        hits = self.cell.contact_pairs(q)
+        if not hits:
+            return "reachable, but the pose reads as in collision"
+        (a, b), worst = min(hits.items(), key=lambda kv: kv[1])
+        more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
+        return (f"reachable, but {a} <-> {b} reads {worst / self.man.scale:+.1f} mm"
+                f"{more} against a {self.cell.obstacle_clearance / self.man.scale:+.1f} mm "
+                f"clearance")
+
     def _solve_locator(self, loc: Locator, seed: np.ndarray) -> tuple[np.ndarray, float]:
         """Joint solution for a locator, plus the gun opening it was reached at."""
         problems = []
         for opening in self._locator_openings(loc):
             with self._clearance_for(loc), self.cell.gun_opening(opening):
                 q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q])
+                if q is None:
+                    problems.append(f"at {opening:g} mm, {self._diagnose(loc, seed)}")
             if q is not None:
                 if opening:
                     self.log(f"    '{loc.name}' needs the gun at {opening:g} mm to be "
                              f"reachable")
                 return q, opening
-            problems.append(opening)
-        raise PlanningError(
-            f"no collision-free IK for locator '{loc.name}' at any gun opening "
-            f"({', '.join(f'{o:g} mm' for o in problems)})")
+        detail = "; ".join(problems)
+        hint = ("" if "reachable, but" not in detail else
+                ". Hulls over-report contact on concave parts: check the pair against the "
+                "raw geometry before trusting it, and see --hull-cell-mm")
+        raise PlanningError(f"cannot place the robot at locator '{loc.name}' -- "
+                            f"{detail}{hint}")
 
     def _approach_pose(self, loc: Locator) -> np.ndarray:
         return offset_pose(loc.pose_world, self.axis, self.man.linear_zone_mm)
