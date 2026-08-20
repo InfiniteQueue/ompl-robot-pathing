@@ -17,15 +17,13 @@ import numpy as np
 
 from .cell import Cell
 from .manifest import Locator, Manifest
-from .planning import PlanningError, plan_freespace, plan_linear, validate
+from .planning import (LIN, PTP, LinearZone, PlanningError, plan_freespace, plan_linear,
+                       validate)
 
 AXES = {"+x": np.array([1.0, 0, 0]), "-x": np.array([-1.0, 0, 0]),
         "+y": np.array([0, 1.0, 0]), "-y": np.array([0, -1.0, 0]),
         "+z": np.array([0, 0, 1.0]), "-z": np.array([0, 0, -1.0])}
 
-
-PTP = "PTP"
-LIN = "LIN"
 
 
 @dataclass
@@ -85,6 +83,7 @@ class ToolpathPlanner:
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
                  ompl_seconds: float = 5.0, linear_zone: bool = True,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
+                 near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
                  weld_clearance_mm: float | None = None,
                  keep_unrefined: bool = False, log=print):
         self.cell = cell
@@ -102,6 +101,13 @@ class ToolpathPlanner:
         self.check_step = np.deg2rad(check_step_deg)
         self.shortcut_seconds = shortcut_seconds
         self.polish_seconds = polish_seconds
+        # Stretches of a transit that run this close to a panel or to tooling come out as
+        # linear motion instead of joint motion.  The clearance query has to be able to
+        # see that far, which it will not do on the penalty's probe alone.
+        self.zone = LinearZone(near_mm=near_panel_mm, min_run_mm=near_panel_min_mm,
+                               step_mm=linear_step_mm)
+        if self.zone.enabled:
+            cell.require_proximity(near_panel_mm)
         self.keep_unrefined = keep_unrefined
         # None means "no separate weld rule", i.e. the cell's own clearance throughout.
         self.weld_clearance = (None if weld_clearance_mm is None
@@ -274,10 +280,15 @@ class ToolpathPlanner:
             check_step=self.check_step, fallback_via=[self.start_q],
             shortcut_seconds=self.shortcut_seconds,
             polish_seconds=self.polish_seconds, planning_time=self.ompl_seconds,
+            zone=self.zone,
             openings=[leave_open, arrive_open], record=raw_legs, log=self.log)
-        for i, (path, opening) in enumerate(legs):
+        for i, (runs, opening) in enumerate(legs):
             opening_mm = 0.0 if opening is None else opening
-            phases.append(Phase("freespace", PTP, path, opening_mm, False))
+            for run in runs:
+                # A linear run is the gun working its way over the panel rather than
+                # crossing open space, so it is named for what it is in the run log.
+                kind = "freespace" if run.motion == PTP else "traverse"
+                phases.append(Phase(kind, run.motion, run.states, opening_mm, False))
             if raw_legs is not None and i < len(raw_legs):
                 raw_phases.append(Phase("freespace", PTP, raw_legs[i], opening_mm, False))
 

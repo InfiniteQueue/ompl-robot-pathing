@@ -17,11 +17,16 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="weldpath",
         description="Plan a FANUC weld path from a Tesseract study directory.")
+    #DIRECTORY PATH
     p.add_argument("directory",
                    help="study directory containing manifest.json and meshes/")
+
+    ###WELD HANDLING###
+    #WELD PULL BACK AXIS
     p.add_argument("--approach-axis", default = "-z", choices=["+x", "-x", "+y", "-y", "+z", "-z"],
                    help="direction in a weld locator's own frame that the straight "
                         "lead-in and lead-out travel along (default: -z)")
+    #DISABLE LINEAR TUNNEL
     p.add_argument("--no-linear-zone", dest="linear_zone", action="store_false",
                    help="do not lead into or out of a weld in a straight line. Every "
                         "millimetre of the manifest's linear_zone_mm has to be clear "
@@ -29,18 +34,27 @@ def build_parser() -> argparse.ArgumentParser:
                         "may have no room for; without it the transit runs weld to weld "
                         "and is free to curve away immediately, at the cost of the gun "
                         "arriving on a curve rather than sliding on straight")
+    #LINEAR TUNNEL STEP LENGTH
     p.add_argument("--linear-step-mm", type=float, default=50.0,
                    help="spacing of points along linear approach/depart moves "
                         "(default: 50)")
+
+    ###COLLISIONS###
+    #COLLISION JOINT STEP RESOLUTION
     p.add_argument("--check-step-deg", type=float, default=3.0,
                    help="joint-space resolution used when checking a move for collision; "
                         "smaller is safer and slower (default: 3)")
+    #COLLISION CHECK RESOLUTION
     p.add_argument("--segment-length-rad", type=float, default=0.02,
                    help="collision checking resolution for the sampling planner "
                         "(default: 0.02)")
+
+    ###PATHFINDING###
+    #MAX OMPL (pathfinding) ATTEMPTS
     p.add_argument("--ompl-attempts", type=int, default=20,
                    help="most freespace planning attempts per segment, used to retry a "
                         "transit that keeps failing (default: 3)")
+    #MIN OMPL ATTEMPTS
     p.add_argument("--ompl-min-runs", type=int, default=7, metavar="N",
                    help="always run the sampling planner at least this many times per "
                         "transit and keep the lowest-penalty solution, rather than taking "
@@ -48,14 +62,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "stumbles on first, and no later pass can move a route to the "
                         "other side of an obstacle, so this is the only stage that can "
                         "choose between them. Costs a full solve per run (default: 3)")
+    #OMPL ATTEMPT MAX TIME
     p.add_argument("--ompl-seconds", type=float, default=7.0, metavar="SECONDS",
                    help="how long one sampling-planner run may search before giving up. Raise it for a transit that keeps failing, where restarting the search wastes the tree built so far; every run costs this long in the worst case, so it multiplies with --ompl-min-runs (default: 5)")
+    #DISABLE SHORTCUT PASS
     p.add_argument("--no-shortcut", dest="shortcut", action="store_false",
                    help="skip the shortcutting pass and emit the sampling planner's own "
                         "route, which is typically much longer")
+    #SHORTCUT PASS TIME
     p.add_argument("--shortcut-seconds", type=float, default=20.0, metavar="SECONDS",
                    help="time budget for shortcutting each freespace transit; longer "
                         "budgets keep shortening with diminishing returns (default: 30)")
+    #POLISH PASS TIME
     p.add_argument("--polish-seconds", type=float, default=20.0, metavar="SECONDS",
                    help="time budget for the final pass over each transit's emitted "
                         "waypoints, which removes and relocates them under the full "
@@ -63,6 +81,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "earlier passes work on a densified path where a waypoint is a "
                         "sampling artefact rather than a stop; this one does not "
                         "(default: 5)")
+    p.add_argument("--no-near-panel-linear", dest="near_panel_linear",
+                   action="store_false",
+                   help="plan every transit as joint motion throughout, rather than "
+                        "re-planning the stretches that run close to the parts as straight "
+                        "moves")
+    p.add_argument("--near-panel-mm", type=float, default=100.0, metavar="MM",
+                   help="clearance from a panel or from tooling at or under which a "
+                        "transit counts as working near the parts, and is re-planned as "
+                        "linear motion. Larger means more of the route comes out linear, "
+                        "which is more predictable and slower to execute (default: 100)")
+    p.add_argument("--near-panel-min-mm", type=float, default=150.0, metavar="MM",
+                   help="shortest near-panel stretch worth converting, measured as tool "
+                        "travel. A sweeping transit that clips the proximity band for a "
+                        "moment is not working near the panel, and cutting it in three to "
+                        "say so costs a stop at each end for nothing (default: 150)")
     p.add_argument("--min-shell-mm", type=float, default=5.0,
                    help="drop collision shells smaller than this across their bounding "
                         "box diagonal (default: 5)")
@@ -251,6 +284,8 @@ def main(argv: list[str] | None = None) -> int:
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,
         polish_seconds=args.polish_seconds if args.shortcut else 0.0,
+        near_panel_mm=args.near_panel_mm if args.near_panel_linear else 0.0,
+        near_panel_min_mm=args.near_panel_min_mm,
         weld_clearance_mm=args.weld_clearance_mm,
         keep_unrefined=args.unrefined_output,
         log=log)

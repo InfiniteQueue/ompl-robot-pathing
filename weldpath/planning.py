@@ -15,6 +15,7 @@ from __future__ import annotations
 import ctypes
 import struct
 import time
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -524,8 +525,9 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
                      runs: int, segment_length: float, check_step: float,
                      fallback_via: list[np.ndarray] | None,
                      shortcut_seconds: float, polish_seconds: float,
-                     planning_time: float = DEFAULT_PLANNING_TIME, log=print,
-                     record: list | None = None) -> list[np.ndarray]:
+                     planning_time: float = DEFAULT_PLANNING_TIME,
+                     zone: LinearZone | None = None, log=print,
+                     record: list | None = None) -> list[Run]:
     """Collision-free joint path from ``qa`` to ``qb`` at the gun's current opening.
 
     If the direct transit cannot be found, the move is retried in two legs through each
@@ -538,7 +540,8 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
                             segment_length=segment_length, check_step=check_step,
                             shortcut_seconds=shortcut_seconds,
                             polish_seconds=polish_seconds,
-                            planning_time=planning_time, log=log, record=record)
+                            planning_time=planning_time, zone=zone, log=log,
+                            record=record)
     except PlanningError:
         if not fallback_via:
             raise
@@ -551,6 +554,9 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
         # the fallback pose is an implementation detail of how it was found.
         halves: list[list[np.ndarray]] = []
         try:
+            # Planned without a linear zone: the two legs are joined below and the whole
+            # route is split afterwards, so splitting each half here would put a phase
+            # boundary at the fallback pose whether the geometry called for one or not.
             first = _plan_direct(cell, qa, mid, attempts=attempts, runs=runs,
                                  segment_length=segment_length, check_step=check_step,
                                  shortcut_seconds=0.0, polish_seconds=0.0,
@@ -565,7 +571,8 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
             _capture(record, halves[0] + halves[1][1:])
         # Refine the joined route rather than each leg: the detour through the fallback
         # pose is exactly the kind of corner these passes exist to cut.
-        return _refine(cell, first + second[1:], shortcut_seconds=shortcut_seconds,
+        joined = first[0].states + second[0].states[1:]
+        return _finish(cell, joined, zone=zone, shortcut_seconds=shortcut_seconds,
                        polish_seconds=polish_seconds, check_step=check_step, log=log)
     raise PlanningError("freespace transit failed, including via fallback poses")
 
@@ -577,8 +584,9 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
                    shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                    planning_time: float = DEFAULT_PLANNING_TIME,
                    openings: list[float] | None = None,
+                   zone: LinearZone | None = None,
                    record: list | None = None,
-                   log=print) -> list[tuple[list[np.ndarray], float | None]]:
+                   log=print) -> list[tuple[list[Run], float | None]]:
     """Plan a transit, choosing a gun opening for it when the natural one will not do.
 
     Some destinations simply cannot be reached at the opening the robot arrives with: the
@@ -586,7 +594,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
     the way back.  ``openings`` lists the openings to consider, most preferred first --
     normally the opening carried over from the previous locator, then closed, then wide.
 
-    Returns one ``(path, opening)`` leg per output phase.  A single leg is always
+    Returns one ``(runs, opening)`` leg per gun state.  A single leg is always
     preferred, and a two-leg answer is only produced when no single opening works: the
     gun then changes at the intermediate pose, where the robot is stationary and the
     change costs no motion.
@@ -602,7 +610,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
                                     check_step=check_step, fallback_via=fallback_via,
                                     shortcut_seconds=budget,
                                     polish_seconds=polish_seconds if budget else 0.0,
-                                    planning_time=planning_time, log=log, record=into)
+                                    planning_time=planning_time, zone=zone, log=log,
+                                    record=into)
 
     candidates = _opening_candidates(cell, openings)
 
@@ -649,13 +658,13 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
                 log(f"      no single gun opening reaches; changing from "
                     f"{first_open:g} mm to {second_open:g} mm at fallback pose {i + 1}")
                 with cell.gun_opening(first_open):
-                    first = _refine(cell, first, shortcut_seconds=shortcut_seconds,
-                                    polish_seconds=polish_seconds,
-                                    check_step=check_step, log=log)
+                    first = _refine_runs(cell, first, shortcut_seconds=shortcut_seconds,
+                                         polish_seconds=polish_seconds,
+                                         check_step=check_step, log=log)
                 with cell.gun_opening(second_open):
-                    second = _refine(cell, second, shortcut_seconds=shortcut_seconds,
-                                     polish_seconds=polish_seconds,
-                                     check_step=check_step, log=log)
+                    second = _refine_runs(cell, second, shortcut_seconds=shortcut_seconds,
+                                          polish_seconds=polish_seconds,
+                                          check_step=check_step, log=log)
                 return [(first, first_open), (second, second_open)]
     raise last or PlanningError("freespace transit failed at every gun opening")
 
@@ -678,20 +687,26 @@ def _opening_candidates(cell: Cell, openings: list[float] | None) -> list[float 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
                  runs: int, segment_length: float, check_step: float,
                  shortcut_seconds: float, polish_seconds: float,
-                 planning_time: float = DEFAULT_PLANNING_TIME, log=print,
-                 record: list | None = None) -> list[np.ndarray]:
+                 planning_time: float = DEFAULT_PLANNING_TIME,
+                 zone: LinearZone | None = None, log=print,
+                 record: list | None = None) -> list[Run]:
     if not cell.segment_collides(qa, qb, max_step=check_step):
         # A clear straight line is normally the best answer there is, and a sampling
         # planner asked to improve on it would only return it again.  But "clear" and
         # "sensible" part company when the line grazes a panel, so when the penalty says
         # this one does, the same pass that stands other routes off is given a chance to
         # bow it away -- there is nothing for OMPL to do here, but plenty for relocation.
+        def straight() -> list[Run]:
+            return _finish(cell, _capture(record, [qa, qb]), zone=zone,
+                           shortcut_seconds=0.0, polish_seconds=0.0,
+                           check_step=check_step, log=log)
+
         raw = cell.move_time(qa, qb)
         if not (cell.penalty is not None and cell.penalty.enabled) or shortcut_seconds <= 0:
-            return _capture(record, [qa, qb])
+            return straight()
         cost = cell.segment_cost(qa, qb, max_step=check_step, stops=True)
         if cost <= raw * 1.05:
-            return _capture(record, [qa, qb])
+            return straight()
         log(f"      direct move is clear but runs close to the parts "
             f"(cost {cost:.2f} s against {raw:.2f} s unpenalised); standing it off")
         # Densified here rather than left to shortcut: a two-point path has no interior
@@ -700,7 +715,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
         _capture(record, [qa, qb])
         seeded = [qa] + _resample(cell, np.asarray(qa, dtype=float),
                                   np.asarray(qb, dtype=float), check_step) + [qb]
-        return _refine(cell, seeded, shortcut_seconds=shortcut_seconds,
+        return _finish(cell, seeded, zone=zone, shortcut_seconds=shortcut_seconds,
                        polish_seconds=polish_seconds, check_step=check_step, log=log)
 
     # RRTConnect returns the first path it finds, and which homotopy class that lands in
@@ -747,10 +762,209 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
         log(f"      keeping the best of {len(candidates)} solutions: cost {cost:.2f} s "
             f"against {worst:.2f} s for the worst")
     # Shortcut before reducing: the dense path gives the cuts somewhere to land.
-    path = _refine(cell, raw, shortcut_seconds=shortcut_seconds,
-                   polish_seconds=polish_seconds, check_step=check_step, log=log)
-    log(f"      reduced to {len(path)} points")
-    return path
+    out = _finish(cell, raw, zone=zone, shortcut_seconds=shortcut_seconds,
+                  polish_seconds=polish_seconds, check_step=check_step, log=log)
+    log(f"      reduced to {sum(len(r.states) for r in out)} points in "
+        f"{len(out)} run{'' if len(out) == 1 else 's'}")
+    return out
+
+
+# ---------------------------------------------------------------------------
+# linear motion near the parts
+# ---------------------------------------------------------------------------
+PTP = "PTP"
+LIN = "LIN"
+
+
+@dataclass
+class Run:
+    """A stretch of one path that the robot executes under a single motion type."""
+    motion: str                     # PTP | LIN
+    states: list[np.ndarray]
+
+
+@dataclass
+class LinearZone:
+    """Settings for turning the near-panel parts of a transit into linear motion."""
+    near_mm: float = 0.0            # clearance at or under which the route counts as near
+    min_run_mm: float = 0.0         # shortest stretch worth converting, in tool travel
+    step_mm: float = 50.0           # point spacing along the straight moves
+
+    @property
+    def enabled(self) -> bool:
+        return self.near_mm > 0.0
+
+
+def _refine_runs(cell: Cell, runs: list[Run], *, shortcut_seconds: float,
+                 polish_seconds: float, check_step: float, log) -> list[Run]:
+    """Run the optimisation passes over the joint-motion stretches and nothing else.
+
+    A linear run is a decision about the shape of the move, not a route to be improved, so
+    it is passed through untouched.  The passes only ever move a path's interior points,
+    so the boundary between a linear run and the joint motion either side of it survives.
+    """
+    out: list[Run] = []
+    for run in runs:
+        if run.motion == LIN or len(run.states) < 2:
+            out.append(run)
+            continue
+        out.append(Run(PTP, _refine(cell, run.states, shortcut_seconds=shortcut_seconds,
+                                    polish_seconds=polish_seconds,
+                                    check_step=check_step, log=log)))
+    return out
+
+
+def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
+            shortcut_seconds: float, polish_seconds: float, check_step: float,
+            log) -> list[Run]:
+    """Split a freshly planned route into runs, then optimise the joint-motion ones.
+
+    Linearisation comes first on purpose.  The optimisation passes reshape a route to save
+    time, and time is exactly what they would save by cutting the corner a linear move is
+    there to hold -- so deciding which stretches are linear afterwards would mean deciding
+    it about a route that had already been pulled out of shape.
+    """
+    if zone is not None and zone.enabled:
+        runs = linearise(cell, path, near_mm=zone.near_mm, min_run_mm=zone.min_run_mm,
+                         step_mm=zone.step_mm, check_step=check_step, log=log)
+    else:
+        runs = [Run(PTP, list(path))]
+    return _refine_runs(cell, runs, shortcut_seconds=shortcut_seconds,
+                        polish_seconds=polish_seconds, check_step=check_step, log=log)
+
+
+def _tcp_travel(cell: Cell, states: list[np.ndarray]) -> float:
+    """Distance the tool centre point covers along a joint path, in manifest units."""
+    points = [cell.fk(q)[:3, 3] for q in states]
+    return float(sum(np.linalg.norm(b - a) for a, b in zip(points, points[1:])))
+
+
+def _linear_chain(cell: Cell, guide: list[np.ndarray], *, step_mm: float,
+                  check_step: float) -> list[np.ndarray] | None:
+    """Joint states covering ``guide`` as a chain of straight Cartesian moves.
+
+    The straight chord end to end is tried first, because one long ``L`` is what a robot
+    programmer would write.  Where the part is in the way the span is halved and each half
+    tried in turn, so the chain bends only where it has to and converges on the guide
+    itself -- whose own steps are a collision-check resolution apart and so are very nearly
+    straight already.  ``None`` means even that failed and the caller should keep the
+    joint-space route.
+
+    The endpoints are snapped back onto the guide's own states afterwards.  IK returns
+    whichever solution is nearest the seed rather than the exact state asked for, and a
+    linear run that ends a hair off where the next run begins is a discontinuity the
+    controller has no way to execute.
+    """
+    if len(guide) < 2:
+        return list(guide)
+
+    def span(lo: int, hi: int) -> list[np.ndarray] | None:
+        try:
+            chain = plan_linear(cell, cell.fk(guide[lo]), cell.fk(guide[hi]), guide[lo],
+                                step_mm=step_mm)
+        except PlanningError:
+            chain = None
+        if chain is not None and not _chain_collides(cell, chain, check_step):
+            if _joins(cell, chain, guide[lo], guide[hi], check_step):
+                chain[0], chain[-1] = guide[lo], guide[hi]
+                return chain
+        if hi - lo < 2:
+            return None
+        mid = (lo + hi) // 2
+        first, second = span(lo, mid), span(mid, hi)
+        if first is None or second is None:
+            return None
+        return first + second[1:]
+
+    return span(0, len(guide) - 1)
+
+
+def _chain_collides(cell: Cell, chain: list[np.ndarray], check_step: float) -> bool:
+    """``plan_linear`` clears the points it places; this clears the gaps between them."""
+    return any(cell.segment_collides(a, b, max_step=check_step)
+               for a, b in zip(chain, chain[1:]))
+
+
+def _joins(cell: Cell, chain: list[np.ndarray], start: np.ndarray, end: np.ndarray,
+           check_step: float) -> bool:
+    """True when the chain's ends are close enough to the guide's to be snapped onto them.
+
+    ``check_step`` is the resolution the whole route is collision-checked at, so a
+    displacement under it is smaller than anything the checking can resolve anyway.
+    """
+    return (float(np.max(np.abs(chain[0] - start))) <= check_step
+            and float(np.max(np.abs(chain[-1] - end))) <= check_step)
+
+
+def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
+              min_run_mm: float, step_mm: float, check_step: float,
+              log=None) -> list[Run]:
+    """Split a joint-space route, re-planning its near-panel stretches as linear moves.
+
+    Close to the parts a joint-interpolated move is hard to reason about: the tool sweeps
+    an arc whose shape depends on the arm's configuration rather than on anything visible
+    in the cell.  A straight-line move is predictable, which is what you want where the
+    margin for error is small.  Far from the parts none of that matters and joint motion is
+    both faster and easier to plan.
+
+    So the route is measured, not assumed: every point within ``near_mm`` of a panel or a
+    piece of tooling is a candidate, maximal runs of those are found, and each run is
+    re-planned as a chain of straight moves.  A run whose tool travel is under
+    ``min_run_mm`` is left alone -- a long sweeping transit that clips the proximity band
+    for a moment is not "working near the panel", and cutting it into three phases to say
+    so would cost a stop at each end for nothing.
+
+    A run that cannot be linearised keeps its joint motion, so the worst case is the route
+    that would have been emitted anyway.
+    """
+    if near_mm <= 0.0 or len(path) < 2:
+        return [Run(PTP, list(path))]
+
+    dense: list[np.ndarray] = [np.asarray(path[0], dtype=float)]
+    for a, b in zip(path, path[1:]):
+        dense.extend(_resample(cell, np.asarray(a, dtype=float),
+                               np.asarray(b, dtype=float), check_step))
+        dense.append(np.asarray(b, dtype=float))
+
+    near = [cell.clearance_mm(q) <= near_mm for q in dense]
+    runs: list[Run] = []
+    kept = skipped = failed = 0
+    cursor = 0
+    i = 0
+    while i < len(dense):
+        if not near[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(dense) and near[j + 1]:
+            j += 1
+        if j > i and _tcp_travel(cell, dense[i:j + 1]) >= min_run_mm:
+            chain = _linear_chain(cell, dense[i:j + 1], step_mm=step_mm,
+                                  check_step=check_step)
+            if chain is not None:
+                if i > cursor:
+                    runs.append(Run(PTP, dense[cursor:i + 1]))
+                runs.append(Run(LIN, chain))
+                cursor = j
+                kept += 1
+            else:
+                failed += 1
+        elif j > i:
+            skipped += 1
+        i = j + 1
+
+    if cursor < len(dense) - 1:
+        runs.append(Run(PTP, dense[cursor:]))
+    if not runs:
+        return [Run(PTP, list(path))]
+    if log and (kept or failed or skipped):
+        note = [f"{kept} near-panel stretches made linear"]
+        if skipped:
+            note.append(f"{skipped} too brief to be worth it")
+        if failed:
+            note.append(f"{failed} with no straight route, left as joint motion")
+        log("      " + ", ".join(note))
+    return runs
 
 
 def validate(cell: Cell, path: list[np.ndarray], max_step: float = 0.05) -> str | None:

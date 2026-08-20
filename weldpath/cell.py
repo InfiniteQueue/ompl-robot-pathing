@@ -76,7 +76,9 @@ class Cell:
                 float(man.start_state.get(self.gun_joint_name, 0.0)))
 
         self.penalty = None                     # set by attach_penalty
-        self._pm = None                         # proximity manager, only if penalised
+        self._pm = None                         # proximity manager, only if measured
+        self._probe_mm = 0.0                    # how far that manager can actually see
+        self._extra_probe_mm = 0.0              # asked for by something other than the penalty
         self.dynamics = None                    # set by attach_dynamics
         self.weights = self._joint_weights()
 
@@ -240,16 +242,36 @@ class Cell:
         silent and the query cost is confined to the pairs that matter.
         """
         self.penalty = penalty
+        wanted = self._extra_probe_mm
+        if penalty is not None and penalty.enabled:
+            wanted = max(wanted, penalty.probe_mm)
+        self._build_proximity(wanted)
+
+    def require_proximity(self, probe_mm: float) -> None:
+        """Make sure clearance can be measured out to ``probe_mm``, penalty or no penalty.
+
+        The penalty owns how far it needs to see, but it is not the only caller that wants
+        a distance -- and it can be switched off entirely, which must not take the
+        measurement with it.  This raises the probe if it has to and leaves it alone
+        otherwise, so asking twice costs nothing.
+        """
+        self._extra_probe_mm = max(self._extra_probe_mm, float(probe_mm))
+        if self._extra_probe_mm > self._probe_mm:
+            self._build_proximity(self._extra_probe_mm)
+
+    def _build_proximity(self, probe_mm: float) -> None:
         self._pm = None
-        if penalty is None or not penalty.enabled:
+        self._probe_mm = 0.0
+        if probe_mm <= 0.0:
             return
-        probe = penalty.probe_mm * self.man.scale
+        probe = probe_mm * self.man.scale
         pm = self._cm.clone()
         pm.setDefaultCollisionMargin(-1.0)
         for a, b in _obstacle_margins(self.man):
             pm.setCollisionMarginPair(a, b, probe)
         pm.setActiveCollisionObjects(self.env.getActiveLinkNames())
         self._pm = pm
+        self._probe_mm = float(probe_mm)
 
     def clearance_mm(self, q: np.ndarray) -> float:
         """Closest approach between the robot or gun and the static objects, in mm.
@@ -270,17 +292,17 @@ class Cell:
         res = ContactResultMap()
         self._pm.contactTest(res, ContactRequest(ContactTestType_ALL))
         if res.size() == 0:
-            return self.penalty.probe_mm
+            return self._probe_mm
         vec = ContactResultVector()
         res.flattenCopyResults(vec)
         worst = min((float(c.distance) for c in vec), default=None)
         if worst is None:
-            return self.penalty.probe_mm
+            return self._probe_mm
         return worst / self.man.scale
 
     def penalty_factor(self, q: np.ndarray) -> float:
         """Cost multiplier for standing where ``q`` puts the robot."""
-        if self._pm is None:
+        if self._pm is None or self.penalty is None:
             return 1.0
         return self.penalty.factor(self.clearance_mm(q))
 

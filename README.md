@@ -345,6 +345,53 @@ rather than dozens.
 A segment that cannot be planned gets an `error` and empty `phases`; the rest of the file
 is still written and the process exits non-zero.
 
+### Linear motion near the parts
+
+Close to a panel, joint motion is hard to reason about: the tool sweeps an arc whose shape
+depends on the arm's configuration rather than on anything you can see in the cell. A
+straight-line move is predictable, which is what you want where the margin for error is
+small. Far from the parts none of that matters and joint motion is both quicker to execute
+and easier to plan.
+
+So the whole transit is planned as joint motion first, and then measured. Every point
+within `--near-panel-mm` of a panel or a piece of tooling is a candidate; maximal runs of
+those points are found, and each run is re-planned as a chain of straight Cartesian moves.
+Deciding it by measurement is the point — the entry and exit of a near-panel stretch are
+themselves the output of pathfinding, so there is no way to pick them in advance, and a
+fixed retract direction is exactly the assumption that fails on a panel with a complex
+shape.
+
+Within a run, the straight chord end to end is tried first, since one long `L` is what a
+robot programmer would write. Where the part is in the way the span is halved and each
+half tried in turn, so the chain bends only where it has to. It converges: the guide's own
+steps are one collision-check resolution apart and so are very nearly straight already. A
+run that cannot be linearised at all keeps its joint motion, which makes the worst case the
+route that would have been emitted anyway.
+
+Two details are worth knowing about:
+
+* **It runs before shortcutting and reduction, not after.** Those passes reshape a route to
+  save time, and cutting the corner that a linear move exists to hold is exactly how they
+  would save it. Deciding which stretches are linear afterwards would mean deciding it
+  about a route that had already been pulled out of shape. Once the split is made, the
+  passes are applied only to the joint-motion runs; a linear run is a decision about the
+  shape of the move, not a route to be improved.
+* **Brief contact with the band is ignored.** A sweeping transit that clips the proximity
+  band for a moment is not working near the panel, and cutting it into three phases to say
+  so would cost a stop at each end for nothing. `--near-panel-min-mm` is the shortest
+  stretch worth converting, measured as tool travel rather than as a waypoint count.
+
+The endpoints of a linear run are snapped back onto the joint route's own states. IK
+returns whichever solution is nearest the seed rather than the exact state asked for, and a
+linear run that ends a hair off where the next run begins is a discontinuity the controller
+has no way to execute; the displacement allowed is one `--check-step-deg`, which is below
+what the collision checking can resolve anyway.
+
+This is separate from, and composes with, the fixed linear zone at a weld
+(`planning.linear_zone_mm`, see [Welds](#welds)): that one is a straight lead-in along one
+named axis, this one follows wherever the route goes. `--no-near-panel-linear` turns it
+off.
+
 ## Velocity profile
 
 Every waypoint is a full stop, and each move runs **bang-bang**: each joint accelerates at
@@ -665,6 +712,9 @@ correction is what keeps the false contact from disabling a real collision check
 | `--no-shortcut` | off | emit the sampling planner's own route, unshortened |
 | `--shortcut-seconds` | 10 | time budget for shortcutting each transit |
 | `--polish-seconds` | 5 | time budget for the final pass over the emitted waypoints |
+| `--no-near-panel-linear` | off | plan every transit as joint motion, never converting to linear |
+| `--near-panel-mm` | 100 | clearance at or under which a stretch is re-planned as linear motion |
+| `--near-panel-min-mm` | 150 | shortest near-panel stretch worth converting, as tool travel |
 | `--min-shell-mm` | 5 | drop collision shells smaller than this |
 | `--max-shells` | 500 | cap convex shells per link |
 | `--hull-cell-mm` | 0 | refine badly-hulled shells into cells this size; 0 disables |
