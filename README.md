@@ -701,35 +701,35 @@ correction is what keeps the false contact from disabling a real collision check
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--approach-axis` | `-x` | lead-in/lead-out direction at welds, in the locator's own frame |
+| `--approach-axis` | -z | lead-in/lead-out direction at welds, in the locator's own frame |
 | `--no-linear-zone` | off | skip the straight lead-in and lead-out at welds entirely |
 | `--linear-step-mm` | 50 | point spacing on linear approach/depart |
 | `--check-step-deg` | 3 | collision checking resolution along a move |
 | `--segment-length-rad` | 0.02 | collision resolution inside the sampling planner |
-| `--ompl-attempts` | 3 | most freespace attempts before the fallback route |
-| `--ompl-min-runs` | 3 | sample this many solutions and keep the cheapest |
-| `--ompl-seconds` | 5 | how long one sampling-planner run may search |
+| `--ompl-attempts` | 20 | most freespace attempts before the fallback route |
+| `--ompl-min-runs` | 7 | sample this many solutions and keep the cheapest |
+| `--ompl-seconds` | 7 | how long one sampling-planner run may search |
 | `--no-shortcut` | off | emit the sampling planner's own route, unshortened |
-| `--shortcut-seconds` | 10 | time budget for shortcutting each transit |
-| `--polish-seconds` | 5 | time budget for the final pass over the emitted waypoints |
+| `--shortcut-seconds` | 20 | time budget for shortcutting each transit |
+| `--polish-seconds` | 20 | time budget for the final pass over the emitted waypoints |
 | `--no-near-panel-linear` | off | plan every transit as joint motion, never converting to linear |
 | `--near-panel-mm` | 100 | clearance at or under which a stretch is re-planned as linear motion |
 | `--near-panel-min-mm` | 150 | shortest near-panel stretch worth converting, as tool travel |
 | `--min-shell-mm` | 5 | drop collision shells smaller than this |
-| `--max-shells` | 500 | cap convex shells per link |
-| `--hull-cell-mm` | 0 | refine badly-hulled shells into cells this size; 0 disables |
+| `--max-shells` | 1500 | cap convex shells per link |
+| `--hull-cell-mm` | 25 | refine badly-hulled shells into cells this size; 0 disables |
 | `--hull-fill` | 0.75 | bounding-box fill below which a shell is refined |
-| `--robot-cell-mm` | `--hull-cell-mm` | cell size for the arm's own links |
-| `--gun-cell-mm` | `--hull-cell-mm` | cell size for the gun body and moving tip |
-| `--tooling-cell-mm` | `--hull-cell-mm` | cell size for static objects the manifest calls tooling |
-| `--panel-cell-mm` | `--hull-cell-mm` | cell size for static objects the manifest calls panel |
+| `--robot-cell-mm` | 0 | cell size for the arm's own links |
+| `--gun-cell-mm` | 0 | cell size for the gun body and moving tip |
+| `--tooling-cell-mm` | 25 | cell size for static objects the manifest calls tooling |
+| `--panel-cell-mm` | 25 | cell size for static objects the manifest calls panel |
 | `--obstacle-clearance-mm` | 0 | clear air to hold from panels and tooling; may be negative |
-| `--weld-clearance-mm` | 2 | clearance used instead on moves to or from a weld |
+| `--weld-clearance-mm` | −12 | clearance used instead on moves to or from a weld |
 | `--weld-shift-mm` | −5 | shift weld locators along their own z before planning |
 | `--no-clearance-penalty` | off | avoid only hard collisions, ignoring proximity |
-| `--clearance-penalty-max-mm` | 50 | clearance at and above which there is no penalty |
-| `--clearance-penalty-min-mm` | 3 | clearance at and below which the penalty peaks |
-| `--clearance-penalty-multiplier` | 50 | peak penalty factor |
+| `--clearance-penalty-max-mm` | 300 | clearance at and above which there is no penalty |
+| `--clearance-penalty-min-mm` | 10 | clearance at and below which the penalty peaks |
+| `--clearance-penalty-multiplier` | 5 | peak penalty factor |
 | `--clearance-penalty-cutoff-mm` | 0 | ignore clearances beyond this; 0 uses the maximum |
 | `--joint-max-velocity` | 2π/3, J6 11π/9 | per-joint velocity limits, rad/s, comma separated |
 | `--joint-max-acceleration` | 2.5, J6 11 | per-joint acceleration limits, rad/s², comma separated |

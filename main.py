@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
     #MAX OMPL (pathfinding) ATTEMPTS
     p.add_argument("--ompl-attempts", type=int, default=20,
                    help="most freespace planning attempts per segment, used to retry a "
-                        "transit that keeps failing (default: 3)")
+                        "transit that keeps failing (default: 20)")
     #MIN OMPL ATTEMPTS
     p.add_argument("--ompl-min-runs", type=int, default=7, metavar="N",
                    help="always run the sampling planner at least this many times per "
@@ -61,10 +61,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "the first one that works. The planner returns whichever route it "
                         "stumbles on first, and no later pass can move a route to the "
                         "other side of an obstacle, so this is the only stage that can "
-                        "choose between them. Costs a full solve per run (default: 3)")
+                        "choose between them. Costs a full solve per run (default: 7)")
     #OMPL ATTEMPT MAX TIME
     p.add_argument("--ompl-seconds", type=float, default=7.0, metavar="SECONDS",
-                   help="how long one sampling-planner run may search before giving up. Raise it for a transit that keeps failing, where restarting the search wastes the tree built so far; every run costs this long in the worst case, so it multiplies with --ompl-min-runs (default: 5)")
+                   help="how long one sampling-planner run may search before giving up. "
+                        "Raise it for a transit that keeps failing, where restarting the "
+                        "search wastes the tree built so far; every run costs this long in "
+                        "the worst case, so it multiplies with --ompl-min-runs "
+                        "(default: 7)")
+
+    ###OPTIMISATION###
     #DISABLE SHORTCUT PASS
     p.add_argument("--no-shortcut", dest="shortcut", action="store_false",
                    help="skip the shortcutting pass and emit the sampling planner's own "
@@ -72,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
     #SHORTCUT PASS TIME
     p.add_argument("--shortcut-seconds", type=float, default=20.0, metavar="SECONDS",
                    help="time budget for shortcutting each freespace transit; longer "
-                        "budgets keep shortening with diminishing returns (default: 30)")
+                        "budgets keep shortening with diminishing returns (default: 20)")
     #POLISH PASS TIME
     p.add_argument("--polish-seconds", type=float, default=20.0, metavar="SECONDS",
                    help="time budget for the final pass over each transit's emitted "
@@ -80,106 +86,140 @@ def build_parser() -> argparse.ArgumentParser:
                         "stop-to-stop time the robot really pays for each one. The "
                         "earlier passes work on a densified path where a waypoint is a "
                         "sampling artefact rather than a stop; this one does not "
-                        "(default: 5)")
+                        "(default: 20)")
+
+    ###LINEAR MOTION NEAR THE PARTS###
+    #DISABLE LINEAR MOTION NEAR THE PARTS
     p.add_argument("--no-near-panel-linear", dest="near_panel_linear",
                    action="store_false",
                    help="plan every transit as joint motion throughout, rather than "
                         "re-planning the stretches that run close to the parts as straight "
                         "moves")
+    #WHAT COUNTS AS NEAR A PART
     p.add_argument("--near-panel-mm", type=float, default=100.0, metavar="MM",
                    help="clearance from a panel or from tooling at or under which a "
                         "transit counts as working near the parts, and is re-planned as "
                         "linear motion. Larger means more of the route comes out linear, "
                         "which is more predictable and slower to execute (default: 100)")
+    #SHORTEST STRETCH WORTH MAKING LINEAR
     p.add_argument("--near-panel-min-mm", type=float, default=150.0, metavar="MM",
                    help="shortest near-panel stretch worth converting, measured as tool "
                         "travel. A sweeping transit that clips the proximity band for a "
                         "moment is not working near the panel, and cutting it in three to "
                         "say so costs a stop at each end for nothing (default: 150)")
+
+    ###COLLISION HULLS###
+    #DROP TINY SHELLS
     p.add_argument("--min-shell-mm", type=float, default=5.0,
                    help="drop collision shells smaller than this across their bounding "
                         "box diagonal (default: 5)")
+    #SHELL COUNT CAP PER LINK
     p.add_argument("--max-shells", type=int, default=1500,
                    help="keep at most this many convex shells per link; fewer is faster "
-                        "but coarser (default: 500)")
+                        "but coarser (default: 1500)")
+    #HULL REFINEMENT CELL SIZE
     p.add_argument("--hull-cell-mm", type=float, default=25.0, metavar="MM",
                    help="split shells that a single convex hull fits badly into cells of "
                         "roughly this size, hulling each one, so the collision geometry "
                         "follows recesses instead of bridging them. Smaller is more "
-                        "accurate and slower; 0 disables (default: 0)")
+                        "accurate and slower; 0 disables (default: 25)")
+    #WHEN A SHELL NEEDS REFINING AT ALL
     p.add_argument("--hull-fill", type=float, default=0.75, metavar="F",
                    help="how much of its own bounding box a shell must fill before a "
                         "single hull is accepted for it; below this it is split by "
                         "--hull-cell-mm. Raise it towards 1 for geometry whose recesses "
                         "matter, such as panelling full of shallow bowls that a hull "
                         "would skin over (default: 0.75)")
+    #CELL SIZE: ARM
     p.add_argument("--robot-cell-mm", type=float, default=0, metavar="MM",
                    help="--hull-cell-mm for the arm's own links. The arm never comes close "
                         "enough to the parts for hull error to decide anything, so this is "
-                        "the first thing to switch off (default: --hull-cell-mm)")
+                        "the first thing to switch off (default: 0, i.e. off)")
+    #CELL SIZE: GUN
     p.add_argument("--gun-cell-mm", type=float, default=0, metavar="MM",
                    help="--hull-cell-mm for the gun body and moving tip. The gun is convex "
                         "where it makes contact, so refining it buys accuracy nowhere and "
-                        "costs shells everywhere (default: --hull-cell-mm)")
+                        "costs shells everywhere (default: 0, i.e. off)")
+    #CELL SIZE: TOOLING
     p.add_argument("--tooling-cell-mm", type=float, default=25, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls tooling. "
                         "These are the largest meshes in the cell and refinement runs "
                         "after --max-shells, so a small cell here dominates both "
-                        "preparation and every later collision check "
-                        "(default: --hull-cell-mm)")
+                        "preparation and every later collision check (default: 25)")
+    #CELL SIZE: PANELS
     p.add_argument("--panel-cell-mm", type=float, default=25, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls panel. This "
                         "is the geometry that is concave exactly where the welds are, so "
-                        "it is where a small cell is worth paying for "
-                        "(default: --hull-cell-mm)")
+                        "it is where a small cell is worth paying for (default: 25)")
+
+    ###CLEARANCE FROM THE PARTS###
+    #CLEARANCE EVERYWHERE
     p.add_argument("--obstacle-clearance-mm", type=float, default=0.0, metavar="MM",
                    help="how close the robot and gun may come to the panels and tooling "
                         "before it counts as a collision. Positive keeps that much clear "
                         "air, 0 means touching collides, negative tolerates that much "
                         "overlap (default: 0)")
+    #CLEARANCE ON A MOVE TO OR FROM A WELD
     p.add_argument("--weld-clearance-mm", type=float, default=-12.0, metavar="MM",
                    help="obstacle clearance used instead of --obstacle-clearance-mm on "
                         "any move starting or ending at a weld locator, where the gun "
-                        "has to reach the panel (default: 2)")
+                        "has to reach the panel (default: -12)")
+    #BACK THE WELD OFF THE PANEL SURFACE
     p.add_argument("--weld-shift-mm", type=float, default=-5.0, metavar="MM",
                    help="move every weld locator this far along its own z axis before "
                         "planning, backing the tool off a pose authored on the panel "
                         "surface. Negative retreats along -z (default: -5)")
+
+    ###CLEARANCE PENALTY###
+    #DISABLE CLEARANCE PENALTY
     p.add_argument("--no-clearance-penalty", dest="clearance_penalty",
                    action="store_false",
                    help="do not penalise routes that run close to the panels and "
                         "tooling; only hard collisions are avoided")
+    #PENALTY CURVE START
     p.add_argument("--clearance-penalty-max-mm", type=float, default=300.0, metavar="MM",
                    help="clearance at and above which there is no penalty; the curve "
                         "starts here (default: 300)")
+    #PENALTY CURVE PEAK
     p.add_argument("--clearance-penalty-min-mm", type=float, default=10.0, metavar="MM",
                    help="clearance at and below which the penalty is at its peak "
                         "(default: 10)")
+    #PENALTY PEAK STRENGTH
     p.add_argument("--clearance-penalty-multiplier", type=float, default=5.0,
                    metavar="N",
                    help="peak penalty: a second spent at the minimum clearance costs as "
                         "much as N seconds in open space (default: 5)")
+    #PENALTY QUERY RANGE
     p.add_argument("--clearance-penalty-cutoff-mm", type=float, default=0.0, metavar="MM",
                    help="ignore clearances beyond this, so the proximity query looks no "
                         "further and planning runs faster. Truncates the shallow end of "
                         "the curve without reshaping the rest, so the penalty steps "
                         "abruptly at this distance; 0 uses the maximum (default: 0)")
+
+    ###VELOCITY PROFILE###
+    #JOINT VELOCITY LIMITS
     p.add_argument("--joint-max-velocity", metavar="V1,V2,...",
                    help="per-joint velocity limits in rad/s, comma separated in joint "
                         "order; a single value applies to every joint "
                         "(default: 2pi/3 for j1-j5, 11pi/9 for j6)")
+    #JOINT ACCELERATION LIMITS
     p.add_argument("--joint-max-acceleration", metavar="A1,A2,...",
                    help="per-joint acceleration limits in rad/s^2, comma separated in "
                         "joint order; a single value applies to every joint "
                         "(default: 2.5 for j1-j5, 11 for j6)")
+    #TOOL SPEED CAP ON LINEAR MOVES
     p.add_argument("--linear-speed-mm-s", type=float, default=250.0,
                    help="commanded tool speed cap on linear moves; the joint limits still "
                         "govern whenever they are slower (default: 250)")
+
+    ###OUTPUT AND DEBUGGING###
+    #WRITE THE PRE-OPTIMISATION PATH TOO
     p.add_argument("--unrefined-output", action="store_true",
                    help="also write waypoints-unrefined.json, holding each transit as the "
                         "sampling planner returned it, before shortcutting and waypoint "
                         "reduction. Same schema as waypoints.json, for comparing what the "
                         "optimisation passes actually changed (default: off)")
+    #WRITE THE HULLS THE PLANNER SEES
     p.add_argument("--export-collision-geometry", action="store_true",
                    help="write the convex geometry the planner actually collides against "
                         "to <directory>/collision_geometry, one OBJ per link with each "
@@ -188,6 +228,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "convex_cache files are the input to the decomposition and still "
                         "hold the original concave triangles, so they cannot show where a "
                         "hull bridges a recess; these can (default: off)")
+    #SUPPRESS THE RUN LOG
     p.add_argument("--quiet", action="store_true", help="only print the final summary")
     return p
 
