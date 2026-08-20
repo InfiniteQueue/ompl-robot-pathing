@@ -17,10 +17,11 @@ writes `<directory>/waypoints.json`. Filenames are fixed.
 | `<dir>/meshes/*.obj` | input: geometry referenced by the manifest |
 | `<dir>/waypoints.json` | **output** |
 | `<dir>/waypoints-unrefined.json` | output, only with `--unrefined-output`: the same motion before shortcutting and reduction |
-| `<dir>/convex_cache/` | generated: convex collision geometry, reused between runs |
+| `<dir>/convex_cache/` | generated: shells for the convex decomposition, reused between runs |
 | `<dir>/generated/` | generated: the URDF/SRDF and plugin configs actually loaded |
+| `<dir>/collision_geometry/` | generated, only with `--export-collision-geometry`: the convex geometry actually collided against |
 
-The two generated directories are safe to delete; they are rebuilt on the next run.
+The generated directories are safe to delete; they are rebuilt on the next run.
 
 ## How it works
 
@@ -67,6 +68,24 @@ make the difference between planning working and not working at all:
   are flat triangle soups, but they are assemblies — the gun is 948 disconnected shells,
   each panel over 120. Splitting on connected components and writing each shell as its
   own `o` group makes Tesseract build one convex hull per shell, keeping the throat open.
+
+`convex_cache` holds the *input* to that step, not its output. Each file groups the
+shells as `o shell_NNNNN`, and each group still carries the original concave triangles;
+Tesseract computes the hulls itself at load, because the URDF tags every prepared mesh
+`tesseract:make_convex="true"`. Opening a cache file therefore shows faithful CAD and says
+nothing about how coarse the collision model is. To see that, run with
+`--export-collision-geometry`, which reads the hull vertices back out of the loaded
+environment and writes them to `<dir>/collision_geometry/`, one OBJ per link with each
+convex piece as its own `o` group, in world coordinates and the manifest's units so they
+drop straight on top of the source meshes in a viewer. That is the geometry Bullet tests,
+so a bridged throat or a filled recess is visible there and nowhere else.
+
+The surface is rebuilt by hulling those vertices rather than by reading the face lists that
+come with them, which are not usable: on a 39-vertex hull the faces name 36 vertices apiece
+and those vertices sit up to a metre off the plane of their own face. Since the points are
+already a hull's vertices, hulling them again reproduces the collision shape exactly — on
+`robot_base` every piece comes out closed with exactly 2V−4 triangles. The export costs
+about 90 s on the sample cell and is off by default.
 
 Shells smaller than `--min-shell-mm` are dropped and only the `--max-shells` largest are
 kept, because every shell is a collision pair to test. Measured on an earlier study whose
@@ -575,6 +594,57 @@ slower checks starve the sampling planner of its time budget. Leave it off unles
 particular cell has a large open feature (a gun throat, a deep fixture pocket) that a
 single hull is closing off, which is the case it was built for.
 
+### Spending the refinement where it matters
+
+A shell is only refined at all if it fills less than `--hull-fill` of its bounding box.
+That gate was inert: `hull_fill` judged watertightness on raw triangle indices, and CAD
+tessellation duplicates vertices along shared edges, so **every** shell in the sample cell
+read as an open surface and scored 0.0 — 0 of 6 panel shells and 0 of the first 200 fixture
+shells were watertight, against 3 and 185 once the vertices are welded. The threshold was
+therefore never comparing anything, and `--hull-cell-mm` was on or off for a whole link.
+Watertightness is now judged on welded indices.
+
+That fix does not change which shells get refined here, and it is worth being clear that
+raising `--hull-fill` will not either: with real fills measured, the panel's shells sit at
+0.000 and the fixture's at a median of 0.005, so they are far below any threshold worth
+setting. Every shell in both is refined at 0.75 already. The threshold is the right control
+for solid, well-filled parts — 14 of the gun body's shells and 12 of `robot_link3`'s score
+above 0.9 and are correctly left alone — but for panelling the control that matters is the
+cell size.
+
+Cell size is set per *category* — `--robot-cell-mm`, `--gun-cell-mm`,
+`--tooling-cell-mm`, `--panel-cell-mm`, each falling back to `--hull-cell-mm` when it is
+not given. The categories come from the manifest, not from the CAD names: the first device
+is the robot, any later one is the gun, and every static object already carries a
+`category` of `panel` or `tooling`. That matters because the links do not all deserve the
+same treatment:
+
+* **Panelling** is concave precisely where the gun reaches, and wants the smallest cell
+  the check time will bear. On the sample panel, `--hull-cell-mm 25` takes it from 6 shells
+  to 1958 and `8` takes it to 10052.
+* **Tooling** is large and mostly open, and wants refinement near the panels but not the
+  triangle budget of the whole frame. Refinement runs *after* `--max-shells`, so the cap
+  stops bounding anything once it is on: at 25 mm the sample fixture goes from 1136 shells
+  to 45222, and that is paid on every collision check for the rest of the run.
+* **The gun body and moving tip** are convex where they come close to anything, so
+  refining them buys accuracy nowhere and costs shells everywhere.
+* **The rest of the arm** never approaches the parts closely enough for hull error to
+  decide anything.
+
+So a sensible split is aggressive on the panels, moderate on the fixture, and off on the
+gun and arm:
+
+```
+--hull-cell-mm 0 --panel-cell-mm 8 --tooling-cell-mm 60
+```
+
+The shell counts that produces are large, and they are paid for on every collision check;
+`--export-collision-geometry` is the way to see whether the extra shells actually followed
+the recess you were after before committing to the runtime.
+
+Each link's cell size and fill threshold are part of its cache key, so changing one link's
+settings re-prepares only that link.
+
 Genuinely tighter geometry needs a decomposition that cuts along concavity rather than on
 a grid — VHACD or CoACD. Neither ships with `tesseract-robotics`, and this venv has only
 numpy, so that would mean taking on a new dependency. Until then the pair-margin
@@ -598,6 +668,11 @@ correction is what keeps the false contact from disabling a real collision check
 | `--min-shell-mm` | 5 | drop collision shells smaller than this |
 | `--max-shells` | 500 | cap convex shells per link |
 | `--hull-cell-mm` | 0 | refine badly-hulled shells into cells this size; 0 disables |
+| `--hull-fill` | 0.75 | bounding-box fill below which a shell is refined |
+| `--robot-cell-mm` | `--hull-cell-mm` | cell size for the arm's own links |
+| `--gun-cell-mm` | `--hull-cell-mm` | cell size for the gun body and moving tip |
+| `--tooling-cell-mm` | `--hull-cell-mm` | cell size for static objects the manifest calls tooling |
+| `--panel-cell-mm` | `--hull-cell-mm` | cell size for static objects the manifest calls panel |
 | `--obstacle-clearance-mm` | 0 | clear air to hold from panels and tooling; may be negative |
 | `--weld-clearance-mm` | 2 | clearance used instead on moves to or from a weld |
 | `--weld-shift-mm` | −5 | shift weld locators along their own z before planning |
@@ -610,6 +685,7 @@ correction is what keeps the false contact from disabling a real collision check
 | `--joint-max-acceleration` | 2.5, J6 11 | per-joint acceleration limits, rad/s², comma separated |
 | `--linear-speed-mm-s` | 250 | tool speed cap on `LIN` moves |
 | `--unrefined-output` | off | also write `waypoints-unrefined.json`, pre-optimisation |
+| `--export-collision-geometry` | off | write the hulls actually collided against to `<dir>/collision_geometry/` |
 | `--quiet` | off | print only the summary |
 
 Exit code is 0 when every segment planned, 1 otherwise.

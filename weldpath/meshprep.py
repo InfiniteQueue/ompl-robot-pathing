@@ -45,18 +45,23 @@ def load_obj(path: str) -> tuple[np.ndarray, np.ndarray]:
     return V, F
 
 
-def connected_shells(V: np.ndarray, F: np.ndarray, weld_tol: float = 1e-6) -> np.ndarray:
-    """Label each triangle with the id of the connected shell it belongs to.
+def weld_index(V: np.ndarray, weld_tol: float = 1e-6) -> np.ndarray:
+    """Map each vertex to an id shared by every vertex at the same rounded position.
 
-    Vertices are welded on a rounded coordinate key first, because CAD tessellation
-    routinely duplicates vertices along shared edges; without welding a single solid
-    would shatter into thousands of fragments.
+    CAD tessellation routinely duplicates vertices along shared edges, so raw indices say
+    nothing about which triangles actually meet.  Every topological question here -- what
+    is one shell, what is closed -- has to be asked of the welded indices instead.
     """
-    if len(F) == 0:
-        return np.zeros(0, dtype=np.int64)
     key = np.round(V / weld_tol).astype(np.int64)
     _, inv = np.unique(key, axis=0, return_inverse=True)
-    inv = inv.reshape(-1)
+    return inv.reshape(-1)
+
+
+def connected_shells(V: np.ndarray, F: np.ndarray, weld_tol: float = 1e-6) -> np.ndarray:
+    """Label each triangle with the id of the connected shell it belongs to."""
+    if len(F) == 0:
+        return np.zeros(0, dtype=np.int64)
+    inv = weld_index(V, weld_tol)
     n = int(inv.max()) + 1
     parent = np.arange(n, dtype=np.int64)
 
@@ -103,7 +108,7 @@ def mesh_volume(V: np.ndarray, tris: np.ndarray) -> float:
     return float(abs(np.einsum("ij,ij->i", a, np.cross(b, c)).sum()) / 6.0)
 
 
-def hull_fill(V: np.ndarray, tris: np.ndarray) -> float:
+def hull_fill(V: np.ndarray, tris: np.ndarray, weld: np.ndarray | None = None) -> float:
     """How much of its own bounding box a shell fills, as a proxy for hull tightness.
 
     A machined block fills nearly all of it and hulls faithfully.  A C-yoke or a casting
@@ -113,12 +118,19 @@ def hull_fill(V: np.ndarray, tris: np.ndarray) -> float:
     Open shells get 0.0, i.e. "assume it needs refining": a surface encloses no volume, so
     there is nothing to compare, and an unclosed sheet is exactly the case where a hull
     over-claims the space behind it.
+
+    Watertightness has to be judged on welded indices.  Asked of the raw ones it comes back
+    false for *every* shell in the sample cell -- 0 of 6 panel shells and 0 of the first 200
+    fixture shells, against 3 and 185 once welded -- which silently collapses the fill
+    threshold into "always refine".
     """
     P = V[np.unique(tris)]
     box = float(np.prod(P.max(axis=0) - P.min(axis=0)))
     if box <= 0:
         return 1.0                          # planar: a hull is already exact
-    if not is_watertight(tris):
+    if weld is None:
+        weld = weld_index(V)
+    if not is_watertight(weld[tris]):
         return 0.0
     return mesh_volume(V, tris) / box
 
@@ -169,6 +181,7 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
     """
     t0 = time.time()
     V, F = load_obj(src)
+    weld = weld_index(V)
     labels = connected_shells(V, F)
     unique = np.unique(labels)
 
@@ -209,7 +222,7 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
         for vids, tris in groups:
             P = V[vids]
             diagonal = float(np.linalg.norm(P.max(axis=0) - P.min(axis=0)))
-            if diagonal <= hull_cell or hull_fill(V, tris) >= fill_threshold:
+            if diagonal <= hull_cell or hull_fill(V, tris, weld) >= fill_threshold:
                 refined.append((vids, tris))
                 continue
             pieces = split_by_grid(V, tris, hull_cell)
@@ -255,16 +268,18 @@ def _signature(path: str) -> list:
     return [int(st.st_size), int(st.st_mtime)]
 
 
+DEFAULT_FILL = 0.75
+
+
 def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             log=print, min_extent: float = 40.0, max_shells: int = 80,
-            hull_cell: float = 0.0) -> dict[str, str]:
+            hull_cell: float = 0.0, fill: float = DEFAULT_FILL,
+            cells: dict[str, float] | None = None) -> dict[str, str]:
     """Convex-decompose every mesh that needs it, reusing cached results.
 
     ``mesh_rel_paths`` maps link name -> mesh path relative to ``directory``.
     Returns link name -> absolute path of the prepared collision OBJ.
     """
-    settings = [round(float(min_extent), 4), int(max_shells), round(float(scale), 9),
-                round(float(hull_cell), 4)]
     cache_dir = os.path.join(directory, CACHE_DIRNAME).replace("\\", "/")
     os.makedirs(cache_dir, exist_ok=True)
     index_path = os.path.join(cache_dir, "index.json")
@@ -278,6 +293,10 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
 
     out: dict[str, str] = {}
     for link, rel in mesh_rel_paths.items():
+        cell = float((cells or {}).get(link, hull_cell))
+        threshold = float(fill)
+        settings = [round(float(min_extent), 4), int(max_shells), round(float(scale), 9),
+                    round(cell, 4), round(threshold, 4)]
         src = os.path.join(directory, rel).replace("\\", "/")
         if not os.path.isfile(src):
             log(f"  ! missing mesh for {link}: {rel}")
@@ -291,9 +310,10 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             out[link] = dst
             continue
         stats = decompose_to_obj(src, dst, scale, min_extent=min_extent,
-                                 max_shells=max_shells, hull_cell=hull_cell)
-        refined = (f", {stats['shells_refined']} refined" if stats["shells_refined"]
-                   else "")
+                                 max_shells=max_shells, hull_cell=cell,
+                                 fill_threshold=threshold)
+        refined = (f", {stats['shells_refined']} split at {cell:g} mm below "
+                   f"{threshold:g} fill" if stats["shells_refined"] else "")
         log("  + %-22s %d tris, %d shells -> %d kept%s (%.1fs)"
             % (link, stats["triangles"], stats["shells"], stats["shells_kept"],
                refined, stats["seconds"]))

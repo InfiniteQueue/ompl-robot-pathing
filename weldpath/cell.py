@@ -432,8 +432,39 @@ class Cell:
         return best
 
 
-def _resolve_collision_meshes(man: Manifest, log, min_extent: float,
-                              max_shells: int, hull_cell: float) -> dict[str, str]:
+def hull_categories(man: Manifest) -> dict[str, str]:
+    """Link name -> the category whose cell size applies to it.
+
+    The categories -- robot, gun, tooling, panel -- come from the manifest: the first
+    device is the robot, any later one is the gun, and every static object already carries
+    a category.  So nothing here depends on how the CAD happens to be named.
+    """
+    out = {link.name: "robot" for link in man.robot.links}
+    for device in man.devices[1:]:
+        out.update({link.name: "gun" for link in device.links})
+    out.update({s.name: s.category for s in man.static_objects})
+    return out
+
+
+def hull_cells(man: Manifest, hull_cell: float,
+               per_category: dict[str, float | None] | None = None) -> dict[str, float]:
+    """Link name -> the cell size to refine its shells at, in manifest units.
+
+    Refinement is worth paying for where the geometry is concave *at the point of closest
+    approach*: the panels the gun reaches into, and the tooling around them.  It is wasted
+    on the arm, which never comes near anything, and on the gun, which is convex where it
+    matters -- and since refinement runs after ``--max-shells``, spending it on a large
+    part is what takes a 1136-shell fixture to 45222 and slows every later check.
+    """
+    chosen = per_category or {}
+    return {name: float(chosen.get(category) if chosen.get(category) is not None
+                        else hull_cell)
+            for name, category in hull_categories(man).items()}
+
+
+def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells: int,
+                              hull_cell: float, hull_fill: float,
+                              hull_per_category) -> dict[str, str]:
     from . import meshprep
 
     rel: dict[str, str] = {}
@@ -446,7 +477,8 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float,
     log("preparing collision geometry (convex decomposition):")
     return meshprep.prepare(man.directory, rel, man.scale, log=log,
                             min_extent=min_extent, max_shells=max_shells,
-                            hull_cell=hull_cell)
+                            hull_cell=hull_cell, fill=hull_fill,
+                            cells=hull_cells(man, hull_cell, hull_per_category))
 
 
 # Probe distance for the exact re-measurement.  Generous on purpose: a pair the hulls
@@ -663,10 +695,12 @@ def _apply_joint_limits(env: Environment, names: list[str], dynamics, log) -> No
 
 def build(man: Manifest, log=print, out_dir: str | None = None,
           min_shell_mm: float = 40.0, max_shells: int = 80,
-          hull_cell_mm: float = 0.0, obstacle_clearance_mm: float = 0.0,
+          hull_cell_mm: float = 0.0, hull_fill: float = 0.75,
+          hull_per_category=None, obstacle_clearance_mm: float = 0.0,
           penalty=None, dynamics=None) -> Cell:
     """Prepare geometry, emit URDF/SRDF, load the environment and generate the ACM."""
-    collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm)
+    collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm,
+                                          hull_fill, hull_per_category)
     velocity = {}
     if dynamics is not None:
         velocity = {n: float(v) for n, v in zip(man.robot_joint_names, dynamics.velocity)}

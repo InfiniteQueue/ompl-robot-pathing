@@ -19,9 +19,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Plan a FANUC weld path from a Tesseract study directory.")
     p.add_argument("directory",
                    help="study directory containing manifest.json and meshes/")
-    p.add_argument("--approach-axis", choices=["+x", "-x", "+y", "-y", "+z", "-z"],
+    p.add_argument("--approach-axis", default = "-z", choices=["+x", "-x", "+y", "-y", "+z", "-z"],
                    help="direction in a weld locator's own frame that the straight "
-                        "lead-in and lead-out travel along (default: -x)")
+                        "lead-in and lead-out travel along (default: -z)")
     p.add_argument("--no-linear-zone", dest="linear_zone", action="store_false",
                    help="do not lead into or out of a weld in a straight line. Every "
                         "millimetre of the manifest's linear_zone_mm has to be clear "
@@ -74,6 +74,31 @@ def build_parser() -> argparse.ArgumentParser:
                         "roughly this size, hulling each one, so the collision geometry "
                         "follows recesses instead of bridging them. Smaller is more "
                         "accurate and slower; 0 disables (default: 0)")
+    p.add_argument("--hull-fill", type=float, default=0.75, metavar="F",
+                   help="how much of its own bounding box a shell must fill before a "
+                        "single hull is accepted for it; below this it is split by "
+                        "--hull-cell-mm. Raise it towards 1 for geometry whose recesses "
+                        "matter, such as panelling full of shallow bowls that a hull "
+                        "would skin over (default: 0.75)")
+    p.add_argument("--robot-cell-mm", type=float, default=0, metavar="MM",
+                   help="--hull-cell-mm for the arm's own links. The arm never comes close "
+                        "enough to the parts for hull error to decide anything, so this is "
+                        "the first thing to switch off (default: --hull-cell-mm)")
+    p.add_argument("--gun-cell-mm", type=float, default=0, metavar="MM",
+                   help="--hull-cell-mm for the gun body and moving tip. The gun is convex "
+                        "where it makes contact, so refining it buys accuracy nowhere and "
+                        "costs shells everywhere (default: --hull-cell-mm)")
+    p.add_argument("--tooling-cell-mm", type=float, default=25, metavar="MM",
+                   help="--hull-cell-mm for static objects the manifest calls tooling. "
+                        "These are the largest meshes in the cell and refinement runs "
+                        "after --max-shells, so a small cell here dominates both "
+                        "preparation and every later collision check "
+                        "(default: --hull-cell-mm)")
+    p.add_argument("--panel-cell-mm", type=float, default=25, metavar="MM",
+                   help="--hull-cell-mm for static objects the manifest calls panel. This "
+                        "is the geometry that is concave exactly where the welds are, so "
+                        "it is where a small cell is worth paying for "
+                        "(default: --hull-cell-mm)")
     p.add_argument("--obstacle-clearance-mm", type=float, default=0.0, metavar="MM",
                    help="how close the robot and gun may come to the panels and tooling "
                         "before it counts as a collision. Positive keeps that much clear "
@@ -122,6 +147,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "sampling planner returned it, before shortcutting and waypoint "
                         "reduction. Same schema as waypoints.json, for comparing what the "
                         "optimisation passes actually changed (default: off)")
+    p.add_argument("--export-collision-geometry", action="store_true",
+                   help="write the convex geometry the planner actually collides against "
+                        "to <directory>/collision_geometry, one OBJ per link with each "
+                        "convex piece as its own o group, in world coordinates and the "
+                        "manifest's units so it overlays the source meshes. The "
+                        "convex_cache files are the input to the decomposition and still "
+                        "hold the original concave triangles, so they cannot show where a "
+                        "hull bridges a recess; these can (default: off)")
     p.add_argument("--quiet", action="store_true", help="only print the final summary")
     return p
 
@@ -186,15 +219,24 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     log(penalty.describe())
 
+    per_category = {"robot": args.robot_cell_mm, "gun": args.gun_cell_mm,
+                    "tooling": args.tooling_cell_mm, "panel": args.panel_cell_mm}
+
     try:
         cell = cell_mod.build(man, log=log, min_shell_mm=args.min_shell_mm,
                               max_shells=args.max_shells,
                               hull_cell_mm=args.hull_cell_mm,
+                              hull_fill=args.hull_fill,
+                              hull_per_category=per_category,
                               obstacle_clearance_mm=args.obstacle_clearance_mm,
                               penalty=penalty, dynamics=dynamics)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    if args.export_collision_geometry:
+        from weldpath import hullexport
+        hullexport.export(cell.env, man, directory, log=print)
 
     log("planning:")
     planner = ToolpathPlanner(
