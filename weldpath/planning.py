@@ -206,6 +206,8 @@ def _refine(cell: Cell, path: list[np.ndarray], *, shortcut_seconds: float,
     points are actually worth stopping at, and polishing then judges those stops under the
     time they really cost.
     """
+    log(f"      refining {len(path)} points: up to {shortcut_seconds:g}s shortcutting "
+        f"then {polish_seconds:g}s polishing, both spent in full")
     improved = shortcut(cell, path, time_budget=shortcut_seconds,
                         max_step=check_step, log=log)
     reduced = simplify(cell, improved, max_step=check_step)
@@ -521,6 +523,30 @@ def _capture(record: list | None, path: list[np.ndarray]) -> list[np.ndarray]:
     return path
 
 
+def _endpoint_block(cell: Cell, qa: np.ndarray, qb: np.ndarray) -> str | None:
+    """Why an endpoint is unusable at the gun's current opening, or ``None`` if both are.
+
+    OMPL discovers this for itself -- "Goal state is in collision", then a run spent
+    failing to seed the goal tree -- but only after the whole time budget has gone, and
+    every retry at the same opening reaches the same answer just as slowly.  Two contact
+    queries settle it first.  The two-leg fallback already screens its intermediate pose
+    this way; the endpoints were the omission.
+
+    Both are worth checking, not just the goal.  A transit leaving a weld is planned at the
+    opening the gun leaves with, and it is the *start* that the panel constrains there.
+    """
+    for label, q in (("start", qa), ("goal", qb)):
+        if not cell.in_collision(q):
+            continue
+        touching = sorted(cell.contact_pairs(q).items(), key=lambda kv: kv[1])
+        if touching:
+            (first, second), distance = touching[0]
+            return (f"the {label} pose has {first} {-distance / cell.man.scale:.1f} mm "
+                    f"inside {second} with the gun at this opening")
+        return f"the {label} pose is in collision with the gun at this opening"
+    return None
+
+
 def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
                      runs: int, segment_length: float, check_step: float,
                      fallback_via: list[np.ndarray] | None,
@@ -535,6 +561,11 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
     through a known-clear pose is what a robot programmer would do by hand, and it turns
     a long detour around the panels into two easy problems.
     """
+    blocked = _endpoint_block(cell, qa, qb)
+    if blocked:
+        # Nothing downstream can rescue this: every route at this opening ends here.  The
+        # caller's next candidate opening, or the two-leg split, is the only way on.
+        raise PlanningError(blocked)
     try:
         return _plan_direct(cell, qa, qb, attempts=attempts, runs=runs,
                             segment_length=segment_length, check_step=check_step,
@@ -628,6 +659,10 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
                 record.extend(raw)
             return [(leg, opening)]
         except PlanningError as exc:
+            # Said out loud because the endpoint screen rejects an opening in microseconds
+            # and would otherwise pass in silence, where a failed OMPL run announces itself
+            # at length.  Both reach the same place: this opening is not the one.
+            log(f"      the gun at {opening:g} mm will not do: {exc}")
             last = exc
 
     if len(candidates) < 2 or not fallback_via:
@@ -726,7 +761,10 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
     # only stage that can make that choice at all.
     candidates: list[tuple[float, float, list[np.ndarray]]] = []
     last = ""
-    for attempt in range(1, max(runs, attempts) + 1):
+    total = max(runs, attempts)
+    log(f"      planning with OMPL: up to {total} runs of {planning_time:g}s each, "
+        f"stopping at {runs} once one has solved")
+    for attempt in range(1, total + 1):
         profiles = ProfileDictionary()
         profiles.addProfile(OMPL_NAMESPACE, "DEFAULT",
                             _ompl_profile(segment_length, planning_time, log))
@@ -788,6 +826,7 @@ class LinearZone:
     """Settings for turning the near-panel parts of a transit into linear motion."""
     near_mm: float = 0.0            # clearance at or under which the route counts as near
     min_run_mm: float = 0.0         # shortest stretch worth converting, in tool travel
+    min_run_pct: float = 0.0        # ...or this much of the leg, whichever it meets first
     step_mm: float = 50.0           # point spacing along the straight moves
 
     @property
@@ -826,7 +865,8 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     """
     if zone is not None and zone.enabled:
         runs = linearise(cell, path, near_mm=zone.near_mm, min_run_mm=zone.min_run_mm,
-                         step_mm=zone.step_mm, check_step=check_step, log=log)
+                         min_run_pct=zone.min_run_pct, step_mm=zone.step_mm,
+                         check_step=check_step, log=log)
     else:
         runs = [Run(PTP, list(path))]
     return _refine_runs(cell, runs, shortcut_seconds=shortcut_seconds,
@@ -898,7 +938,7 @@ def _joins(cell: Cell, chain: list[np.ndarray], start: np.ndarray, end: np.ndarr
 
 def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
               min_run_mm: float, step_mm: float, check_step: float,
-              log=None) -> list[Run]:
+              min_run_pct: float = 0.0, log=None) -> list[Run]:
     """Split a joint-space route, re-planning its near-panel stretches as linear moves.
 
     Close to the parts a joint-interpolated move is hard to reason about: the tool sweeps
@@ -909,10 +949,17 @@ def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
 
     So the route is measured, not assumed: every point within ``near_mm`` of a panel or a
     piece of tooling is a candidate, maximal runs of those are found, and each run is
-    re-planned as a chain of straight moves.  A run whose tool travel is under
-    ``min_run_mm`` is left alone -- a long sweeping transit that clips the proximity band
-    for a moment is not "working near the panel", and cutting it into three phases to say
-    so would cost a stop at each end for nothing.
+    re-planned as a chain of straight moves.
+
+    A run qualifies on either of two counts, because a run can be worth converting for
+    either reason.  ``min_run_mm`` is an absolute length: a long sweeping transit that
+    clips the proximity band for a moment is not "working near the panel", and cutting it
+    into three phases to say so would cost a stop at each end for nothing.  But that test
+    alone measures the wrong thing on a short leg -- a 60 mm hop from one weld to the next
+    is near the panel for its whole length and is exactly the motion that should be
+    straight, yet no absolute threshold worth setting for transits will ever admit it.  So
+    ``min_run_pct`` qualifies a run that is a large enough share of the leg's own tool
+    travel, whatever its length.  Either is sufficient.
 
     A run that cannot be linearised keeps its joint motion, so the worst case is the route
     that would have been emitted anyway.
@@ -926,7 +973,11 @@ def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
                                np.asarray(b, dtype=float), check_step))
         dense.append(np.asarray(b, dtype=float))
 
+    if log and len(dense) > 200:
+        log(f"      measuring clearance at {len(dense)} points along the route to find "
+            f"its near-panel stretches")
     near = [cell.clearance_mm(q) <= near_mm for q in dense]
+    total = _tcp_travel(cell, dense)
     runs: list[Run] = []
     kept = skipped = failed = 0
     cursor = 0
@@ -938,7 +989,10 @@ def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
         j = i
         while j + 1 < len(dense) and near[j + 1]:
             j += 1
-        if j > i and _tcp_travel(cell, dense[i:j + 1]) >= min_run_mm:
+        travel = _tcp_travel(cell, dense[i:j + 1]) if j > i else 0.0
+        share = 100.0 * travel / total if total > 0.0 else 0.0
+        if j > i and (travel >= min_run_mm
+                      or (min_run_pct > 0.0 and share >= min_run_pct)):
             chain = _linear_chain(cell, dense[i:j + 1], step_mm=step_mm,
                                   check_step=check_step)
             if chain is not None:

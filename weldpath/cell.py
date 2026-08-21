@@ -14,6 +14,10 @@ Two things here are load-bearing and were established by measurement rather than
   wrong and unsafe, so each tripped pair is re-checked against the raw concave geometry.
   A pair that merely grazes keeps its collision check and gets a pair-specific margin
   offsetting the measured hull inflation; only a genuine overlap is disabled outright.
+* **A collision against the panels or the tooling is never waived.**  Whatever the arm
+  and the gun do among themselves, they may not start inside the parts: disabling such a
+  pair would blind the planner to it everywhere, so the build aborts instead and says
+  which pair and by how much.
 """
 from __future__ import annotations
 
@@ -231,7 +235,7 @@ class Cell:
         return np.concatenate([q, [self.gun_value]])
 
     # -- proximity -----------------------------------------------------------
-    def attach_penalty(self, penalty) -> None:
+    def attach_penalty(self, penalty, log=None) -> None:
         """Give the cell a second contact manager dedicated to measuring clearance.
 
         Margins decide what a manager will even report, and the planning manager's are set
@@ -245,9 +249,12 @@ class Cell:
         wanted = self._extra_probe_mm
         if penalty is not None and penalty.enabled:
             wanted = max(wanted, penalty.probe_mm)
+        if log and wanted > 0.0:
+            log(f"  cloning the collision scene into a clearance manager that can see "
+                f"{wanted:g} mm")
         self._build_proximity(wanted)
 
-    def require_proximity(self, probe_mm: float) -> None:
+    def require_proximity(self, probe_mm: float, log=None) -> None:
         """Make sure clearance can be measured out to ``probe_mm``, penalty or no penalty.
 
         The penalty owns how far it needs to see, but it is not the only caller that wants
@@ -257,6 +264,10 @@ class Cell:
         """
         self._extra_probe_mm = max(self._extra_probe_mm, float(probe_mm))
         if self._extra_probe_mm > self._probe_mm:
+            if log:
+                log(f"  building a clearance manager that can see {self._extra_probe_mm:g} "
+                    f"mm; it clones the collision scene and sets a margin on every "
+                    f"robot-to-part pair")
             self._build_proximity(self._extra_probe_mm)
 
     def _build_proximity(self, probe_mm: float) -> None:
@@ -324,17 +335,37 @@ class Cell:
         return res.size() > 0
 
     def contact_pairs(self, q: np.ndarray) -> dict[tuple[str, str], float]:
+        return {pair: d for pair, (d, _) in self.contacts(q).items()}
+
+    def contacts(self, q: np.ndarray) -> dict[tuple[str, str], tuple[float, np.ndarray]]:
+        """Worst contact per pair, with the world point where it was measured.
+
+        The point is the midpoint of the contact's two nearest points, which for anything
+        close enough to be worth reporting are within a millimetre or two of each other.
+        It answers "where on the gun is this happening", which the distance alone does not.
+        """
         self.set_state(q)
         res = ContactResultMap()
         self._cm.contactTest(res, ContactRequest(ContactTestType_ALL))
         vec = ContactResultVector()
         res.flattenCopyResults(vec)
-        worst: dict[tuple[str, str], float] = {}
+        worst: dict[tuple[str, str], tuple[float, np.ndarray]] = {}
         for c in vec:
             key = tuple(sorted((c.link_names[0], c.link_names[1])))
-            if key not in worst or c.distance < worst[key]:
-                worst[key] = float(c.distance)
+            d = float(c.distance)
+            if key not in worst or d < worst[key][0]:
+                worst[key] = (d, _contact_point(c))
         return worst
+
+    def in_tcp_frame(self, q: np.ndarray, point_world: np.ndarray) -> np.ndarray:
+        """A world point expressed in the TCP's own frame, in manifest units.
+
+        The TCP frame is the one worth quoting a contact in: it is where the operator is
+        looking, and its axes are the ones the approach and the lead-in are defined along.
+        """
+        T = self.fk(q)
+        local = T[:3, :3].T @ (np.asarray(point_world, dtype=float) - T[:3, 3])
+        return local / self.man.scale
 
     def segment_collides(self, a: np.ndarray, b: np.ndarray, max_step: float = 0.05) -> bool:
         """Discretely check the straight joint-space segment a->b."""
@@ -484,9 +515,135 @@ def hull_cells(man: Manifest, hull_cell: float,
             for name, category in hull_categories(man).items()}
 
 
+def weld_points(man: Manifest) -> np.ndarray:
+    """Every weld locator's position, in the frame the static meshes are stored in.
+
+    The static objects are placed at the world origin (see ``SceneBuilder._compute_frames``)
+    and their meshes are exported in world coordinates, so a locator's world position is
+    directly comparable with their vertices.  That is what makes a proximity test possible
+    without a transform -- and why it is offered for the statics only, the arm and the gun
+    being captured in one pose and then moving away from it.
+    """
+    return np.array([loc.pose_world[:3, 3] for loc in man.locators if loc.is_weld],
+                    dtype=float).reshape(-1, 3)
+
+
+# The gun cloud is sampled at a fraction of the radius being tested, floored so a tight
+# radius cannot ask for an unbounded number of points, and the whole cloud is thinned again
+# if it still comes out too large to measure a 2M-triangle fixture against.
+GUN_SAMPLE_FRACTION = 0.25
+GUN_SAMPLE_FLOOR = 10.0
+MAX_FOCUS_POINTS = 4000
+
+
+def _thin(P: np.ndarray, spacing: float) -> np.ndarray:
+    """One point per ``spacing``-sized cube, keeping the first that lands in each."""
+    if spacing <= 0.0 or not len(P):
+        return P
+    _, idx = np.unique(np.floor(P / spacing).astype(np.int64), axis=0, return_index=True)
+    return P[np.sort(idx)]
+
+
+def gun_cloud(man: Manifest, spacing: float) -> np.ndarray:
+    """The gun's surface, thinned, expressed in the TCP's frame in manifest units.
+
+    Read from the source meshes rather than the prepared ones: this is a question about
+    where the metal is, and the prepared file is a decomposition of it whose hulls may sit
+    slightly proud of the surface.
+    """
+    from . import meshprep
+
+    T = np.array(man.tcp_world_pose, dtype=float)
+    R, t = T[:3, :3], T[:3, 3]
+    out: list[np.ndarray] = []
+    for device in man.devices[1:]:
+        for link in device.links:
+            if not link.mesh:
+                continue
+            try:
+                V, _ = meshprep.load_obj(man.mesh_path(link.mesh))
+            except (OSError, ValueError):
+                continue
+            if len(V):
+                out.append(_thin((V - t) @ R, spacing))
+    return np.concatenate(out) if out else np.zeros((0, 3))
+
+
+def gun_at_welds(man: Manifest, radius: float, log=None) -> tuple[np.ndarray, float]:
+    """Where the gun sits when it is at a weld, as points, with the radius to test it at.
+
+    A weld locator is a TCP pose, and the gun is rigid with respect to the TCP, so placing
+    the gun's own surface at every weld says where the metal will actually be -- which is
+    the question the panels and the tooling need answered.  The weld point alone does not
+    answer it: the C-frame reaches a long way back past the electrodes, so tooling that the
+    gun's *throat* will pass through sits well outside any radius drawn around the weld,
+    and refining by that radius refines the wrong side of the part.
+
+    The returned radius is the caller's plus the sampling spacing.  Sampling a surface can
+    only ever understate how close it comes, and that margin covers the understatement, so
+    the test stays conservative.
+    """
+    spacing = max(radius * GUN_SAMPLE_FRACTION, GUN_SAMPLE_FLOOR)
+    welds = [loc for loc in man.locators if loc.is_weld]
+    local = gun_cloud(man, spacing)
+    if not len(local) or not welds:
+        if log:
+            log("  ! no gun geometry to place at the welds; falling back to the weld "
+                "points themselves")
+        return weld_points(man), radius
+    placed = np.concatenate([np.array(loc.pose_world, dtype=float)[:3, :3] @ local.T
+                             + np.array(loc.pose_world, dtype=float)[:3, 3:4]
+                             for loc in welds], axis=1).T
+    points = _thin(placed, spacing)
+    while len(points) > MAX_FOCUS_POINTS:
+        spacing *= 1.5
+        points = _thin(points, spacing)
+    if log:
+        log(f"  the gun sampled at {spacing:g} mm and placed at {len(welds)} weld"
+            f"{'' if len(welds) == 1 else 's'} gives {len(points)} focus points for the "
+            f"panels and tooling")
+    return points, radius + spacing
+
+
+def refinement_focus(man: Manifest, weld_proximity: float, tcp_proximity: float,
+                     log=None) -> dict[str, tuple[np.ndarray, float]]:
+    """Link -> the points its hull refinement should concentrate around, and the radius.
+
+    Both entries rest on the same fact: a source mesh is stored in the coordinates it was
+    captured in, and the link's own origin is applied in the URDF rather than to the file.
+    So a world position from the manifest is directly comparable with a mesh's vertices,
+    and no transform is involved.
+
+    * **Panels and tooling** focus on the gun as it sits at each weld -- see
+      :func:`gun_at_welds`.  They never move, so the capture frame is the world frame and
+      those placements stay where they are put.
+    * **The gun** focuses on the TCP.  The gun and the tool centre point are rigid with
+      respect to each other, so a radius in the capture frame stays meaningful wherever the
+      arm carries them -- which is what makes this work for a moving link, where a weld
+      position would not.  The one caveat is the electrode stroke: the tip travels relative
+      to the body, so a radius around the captured TCP has to be generous enough to cover
+      the opening range as well as the approach.
+
+    The arm is deliberately absent.  It has no fixed feature to focus on, and it is the one
+    category that never comes close to anything.
+    """
+    out: dict[str, tuple[np.ndarray, float]] = {}
+    if weld_proximity > 0.0:
+        points, radius = gun_at_welds(man, weld_proximity, log=log)
+        if len(points):
+            out.update({s.name: (points, radius) for s in man.static_objects})
+    if tcp_proximity > 0.0:
+        tcp = np.array(man.tcp_world_pose, dtype=float)[:3, 3].reshape(1, 3)
+        for device in man.devices[1:]:
+            out.update({link.name: (tcp, tcp_proximity) for link in device.links})
+    return out
+
+
 def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells: int,
                               hull_cell: float, hull_fill: float,
-                              hull_per_category) -> dict[str, str]:
+                              hull_per_category, weld_proximity: float = 0.0,
+                              tcp_proximity: float = 0.0,
+                              far_cell_factor: float = 4.0) -> dict[str, str]:
     from . import meshprep
 
     rel: dict[str, str] = {}
@@ -497,10 +654,20 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
         if s.mesh:
             rel[s.name] = s.mesh
     log("preparing collision geometry (convex decomposition):")
+    focus = refinement_focus(man, weld_proximity, tcp_proximity, log=log)
+    if focus:
+        if weld_proximity > 0.0:
+            log(f"  panels and tooling refined within {weld_proximity:g} mm of the gun "
+                f"at a weld")
+        if tcp_proximity > 0.0:
+            log(f"  the gun refined within {tcp_proximity:g} mm of the tool centre point")
+        log(f"  elsewhere the cell is {far_cell_factor:g}x as coarse"
+            if far_cell_factor > 0 else "  elsewhere a shell is left as one hull")
     return meshprep.prepare(man.directory, rel, man.scale, log=log,
                             min_extent=min_extent, max_shells=max_shells,
                             hull_cell=hull_cell, fill=hull_fill,
-                            cells=hull_cells(man, hull_cell, hull_per_category))
+                            cells=hull_cells(man, hull_cell, hull_per_category),
+                            focus=focus, far_factor=far_cell_factor)
 
 
 # Probe distance for the exact re-measurement.  Generous on purpose: a pair the hulls
@@ -573,7 +740,8 @@ def _exact_contacts(man: Manifest, collision: dict[str, str], out_dir: str,
     could not be made at all, and the caller decides what to do about that.
     """
     out: dict[tuple[str, str], float] = {}
-    for a, b in pairs:
+    for i, (a, b) in enumerate(pairs, 1):
+        log(f"    . {i}/{len(pairs)} measuring {a} <-> {b}")
         for probe in EXACT_PROBE_STEPS:
             try:
                 worst = _exact_pair(man, collision, out_dir, a, b, q, joint_names, probe)
@@ -638,6 +806,20 @@ def _exact_pair(man: Manifest, collision: dict[str, str], out_dir: str,
     vec = ContactResultVector()
     res.flattenCopyResults(vec)
     return min((float(c.distance) for c in vec), default=None)
+
+
+def _contact_point(c) -> np.ndarray:
+    """Midpoint of a contact's two nearest points, in world metres.
+
+    Defensive because these come straight out of SWIG: a contact that cannot report a
+    position is still a contact worth reporting a distance for.
+    """
+    try:
+        a = np.asarray(c.nearest_points[0], dtype=float).reshape(3)
+        b = np.asarray(c.nearest_points[1], dtype=float).reshape(3)
+    except Exception:
+        return np.full(3, np.nan)
+    return 0.5 * (a + b)
 
 
 def _obstacle_margins(man: Manifest) -> list[tuple[str, str]]:
@@ -718,11 +900,14 @@ def _apply_joint_limits(env: Environment, names: list[str], dynamics, log) -> No
 def build(man: Manifest, log=print, out_dir: str | None = None,
           min_shell_mm: float = 40.0, max_shells: int = 80,
           hull_cell_mm: float = 0.0, hull_fill: float = 0.75,
-          hull_per_category=None, obstacle_clearance_mm: float = 0.0,
+          hull_per_category=None, weld_proximity_mm: float = 0.0,
+          tcp_proximity_mm: float = 0.0, far_cell_factor: float = 4.0,
+          obstacle_clearance_mm: float = 0.0,
           penalty=None, dynamics=None) -> Cell:
     """Prepare geometry, emit URDF/SRDF, load the environment and generate the ACM."""
     collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm,
-                                          hull_fill, hull_per_category)
+                                          hull_fill, hull_per_category, weld_proximity_mm,
+                                          tcp_proximity_mm, far_cell_factor)
     velocity = {}
     if dynamics is not None:
         velocity = {n: float(v) for n, v in zip(man.robot_joint_names, dynamics.velocity)}
@@ -749,6 +934,8 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
     write_srdf(pairs)
 
     os.environ.setdefault("TESSERACT_RESOURCE_PATH", man.directory)
+    log("loading the scene into Tesseract; builds a collision broadphase over every "
+        "shell above")
     env = Environment()
     if not env.init(FilesystemPath(urdf_path), FilesystemPath(srdf_path),
                     GeneralResourceLocator()):
@@ -763,19 +950,25 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
 
     cell = Cell(man, builder, env, pairs)
     cell.margin, cell.obstacle_clearance = margin, clearance
-    cell.attach_penalty(penalty)
+    cell.attach_penalty(penalty, log=log)
     cell.attach_dynamics(dynamics)
     _log_gun(man, log)
 
     # -- pairs in contact at the start pose: re-measure, then loosen or disable ---------
     start = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
+    log("testing the start pose against every collision pair; this is the first full test "
+        "of the scene and the slowest one")
     always = cell.contact_pairs(start)
     overrides: dict[tuple[str, str], float] = {}
+    obstacle = {tuple(sorted(p)) for p in _obstacle_margins(man)}
     if always:
+        log(f"  {len(always)} pairs read as in contact; re-measuring each against the raw "
+            f"concave meshes. Every pair loads full-resolution CAD into a scene of its "
+            f"own, so expect seconds to minutes per pair")
         exact = _exact_contacts(man, collision, out_dir, sorted(always), start,
                                 cell.joint_names, log)
-        obstacle = {tuple(sorted(p)) for p in _obstacle_margins(man)}
         disable: list[tuple[str, str]] = []
+        fatal: list[tuple[str, str, float]] = []
         for (a, b), hull in sorted(always.items(), key=lambda kv: kv[1]):
             if (a, b) not in exact:
                 # Unmeasurable, already reported. Inventing a distance here would either
@@ -787,6 +980,12 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
             if true_d < 0.0:
                 # Real geometry genuinely interpenetrates: a modelling problem, not
                 # something a margin should paper over.
+                if (a, b) in obstacle:
+                    # The arm or the gun is inside a panel or a fixture before anything
+                    # has moved.  Waiving that would blind the planner to that pair for
+                    # the whole run, so the study is wrong and has to be fixed.
+                    fatal.append((a, b, true_d))
+                    continue
                 disable.append((a, b))
                 log(f"  ACM: disabling {a} <-> {b} (exact overlap "
                     f"{-true_d * 1000:.1f} mm)")
@@ -806,8 +1005,21 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
                     f"(hulls read {hull * 1000:.1f} mm, exact geometry "
                     f"{true_d * 1000:.1f} mm)")
 
+        if fatal:
+            detail = "\n".join(f"  {a} <-> {b}: {-d * 1000:.1f} mm of overlap"
+                               for a, b, d in sorted(fatal, key=lambda f: f[2]))
+            raise RuntimeError(
+                "the robot or the gun starts inside the tooling or the panels:\n"
+                f"{detail}\n"
+                "These are measured on the exact meshes, not the collision hulls, so "
+                "this is a real overlap in the imported study rather than an artefact "
+                "of the approximation. Collisions against the parts are never waived -- "
+                "fix the start pose or the part placement in the study and re-import.")
+
         pairs = pairs + [(a, b, "InContactAtStart") for (a, b) in disable]
         write_srdf(pairs)
+        log("  reloading the scene with the generated collision matrix; the broadphase is "
+            "built a second time")
         env = Environment()
         if not env.init(FilesystemPath(urdf_path), FilesystemPath(srdf_path),
                         GeneralResourceLocator()):
@@ -817,12 +1029,21 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         cell = Cell(man, builder, env, pairs)
         cell.margin, cell.obstacle_clearance = margin, clearance
         cell.margin_overrides = overrides
-        cell.attach_penalty(penalty)
+        cell.attach_penalty(penalty, log=log)
         cell.attach_dynamics(dynamics)
 
     if cell.in_collision(start):
-        remaining = cell.contact_pairs(start)
-        raise RuntimeError(f"start state still in collision: {sorted(remaining)}")
+        remaining = sorted(cell.contact_pairs(start))
+        parts = [p for p in remaining if tuple(sorted(p)) in obstacle]
+        if parts:
+            # Reached when the exact re-measurement could not put a number on the pair,
+            # so it was neither loosened nor waived.  Same verdict as a measured overlap:
+            # the parts are not something to plan through.
+            raise RuntimeError(
+                "the robot or the gun starts in contact with the tooling or the panels: "
+                f"{parts}; collisions against the parts are never waived, so fix the "
+                "start pose or the part placement in the study and re-import")
+        raise RuntimeError(f"start state still in collision: {remaining}")
     log(f"start state is collision free ({len(pairs)} disabled pairs in generated SRDF, "
         f"{len(overrides)} pair margins adjusted)")
     return cell

@@ -19,7 +19,7 @@ writes `<directory>/waypoints.json`. Filenames are fixed.
 | `<dir>/waypoints-unrefined.json` | output, only with `--unrefined-output`: the same motion before shortcutting and reduction |
 | `<dir>/convex_cache/` | generated: shells for the convex decomposition, reused between runs |
 | `<dir>/generated/` | generated: the URDF/SRDF and plugin configs actually loaded |
-| `<dir>/collision_geometry/` | generated, only with `--export-collision-geometry`: the convex geometry actually collided against |
+| `<dir>/collision_geometry/` | generated, only with `--export-collision-geometry`: the convex geometry actually collided against, plus a `blocked_*.obj` per unplaceable locator |
 
 The generated directories are safe to delete; they are rebuilt on the next run.
 
@@ -32,10 +32,15 @@ The generated directories are safe to delete; they are rebuilt on the next run.
    configuration reproduces the manifest's TCP pose to sub-micron accuracy, which is the
    check that this convention is right.
 2. **Collision geometry** (`meshprep.py`). Meshes are convex-decomposed and cached.
-3. **Collision matrix** (`cell.py`). Adjacent pairs are disabled. Any pair that reads as
-   in contact in the start pose is then re-measured against the raw concave meshes: a
-   pair that merely grazes keeps its collision check under a corrected margin, and only a
-   genuine overlap is disabled. Both outcomes are reported in the run log.
+3. **Collision matrix** (`cell.py`). Adjacent pairs are disabled, as are two groups that
+   can never be informative: the arm against itself, and the gun against the wrist it is
+   bolted to — the attachment link, the link before it, and the link driven by joint 3,
+   which the arm folds the gun back against in ordinary poses. Any other pair that reads as in contact in the start pose is re-measured
+   against the raw concave meshes: a pair that merely grazes keeps its collision check
+   under a corrected margin, and only a genuine overlap is disabled. Both outcomes are
+   reported in the run log. Contact between the robot or gun and the panels or tooling is
+   never waived this way -- a study that starts inside the parts is rejected with the
+   offending pairs and their overlaps.
 4. **Planning** (`planning.py`, `toolpath.py`). A direct joint move is tried first;
    otherwise OMPL, and failing that a two-leg route through the start pose. Each stretch of
    motion is planned with the gun tip where that phase will hold it, and a transit that no
@@ -80,6 +85,41 @@ convex piece as its own `o` group, in world coordinates and the manifest's units
 drop straight on top of the source meshes in a viewer. That is the geometry Bullet tests,
 so a bridged throat or a filled recess is visible there and nowhere else.
 
+The same flag also turns the "cannot place the robot at locator" failure into something
+you can look at. When a locator's pose is reachable but rejected by the collision check,
+the two links that blocked it are written to `blocked_<locator>_at_<opening>mm.obj` — just
+those two, at the joint state that was rejected, each link's pieces grouped under its own
+name. The log already names the pair, its depth and where the closest approach sits in the
+TCP's frame; the file is the same event with the geometry attached, which is usually the
+faster way to tell a real interference from a hull bridging a recess.
+
+### Asking what occupies a point
+
+Opening the exported geometry tells you a shape is there. It does not tell you *which*
+shape, which shell it came from, or whether the CAD agrees. `--probe-point` answers all
+three and then stops, without planning:
+
+```bash
+python main.py <dir> --probe-point "73050-01-R_2t:-39.8,,-82.1"
+```
+
+The point is given in a locator's own frame, because that is how the discrepancy is seen —
+the robot is jumped to a weld and something is in the way a fixed distance along the tool's
+axes. An empty axis means zero, so a two-axis offset does not have to be padded by hand and
+land in the wrong slot. A bare `x,y,z` is world coordinates.
+
+It reports the convex pieces containing the point and how deep inside each it sits, the
+distance from the point to the nearest triangle of the **source** mesh, and what the
+decomposition did to the links implicated — shells kept, shells refined, the cell and fill
+gate used. The comparison is the whole point: a hull containing a point that has no real
+material within tens of millimetres is a hull bridging a void, and that is called out
+explicitly. So is a link where nothing was refined at all, which is the usual reason.
+
+Distances to the source mesh are exact point-to-triangle, not point-to-vertex: a coarsely
+tessellated fixture has triangles far larger than the gap being measured, and the nearest
+vertex of one can be a long way from its nearest point. Every triangle gets a cheap
+bounding-box lower bound first and only the closest few hundred are measured properly.
+
 The surface is rebuilt by hulling those vertices rather than by reading the face lists that
 come with them, which are not usable: on a 39-vertex hull the faces name 36 vertices apiece
 and those vertices sit up to a metre off the plane of their own face. Since the points are
@@ -111,7 +151,7 @@ declares are written.
     {
      "motion": "PTP",           // PTP | LIN
      "contact_allowed": false,  // true where the gun is deliberately against a panel
-     "gun_opening_mm": 0.0,     // one gun state per phase, not per waypoint
+     "gun_opening_mm": 0.0,     // one gun state per phase
      "waypoints": [
       {
        "joints": {"robot_j1": -1.9547943, "...": 0.0},
@@ -119,7 +159,9 @@ declares are written.
                         [0.0, -1.0, 0.0, 2136.612],
                         [-0.9848, 0.0, -0.1736, 1215.386],
                         [0.0, 0.0, 0.0, 1.0]],
-       "time": 0.0              // seconds from the start of this phase
+       "time": 0.0,             // seconds from the start of this phase
+       "motion": "PTP",         // repeated from the phase, for flat waypoint lists
+       "gun_opening_mm": 0.0    // likewise
       }
      ]
     }
@@ -143,7 +185,12 @@ Three details of the contract are easy to get wrong and are worth restating:
   fourth column, in the same frame as the manifest's `locators[].pose_world`, so it drops
   straight back into the cell with no transformation.
 * **`gun_opening_mm` and `contact_allowed` belong to the phase**, since a phase is a run
-  of waypoints sharing one motion type and one gun state.
+  of waypoints sharing one motion type and one gun state. `motion` and `gun_opening_mm`
+  are repeated on every waypoint as a convenience for a consumer walking a flat list, so
+  that how a point is reached and where the gun must be are both readable without carrying
+  the enclosing phase along. They are copies of the phase's values and cannot disagree with
+  them; `contact_allowed` is not repeated. On the first waypoint of a phase, `motion`
+  describes the move that *leaves* it — there is no move into it.
 
 A segment may contain **more than one `PTP` phase**. That happens when no single gun opening
 gets the robot through the transit, so the move is split and the gun changes at the join —
@@ -376,10 +423,17 @@ Two details are worth knowing about:
   about a route that had already been pulled out of shape. Once the split is made, the
   passes are applied only to the joint-motion runs; a linear run is a decision about the
   shape of the move, not a route to be improved.
-* **Brief contact with the band is ignored.** A sweeping transit that clips the proximity
-  band for a moment is not working near the panel, and cutting it into three phases to say
-  so would cost a stop at each end for nothing. `--near-panel-min-mm` is the shortest
-  stretch worth converting, measured as tool travel rather than as a waypoint count.
+* **Brief contact with the band is ignored, but "brief" is measured two ways.** A sweeping
+  transit that clips the proximity band for a moment is not working near the panel, and
+  cutting it into three phases to say so would cost a stop at each end for nothing.
+  `--near-panel-min-mm` is the shortest stretch worth converting, measured as tool travel
+  rather than as a waypoint count. On its own, though, that test measures the wrong thing
+  on a short move: a 60 mm hop from one weld to the next is near the panel for its entire
+  length and is precisely the motion that should be straight, yet no absolute threshold
+  worth setting for transits will ever admit it. So a stretch also qualifies on
+  `--near-panel-min-pct`, its share of that move's own tool travel. Either test is
+  sufficient; the length test catches long work near the panel, the share test catches
+  short moves that never leave it.
 
 The endpoints of a linear run are snapped back onto the joint route's own states. IK
 returns whichever solution is nearest the seed rather than the exact state asked for, and a
@@ -503,10 +557,25 @@ Where the tip sits genuinely decides what the robot can do. Sampling 600 random 
 changed collision state with the gun — **in both directions**: some are blocked closed and
 clear wide open, others the reverse. So a destination can be unreachable at the opening the
 robot arrives with, and the transit planner searches openings for one that works: the
-opening carried over from the previous locator first, then closed, then wide, then half.
-Changing the gun is a real operation on the machine, so a single opening for the whole
-transit is always preferred; only when none works is the move split into two legs with the
-gun changing at the intermediate pose, where the robot is stationary anyway.
+opening at the *weld* end of the move first, then the one carried over from the other end,
+then closed, wide and half. Changing the gun is a real operation on the machine, so a
+single opening for the whole transit is always preferred; only when none works is the move
+split into two legs with the gun changing at the intermediate pose, where the robot is
+stationary anyway.
+
+**The weld end leads because it is the end that was actually checked.** A weld anchor and
+its linear approach are solved at the weld's own opening, and that is the only gun state
+they were ever proved reachable in. Preferring the other end's opening put the goal pose
+into the planner in a state nobody had validated, and on this cell that cost a full time
+budget per run to rediscover: `gun_moving_tip` 5.7 mm inside `Assy_ST200_RH`, past
+the -5 mm `--weld-clearance-mm` tolerance, reported as *Goal state is in collision*
+after 11 s of OMPL and again after 11 s more.
+
+**Both endpoints are screened before the planner starts**, for the same reason. Endpoint
+validity at a given opening is two contact queries; letting OMPL find out costs a whole
+solve, and every retry at that opening rediscovers it just as slowly. A rejected opening
+is logged with its reason, since a microsecond screen would otherwise pass in silence
+where a failed OMPL run announces itself at length.
 
 A weld's openings are process data and are never overridden — if the robot cannot reach the
 pose at the opening the weld schedule states, that is a failure, not a wider gun. An
@@ -641,6 +710,42 @@ slower checks starve the sampling planner of its time budget. Leave it off unles
 particular cell has a large open feature (a gun throat, a deep fixture pocket) that a
 single hull is closing off, which is the case it was built for.
 
+### The cell can only be as fine as the triangles
+
+Cutting a shell into cells sorts whole triangles into buckets, so a shell tessellated more
+coarsely than the grid cannot honour the cell size it was given: a flat fixture face
+exported as two triangles metres across produced a metres-wide hull no matter how small
+`--tooling-cell-mm` was set. That is the same defect as measuring focus distance from a
+centroid, on the other side of the fence — and it silently capped how much good any of the
+refinement controls could do.
+
+Triangles longer than a cell are therefore bisected down to it first, splitting the longest
+edge at its midpoint and replacing the triangle with the two halves, repeatedly. The new
+vertex sits on an existing edge, so the subdivided mesh occupies **exactly** the same
+space as the original — the hulls built from it can only get tighter, never inflate. On a
+2 m plate at a 100 mm cell the largest resulting hull spans 265 mm instead of 2828 mm, and
+the surface area is unchanged to the last digit.
+
+Bisecting one edge rather than all three costs two triangles per pass instead of four, and
+keeps CAD's long thin triangles from being shattered: a 1000 x 1 mm sliver becomes 81
+triangles rather than 256. It leaves hanging nodes where a split triangle meets an unsplit
+neighbour, which does not matter here — the pieces only ever reach a hull builder, which
+reads points and cares nothing for topology, and the watertightness tests all run earlier
+on the whole shell.
+
+Two consequences worth knowing:
+
+* **Shell counts on coarse geometry can rise sharply**, because the cell now means what it
+  says. A part that used to be capped by its own tessellation is not any more. The fill
+  gate below still keeps solid, well-hulling parts out of it entirely, and outside the
+  focus radius the coarser far cell applies, so the growth lands where the accuracy was
+  actually wanted.
+* **The cached geometry is invalidated** for every link being refined, since the same cell
+  now yields different shells. Links with no cell set keep their existing cache entries.
+
+Subdivision stops at 400 000 triangles per shell, which degrades to a coarser result rather
+than a wrong one.
+
 ### Spending the refinement where it matters
 
 A shell is only refined at all if it fills less than `--hull-fill` of its bounding box.
@@ -685,7 +790,72 @@ gun and arm:
 --hull-cell-mm 0 --panel-cell-mm 8 --tooling-cell-mm 60
 ```
 
-The shell counts that produces are large, and they are paid for on every collision check;
+### Refining only where the geometry gets close
+
+Cell size is a blunt control: it refines a whole link, and the far side of a fixture costs
+exactly as much per shell as the face the gun reaches into. Close proximity is a local
+business, so refinement can be confined to a radius around the features that matter, with
+the cell multiplied by `--far-cell-factor` beyond it — the geometry out there is still
+followed, just coarsely.
+
+Both settings rest on the same fact: a source mesh is stored in the coordinates it was
+captured in, and the link's own origin is applied in the URDF rather than to the file. So a
+world position out of the manifest is directly comparable with a mesh's vertices, and no
+transform is involved.
+
+* `--shell-split-weld-prox` focuses **the panels and the tooling** on *the gun, as it sits
+  at each weld*. A weld locator is a TCP pose and the gun is rigid with respect to the TCP,
+  so the gun's own surface can be placed at every weld and used as the focus. The weld
+  point alone is the wrong thing to measure from: the C-frame reaches a long way back past
+  the electrodes, so tooling the throat has to swallow sits outside any radius drawn around
+  the weld, and that radius refines the wrong side of the part. The radius is therefore a
+  distance from the gun's surface and can be much smaller than one drawn from the weld.
+  Static objects never move, so those placements stay where they are put.
+* `--shell-split-tcp-prox` focuses **the gun body and the moving tip** on the tool centre
+  point. The gun and the TCP are rigid with respect to each other, so a radius in the
+  capture frame stays meaningful wherever the arm carries them — which is what makes this
+  work for a moving link, where a weld position would not. Allow for the electrode stroke
+  as well as the approach: the tip travels up to 200 mm relative to the body, so a radius
+  measured from the captured TCP has to cover the opening range too. Note also that
+  `--gun-cell-mm` defaults to 0, so this does nothing until the gun is being refined at all.
+
+**The arm has no equivalent.** It has no fixed feature worth focusing on, and it is the one
+category that never comes near anything, so it refines everywhere — which, at
+`--robot-cell-mm 0`, means not at all.
+
+Two details are load-bearing:
+
+* The band one cell wide either side of the radius belongs to *both* sets. Without it the
+  near and far hulls meet edge to edge with nothing spanning the seam, which is a hole a
+  planner will drive the gun through — the same reason the grid cells overlap.
+* `--far-cell-factor 0` makes each far region a single hull. That is coarser still, and a
+  hull of everything far can bridge back *across* the near region: safe for collision, but
+  it can wall off a legitimate approach to the weld. The default of 4 grades the cell
+  instead.
+
+Two things about how the distance itself is measured:
+
+* **It is measured to a triangle's bounding box, not its centroid.** Tessellation produces
+  triangles of wildly different sizes — a flat face on a fixture can be two triangles
+  metres across — and a centroid says nothing about where such a triangle reaches. On a
+  2 m triangle with a corner sitting on the weld, the centroid reads 943 mm and the box
+  reads 0. The box distance is a lower bound on the true one, so the error only ever runs
+  towards refining something that did not need it.
+* **The gun is sampled, and sampling understates closeness.** The cloud is thinned to one
+  point per cube of a quarter the radius, and that spacing is added back to the radius, so
+  the test stays conservative. The log reports the spacing and the resulting point count.
+
+The radius still has to cover the approach and not just the weld — the linear run into the
+weld is exactly where hull error decides something — but since it is measured from the
+gun rather than from the weld point, it needs to cover only the clearance either side of
+the gun, not the gun's own reach.
+
+The focus points are part of the cache key along with the radius, so moving a weld
+re-prepares the geometry refined around the old one rather than silently reusing it. The
+key is per link, so widening the gun's radius leaves the panels' cached geometry alone.
+
+The shell counts refinement produces are large, and they are paid for on every collision
+check;
 `--export-collision-geometry` is the way to see whether the extra shells actually followed
 the recess you were after before committing to the runtime.
 
@@ -715,14 +885,18 @@ correction is what keeps the false contact from disabling a real collision check
 | `--no-near-panel-linear` | off | plan every transit as joint motion, never converting to linear |
 | `--near-panel-mm` | 100 | clearance at or under which a stretch is re-planned as linear motion |
 | `--near-panel-min-mm` | 150 | shortest near-panel stretch worth converting, as tool travel |
+| `--near-panel-min-pct` | 50 | ...or this share of the move's own travel, however short |
 | `--min-shell-mm` | 5 | drop collision shells smaller than this |
 | `--max-shells` | 1500 | cap convex shells per link |
 | `--hull-cell-mm` | 25 | refine badly-hulled shells into cells this size; 0 disables |
 | `--hull-fill` | 0.75 | bounding-box fill below which a shell is refined |
 | `--robot-cell-mm` | 0 | cell size for the arm's own links |
 | `--gun-cell-mm` | 0 | cell size for the gun body and moving tip |
-| `--tooling-cell-mm` | 25 | cell size for static objects the manifest calls tooling |
+| `--tooling-cell-mm` | 50 | cell size for static objects the manifest calls tooling |
 | `--panel-cell-mm` | 25 | cell size for static objects the manifest calls panel |
+| `--shell-split-weld-prox` | 0 | refine panels and tooling only this far from the gun at a weld; 0 refines everywhere |
+| `--shell-split-tcp-prox` | 0 | refine the gun only this far from the TCP; 0 refines everywhere |
+| `--far-cell-factor` | 4 | multiplier on the cell size beyond either radius; 0 means one hull |
 | `--obstacle-clearance-mm` | 0 | clear air to hold from panels and tooling; may be negative |
 | `--weld-clearance-mm` | −12 | clearance used instead on moves to or from a weld |
 | `--weld-shift-mm` | −5 | shift weld locators along their own z before planning |
@@ -735,7 +909,8 @@ correction is what keeps the false contact from disabling a real collision check
 | `--joint-max-acceleration` | 2.5, J6 11 | per-joint acceleration limits, rad/s², comma separated |
 | `--linear-speed-mm-s` | 250 | tool speed cap on `LIN` moves |
 | `--unrefined-output` | off | also write `waypoints-unrefined.json`, pre-optimisation |
-| `--export-collision-geometry` | off | write the hulls actually collided against to `<dir>/collision_geometry/` |
+| `--probe-point` | off | name the collision hulls containing `LOCATOR:X,Y,Z` and how far the nearest real material is, then stop |
+| `--export-collision-geometry` | off | write the hulls actually collided against, and the blocking pair at each unplaceable locator, to `<dir>/collision_geometry/` |
 | `--quiet` | off | print only the summary |
 
 Exit code is 0 when every segment planned, 1 otherwise.

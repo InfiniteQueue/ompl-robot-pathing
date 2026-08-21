@@ -12,9 +12,13 @@ easy to get wrong:
   millimetres in the fourth column, in the same frame as the manifest's
   ``locators[].pose_world``, so the consumer can place it back in the cell untransformed.
 
-``gun_opening_mm`` and ``contact_allowed`` belong to the phase, not the waypoint: a phase
-is a run of waypoints sharing one motion type and one gun state.  Only members the schema
-declares are written.
+``gun_opening_mm`` and ``contact_allowed`` belong to the phase: a phase is a run of
+waypoints sharing one motion type and one gun state.  ``motion`` and ``gun_opening_mm``
+are *also* written on every waypoint, repeating the phase's own values, so a consumer
+walking a flat list of waypoints can see how each one is reached and where the gun has to
+be without having to carry the enclosing phase along with it.  The phase members remain
+the authority, and the two can never disagree because the waypoint copies are taken from
+the phase.
 """
 from __future__ import annotations
 
@@ -105,6 +109,7 @@ def build_document(cell: Cell, man: Manifest, segments: list[Segment],
             poses = [_pose_rows(cell, q) for q in ph.states]
             positions = [np.array([r[0][3], r[1][3], r[2][3]]) for r in poses]
             times = timing.phase_times(ph.motion, ph.states, positions)
+            opening = round(float(ph.gun_opening_mm), 6)
             waypoints = [
                 {
                     "joints": {name: round(float(value), 9)
@@ -112,13 +117,17 @@ def build_document(cell: Cell, man: Manifest, segments: list[Segment],
                                in zip(cell.joint_names, commanded(q) * scales)},
                     "tcp_world_mm": rows,
                     "time": round(t, 6),
+                    # Repeated from the phase.  On the first waypoint of a phase this
+                    # describes the move that leaves it, there being no move into it.
+                    "motion": ph.motion,
+                    "gun_opening_mm": opening,
                 }
                 for q, rows, t in zip(ph.states, poses, times)
             ]
             phases.append({
                 "motion": ph.motion,
                 "contact_allowed": bool(ph.contact_allowed),
-                "gun_opening_mm": round(float(ph.gun_opening_mm), 6),
+                "gun_opening_mm": opening,
                 "waypoints": waypoints,
             })
         entry = {"from": seg.source, "to": seg.target, "phases": phases}

@@ -21,7 +21,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("directory",
                    help="study directory containing manifest.json and meshes/")
 
-    ###WELD HANDLING###
+    #region ###WELD HANDLING###
     #WELD PULL BACK AXIS
     p.add_argument("--approach-axis", default = "-z", choices=["+x", "-x", "+y", "-y", "+z", "-z"],
                    help="direction in a weld locator's own frame that the straight "
@@ -38,8 +38,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--linear-step-mm", type=float, default=50.0,
                    help="spacing of points along linear approach/depart moves "
                         "(default: 50)")
-
-    ###COLLISIONS###
+#endregion
+    #region ###COLLISIONS###
     #COLLISION JOINT STEP RESOLUTION
     p.add_argument("--check-step-deg", type=float, default=3.0,
                    help="joint-space resolution used when checking a move for collision; "
@@ -48,14 +48,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--segment-length-rad", type=float, default=0.02,
                    help="collision checking resolution for the sampling planner "
                         "(default: 0.02)")
-
-    ###PATHFINDING###
+#endregion
+    #region ###PATHFINDING###
     #MAX OMPL (pathfinding) ATTEMPTS
     p.add_argument("--ompl-attempts", type=int, default=20,
                    help="most freespace planning attempts per segment, used to retry a "
                         "transit that keeps failing (default: 20)")
     #MIN OMPL ATTEMPTS
-    p.add_argument("--ompl-min-runs", type=int, default=7, metavar="N",
+    p.add_argument("--ompl-min-runs", type=int, default=5, metavar="N",
                    help="always run the sampling planner at least this many times per "
                         "transit and keep the lowest-penalty solution, rather than taking "
                         "the first one that works. The planner returns whichever route it "
@@ -63,14 +63,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "other side of an obstacle, so this is the only stage that can "
                         "choose between them. Costs a full solve per run (default: 7)")
     #OMPL ATTEMPT MAX TIME
-    p.add_argument("--ompl-seconds", type=float, default=7.0, metavar="SECONDS",
+    p.add_argument("--ompl-seconds", type=float, default=10.0, metavar="SECONDS",
                    help="how long one sampling-planner run may search before giving up. "
                         "Raise it for a transit that keeps failing, where restarting the "
                         "search wastes the tree built so far; every run costs this long in "
                         "the worst case, so it multiplies with --ompl-min-runs "
-                        "(default: 7)")
+                        "(default: 10)")
+    #endregion
+    #region ###OPTIMISATION###
 
-    ###OPTIMISATION###
     #DISABLE SHORTCUT PASS
     p.add_argument("--no-shortcut", dest="shortcut", action="store_false",
                    help="skip the shortcutting pass and emit the sampling planner's own "
@@ -87,8 +88,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "earlier passes work on a densified path where a waypoint is a "
                         "sampling artefact rather than a stop; this one does not "
                         "(default: 20)")
-
-    ###LINEAR MOTION NEAR THE PARTS###
+    #endregion
+    #region ###LINEAR MOTION NEAR THE PARTS###
     #DISABLE LINEAR MOTION NEAR THE PARTS
     p.add_argument("--no-near-panel-linear", dest="near_panel_linear",
                    action="store_false",
@@ -106,9 +107,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="shortest near-panel stretch worth converting, measured as tool "
                         "travel. A sweeping transit that clips the proximity band for a "
                         "moment is not working near the panel, and cutting it in three to "
-                        "say so costs a stop at each end for nothing (default: 150)")
-
-    ###COLLISION HULLS###
+                        "say so costs a stop at each end for nothing. A stretch under "
+                        "this length still qualifies on --near-panel-min-pct "
+                        "(default: 150)")
+    #...OR THIS MUCH OF THE MOVE, HOWEVER SHORT
+    p.add_argument("--near-panel-min-pct", type=float, default=50.0, metavar="PCT",
+                   help="a near-panel stretch shorter than --near-panel-min-mm is still "
+                        "made linear if it is this much of the move's own tool travel. "
+                        "Without it no short move could ever come out linear, however "
+                        "completely it runs alongside the panel -- a hop from one weld to "
+                        "the next being the case that matters. 0 leaves length as the only "
+                        "test (default: 50)")
+    #endregion
+    #region ###COLLISION HULLS###
     #DROP TINY SHELLS
     p.add_argument("--min-shell-mm", type=float, default=5.0,
                    help="drop collision shells smaller than this across their bounding "
@@ -118,59 +129,86 @@ def build_parser() -> argparse.ArgumentParser:
                    help="keep at most this many convex shells per link; fewer is faster "
                         "but coarser (default: 1500)")
     #HULL REFINEMENT CELL SIZE
-    p.add_argument("--hull-cell-mm", type=float, default=25.0, metavar="MM",
+    p.add_argument("--hull-cell-mm", type=float, default=50.0, metavar="MM",
                    help="split shells that a single convex hull fits badly into cells of "
                         "roughly this size, hulling each one, so the collision geometry "
                         "follows recesses instead of bridging them. Smaller is more "
-                        "accurate and slower; 0 disables (default: 25)")
+                        "accurate and slower; 0 disables (default: 50)")
     #WHEN A SHELL NEEDS REFINING AT ALL
-    p.add_argument("--hull-fill", type=float, default=0.75, metavar="F",
+    p.add_argument("--hull-fill", type=float, default=0.65, metavar="F",
                    help="how much of its own bounding box a shell must fill before a "
                         "single hull is accepted for it; below this it is split by "
                         "--hull-cell-mm. Raise it towards 1 for geometry whose recesses "
                         "matter, such as panelling full of shallow bowls that a hull "
-                        "would skin over (default: 0.75)")
+                        "would skin over (default: 0.85)")
     #CELL SIZE: ARM
     p.add_argument("--robot-cell-mm", type=float, default=0, metavar="MM",
                    help="--hull-cell-mm for the arm's own links. The arm never comes close "
                         "enough to the parts for hull error to decide anything, so this is "
                         "the first thing to switch off (default: 0, i.e. off)")
     #CELL SIZE: GUN
-    p.add_argument("--gun-cell-mm", type=float, default=0, metavar="MM",
+    p.add_argument("--gun-cell-mm", type=float, default=100, metavar="MM",
                    help="--hull-cell-mm for the gun body and moving tip. The gun is convex "
                         "where it makes contact, so refining it buys accuracy nowhere and "
                         "costs shells everywhere (default: 0, i.e. off)")
     #CELL SIZE: TOOLING
-    p.add_argument("--tooling-cell-mm", type=float, default=25, metavar="MM",
+    p.add_argument("--tooling-cell-mm", type=float, default=10, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls tooling. "
                         "These are the largest meshes in the cell and refinement runs "
                         "after --max-shells, so a small cell here dominates both "
-                        "preparation and every later collision check (default: 25)")
+                        "preparation and every later collision check (default: 50)")
     #CELL SIZE: PANELS
-    p.add_argument("--panel-cell-mm", type=float, default=25, metavar="MM",
+    p.add_argument("--panel-cell-mm", type=float, default=60, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls panel. This "
                         "is the geometry that is concave exactly where the welds are, so "
-                        "it is where a small cell is worth paying for (default: 25)")
-
-    ###CLEARANCE FROM THE PARTS###
+                        "it is where a small cell is worth paying for (default: 10)")
+    #WELD PROXIMITY FOR SHELL SPLIT
+    p.add_argument("--shell-split-weld-prox", type=float, default=5.0, metavar="MM",
+                   help="only refine panel and tooling geometry within this many mm of "
+                        "the gun, as the gun sits when it is at a weld; beyond it the cell "
+                        "is scaled by --far-cell-factor. Measured from the gun's own "
+                        "surface, not from the weld point, so the C-frame's throat and "
+                        "back are covered rather than a sphere around the electrodes. "
+                        "Refinement runs after --max-shells, so confining it is the "
+                        "cheapest way to cut shell count without losing accuracy where it "
+                        "decides anything. Allow for the approach as well as the weld "
+                        "itself. 0 refines everywhere (default: 0, i.e. off)")
+    #TCP PROXIMITY FOR SHELL SPLIT
+    p.add_argument("--shell-split-tcp-prox", type=float, default=20.0, metavar="MM",
+                   help="only refine the gun body and moving tip within this many mm of "
+                        "the tool centre point. The gun and the TCP are rigid with respect "
+                        "to each other, so unlike a weld this stays meaningful wherever the "
+                        "arm carries them. Allow for the electrode stroke as well as the "
+                        "approach, since the tip travels relative to the body. Needs "
+                        "--gun-cell-mm above 0 to do anything at all. 0 refines everywhere "
+                        "(default: 0, i.e. off)")
+    #HOW COARSE THE GEOMETRY AWAY FROM THE WELDS AND THE TCP GETS
+    p.add_argument("--far-cell-factor", type=float, default=4.0, metavar="N",
+                   help="multiplier on the cell size beyond --shell-split-weld-prox and "
+                        "--shell-split-tcp-prox; 0 "
+                        "makes each far shell a single hull, which is coarser still and "
+                        "can "
+                        "bridge back across the welds (default: 4)")
+    #endregion
+    #region ###CLEARANCE FROM THE PARTS###
     #CLEARANCE EVERYWHERE
-    p.add_argument("--obstacle-clearance-mm", type=float, default=0.0, metavar="MM",
+    p.add_argument("--obstacle-clearance-mm", type=float, default=2.0, metavar="MM",
                    help="how close the robot and gun may come to the panels and tooling "
                         "before it counts as a collision. Positive keeps that much clear "
                         "air, 0 means touching collides, negative tolerates that much "
                         "overlap (default: 0)")
     #CLEARANCE ON A MOVE TO OR FROM A WELD
-    p.add_argument("--weld-clearance-mm", type=float, default=-12.0, metavar="MM",
+    p.add_argument("--weld-clearance-mm", type=float, default=-10.0, metavar="MM",
                    help="obstacle clearance used instead of --obstacle-clearance-mm on "
                         "any move starting or ending at a weld locator, where the gun "
-                        "has to reach the panel (default: -12)")
+                        "has to reach the panel (default: -0)")
     #BACK THE WELD OFF THE PANEL SURFACE
     p.add_argument("--weld-shift-mm", type=float, default=-5.0, metavar="MM",
                    help="move every weld locator this far along its own z axis before "
                         "planning, backing the tool off a pose authored on the panel "
                         "surface. Negative retreats along -z (default: -5)")
-
-    ###CLEARANCE PENALTY###
+    #endregion
+    #region ###CLEARANCE PENALTY###
     #DISABLE CLEARANCE PENALTY
     p.add_argument("--no-clearance-penalty", dest="clearance_penalty",
                    action="store_false",
@@ -195,8 +233,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "further and planning runs faster. Truncates the shallow end of "
                         "the curve without reshaping the rest, so the penalty steps "
                         "abruptly at this distance; 0 uses the maximum (default: 0)")
-
-    ###VELOCITY PROFILE###
+    #endregion
+    #region ###VELOCITY PROFILE###
     #JOINT VELOCITY LIMITS
     p.add_argument("--joint-max-velocity", metavar="V1,V2,...",
                    help="per-joint velocity limits in rad/s, comma separated in joint "
@@ -211,14 +249,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--linear-speed-mm-s", type=float, default=250.0,
                    help="commanded tool speed cap on linear moves; the joint limits still "
                         "govern whenever they are slower (default: 250)")
-
-    ###OUTPUT AND DEBUGGING###
+    #endregion
+    #region ###OUTPUT AND DEBUGGING###
     #WRITE THE PRE-OPTIMISATION PATH TOO
     p.add_argument("--unrefined-output", action="store_true",
                    help="also write waypoints-unrefined.json, holding each transit as the "
                         "sampling planner returned it, before shortcutting and waypoint "
                         "reduction. Same schema as waypoints.json, for comparing what the "
                         "optimisation passes actually changed (default: off)")
+    #ASK WHAT OCCUPIES A PARTICULAR POINT
+    p.add_argument("--probe-point", metavar="LOCATOR:X,Y,Z",
+                   help="name the collision hulls containing a point and report how far "
+                        "the nearest real material is, then stop. The point is given in a "
+                        "locator's own frame -- 'weld_7:-39.8,,-82.1', with an empty axis "
+                        "meaning zero -- or as a bare 'x,y,z' in world coordinates. Use it "
+                        "when the planner reports something solid that the input model "
+                        "says is empty: a hull containing the point with no material near "
+                        "it is a hull bridging a void, and the decomposition settings that "
+                        "produced it are printed alongside (default: off)")
     #WRITE THE HULLS THE PLANNER SEES
     p.add_argument("--export-collision-geometry", action="store_true",
                    help="write the convex geometry the planner actually collides against "
@@ -227,11 +275,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "manifest's units so it overlays the source meshes. The "
                         "convex_cache files are the input to the decomposition and still "
                         "hold the original concave triangles, so they cannot show where a "
-                        "hull bridges a recess; these can (default: off)")
+                        "hull bridges a recess; these can. Also writes a blocked_*.obj "
+                        "for every locator the robot cannot be placed at, holding just "
+                        "the two links that blocked it, at the pose that was rejected "
+                        "(default: off)")
     #SUPPRESS THE RUN LOG
     p.add_argument("--quiet", action="store_true", help="only print the final summary")
     return p
-
+    #endregion
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
@@ -302,11 +353,21 @@ def main(argv: list[str] | None = None) -> int:
                               hull_cell_mm=args.hull_cell_mm,
                               hull_fill=args.hull_fill,
                               hull_per_category=per_category,
+                              weld_proximity_mm=args.shell_split_weld_prox,
+                              tcp_proximity_mm=args.shell_split_tcp_prox,
+                              far_cell_factor=args.far_cell_factor,
                               obstacle_clearance_mm=args.obstacle_clearance_mm,
                               penalty=penalty, dynamics=dynamics)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    if args.probe_point:
+        # Before the export, and instead of planning: this is asked when a specific pose is
+        # already known to be blocked, and the answer does not depend on either.
+        from weldpath import probe
+        probe.report(cell.env, man, args.probe_point, log=print)
+        return 0
 
     if args.export_collision_geometry:
         from weldpath import hullexport
@@ -327,7 +388,9 @@ def main(argv: list[str] | None = None) -> int:
         polish_seconds=args.polish_seconds if args.shortcut else 0.0,
         near_panel_mm=args.near_panel_mm if args.near_panel_linear else 0.0,
         near_panel_min_mm=args.near_panel_min_mm,
+        near_panel_min_pct=args.near_panel_min_pct,
         weld_clearance_mm=args.weld_clearance_mm,
+        export_dir=directory if args.export_collision_geometry else None,
         keep_unrefined=args.unrefined_output,
         log=log)
     segments = planner.run()

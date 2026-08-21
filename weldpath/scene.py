@@ -45,6 +45,12 @@ def _xyz(v: np.ndarray) -> str:
     return "%.9g %.9g %.9g" % (v[0], v[1], v[2])
 
 
+# The arm carries the gun back against this link in ordinary poses, so contact between the
+# two is a constant of the machine rather than news.  A joint number, in the same
+# convention as weldpath.profile's COUPLED_JOINT: joint N drives the link named here.
+GUN_CLEAR_JOINT = 3
+
+
 class SceneBuilder:
     def __init__(self, man: Manifest, collision_meshes: dict[str, str],
                  exact_links: set[str] | None = None,
@@ -256,31 +262,53 @@ class SceneBuilder:
         for i in range(len(names)):
             for k in range(i + 1, len(names)):
                 pairs.append((names[i], names[k], "Never"))
-        pairs += self.gun_tip_pairs()
-        return pairs
+        pairs += self.never_collide_pairs()
+        seen: set[tuple[str, str]] = set()
+        out: list[tuple[str, str, str]] = []
+        for a, b, reason in pairs:
+            key = (a, b) if a <= b else (b, a)
+            if key not in seen:
+                seen.add(key)
+                out.append((a, b, reason))
+        return out
 
-    def gun_tip_pairs(self) -> list[tuple[str, str, str]]:
-        """Contacts the moving electrode makes with its own machinery, which are expected.
+    def never_collide_pairs(self) -> list[tuple[str, str, str]]:
+        """Contacts that can never say anything about whether a move is safe.
 
-        Swinging the tip through 200 mm of travel inevitably brings it close to the rest of
-        the gun and to the wrist it hangs off.  Those readings say nothing about whether a
-        move is safe, and leaving them in would make the gun uncloseable in most poses, so
-        they are excluded and the tip is checked against everything else.
+        Two groups, both worked out from the manifest's structure rather than by matching
+        names, so they hold for any cell:
 
-        The wrist links are found by walking up from the link the gun is bolted to, rather
-        than by matching names, so this holds for any manifest.
+        * **every pair of robot links.**  The arm's own castings read as touching wherever
+          they are merely close, and this machine cannot fold into itself, so a
+          self-collision reading is noise in every pose.
+        * **every pair among the gun and the wrist it hangs off** -- the whole gun (body
+          and moving electrode alike) plus the link the gun is bolted to and the link
+          before it.  The gun is *mounted* there, and swinging the tip through 200 mm of
+          travel inevitably brings it close to both, so those readings are a constant of
+          the assembly; leaving them in makes the gun uncloseable in most poses.  The link
+          driven by joint ``GUN_CLEAR_JOINT`` joins that group: the arm folds the gun back
+          against it in ordinary poses, and the reading says nothing about whether the
+          move is safe.
+
+        Everything else the gun and the arm can hit -- the panels, the tooling, the rest
+        of the arm -- keeps its check, and cannot be waived later (see
+        :func:`weldpath.cell.build`).
         """
-        moving = [n for n in self.man.gun_moving_links]
-        if not moving:
-            return []
-        ignore: set[str] = set()
-        for dev in self.man.devices[1:]:            # the rest of the gun
-            ignore.update(l.name for l in dev.links)
-        for parent, _child in self.man.attachments:  # the wrist, and the link before it
-            ignore.add(parent)
+        def combinations(names, reason):
+            names = sorted(set(names))
+            return [(names[i], names[k], reason)
+                    for i in range(len(names)) for k in range(i + 1, len(names))]
+
+        robot = [l.name for l in self.man.robot.links]
+        mount = [l.name for dev in self.man.devices[1:] for l in dev.links]
+        for parent, _child in self.man.attachments:   # the wrist, and the link before it
+            mount.append(parent)
             for dev in self.man.devices:
                 for j in dev.joints:
                     if j.child_link == parent:
-                        ignore.add(j.parent_link)
-        return [(m, other, "GunTipTravel")
-                for m in moving for other in sorted(ignore) if other != m]
+                        mount.append(j.parent_link)
+        joints = self.man.robot.joints
+        if len(joints) >= GUN_CLEAR_JOINT:
+            mount.append(joints[GUN_CLEAR_JOINT - 1].child_link)
+        return (combinations(robot, "RobotSelfCollision")
+                + combinations(mount, "GunMounting"))

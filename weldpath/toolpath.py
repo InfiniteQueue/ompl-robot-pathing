@@ -84,7 +84,9 @@ class ToolpathPlanner:
                  ompl_seconds: float = 5.0, linear_zone: bool = True,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                  near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
+                 near_panel_min_pct: float = 0.0,
                  weld_clearance_mm: float | None = None,
+                 export_dir: str | None = None,
                  keep_unrefined: bool = False, log=print):
         self.cell = cell
         self.man = man
@@ -105,9 +107,12 @@ class ToolpathPlanner:
         # linear motion instead of joint motion.  The clearance query has to be able to
         # see that far, which it will not do on the penalty's probe alone.
         self.zone = LinearZone(near_mm=near_panel_mm, min_run_mm=near_panel_min_mm,
-                               step_mm=linear_step_mm)
+                               min_run_pct=near_panel_min_pct, step_mm=linear_step_mm)
         if self.zone.enabled:
-            cell.require_proximity(near_panel_mm)
+            cell.require_proximity(near_panel_mm, log=log)
+        # Set when --export-collision-geometry is on: a pose that cannot be placed then
+        # also writes the two links that blocked it, as they sat when it was rejected.
+        self.export_dir = export_dir
         self.keep_unrefined = keep_unrefined
         # None means "no separate weld rule", i.e. the cell's own clearance throughout.
         self.weld_clearance = (None if weld_clearance_mm is None
@@ -143,7 +148,7 @@ class ToolpathPlanner:
         widest = self.man.gun_opening_max
         return [declared, widest, widest / 2.0]
 
-    def _diagnose(self, loc: Locator, seed: np.ndarray) -> str:
+    def _diagnose(self, loc: Locator, seed: np.ndarray, tag: str = "") -> str:
         """Why the pose was rejected.  Call inside the clearance and gun-opening context.
 
         Worth the extra solve: "no solution" and "solution rejected by the collision check"
@@ -156,14 +161,40 @@ class ToolpathPlanner:
                                  require_collision_free=False)
         if q is None:
             return "no inverse-kinematics solution inside the joint limits"
-        hits = self.cell.contact_pairs(q)
+        hits = self.cell.contacts(q)
         if not hits:
             return "reachable, but the pose reads as in collision"
-        (a, b), worst = min(hits.items(), key=lambda kv: kv[1])
+        (a, b), (worst, point) = min(hits.items(), key=lambda kv: kv[1][0])
         more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
+        # Where the contact sits, said in the frame the reader is looking at: the TCP's
+        # own axes are the ones the approach and the lead-in are defined along, so "40 mm
+        # behind and 12 mm off to the side" locates it on the gun without a viewer.
+        local = self.cell.in_tcp_frame(q, point)
+        self._export_blocked(q, (a, b), tag or loc.name)
+        where = ("" if not np.all(np.isfinite(local)) else
+                 f"; closest at ({local[0]:+.1f}, {local[1]:+.1f}, {local[2]:+.1f}) mm "
+                 f"from the TCP, in the TCP's own axes")
         return (f"reachable, but {a} <-> {b} reads {worst / self.man.scale:+.1f} mm"
-                f"{more} against a {self.cell.obstacle_clearance / self.man.scale:+.1f} mm "
-                f"clearance")
+                f"{more} against a "
+                f"{self.cell.obstacle_clearance / self.man.scale:+.1f} mm clearance{where}")
+
+    def _export_blocked(self, q: np.ndarray, pair: tuple[str, str], tag: str) -> None:
+        """Write the blocking geometry, if the run was asked for collision geometry.
+
+        The state has to be pushed into the environment first: the contact test that found
+        this pair went through the contact manager, which carries its own transforms, and
+        the exporter reads the environment's.
+        """
+        if not self.export_dir:
+            return
+        from . import hullexport
+        try:
+            self.cell.set_state(q)
+            hullexport.export_pair(self.cell.env, self.man, self.export_dir, pair, tag,
+                                   log=self.log)
+        except Exception as exc:                # diagnostics must not mask the failure
+            self.log(f"      could not write the blocking geometry: "
+                     f"{type(exc).__name__}: {exc}")
 
     def _solve_locator(self, loc: Locator, seed: np.ndarray) -> tuple[np.ndarray, float]:
         """Joint solution for a locator, plus the gun opening it was reached at."""
@@ -172,7 +203,9 @@ class ToolpathPlanner:
             with self._clearance_for(loc), self.cell.gun_opening(opening):
                 q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q])
                 if q is None:
-                    problems.append(f"at {opening:g} mm, {self._diagnose(loc, seed)}")
+                    tag = f"{loc.name}_at_{opening:g}mm"
+                    problems.append(f"at {opening:g} mm, "
+                                    f"{self._diagnose(loc, seed, tag)}")
             if q is not None:
                 if opening:
                     self.log(f"    '{loc.name}' needs the gun at {opening:g} mm to be "
@@ -229,6 +262,23 @@ class ToolpathPlanner:
             segments.append(seg)
         return segments
 
+    @staticmethod
+    def _transit_openings(a: Locator, b: Locator, leave_open: float,
+                          arrive_open: float) -> list[float]:
+        """Gun openings to try for the transit between two locators, best first.
+
+        The weld end is the constrained one: its opening is process data, and it is the
+        opening the anchor and the linear approach were actually proved reachable at.  Try
+        the free end's opening first and the planner spends a full time budget discovering
+        that the pose it has to finish at was never checked in that gun state.
+
+        With a weld at both ends or neither, the departure opening leads: it is the one
+        already in force, so using it costs no gun change at the start of the move.
+        """
+        if b.is_weld and not a.is_weld:
+            return [arrive_open, leave_open]
+        return [leave_open, arrive_open]
+
     def _plan_pair(self, a: Locator, b: Locator, anchors
                    ) -> tuple[list[Phase], list[Phase]]:
         # The path starts at the first locator, not at start_state. start_state is still
@@ -281,7 +331,8 @@ class ToolpathPlanner:
             shortcut_seconds=self.shortcut_seconds,
             polish_seconds=self.polish_seconds, planning_time=self.ompl_seconds,
             zone=self.zone,
-            openings=[leave_open, arrive_open], record=raw_legs, log=self.log)
+            openings=self._transit_openings(a, b, leave_open, arrive_open),
+            record=raw_legs, log=self.log)
         for i, (runs, opening) in enumerate(legs):
             opening_mm = 0.0 if opening is None else opening
             for run in runs:
