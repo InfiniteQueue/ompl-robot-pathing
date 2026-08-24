@@ -75,6 +75,11 @@ def _hull(V: np.ndarray) -> list[tuple[int, int, int]]:
         return _flat(V) if n == 3 else []
     span = float(np.linalg.norm(V.max(axis=0) - V.min(axis=0)))
     eps = max(1e-12, 1e-9 * span)
+    # Study coordinates run to six figures while the parts are a few hundred units across,
+    # so every height below would otherwise be a difference of two large numbers, and the
+    # decision "is this point outside that face" would be made in the round-off. Only the
+    # face indices are returned, so shifting the points here changes nothing but precision.
+    V = V - V.mean(axis=0)
 
     a = int(np.argmin(V[:, 0]))
     b = int(np.argmax(np.linalg.norm(V - V[a], axis=1)))
@@ -97,18 +102,27 @@ def _hull(V: np.ndarray) -> list[tuple[int, int, int]]:
     F = seed
     N, O = _outward(V, F)
 
-    for p in range(n):
-        if p in (a, b, c, d):
+    seeded = {a, b, c, d}
+    # Furthest from the centre first. Adding the points that define the shape early means
+    # most of the rest fail their single height test and never touch the face list, where
+    # in file order the hull is rebuilt over and over as it grows outwards. The hull that
+    # comes out is the same either way; only the work done to reach it changes.
+    for index in np.argsort(-np.linalg.norm(V, axis=1)):
+        p = int(index)
+        if p in seeded:
             continue
         seen = (N @ V[p] - O) > eps
         if not seen.any():
             continue
         rim = F[seen]
         edges = np.concatenate([rim[:, [0, 1]], rim[:, [1, 2]], rim[:, [2, 0]]])
-        _, inverse, counts = np.unique(np.sort(edges, axis=1), axis=0,
-                                       return_inverse=True, return_counts=True)
-        horizon = edges[counts[inverse.reshape(-1)] == 1]
-        if not len(horizon):
+        # Every face is wound the same way round, so an edge interior to the lit patch
+        # appears once in each direction and an edge on its rim appears only once. Finding
+        # the rim is then a lookup of one integer key per edge, rather than a lexsort of
+        # sorted vertex pairs -- the same answer for a fraction of the cost.
+        key = edges[:, 0] * n + edges[:, 1]
+        horizon = edges[~np.isin(edges[:, 1] * n + edges[:, 0], key)]
+        if len(horizon) < 3:
             continue
         fresh = np.column_stack([horizon, np.full(len(horizon), p, dtype=np.int64)])
         Nf, Of = _outward(V, fresh)
