@@ -981,6 +981,26 @@ def _apply_joint_limits(env: Environment, names: list[str], dynamics, log) -> No
     log(dynamics.describe(names))
 
 
+def _export_start_contacts(cell: Cell, man: Manifest, directory: str,
+                           start: np.ndarray, pairs: list, log) -> None:
+    """Write each pair that reads as touching at the start pose to its own OBJ.
+
+    Called before the exact re-measurement rather than after it, because that step is the
+    slow one and this is the geometry it is about to spend minutes on.  The state is pushed
+    again here so the file does not depend on what the contact test happened to leave
+    loaded: what lands in it is the geometry at the pose that read as contact.
+    """
+    from . import hullexport
+    cell.set_state(start)
+    for a, b in pairs:
+        try:
+            hullexport.export_pair(cell.env, man, directory, (a, b),
+                                   f"start_{a}__{b}", log=log)
+        except Exception as exc:        # diagnostics must never mask the contact report
+            log(f"      could not write the blocking geometry for {a} <-> {b}: "
+                f"{type(exc).__name__}: {exc}")
+
+
 def build(man: Manifest, log=print, out_dir: str | None = None,
           min_shell_mm: float = 40.0, max_shells: int = 80,
           hull_cell_mm: float = 0.0, hull_fill: float = 0.75,
@@ -988,6 +1008,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
           tcp_proximity_mm: float = 0.0, far_cell_factor: float = 4.0,
           hull_overlap: float | None = None,
           obstacle_clearance_mm: float = 0.0, tcp_check_mm: float = 0.0,
+          export_dir: str | None = None,
           penalty=None, dynamics=None) -> Cell:
     """Prepare geometry, emit URDF/SRDF, load the environment and generate the ACM."""
     collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm,
@@ -1045,6 +1066,14 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
     cell.attach_dynamics(dynamics)
     _log_gun(man, log)
 
+    if export_dir:
+        # Written here rather than after planning.  The start-pose test below re-measures
+        # every contacting pair against full-resolution CAD and can run for minutes per
+        # pair, and the hulls it is complaining about are exactly what a reader wants open
+        # in front of them while it does.  Nothing after this point changes them.
+        from . import hullexport
+        hullexport.export(env, man, export_dir, log=log)
+
     # -- pairs in contact at the start pose: re-measure, then loosen or disable ---------
     start = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
     log("testing the start pose against every collision pair; this is the first full test "
@@ -1053,6 +1082,8 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
     overrides: dict[tuple[str, str], float] = {}
     obstacle = {tuple(sorted(p)) for p in _obstacle_margins(man)}
     if always:
+        if export_dir:
+            _export_start_contacts(cell, man, export_dir, start, sorted(always), log)
         log(f"  {len(always)} pairs read as in contact; re-measuring each against the raw "
             f"concave meshes. Every pair loads full-resolution CAD into a scene of its "
             f"own, so expect seconds to minutes per pair")

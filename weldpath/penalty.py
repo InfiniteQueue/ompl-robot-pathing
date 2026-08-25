@@ -8,14 +8,24 @@ being much shorter rather than marginally shorter.
 
 The multiplier is applied to time, not distance -- "a second spent here counts as N
 seconds" -- which is why it composes with the travel metric the shortcut pass already
-uses.  Between ``max_mm`` and ``min_mm`` it follows ``x**2`` on ``[0, 1]``, stretched to
-fit, so cost climbs slowly at first and sharply as the gun closes on the part::
+uses.  Between ``max_mm`` and ``min_mm`` it follows a power curve on ``[0, 1]``,
+stretched to fit::
 
     u = (max_mm - d) / (max_mm - min_mm)     clamped to [0, 1]
-    factor = 1 + (multiplier - 1) * u**2
+    factor = 1 + (multiplier - 1) * u**exponent
 
 At ``max_mm`` and beyond the factor is exactly 1, so open space is unaffected; at
-``min_mm`` and below it saturates at ``multiplier``.  Saturating rather than continuing to
+``min_mm`` and below it saturates at ``multiplier``.  Both ends are fixed whatever the
+exponent is -- it changes only how the climb is distributed between them, so the peak
+penalty is the one thing that stays put while the shape is tuned.
+
+The exponent is what decides where the curve can tell one clearance from another, and the
+whole span is only so much resolution to spend.  Above 1 it is spent near ``min_mm``: at 2
+the cost climbs slowly at first and sharply as the gun closes on the part, and higher
+still concentrates almost all of the difference into the last few millimetres, which is
+what a wide ``max_mm`` needs if "very close" is not to cost much the same as "close".
+Below 1 the curve is concave and spends its resolution at the open end instead, so a route
+is pushed away from the part early and then hardly cares how close it finally comes.  Saturating rather than continuing to
 climb matters: without it, the pass would spend its whole budget fighting over the last
 millimetre of a clearance that is already as bad as it is allowed to get.
 
@@ -30,16 +40,22 @@ class ClearancePenalty:
 
     def __init__(self, max_mm: float = 50.0, min_mm: float = 3.0,
                  multiplier: float = 50.0, cutoff_mm: float = 0.0,
-                 enabled: bool = True):
+                 exponent: float = 2.0, enabled: bool = True):
         if max_mm <= min_mm:
             raise ValueError(
                 f"clearance penalty needs max ({max_mm:g} mm) above min ({min_mm:g} mm)")
         if multiplier < 1.0:
             raise ValueError(
                 f"clearance penalty multiplier must be at least 1, got {multiplier:g}")
+        if not exponent > 0.0:
+            # 0 would make every clearance below max_mm cost the full multiplier, turning
+            # the soft preference into a second collision margin; negative diverges.
+            raise ValueError(
+                f"clearance penalty exponent must be above 0, got {exponent:g}")
         self.max_mm = float(max_mm)
         self.min_mm = float(min_mm)
         self.multiplier = float(multiplier)
+        self.exponent = float(exponent)
         # A cutoff below max_mm truncates the shallow end of the curve without reshaping
         # what remains, so the proximity query only has to look out that far.  Values
         # outside (0, max_mm) mean "no cutoff".
@@ -58,13 +74,14 @@ class ClearancePenalty:
             return 1.0
         u = (self.max_mm - distance_mm) / (self.max_mm - self.min_mm)
         u = 0.0 if u < 0.0 else (1.0 if u > 1.0 else u)
-        return 1.0 + (self.multiplier - 1.0) * u * u
+        return 1.0 + (self.multiplier - 1.0) * u ** self.exponent
 
     def describe(self) -> str:
         if not self.enabled:
             return "clearance penalty: off"
-        out = (f"clearance penalty: 1x at {self.max_mm:g} mm rising as x^2 to "
-               f"{self.multiplier:g}x at {self.min_mm:g} mm and below")
+        out = (f"clearance penalty: 1x at {self.max_mm:g} mm rising as "
+               f"x^{self.exponent:g} to {self.multiplier:g}x at {self.min_mm:g} mm "
+               f"and below")
         if self.cutoff_mm < self.max_mm:
             out += (f"; ignored beyond {self.cutoff_mm:g} mm, so the factor steps "
                     f"straight to {self.factor(self.cutoff_mm - 1e-9):.1f}x there")

@@ -238,7 +238,7 @@ def build_parser() -> argparse.ArgumentParser:
     #PENALTY CURVE START
     p.add_argument("--clearance-penalty-max-mm", type=float, default=200.0, metavar="MM",
                    help="clearance at and above which there is no penalty; the curve "
-                        "starts here (default: 300)")
+                        "starts here (default: 200)")
     #PENALTY CURVE PEAK
     p.add_argument("--clearance-penalty-min-mm", type=float, default=0.0, metavar="MM",
                    help="clearance at and below which the penalty is at its peak "
@@ -247,7 +247,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clearance-penalty-multiplier", type=float, default=8.0,
                    metavar="N",
                    help="peak penalty: a second spent at the minimum clearance costs as "
-                        "much as N seconds in open space (default: 5)")
+                        "much as N seconds in open space (default: 8)")
+    #PENALTY CURVE SHAPE
+    p.add_argument("--clearance-penalty-exponent", type=float, default=5.0, metavar="Y",
+                   help="shape of the climb between --clearance-penalty-max-mm and "
+                        "--clearance-penalty-min-mm, as x^Y on the span between them. "
+                        "Both ends are fixed whatever this is, so the peak penalty does "
+                        "not move; Y only decides where along the span the curve can tell "
+                        "one clearance from another. Above 1 spends that resolution near "
+                        "the minimum, which is what a wide maximum needs if very close is "
+                        "not to cost about the same as close; below 1 spends it at the "
+                        "open end instead. Must be above 0 (default: 5)")
     #PENALTY QUERY RANGE
     p.add_argument("--clearance-penalty-cutoff-mm", type=float, default=0.0, metavar="MM",
                    help="ignore clearances beyond this, so the proximity query looks no "
@@ -359,6 +369,7 @@ def main(argv: list[str] | None = None) -> int:
             min_mm=args.clearance_penalty_min_mm,
             multiplier=args.clearance_penalty_multiplier,
             cutoff_mm=args.clearance_penalty_cutoff_mm,
+            exponent=args.clearance_penalty_exponent,
             enabled=args.clearance_penalty)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
@@ -380,21 +391,20 @@ def main(argv: list[str] | None = None) -> int:
                               hull_overlap=args.hull_cell_overlap,
                               obstacle_clearance_mm=args.obstacle_clearance_mm,
                               tcp_check_mm=args.check_step_mm,
+                              export_dir=(directory if args.export_collision_geometry
+                                          else None),
                               penalty=penalty, dynamics=dynamics)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
     if args.probe_point:
-        # Before the export, and instead of planning: this is asked when a specific pose is
-        # already known to be blocked, and the answer does not depend on either.
+        # Instead of planning: this is asked when a specific pose is already known to be
+        # blocked, and the answer does not depend on the toolpath.  The export, if one was
+        # asked for, has already happened inside build().
         from weldpath import probe
         probe.report(cell.env, man, args.probe_point, log=print)
         return 0
-
-    if args.export_collision_geometry:
-        from weldpath import hullexport
-        hullexport.export(cell.env, man, directory, log=print)
 
     log("planning:")
     planner = ToolpathPlanner(
