@@ -69,6 +69,12 @@ def retract_axis(override: str | None = None) -> np.ndarray:
     return AXES[override.lower()] if override else AXES["-x"]
 
 
+# Headroom past the clearance a locator has to meet, so the report can distinguish a pose
+# that just scrapes past from one with room around it.  Without it the query stops at the
+# threshold and every success reads the same.
+CLEARANCE_REPORT_HEADROOM_MM = 25.0
+
+
 def offset_pose(pose: np.ndarray, axis_tcp: np.ndarray, distance: float) -> np.ndarray:
     """Shift ``pose`` along a direction expressed in its own frame."""
     out = np.array(pose, dtype=float).copy()
@@ -108,8 +114,15 @@ class ToolpathPlanner:
         # see that far, which it will not do on the penalty's probe alone.
         self.zone = LinearZone(near_mm=near_panel_mm, min_run_mm=near_panel_min_mm,
                                min_run_pct=near_panel_min_pct, step_mm=linear_step_mm)
-        if self.zone.enabled:
-            cell.require_proximity(near_panel_mm, log=log)
+        # Every locator reports its measured clearance against the one it has to meet,
+        # placed or not, so the query has to see past the larger threshold with room to
+        # spare.  A probe that stops at the threshold can only ever answer "at least the
+        # requirement", which is the half of the question already known.
+        report_probe = max(cell.obstacle_clearance / man.scale,
+                           weld_clearance_mm or 0.0) + CLEARANCE_REPORT_HEADROOM_MM
+        wanted = max(near_panel_mm if self.zone.enabled else 0.0, report_probe)
+        if wanted > 0.0:
+            cell.require_proximity(wanted, log=log)
         # Set when --export-collision-geometry is on: a pose that cannot be placed then
         # also writes the two links that blocked it, as they sat when it was rejected.
         self.export_dir = export_dir
@@ -132,6 +145,35 @@ class ToolpathPlanner:
             return self.cell.clearance(self.weld_clearance)
         return self.cell.clearance(self.cell.obstacle_clearance)
 
+    def _report_clearance(self, loc: Locator, q: np.ndarray | None,
+                          opening: float, placed: bool) -> None:
+        """State the clearance the pose actually has beside the one it has to meet.
+
+        Printed for every locator on the first pass whether it was placed or not, because
+        the two cases raise the same question and neither answered it before.  A weld that
+        was placed with 0.3 mm to spare is a weld the next change to the geometry will
+        break, and nothing said so; a weld that was rejected by 30 mm is a different
+        problem from one rejected by 0.3, and the blocking pair alone does not separate
+        them.  Call inside the clearance and gun-opening context, so the requirement read
+        here is the one the solve was actually held to.
+        """
+        required = self.cell.obstacle_clearance / self.man.scale
+        verdict = "placed" if placed else "rejected"
+        if q is None:
+            self.log(f"    '{loc.name}' at {opening:g} mm: no pose to measure "
+                     f"({required:+.1f} mm required) -- {verdict}")
+            return
+        got = self.cell.clearance_mm(q)
+        probe = self.cell.probe_mm
+        if not np.isfinite(got):
+            shown = "unmeasured"
+        elif probe > 0.0 and got >= probe:
+            shown = f"beyond {probe:+.1f} mm"     # the query ran out of range, not a reading
+        else:
+            shown = f"{got:+.1f} mm"
+        self.log(f"    '{loc.name}' at {opening:g} mm: clearance {shown} against "
+                 f"{required:+.1f} mm required -- {verdict}")
+
     # -- per-locator anchor states ------------------------------------------
     def _locator_openings(self, loc: Locator) -> list[float]:
         """Gun openings worth trying when reaching this locator, most preferred first.
@@ -148,7 +190,8 @@ class ToolpathPlanner:
         widest = self.man.gun_opening_max
         return [declared, widest, widest / 2.0]
 
-    def _diagnose(self, loc: Locator, seed: np.ndarray, tag: str = "") -> str:
+    def _diagnose(self, loc: Locator, seed: np.ndarray, tag: str = "",
+                  opening: float = 0.0) -> str:
         """Why the pose was rejected.  Call inside the clearance and gun-opening context.
 
         Worth the extra solve: "no solution" and "solution rejected by the collision check"
@@ -159,6 +202,10 @@ class ToolpathPlanner:
         """
         q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q],
                                  require_collision_free=False)
+        # Measured off this pose rather than a third solve of its own: the collision-free
+        # solve returned nothing to measure, and this is the same pose the pair below is
+        # named from, so the two lines describe one state.
+        self._report_clearance(loc, q, opening, placed=False)
         if q is None:
             return "no inverse-kinematics solution inside the joint limits"
         hits = self.cell.contacts(q)
@@ -205,7 +252,9 @@ class ToolpathPlanner:
                 if q is None:
                     tag = f"{loc.name}_at_{opening:g}mm"
                     problems.append(f"at {opening:g} mm, "
-                                    f"{self._diagnose(loc, seed, tag)}")
+                                    f"{self._diagnose(loc, seed, tag, opening)}")
+                else:
+                    self._report_clearance(loc, q, opening, placed=True)
             if q is not None:
                 if opening:
                     self.log(f"    '{loc.name}' needs the gun at {opening:g} mm to be "

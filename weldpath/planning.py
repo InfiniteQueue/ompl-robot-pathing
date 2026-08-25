@@ -874,9 +874,16 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
 
 
 def _tcp_travel(cell: Cell, states: list[np.ndarray]) -> float:
-    """Distance the tool centre point covers along a joint path, in manifest units."""
+    """Distance the tool centre point covers along a joint path, in manifest units.
+
+    ``fk`` answers in environment units, which are metres, while every threshold this is
+    measured against is quoted in the manifest's own units.  Converting here rather than at
+    the caller keeps the two from being compared raw, which read a 1.8 m stretch as 1.8
+    against a 250 mm threshold and so failed every length test there was.
+    """
     points = [cell.fk(q)[:3, 3] for q in states]
-    return float(sum(np.linalg.norm(b - a) for a, b in zip(points, points[1:])))
+    raw = float(sum(np.linalg.norm(b - a) for a, b in zip(points, points[1:])))
+    return raw / cell.man.scale
 
 
 def _linear_chain(cell: Cell, guide: list[np.ndarray], *, step_mm: float,
@@ -990,6 +997,10 @@ def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
     in_range = 100.0 * sum(near) / len(near) if near else 0.0
     leg_qualifies = min_run_pct > 0.0 and in_range >= min_run_pct
     runs: list[Run] = []
+    # Tool travel of each near-panel stretch, in the units --near-panel-min-mm is quoted
+    # in.  Kept for the report: the verdict on a stretch is this number against that
+    # threshold, and a line that gives the verdict without the number cannot be acted on.
+    stretches: list[float] = []
     kept = skipped = failed = 0
     cursor = 0
     i = 0
@@ -1001,6 +1012,8 @@ def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
         while j + 1 < len(dense) and near[j + 1]:
             j += 1
         travel = _tcp_travel(cell, dense[i:j + 1]) if j > i else 0.0
+        if j > i:
+            stretches.append(travel)
         if j > i and (travel >= min_run_mm or leg_qualifies):
             chain = _linear_chain(cell, dense[i:j + 1], step_mm=step_mm,
                                   check_step=check_step)
@@ -1021,8 +1034,12 @@ def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
     if not runs:
         return [Run(PTP, list(path))]
     if log and (kept or failed or skipped):
-        note = [f"{in_range:.0f}% of the leg in range, "
-                f"{kept} near-panel stretches made linear"]
+        note = [f"{in_range:.0f}% of the leg in range"]
+        if stretches:
+            note.append(f"longest stretch {max(stretches):.0f} mm of "
+                        f"{sum(stretches):.0f} mm near the panel, against a "
+                        f"{min_run_mm:g} mm threshold")
+        note.append(f"{kept} near-panel stretches made linear")
         if skipped:
             note.append(f"{skipped} too brief to be worth it")
         if failed:

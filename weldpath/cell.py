@@ -40,6 +40,14 @@ from tesseract_robotics.tesseract_kinematics import KinGroupIKInput, KinGroupIKI
 from .manifest import Manifest
 from .scene import GROUP, TCP_LINK, SceneBuilder
 
+# How many times an interval may be halved when the tool criterion keeps tripping.  The
+# joint step already lays down a grid fine enough on its own, so this refines only where
+# the tool outruns that grid, and six levels make the tool gap 64x smaller than it gives.
+# It is a guard rather than a working limit: near a singularity the tool moves arbitrarily
+# far for arbitrarily little joint travel, and without a cap such a segment would subdivide
+# until it ran out of floating point.
+MAX_TOOL_SUBDIVISION = 6
+
 
 class Cell:
     """A loaded scene plus the collision and kinematics helpers the planner needs."""
@@ -83,6 +91,7 @@ class Cell:
         self._pm = None                         # proximity manager, only if measured
         self._probe_mm = 0.0                    # how far that manager can actually see
         self._extra_probe_mm = 0.0              # asked for by something other than the penalty
+        self.tcp_check_mm = 0.0                 # tool-space check resolution; 0 disables
         self.dynamics = None                    # set by attach_dynamics
         self.weights = self._joint_weights()
 
@@ -284,6 +293,15 @@ class Cell:
         self._pm = pm
         self._probe_mm = float(probe_mm)
 
+    @property
+    def probe_mm(self) -> float:
+        """How far :meth:`clearance_mm` can actually see, in mm.
+
+        A clearance at or beyond this is the query running out of range, not a measurement,
+        and anything reporting a distance has to be able to say which of the two it has.
+        """
+        return self._probe_mm
+
     def clearance_mm(self, q: np.ndarray) -> float:
         """Closest approach between the robot or gun and the static objects, in mm.
 
@@ -368,11 +386,60 @@ class Cell:
         return local / self.man.scale
 
     def segment_collides(self, a: np.ndarray, b: np.ndarray, max_step: float = 0.05) -> bool:
-        """Discretely check the straight joint-space segment a->b."""
-        n = max(2, int(np.ceil(np.max(np.abs(b - a)) / max_step)) + 1)
-        for t in np.linspace(0.0, 1.0, n):
-            if self.in_collision(a + t * (b - a)):
+        """Discretely check the straight joint-space segment a->b.
+
+        ``max_step`` sets the base resolution in joint space, which is the whole of the
+        test when :attr:`tcp_check_mm` is 0.  A joint step is a poor proxy for how far the
+        gun actually goes, though: the same few degrees are millimetres at the wrist and a
+        hand's breadth at the base, so a step fine enough for the one over-checks the
+        other by an order of magnitude and a step sized for the base can carry the gun
+        clean through a fixture between two samples.
+
+        With :attr:`tcp_check_mm` set, both are asked at once and either may trip.  The
+        joint step lays down the grid as before, then any interval whose ends are further
+        apart than that at the tool is halved and rechecked, and its halves are judged the
+        same way.  So the test is never weaker than the joint step alone, it costs nothing
+        on the stretches where the two agree, and the samples land where the gun is really
+        moving rather than where the numbers happen to be large.
+
+        The tool position is free: :meth:`in_collision` has already loaded the state, so
+        reading the transform off it costs no kinematics.
+        """
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        delta = b - a
+        span = float(np.max(np.abs(delta)))
+        n = max(2, int(np.ceil(span / max_step)) + 1)
+        grid = np.linspace(0.0, 1.0, n)
+
+        if self.tcp_check_mm <= 0.0:
+            for t in grid:
+                if self.in_collision(a + t * delta):
+                    return True
+            return False
+
+        tool_step = self.tcp_check_mm * self.man.scale
+        tools = []
+        for t in grid:
+            if self.in_collision(a + t * delta):
                 return True
+            tools.append(self._tcp_now())
+
+        # Right to left, so the halves of a split are popped in the order they are flown.
+        stack = [(grid[k], grid[k + 1], tools[k], tools[k + 1], 0)
+                 for k in range(n - 2, -1, -1)]
+        while stack:
+            t0, t1, p0, p1, depth = stack.pop()
+            if depth >= MAX_TOOL_SUBDIVISION:
+                continue
+            if float(np.linalg.norm(p1 - p0)) <= tool_step:
+                continue
+            tm = 0.5 * (t0 + t1)
+            if self.in_collision(a + tm * delta):
+                return True
+            pm = self._tcp_now()
+            stack.append((tm, t1, pm, p1, depth + 1))
+            stack.append((t0, tm, p0, pm, depth + 1))
         return False
 
     def segment_cost(self, a: np.ndarray, b: np.ndarray, max_step: float = 0.05,
@@ -422,6 +489,16 @@ class Cell:
         return bool(np.all(q >= self.lower - 1e-9) and np.all(q <= self.upper + 1e-9))
 
     # -- kinematics ----------------------------------------------------------
+    def _tcp_now(self) -> np.ndarray:
+        """Where the tool is for the state already loaded, in environment units.
+
+        :meth:`fk` answers the same question but pushes the state first, which is the
+        expensive half.  This is for callers that have just collision-checked a state and
+        so have already paid for it.
+        """
+        return np.array(self.env.getLinkTransform(TCP_LINK).matrix(),
+                        dtype=float)[:3, 3]
+
     def fk(self, q: np.ndarray, link: str = TCP_LINK) -> np.ndarray:
         self.env.setState(self._state_names, self._state_values(q))
         self._state = self.env.getState()
@@ -910,7 +987,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
           hull_per_category=None, weld_proximity_mm: float = 0.0,
           tcp_proximity_mm: float = 0.0, far_cell_factor: float = 4.0,
           hull_overlap: float | None = None,
-          obstacle_clearance_mm: float = 0.0,
+          obstacle_clearance_mm: float = 0.0, tcp_check_mm: float = 0.0,
           penalty=None, dynamics=None) -> Cell:
     """Prepare geometry, emit URDF/SRDF, load the environment and generate the ACM."""
     collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm,
@@ -959,6 +1036,11 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
 
     cell = Cell(man, builder, env, pairs)
     cell.margin, cell.obstacle_clearance = margin, clearance
+    cell.tcp_check_mm = max(0.0, float(tcp_check_mm))
+    if cell.tcp_check_mm > 0.0:
+        log(f"collision checks also measure the tool: an interval that carries the gun "
+            f"more than {cell.tcp_check_mm:g} mm is split and rechecked, up to "
+            f"{MAX_TOOL_SUBDIVISION} times")
     cell.attach_penalty(penalty, log=log)
     cell.attach_dynamics(dynamics)
     _log_gun(man, log)
