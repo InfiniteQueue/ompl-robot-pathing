@@ -141,7 +141,19 @@ def hull_fill(V: np.ndarray, tris: np.ndarray, weld: np.ndarray | None = None) -
 # more coarsely than the grid cannot honour that -- a flat fixture face exported as two
 # triangles metres across yields a metres-wide hull whatever the cell is set to.
 # ``subdivide_to`` removes the floor by bisecting oversized triangles first.
-SUBDIVISION_BUDGET = 400_000
+# How far past its own bounds a cell reaches when claiming triangles, as a fraction of the
+# cell. It exists so that two neighbouring hulls are not decided apart by round-off where
+# their faces are exactly coplanar, and so that a cell catching two near-collinear triangles
+# has enough points to hull. Both are numerical concerns, worth thousandths of a cell.
+#
+# It is not what stops the surface being covered: a triangle lands in exactly one cell when
+# this is 0, and that cell's hull is built from its vertices, so the triangle is inside it
+# either way. Every increment here inflates every hull -- centroids assigned to one cell
+# span ``1 + 2 * overlap`` cells before the triangles' own reach is added -- so it buys
+# robustness in millimetres and costs claimed space in centimetres.
+DEFAULT_OVERLAP = 0.02
+
+SUBDIVISION_BUDGET = 800_000
 SUBDIVISION_PASSES = 64
 
 
@@ -194,7 +206,7 @@ def subdivide_to(V: np.ndarray, tris: np.ndarray, target: float,
 
 
 def split_by_grid(V: np.ndarray, tris: np.ndarray, cell: float,
-                  overlap: float = 0.25) -> tuple[np.ndarray, list[np.ndarray]]:
+                  overlap: float = DEFAULT_OVERLAP) -> tuple[np.ndarray, list[np.ndarray]]:
     """Cut a shell into a grid of cells, each of which is hulled separately.
 
     This is the whole reason a hull can be made more precise without a full convex
@@ -210,9 +222,16 @@ def split_by_grid(V: np.ndarray, tris: np.ndarray, cell: float,
     is returned alongside the pieces; existing indices keep their meaning.
 
     Triangles are assigned by centroid, and also to any neighbouring cell within
-    ``overlap`` of a cell width.  Without that padding the hulls would meet edge to edge
-    with nothing spanning the seam, and a thin gap between two collision shapes is a hole
-    a planner will happily drive the gun through.
+    ``overlap`` of a cell width.  That padding is a numerical margin, not a coverage one:
+    at an overlap of zero a triangle still lands in exactly one cell, and that cell's hull
+    is built from its vertices, so the triangle is inside it and the surface is covered
+    either way.  What the margin buys is that two hulls whose faces are exactly coplanar
+    are not decided apart by round-off, and that a cell catching two near-collinear
+    triangles has enough points to hull with.
+
+    So it is worth thousandths of a cell and costs dearly above that: the centroids
+    assigned to one cell span ``1 + 2 * overlap`` cells before the triangles' own reach is
+    added, and all of that is space the hull claims with no material in it.
     """
     V, tris = subdivide_to(V, tris, cell)
     P = V[np.unique(tris)]
@@ -252,7 +271,8 @@ def _box_distances(lo: np.ndarray, hi: np.ndarray, points: np.ndarray) -> np.nda
 
 def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
                      points: np.ndarray | None, radius: float,
-                     far_factor: float) -> tuple[np.ndarray, list[np.ndarray]]:
+                     far_factor: float,
+                     overlap: float = DEFAULT_OVERLAP) -> tuple[np.ndarray, list[np.ndarray]]:
     """Grid-split a shell, finely near ``points`` and coarsely everywhere else.
 
     Refinement is only ever worth its cost where two pieces of geometry actually come
@@ -268,22 +288,30 @@ def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
     touches it.  The box distance is a lower bound on the true one, so the error only ever
     runs towards refining something that did not need it.
 
-    The band one cell wide either side of ``radius`` goes into *both* sets.  Without that
-    the near and far hulls would meet edge to edge with nothing spanning the seam, which is
-    a hole a planner will happily drive the gun through -- the same reason
-    ``split_by_grid`` pads its cells.
+    The two sets are disjoint: a triangle is refined finely or coarsely, never both.  They
+    used to overlap by a cell, on the same reasoning that once padded the grid cells -- that
+    a seam between the near and far hulls would be a hole.  It is not.  Whichever set a
+    triangle lands in, that set's cell hull is built from its vertices and so contains it,
+    so the surface is covered exactly once and covered completely.
+
+    Overlapping them was expensive in the one place it could least be afforded.  Material
+    just outside the radius was hulled twice: once on the fine grid, and again on the grid
+    ``far_factor`` times coarser -- and that coarse copy sits directly over the weld, which
+    is precisely where a hull claiming space it should not is worst.
 
     ``far_factor`` scales the cell used beyond the radius.  Deliberately a coarser grid
     rather than a single hull: one hull of everything far can bridge back *across* the
     near region, which is safe but can wall off an approach that was actually available.
 
     Classification happens before ``split_by_grid`` subdivides, so it is the original
-    triangles that are sorted: an oversized one straddling the boundary lands in both sets
-    and is then cut down within each.  ``V`` grows as a result and is returned with the
-    pieces.
+    triangles that are sorted, and an oversized one is sorted by the distance from its
+    nearest corner.  That is why ``near`` reaches a cell past the radius: a triangle up to
+    a cell across whose far end is just outside the radius still has material inside it, and
+    the cell it is cut into afterwards has to be the fine one.  ``V`` grows as a result and
+    is returned with the pieces.
     """
     if points is None or len(points) == 0 or radius <= 0.0:
-        return split_by_grid(V, tris, cell)
+        return split_by_grid(V, tris, cell, overlap)
 
     coarse = cell * far_factor
     lo = V[np.unique(tris)].min(axis=0)
@@ -292,20 +320,20 @@ def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
     # a shell every point is clear of skips the per-triangle measurement entirely.
     box = np.linalg.norm(np.maximum(np.maximum(lo - points, points - hi), 0.0), axis=1)
     if float(box.min()) > radius + cell:
-        return split_by_grid(V, tris, coarse) if far_factor > 0 else (V, [tris])
+        return split_by_grid(V, tris, coarse, overlap) if far_factor > 0 else (V, [tris])
 
     corners = np.stack((V[tris[:, 0]], V[tris[:, 1]], V[tris[:, 2]]))
     t_lo, t_hi = corners.min(axis=0), corners.max(axis=0)
     nearest = _box_distances(t_lo, t_hi, points)
     pieces: list[np.ndarray] = []
     near = tris[nearest <= radius + cell]
-    far = tris[nearest > radius]
+    far = tris[nearest > radius + cell]
     if len(near):
-        V, cut = split_by_grid(V, near, cell)
+        V, cut = split_by_grid(V, near, cell, overlap)
         pieces += cut
     if len(far):
         if far_factor > 0:
-            V, cut = split_by_grid(V, far, coarse)
+            V, cut = split_by_grid(V, far, coarse, overlap)
             pieces += cut
         else:
             pieces.append(far)
@@ -316,7 +344,8 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
                      min_extent: float = 40.0, max_shells: int = 80,
                      hull_cell: float = 0.0, fill_threshold: float = 0.75,
                      focus_points: np.ndarray | None = None,
-                     focus_radius: float = 0.0, far_factor: float = 4.0) -> dict:
+                     focus_radius: float = 0.0, far_factor: float = 4.0,
+                     overlap: float = DEFAULT_OVERLAP) -> dict:
     """Split ``src`` into connected shells and write them as ``o`` groups into ``dst``.
 
     Every shell becomes a convex hull, and each hull is a collision pair to test, so the
@@ -374,7 +403,7 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
                 refined.append((vids, tris))
                 continue
             V, pieces = split_near_focus(V, tris, hull_cell, focus_points,
-                                         focus_radius, far_factor)
+                                         focus_radius, far_factor, overlap)
             if len(pieces) < 2:
                 refined.append((vids, tris))
                 continue
@@ -425,7 +454,8 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             hull_cell: float = 0.0, fill: float = DEFAULT_FILL,
             cells: dict[str, float] | None = None,
             focus: dict[str, tuple[np.ndarray, float]] | None = None,
-            far_factor: float = 4.0) -> dict[str, str]:
+            far_factor: float = 4.0,
+            overlap: float = DEFAULT_OVERLAP) -> dict[str, str]:
     """Convex-decompose every mesh that needs it, reusing cached results.
 
     ``mesh_rel_paths`` maps link name -> mesh path relative to ``directory``.
@@ -456,6 +486,10 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
         points, radius = focus.get(link, (None, 0.0))
         settings = [round(float(min_extent), 4), int(max_shells), round(float(scale), 9),
                     round(cell, 4), round(threshold, 4)]
+        if cell > 0.0 and round(float(overlap), 4) != 0.25:
+            # The cell padding used to be fixed at 0.25 and was not part of the key. Naming
+            # it only when it differs keeps every cache built before it was tunable valid.
+            settings += ["ovl", round(float(overlap), 4)]
         if cell > 0.0:
             # Subdividing oversized triangles changed what a cell produces, so geometry
             # cached before it must not be reused.  Only appended where a cell is in play,
@@ -467,7 +501,10 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             # cache prepared before this option existed stays valid while it is left off.
             digest = hashlib.sha1(
                 np.round(np.sort(points, axis=0), 3).tobytes()).hexdigest()[:12]
-            settings += [round(radius, 4), round(float(far_factor), 4), digest]
+            settings += [round(radius, 4), round(float(far_factor), 4), digest,
+                         # The near and far sets no longer overlap, so geometry cached while
+                         # they did holds a coarse duplicate of the refined material.
+                         "disjoint"]
         src = os.path.join(directory, rel).replace("\\", "/")
         if not os.path.isfile(src):
             log(f"  ! missing mesh for {link}: {rel}")
@@ -485,7 +522,8 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
         stats = decompose_to_obj(src, dst, scale, min_extent=min_extent,
                                  max_shells=max_shells, hull_cell=cell,
                                  fill_threshold=threshold, focus_points=points,
-                                 focus_radius=radius, far_factor=far_factor)
+                                 focus_radius=radius, far_factor=far_factor,
+                                 overlap=overlap)
         near = f" within {radius:g} mm of a focus point" if radius > 0.0 else ""
         refined = (f", {stats['shells_refined']} split at {cell:g} mm below "
                    f"{threshold:g} fill{near}" if stats["shells_refined"] else "")

@@ -41,9 +41,9 @@ def build_parser() -> argparse.ArgumentParser:
 #endregion
     #region ###COLLISIONS###
     #COLLISION JOINT STEP RESOLUTION
-    p.add_argument("--check-step-deg", type=float, default=3.0,
+    p.add_argument("--check-step-deg", type=float, default=2.0,
                    help="joint-space resolution used when checking a move for collision; "
-                        "smaller is safer and slower (default: 3)")
+                        "smaller is safer and slower (default: 2)")
     #COLLISION CHECK RESOLUTION
     p.add_argument("--segment-length-rad", type=float, default=0.02,
                    help="collision checking resolution for the sampling planner "
@@ -103,25 +103,28 @@ def build_parser() -> argparse.ArgumentParser:
                         "linear motion. Larger means more of the route comes out linear, "
                         "which is more predictable and slower to execute (default: 100)")
     #SHORTEST STRETCH WORTH MAKING LINEAR
-    p.add_argument("--near-panel-min-mm", type=float, default=150.0, metavar="MM",
+    p.add_argument("--near-panel-min-mm", type=float, default=250.0, metavar="MM",
                    help="shortest near-panel stretch worth converting, measured as tool "
                         "travel. A sweeping transit that clips the proximity band for a "
                         "moment is not working near the panel, and cutting it in three to "
                         "say so costs a stop at each end for nothing. A stretch under "
                         "this length still qualifies on --near-panel-min-pct "
-                        "(default: 150)")
+                        "(default: 250)")
     #...OR THIS MUCH OF THE MOVE, HOWEVER SHORT
     p.add_argument("--near-panel-min-pct", type=float, default=50.0, metavar="PCT",
-                   help="a near-panel stretch shorter than --near-panel-min-mm is still "
-                        "made linear if it is this much of the move's own tool travel. "
-                        "Without it no short move could ever come out linear, however "
-                        "completely it runs alongside the panel -- a hop from one weld to "
-                        "the next being the case that matters. 0 leaves length as the only "
-                        "test (default: 50)")
+                   help="if this much of a move is within --near-panel-mm of the parts, "
+                        "every near-panel stretch of it is made linear however short each "
+                        "one is. Measured over the whole move, not over each stretch: time "
+                        "spent near the panel does not have to be continuous, so a retract "
+                        "whose apex leaves the band for an instant no longer disqualifies "
+                        "the move either side of it. Without this no short move could come "
+                        "out linear however completely it runs alongside the panel -- a hop "
+                        "from one weld to the next being the case that matters. 0 leaves "
+                        "--near-panel-min-mm as the only test (default: 50)")
     #endregion
     #region ###COLLISION HULLS###
     #DROP TINY SHELLS
-    p.add_argument("--min-shell-mm", type=float, default=5.0,
+    p.add_argument("--min-shell-mm", type=float, default=20.0,
                    help="drop collision shells smaller than this across their bounding "
                         "box diagonal (default: 5)")
     #SHELL COUNT CAP PER LINK
@@ -135,7 +138,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "follows recesses instead of bridging them. Smaller is more "
                         "accurate and slower; 0 disables (default: 50)")
     #WHEN A SHELL NEEDS REFINING AT ALL
-    p.add_argument("--hull-fill", type=float, default=0.65, metavar="F",
+    p.add_argument("--hull-fill", type=float, default=0.85, metavar="F",
                    help="how much of its own bounding box a shell must fill before a "
                         "single hull is accepted for it; below this it is split by "
                         "--hull-cell-mm. Raise it towards 1 for geometry whose recesses "
@@ -152,13 +155,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "where it makes contact, so refining it buys accuracy nowhere and "
                         "costs shells everywhere (default: 0, i.e. off)")
     #CELL SIZE: TOOLING
-    p.add_argument("--tooling-cell-mm", type=float, default=10, metavar="MM",
+    p.add_argument("--tooling-cell-mm", type=float, default=30, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls tooling. "
                         "These are the largest meshes in the cell and refinement runs "
                         "after --max-shells, so a small cell here dominates both "
                         "preparation and every later collision check (default: 50)")
     #CELL SIZE: PANELS
-    p.add_argument("--panel-cell-mm", type=float, default=60, metavar="MM",
+    p.add_argument("--panel-cell-mm", type=float, default=40, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls panel. This "
                         "is the geometry that is concave exactly where the welds are, so "
                         "it is where a small cell is worth paying for (default: 10)")
@@ -183,12 +186,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "--gun-cell-mm above 0 to do anything at all. 0 refines everywhere "
                         "(default: 0, i.e. off)")
     #HOW COARSE THE GEOMETRY AWAY FROM THE WELDS AND THE TCP GETS
-    p.add_argument("--far-cell-factor", type=float, default=4.0, metavar="N",
+    p.add_argument("--far-cell-factor", type=float, default=6.0, metavar="N",
                    help="multiplier on the cell size beyond --shell-split-weld-prox and "
                         "--shell-split-tcp-prox; 0 "
                         "makes each far shell a single hull, which is coarser still and "
                         "can "
-                        "bridge back across the welds (default: 4)")
+                        "bridge back across the welds (default: 6)")
+    #HOW FAR A CELL REACHES PAST ITS OWN BOUNDS
+    p.add_argument("--hull-cell-overlap", type=float, default=0.02, metavar="F",
+                   help="how far past its own bounds a cell claims triangles, as a "
+                        "fraction of the cell. A cell's hull ends up spanning about "
+                        "1 + 2F cells, so every increment inflates every hull. It is only "
+                        "a numerical margin -- at 0 a triangle still lands in one cell "
+                        "and that cell's hull contains it, so the surface stays covered "
+                        "-- and it exists so hulls with exactly coplanar faces are not "
+                        "decided apart by round-off (default: 0.02)")
     #endregion
     #region ###CLEARANCE FROM THE PARTS###
     #CLEARANCE EVERYWHERE
@@ -356,6 +368,7 @@ def main(argv: list[str] | None = None) -> int:
                               weld_proximity_mm=args.shell_split_weld_prox,
                               tcp_proximity_mm=args.shell_split_tcp_prox,
                               far_cell_factor=args.far_cell_factor,
+                              hull_overlap=args.hull_cell_overlap,
                               obstacle_clearance_mm=args.obstacle_clearance_mm,
                               penalty=penalty, dynamics=dynamics)
     except RuntimeError as exc:

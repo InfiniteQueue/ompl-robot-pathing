@@ -643,8 +643,11 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
                               hull_cell: float, hull_fill: float,
                               hull_per_category, weld_proximity: float = 0.0,
                               tcp_proximity: float = 0.0,
-                              far_cell_factor: float = 4.0) -> dict[str, str]:
+                              far_cell_factor: float = 4.0,
+                              hull_overlap: float | None = None) -> dict[str, str]:
     from . import meshprep
+
+    overlap = meshprep.DEFAULT_OVERLAP if hull_overlap is None else float(hull_overlap)
 
     rel: dict[str, str] = {}
     for link in man.all_links():
@@ -663,11 +666,15 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
             log(f"  the gun refined within {tcp_proximity:g} mm of the tool centre point")
         log(f"  elsewhere the cell is {far_cell_factor:g}x as coarse"
             if far_cell_factor > 0 else "  elsewhere a shell is left as one hull")
+    if hull_cell > 0.0:
+        log(f"  cells claim triangles {overlap:g} of a cell past their own bounds, so a "
+            f"cell's hull spans about {1.0 + 2.0 * overlap:.2f}x the cell")
     return meshprep.prepare(man.directory, rel, man.scale, log=log,
                             min_extent=min_extent, max_shells=max_shells,
                             hull_cell=hull_cell, fill=hull_fill,
                             cells=hull_cells(man, hull_cell, hull_per_category),
-                            focus=focus, far_factor=far_cell_factor)
+                            focus=focus, far_factor=far_cell_factor,
+                            overlap=overlap)
 
 
 # Probe distance for the exact re-measurement.  Generous on purpose: a pair the hulls
@@ -902,12 +909,14 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
           hull_cell_mm: float = 0.0, hull_fill: float = 0.75,
           hull_per_category=None, weld_proximity_mm: float = 0.0,
           tcp_proximity_mm: float = 0.0, far_cell_factor: float = 4.0,
+          hull_overlap: float | None = None,
           obstacle_clearance_mm: float = 0.0,
           penalty=None, dynamics=None) -> Cell:
     """Prepare geometry, emit URDF/SRDF, load the environment and generate the ACM."""
     collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm,
                                           hull_fill, hull_per_category, weld_proximity_mm,
-                                          tcp_proximity_mm, far_cell_factor)
+                                          tcp_proximity_mm, far_cell_factor,
+                                          hull_overlap)
     velocity = {}
     if dynamics is not None:
         velocity = {n: float(v) for n, v in zip(man.robot_joint_names, dynamics.velocity)}

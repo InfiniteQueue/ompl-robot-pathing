@@ -957,9 +957,16 @@ def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
     into three phases to say so would cost a stop at each end for nothing.  But that test
     alone measures the wrong thing on a short leg -- a 60 mm hop from one weld to the next
     is near the panel for its whole length and is exactly the motion that should be
-    straight, yet no absolute threshold worth setting for transits will ever admit it.  So
-    ``min_run_pct`` qualifies a run that is a large enough share of the leg's own tool
-    travel, whatever its length.  Either is sufficient.
+    straight, yet no absolute threshold worth setting for transits will ever admit it.
+
+    ``min_run_pct`` is therefore asked about the leg rather than about the run: what share
+    of the measured points along it are in range at all.  Being near the panel is a
+    property of the move, and it does not stop being one because the clearance rose above
+    the band for an instant somewhere in the middle -- which is what the apex of a retract
+    between two welds looks like.  Measured per run, one such blip splits a leg that is
+    85% near the panel into two runs of 45% and 40%, and a 50% threshold then rejects
+    both.  Measured over the leg, the blip costs its own points and nothing else, and every
+    near-panel stretch of a qualifying leg is converted.  Either test is sufficient.
 
     A run that cannot be linearised keeps its joint motion, so the worst case is the route
     that would have been emitted anyway.
@@ -977,7 +984,11 @@ def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
         log(f"      measuring clearance at {len(dense)} points along the route to find "
             f"its near-panel stretches")
     near = [cell.clearance_mm(q) <= near_mm for q in dense]
-    total = _tcp_travel(cell, dense)
+    # How much of the leg is in range at all, counted over its measured points rather than
+    # over any one stretch of them.  The points are a collision-check step apart, so this
+    # is how much of the route runs near the panel, whether or not it does so in one go.
+    in_range = 100.0 * sum(near) / len(near) if near else 0.0
+    leg_qualifies = min_run_pct > 0.0 and in_range >= min_run_pct
     runs: list[Run] = []
     kept = skipped = failed = 0
     cursor = 0
@@ -990,9 +1001,7 @@ def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
         while j + 1 < len(dense) and near[j + 1]:
             j += 1
         travel = _tcp_travel(cell, dense[i:j + 1]) if j > i else 0.0
-        share = 100.0 * travel / total if total > 0.0 else 0.0
-        if j > i and (travel >= min_run_mm
-                      or (min_run_pct > 0.0 and share >= min_run_pct)):
+        if j > i and (travel >= min_run_mm or leg_qualifies):
             chain = _linear_chain(cell, dense[i:j + 1], step_mm=step_mm,
                                   check_step=check_step)
             if chain is not None:
@@ -1012,7 +1021,8 @@ def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
     if not runs:
         return [Run(PTP, list(path))]
     if log and (kept or failed or skipped):
-        note = [f"{kept} near-panel stretches made linear"]
+        note = [f"{in_range:.0f}% of the leg in range, "
+                f"{kept} near-panel stretches made linear"]
         if skipped:
             note.append(f"{skipped} too brief to be worth it")
         if failed:
