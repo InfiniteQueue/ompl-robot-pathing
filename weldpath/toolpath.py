@@ -66,7 +66,7 @@ class ToolpathPlanner:
                  ompl_seconds: float = 5.0,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                  near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
-                 near_panel_min_pct: float = 0.0,
+                 near_panel_min_pct: float = 0.0, linear_speed_mm_s: float = 0.0,
                  weld_clearance_mm: float | None = None,
                  export_dir: str | None = None,
                  keep_unrefined: bool = False, log=print):
@@ -85,7 +85,8 @@ class ToolpathPlanner:
         # linear motion instead of joint motion.  The clearance query has to be able to
         # see that far, which it will not do on the penalty's probe alone.
         self.zone = LinearZone(near_mm=near_panel_mm, min_run_mm=near_panel_min_mm,
-                               min_run_pct=near_panel_min_pct, step_mm=linear_step_mm)
+                               min_run_pct=near_panel_min_pct, step_mm=linear_step_mm,
+                               linear_speed_mm_s=linear_speed_mm_s)
         # Every locator reports its measured clearance against the one it has to meet,
         # placed or not, so the query has to see past the larger threshold with room to
         # spare.  A probe that stops at the threshold can only ever answer "at least the
@@ -347,7 +348,8 @@ class ToolpathPlanner:
         # tip position the robot never holds.
         for ph in phases:
             with self.cell.gun_opening(ph.gun_opening_mm):
-                problem = validate(self.cell, ph.states, max_step=self.check_step)
+                problem = validate(self.cell, ph.states, max_step=self.check_step,
+                                   motion=ph.motion, zone=self.zone)
             if problem:
                 raise PlanningError(f"planned {ph.kind} failed validation: {problem}")
         problem = self._validate_junctions(phases)

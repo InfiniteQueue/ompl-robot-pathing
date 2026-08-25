@@ -408,6 +408,7 @@ def main(argv: list[str] | None = None) -> int:
         near_panel_mm=args.near_panel_mm if args.near_panel_linear else 0.0,
         near_panel_min_mm=args.near_panel_min_mm,
         near_panel_min_pct=args.near_panel_min_pct,
+        linear_speed_mm_s=args.linear_speed_mm_s,
         weld_clearance_mm=args.weld_clearance_mm,
         export_dir=directory if args.export_collision_geometry else None,
         keep_unrefined=args.unrefined_output,

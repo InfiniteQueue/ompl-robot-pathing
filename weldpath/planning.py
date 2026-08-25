@@ -37,8 +37,148 @@ class PlanningError(RuntimeError):
 # ---------------------------------------------------------------------------
 # path post-processing
 # ---------------------------------------------------------------------------
-def simplify(cell: Cell, path: list[np.ndarray], max_step: float = 0.05
-             ) -> list[np.ndarray]:
+class MotionModel:
+    """Which profile governs a move, and what that profile forbids and costs.
+
+    The profile is **not** stored against a waypoint.  It is derived from the two states a
+    move runs between: the move is linear when either end is inside the panel band.  That
+    is what makes it survive the optimisation passes -- shortcut and polish move points
+    around, and a waypoint relocated out of the band changes the profile of its own two
+    moves with it, with nothing to invalidate and no bookkeeping to get wrong.
+
+    It also gives the marking the output wants for free.  A waypoint is reached by exactly
+    one move, and that move is linear if the waypoint is in the band or the one before it
+    was -- "ends in the region, or was moved to from a point in the region".
+
+    With no zone in force every move is ``PTP`` and every method here reduces to the plain
+    joint-space one it wraps, so the un-zoned path through the planner is unchanged.
+    """
+
+    def __init__(self, cell: Cell, *, max_step: float, zone: "LinearZone | None" = None):
+        self.cell = cell
+        self.max_step = max_step
+        self.zone = zone if (zone is not None and zone.enabled) else None
+        # One clearance query per distinct state: the query loads a joint state into the
+        # environment, which costs far more than everything else these passes do.
+        self._near: dict[bytes, bool] = {}
+
+    # -- which profile ------------------------------------------------------
+    def near(self, q: np.ndarray) -> bool:
+        if self.zone is None:
+            return False
+        key = np.asarray(q, dtype=float).tobytes()
+        hit = self._near.get(key)
+        if hit is None:
+            hit = bool(self.cell.clearance_mm(q) <= self.zone.near_mm)
+            self._near[key] = hit
+        return hit
+
+    def motion(self, a: np.ndarray, b: np.ndarray) -> str:
+        return LIN if (self.near(a) or self.near(b)) else PTP
+
+    def demotes(self, a: np.ndarray, b: np.ndarray, replaced) -> bool:
+        """Would replacing ``replaced`` with the move a->b drop it out of the profile?
+
+        The optimisation passes exist to delete waypoints, and deleting is nearly always
+        quicker: every retained hop pays its own pair of ramps, so a chord across twenty
+        dense points beats them on time before the clearance penalty is even consulted.
+        Left alone they would therefore dissolve exactly the near-panel stretches this is
+        here to create, and hand back a single long move whose two ends sit outside the
+        band -- which by the endpoint rule is joint motion, sweeping an arc through the
+        very region the linear profile was chosen for.
+
+        So a replacement that takes points out of the band without inheriting the band
+        itself is refused.  Everything else the passes want to do is still allowed,
+        including reshaping and thinning the stretch, since a chord between two points
+        that are themselves in the band stays linear and stays checked as one.
+        """
+        if self.zone is None or self.motion(a, b) == LIN:
+            return False
+        return any(self.near(q) for q in replaced)
+
+    # -- what it forbids ----------------------------------------------------
+    def blocked(self, a: np.ndarray, b: np.ndarray) -> bool:
+        """Whether this move is unusable, checked along the path it will really take."""
+        if self.motion(a, b) == PTP:
+            return self.cell.segment_collides(a, b, max_step=self.max_step)
+        return not self.linear_ok(a, b)
+
+    def _pose_mm(self, q: np.ndarray) -> np.ndarray:
+        """TCP pose in manifest units.
+
+        ``fk`` answers in environment units, which are metres, while ``plan_linear`` and
+        the inverse kinematics behind it take manifest units and apply the scale
+        themselves.  Handing the raw transform over asks for a pose a millimetre from the
+        base, which has no solution, so every linear move reads as unreachable.
+        """
+        T = self.cell.fk(q).copy()
+        T[:3, 3] /= self.cell.man.scale
+        return T
+
+    def linear_ok(self, a: np.ndarray, b: np.ndarray) -> bool:
+        """Can the tool run straight from ``a`` to ``b``?
+
+        Under a linear profile the controller drives the tool along the straight line and
+        solves inverse kinematics as it goes, so that line -- not the joint chord between
+        the same two states -- is what has to be reachable and clear.  A joint-space check
+        here would be checking a path the robot does not take, and for the long chords the
+        shortcut pass proposes the two are nowhere near each other.
+        """
+        try:
+            chain = plan_linear(self.cell, self._pose_mm(a), self._pose_mm(b), a,
+                                step_mm=self.zone.step_mm)
+        except PlanningError:
+            return False                    # no inverse kinematics somewhere along it
+        # Inverse kinematics returns the solution nearest its seed rather than the state
+        # asked for, so pin the ends back before checking the gaps between the samples.
+        chain[0] = np.asarray(a, dtype=float)
+        chain[-1] = np.asarray(b, dtype=float)
+        return not _chain_collides(self.cell, chain, self.max_step)
+
+    # -- what it costs ------------------------------------------------------
+    def _cartesian_floor(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Seconds the tool speed cap imposes on a linear move, or 0 where none applies."""
+        if self.zone is None or self.zone.linear_speed_mm_s <= 0.0:
+            return 0.0
+        if self.motion(a, b) == PTP:
+            return 0.0
+        return _tcp_travel(self.cell, [a, b]) / self.zone.linear_speed_mm_s
+
+    def cruise_time(self, a: np.ndarray, b: np.ndarray) -> float:
+        return max(self.cell.cruise_time(a, b), self._cartesian_floor(a, b))
+
+    def move_time(self, a: np.ndarray, b: np.ndarray) -> float:
+        return max(self.cell.move_time(a, b), self._cartesian_floor(a, b))
+
+    def cost(self, a: np.ndarray, b: np.ndarray, *, fa: float | None = None,
+             fb: float | None = None, stops: bool = False) -> float:
+        """Penalised time, with the tool speed cap folded in.
+
+        The cap raises the base time; the clearance penalty on top of it is unchanged, so
+        the two are combined by scaling rather than by replacement.  Optimising without
+        this would let the passes trade a joint move for a linear one that is quicker on
+        the joint limits and slower once the tool speed governs it.
+        """
+        penalised = self.cell.segment_cost(a, b, max_step=self.max_step,
+                                           fa=fa, fb=fb, stops=stops)
+        floor = self._cartesian_floor(a, b)
+        if floor <= 0.0:
+            return penalised
+        raw = self.cell.move_time(a, b) if stops else self.cell.cruise_time(a, b)
+        if raw <= 0.0:
+            return max(penalised, floor)
+        return penalised * max(1.0, floor / raw)
+
+    # -- pass-through -------------------------------------------------------
+    def penalty_factor(self, q: np.ndarray) -> float:
+        return self.cell.penalty_factor(q)
+
+    @property
+    def penalised(self) -> bool:
+        return self.cell.penalty is not None and self.cell.penalty.enabled
+
+
+def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
     """Reduce a path to the fewest waypoints that still traverse it without collision.
 
     From each kept waypoint, reach for the furthest later waypoint the robot can get to
@@ -67,13 +207,13 @@ def simplify(cell: Cell, path: list[np.ndarray], max_step: float = 0.05
 
     def factor(k: int) -> float:
         if k not in factors:
-            factors[k] = cell.penalty_factor(path[k])
+            factors[k] = model.penalty_factor(path[k])
         return factors[k]
 
     def polyline_cost(i: int, j: int) -> float:
         # Each retained hop is its own stop-to-stop move.  The hops are short, so the
         # endpoint factors describe them well enough without sampling their interiors.
-        return sum(cell.move_time(path[k], path[k + 1]) * max(factor(k), factor(k + 1))
+        return sum(model.move_time(path[k], path[k + 1]) * max(factor(k), factor(k + 1))
                    for k in range(i, j))
 
     out = [path[0]]
@@ -81,11 +221,14 @@ def simplify(cell: Cell, path: list[np.ndarray], max_step: float = 0.05
     while i < len(path) - 1:
         j = len(path) - 1
         while j > i + 1:
-            if cell.segment_collides(path[i], path[j], max_step=max_step):
+            if model.demotes(path[i], path[j], path[i + 1:j]):
                 j -= 1
                 continue
-            chord = cell.segment_cost(path[i], path[j], max_step=max_step,
-                                      fa=factor(i), fb=factor(j), stops=True)
+            if model.blocked(path[i], path[j]):
+                j -= 1
+                continue
+            chord = model.cost(path[i], path[j],
+                               fa=factor(i), fb=factor(j), stops=True)
             if chord > polyline_cost(i, j) + 1e-9:
                 j -= 1
                 continue
@@ -95,14 +238,14 @@ def simplify(cell: Cell, path: list[np.ndarray], max_step: float = 0.05
     return out
 
 
-def _hop(cell: Cell, a: np.ndarray, b: np.ndarray, fa: float, fb: float,
-         max_step: float) -> float:
+def _hop(model: "MotionModel", a: np.ndarray, b: np.ndarray,
+         fa: float, fb: float) -> float:
     """Penalised time of one emitted move: full bang-bang, ramps included."""
-    return cell.segment_cost(a, b, max_step=max_step, fa=fa, fb=fb, stops=True)
+    return model.cost(a, b, fa=fa, fb=fb, stops=True)
 
 
-def polish(cell: Cell, path: list[np.ndarray], *, time_budget: float = 5.0,
-           max_step: float = 0.05, rng: np.random.Generator | None = None,
+def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float = 5.0,
+           rng: np.random.Generator | None = None,
            log=None) -> list[np.ndarray]:
     """Remove and relocate waypoints of the reduced path, judged on penalised time.
 
@@ -129,10 +272,11 @@ def polish(cell: Cell, path: list[np.ndarray], *, time_budget: float = 5.0,
     if len(path) < 3 or time_budget <= 0:
         return [np.asarray(p, dtype=float).copy() for p in path]
 
+    cell = model.cell
     rng = rng or np.random.default_rng(1)
     pts = [np.asarray(p, dtype=float).copy() for p in path]
-    fac = [cell.penalty_factor(p) for p in pts]
-    costs = [_hop(cell, pts[i], pts[i + 1], fac[i], fac[i + 1], max_step)
+    fac = [model.penalty_factor(p) for p in pts]
+    costs = [_hop(model, pts[i], pts[i + 1], fac[i], fac[i + 1])
              for i in range(len(pts) - 1)]
     before = sum(costs)
     deadline = time.time() + time_budget
@@ -142,10 +286,13 @@ def polish(cell: Cell, path: list[np.ndarray], *, time_budget: float = 5.0,
         nonlocal dropped
         k = 1
         while k < len(pts) - 1 and time.time() < deadline:
-            if cell.segment_collides(pts[k - 1], pts[k + 1], max_step=max_step):
+            if model.demotes(pts[k - 1], pts[k + 1], [pts[k]]):
                 k += 1
                 continue
-            direct = _hop(cell, pts[k - 1], pts[k + 1], fac[k - 1], fac[k + 1], max_step)
+            if model.blocked(pts[k - 1], pts[k + 1]):
+                k += 1
+                continue
+            direct = _hop(model, pts[k - 1], pts[k + 1], fac[k - 1], fac[k + 1])
             if direct >= costs[k - 1] + costs[k] - 1e-9:
                 k += 1
                 continue
@@ -172,16 +319,19 @@ def polish(cell: Cell, path: list[np.ndarray], *, time_budget: float = 5.0,
         # Unpenalised time is a lower bound on penalised time, so this rejects most
         # candidates before paying for a collision check or a clearance query.
         budget = costs[k - 1] + costs[k]
-        if (cell.move_time(pts[k - 1], candidate)
-                + cell.move_time(candidate, pts[k + 1])) >= budget - 1e-9:
+        if (model.move_time(pts[k - 1], candidate)
+                + model.move_time(candidate, pts[k + 1])) >= budget - 1e-9:
             continue
-        if cell.segment_collides(pts[k - 1], candidate, max_step=max_step):
+        if (model.demotes(pts[k - 1], candidate, [pts[k]])
+                or model.demotes(candidate, pts[k + 1], [pts[k]])):
             continue
-        if cell.segment_collides(candidate, pts[k + 1], max_step=max_step):
+        if model.blocked(pts[k - 1], candidate):
             continue
-        f = cell.penalty_factor(candidate)
-        first = _hop(cell, pts[k - 1], candidate, fac[k - 1], f, max_step)
-        second = _hop(cell, candidate, pts[k + 1], f, fac[k + 1], max_step)
+        if model.blocked(candidate, pts[k + 1]):
+            continue
+        f = model.penalty_factor(candidate)
+        first = _hop(model, pts[k - 1], candidate, fac[k - 1], f)
+        second = _hop(model, candidate, pts[k + 1], f, fac[k + 1])
         if first + second >= budget - 1e-9:
             continue
         pts[k], fac[k] = candidate, f
@@ -198,8 +348,8 @@ def polish(cell: Cell, path: list[np.ndarray], *, time_budget: float = 5.0,
     return pts
 
 
-def _refine(cell: Cell, path: list[np.ndarray], *, shortcut_seconds: float,
-            polish_seconds: float, check_step: float, log) -> list[np.ndarray]:
+def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: float,
+            polish_seconds: float, log) -> list[np.ndarray]:
     """The whole post-processing chain, in the order the three passes need to run.
 
     Shortcutting reshapes the route while it is still dense, reduction picks which of those
@@ -208,11 +358,9 @@ def _refine(cell: Cell, path: list[np.ndarray], *, shortcut_seconds: float,
     """
     log(f"      refining {len(path)} points: up to {shortcut_seconds:g}s shortcutting "
         f"then {polish_seconds:g}s polishing, both spent in full")
-    improved = shortcut(cell, path, time_budget=shortcut_seconds,
-                        max_step=check_step, log=log)
-    reduced = simplify(cell, improved, max_step=check_step)
-    return polish(cell, reduced, time_budget=polish_seconds,
-                  max_step=check_step, log=log)
+    improved = shortcut(model, path, time_budget=shortcut_seconds, log=log)
+    reduced = simplify(model, improved)
+    return polish(model, reduced, time_budget=polish_seconds, log=log)
 
 
 def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.ndarray]:
@@ -221,8 +369,25 @@ def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.
     return [a + (b - a) * (k / n) for k in range(1, n)]
 
 
-def shortcut(cell: Cell, path: list[np.ndarray], *, time_budget: float = 2.0,
-             max_step: float = 0.05, rng: np.random.Generator | None = None,
+def _densify(cell: Cell, path: list[np.ndarray], step: float) -> list[np.ndarray]:
+    """A sampling planner's handful of states, filled in at collision-check resolution.
+
+    OMPL returns very few points -- four is typical -- and every pass downstream wants the
+    route rather than the tree's nodes.  The spacing is a joint-space one, the same
+    ``--check-step-deg`` the checking uses, so consecutive points differ by less than the
+    resolution anything here can resolve.
+    """
+    out: list[np.ndarray] = [np.asarray(path[0], dtype=float)]
+    for a, b in zip(path, path[1:]):
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        out.extend(_resample(cell, a, b, step))
+        out.append(b)
+    return out
+
+
+def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float = 2.0,
+             rng: np.random.Generator | None = None,
              log=None) -> list[np.ndarray]:
     """Reshape a path to take less time, penalised for running close to the parts.
 
@@ -259,19 +424,17 @@ def shortcut(cell: Cell, path: list[np.ndarray], *, time_budget: float = 2.0,
     if len(path) < 3 or time_budget <= 0:
         return [np.asarray(p, dtype=float).copy() for p in path]
 
-    dense: list[np.ndarray] = [np.asarray(path[0], dtype=float)]
-    for a, b in zip(path, path[1:]):
-        dense.extend(_resample(cell, np.asarray(a, dtype=float),
-                               np.asarray(b, dtype=float), max_step))
-        dense.append(np.asarray(b, dtype=float))
+    cell = model.cell
+    max_step = model.max_step
+    dense = _densify(cell, path, max_step)
 
     # One clearance query per waypoint, cached: the geometry query dominates, so scoring a
     # candidate has to be arithmetic over remembered factors rather than fresh queries.
-    penalised = cell.penalty is not None and cell.penalty.enabled
-    fac = [cell.penalty_factor(p) if penalised else 1.0 for p in dense]
+    penalised = model.penalised
+    fac = [model.penalty_factor(p) if penalised else 1.0 for p in dense]
 
     def step_cost(x: np.ndarray, y: np.ndarray, fx: float, fy: float) -> float:
-        return cell.cruise_time(x, y) * max(fx, fy)
+        return model.cruise_time(x, y) * max(fx, fy)
 
     def span_cost(i: int, j: int) -> float:
         return sum(step_cost(dense[k], dense[k + 1], fac[k], fac[k + 1])
@@ -285,9 +448,9 @@ def shortcut(cell: Cell, path: list[np.ndarray], *, time_budget: float = 2.0,
     while time.time() < deadline and len(dense) > 2:
         tried += 1
         if rng.random() < 0.5:
-            cuts += _try_cut(cell, dense, fac, rng, max_step, penalised, span_cost)
+            cuts += _try_cut(model, dense, fac, rng, penalised, span_cost)
         else:
-            moves += _try_relocate(cell, dense, fac, rng, max_step, penalised, step_cost)
+            moves += _try_relocate(model, dense, fac, rng, penalised, step_cost)
 
     if log:
         after = span_cost(0, len(dense) - 1)
@@ -298,7 +461,7 @@ def shortcut(cell: Cell, path: list[np.ndarray], *, time_budget: float = 2.0,
     return dense
 
 
-def _try_cut(cell: Cell, dense, fac, rng, max_step, penalised, span_cost) -> int:
+def _try_cut(model: "MotionModel", dense, fac, rng, penalised, span_cost) -> int:
     """Replace dense[i..j] with the straight move between the ends, if that is cheaper."""
     i, j = sorted(rng.integers(0, len(dense), size=2))
     if j - i < 2:
@@ -308,16 +471,18 @@ def _try_cut(cell: Cell, dense, fac, rng, max_step, penalised, span_cost) -> int
     # time of the direct move is a valid lower bound on what the replacement can cost.
     # Rejecting on that first keeps the expensive checks off the many candidates that
     # were never going to win.
-    if cell.cruise_time(dense[i], dense[j]) >= span - 1e-9:
+    if model.cell.cruise_time(dense[i], dense[j]) >= span - 1e-9:
         return 0
-    if cell.segment_collides(dense[i], dense[j], max_step=max_step):
+    if model.demotes(dense[i], dense[j], dense[i + 1:j]):
         return 0
-    points = _resample(cell, dense[i], dense[j], max_step)
+    if model.blocked(dense[i], dense[j]):
+        return 0
+    points = _resample(model.cell, dense[i], dense[j], model.max_step)
     if penalised:
-        factors = [cell.penalty_factor(p) for p in points]
+        factors = [model.penalty_factor(p) for p in points]
         chain = [dense[i]] + points + [dense[j]]
         chain_f = [fac[i]] + factors + [fac[j]]
-        direct = sum(cell.cruise_time(x, y) * max(fx, fy)
+        direct = sum(model.cruise_time(x, y) * max(fx, fy)
                      for x, y, fx, fy in zip(chain, chain[1:], chain_f, chain_f[1:]))
         if direct >= span - 1e-9:
             return 0
@@ -328,7 +493,7 @@ def _try_cut(cell: Cell, dense, fac, rng, max_step, penalised, span_cost) -> int
     return 1
 
 
-def _try_relocate(cell: Cell, dense, fac, rng, max_step, penalised, step_cost) -> int:
+def _try_relocate(model: "MotionModel", dense, fac, rng, penalised, step_cost) -> int:
     """Displace one interior waypoint and keep the move if it lowers the local cost.
 
     The displacement is drawn in joint space but scaled by the cell's joint weights, so a
@@ -337,6 +502,7 @@ def _try_relocate(cell: Cell, dense, fac, rng, max_step, penalised, step_cost) -
     """
     if len(dense) < 3:
         return 0
+    cell = model.cell
     k = int(rng.integers(1, len(dense) - 1))        # endpoints are fixed by the caller
     target = float(rng.uniform(0.005, 0.15))        # metres of tool travel
     direction = rng.normal(size=len(dense[k]))
@@ -355,12 +521,15 @@ def _try_relocate(cell: Cell, dense, fac, rng, max_step, penalised, step_cost) -
              + cell.cruise_time(candidate, dense[k + 1]))
     if floor >= before - 1e-9:
         return 0
-    if cell.segment_collides(dense[k - 1], candidate, max_step=max_step):
+    if (model.demotes(dense[k - 1], candidate, [dense[k]])
+            or model.demotes(candidate, dense[k + 1], [dense[k]])):
         return 0
-    if cell.segment_collides(candidate, dense[k + 1], max_step=max_step):
+    if model.blocked(dense[k - 1], candidate):
+        return 0
+    if model.blocked(candidate, dense[k + 1]):
         return 0
 
-    f = cell.penalty_factor(candidate) if penalised else 1.0
+    f = model.penalty_factor(candidate) if penalised else 1.0
     after = (step_cost(dense[k - 1], candidate, fac[k - 1], f)
              + step_cost(candidate, dense[k + 1], f, fac[k + 1]))
     if after >= before - 1e-9:
@@ -693,11 +862,13 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
                 log(f"      no single gun opening reaches; changing from "
                     f"{first_open:g} mm to {second_open:g} mm at fallback pose {i + 1}")
                 with cell.gun_opening(first_open):
-                    first = _refine_runs(cell, first, shortcut_seconds=shortcut_seconds,
+                    first = _refine_runs(cell, first, zone=zone,
+                                         shortcut_seconds=shortcut_seconds,
                                          polish_seconds=polish_seconds,
                                          check_step=check_step, log=log)
                 with cell.gun_opening(second_open):
-                    second = _refine_runs(cell, second, shortcut_seconds=shortcut_seconds,
+                    second = _refine_runs(cell, second, zone=zone,
+                                          shortcut_seconds=shortcut_seconds,
                                           polish_seconds=polish_seconds,
                                           check_step=check_step, log=log)
                 return [(first, first_open), (second, second_open)]
@@ -744,13 +915,10 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
             return straight()
         log(f"      direct move is clear but runs close to the parts "
             f"(cost {cost:.2f} s against {raw:.2f} s unpenalised); standing it off")
-        # Densified here rather than left to shortcut: a two-point path has no interior
-        # waypoint, and relocation is the only move that can help.  The unrefined route is
-        # still the bare straight line; the densification is part of the refinement.
+        # The unrefined route stays the bare straight line; _finish fills the interior in,
+        # which a two-point path needs before relocation has anything to move.
         _capture(record, [qa, qb])
-        seeded = [qa] + _resample(cell, np.asarray(qa, dtype=float),
-                                  np.asarray(qb, dtype=float), check_step) + [qb]
-        return _finish(cell, seeded, zone=zone, shortcut_seconds=shortcut_seconds,
+        return _finish(cell, [qa, qb], zone=zone, shortcut_seconds=shortcut_seconds,
                        polish_seconds=polish_seconds, check_step=check_step, log=log)
 
     # RRTConnect returns the first path it finds, and which homotopy class that lands in
@@ -827,50 +995,76 @@ class LinearZone:
     near_mm: float = 0.0            # clearance at or under which the route counts as near
     min_run_mm: float = 0.0         # shortest stretch worth converting, in tool travel
     min_run_pct: float = 0.0        # ...or this much of the leg, whichever it meets first
-    step_mm: float = 50.0           # point spacing along the straight moves
+    step_mm: float = 50.0           # sampling along a straight move when it is checked
+    linear_speed_mm_s: float = 0.0  # tool speed cap; 0 leaves linear moves costed on joints
 
     @property
     def enabled(self) -> bool:
         return self.near_mm > 0.0
 
 
-def _refine_runs(cell: Cell, runs: list[Run], *, shortcut_seconds: float,
-                 polish_seconds: float, check_step: float, log) -> list[Run]:
-    """Run the optimisation passes over the joint-motion stretches and nothing else.
-
-    A linear run is a decision about the shape of the move, not a route to be improved, so
-    it is passed through untouched.  The passes only ever move a path's interior points,
-    so the boundary between a linear run and the joint motion either side of it survives.
-    """
-    out: list[Run] = []
-    for run in runs:
-        if run.motion == LIN or len(run.states) < 2:
-            out.append(run)
-            continue
-        out.append(Run(PTP, _refine(cell, run.states, shortcut_seconds=shortcut_seconds,
-                                    polish_seconds=polish_seconds,
-                                    check_step=check_step, log=log)))
+def _flatten(runs: list[Run]) -> list[np.ndarray]:
+    """The one point list a set of runs describes; consecutive runs share their boundary."""
+    if not runs:
+        return []
+    out = list(runs[0].states)
+    for run in runs[1:]:
+        out.extend(run.states[1:])
     return out
+
+
+def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
+                 shortcut_seconds: float, polish_seconds: float, check_step: float,
+                 log) -> list[Run]:
+    """Optimise an already-split route and split it again.
+
+    Used where a leg was planned without a refinement budget and is being refined
+    afterwards -- the two halves of a transit that changes the gun partway, each of which
+    has to be refined with its own opening in force.  The split is redone rather than
+    preserved, since the passes move the waypoints and a move's profile follows its ends.
+    """
+    pts = _flatten(runs)
+    if len(pts) < 2:
+        return runs
+    allowed = zone is not None and _linear_allowed(cell, pts, zone, log=log)
+    model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
+    refined = _refine(model, pts, shortcut_seconds=shortcut_seconds,
+                      polish_seconds=polish_seconds, log=log)
+    return _split_runs(model, refined)
 
 
 def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
             shortcut_seconds: float, polish_seconds: float, check_step: float,
             log) -> list[Run]:
-    """Split a freshly planned route into runs, then optimise the joint-motion ones.
+    """Densify a freshly planned route, optimise it, then split it by motion type.
 
-    Linearisation comes first on purpose.  The optimisation passes reshape a route to save
-    time, and time is exactly what they would save by cutting the corner a linear move is
-    there to hold -- so deciding which stretches are linear afterwards would mean deciding
-    it about a route that had already been pulled out of shape.
+    The route arrives as the handful of states the sampling planner happened to stop at,
+    so it is filled in first: every pass below wants the route, not the tree's nodes, and
+    a shortcut pass given four points has almost nothing to work with.
+
+    Optimisation runs before the split, not after.  The passes are profile aware -- a move
+    that will be executed linearly is costed under the tool speed cap and collision
+    checked along the straight line the tool will really take -- so they can reshape a
+    near-panel stretch without misjudging it.  The old order linearised first precisely
+    because the passes could not do that, and then had to leave the result untouched.
+
+    Which profile governs a move is decided per move, from where its two ends sit, so the
+    split at the end is a reading of the finished path rather than a decision imposed on
+    it.
     """
-    if zone is not None and zone.enabled:
-        runs = linearise(cell, path, near_mm=zone.near_mm, min_run_mm=zone.min_run_mm,
-                         min_run_pct=zone.min_run_pct, step_mm=zone.step_mm,
-                         check_step=check_step, log=log)
-    else:
-        runs = [Run(PTP, list(path))]
-    return _refine_runs(cell, runs, shortcut_seconds=shortcut_seconds,
-                        polish_seconds=polish_seconds, check_step=check_step, log=log)
+    dense = _densify(cell, path, check_step)
+    allowed = zone is not None and _linear_allowed(cell, dense, zone, log=log)
+    model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
+    refined = _refine(model, dense, shortcut_seconds=shortcut_seconds,
+                      polish_seconds=polish_seconds, log=log)
+    runs = _split_runs(model, refined)
+    if log:
+        lin = sum(1 for r in runs if r.motion == LIN)
+        if lin:
+            moves = sum(len(r.states) - 1 for r in runs if r.motion == LIN)
+            log(f"      {lin} linear runs over {moves} moves, "
+                f"{len(runs) - lin} joint runs, {len(refined)} waypoints")
+    return runs
 
 
 def _tcp_travel(cell: Cell, states: list[np.ndarray]) -> float:
@@ -886,123 +1080,42 @@ def _tcp_travel(cell: Cell, states: list[np.ndarray]) -> float:
     return raw / cell.man.scale
 
 
-def _linear_chain(cell: Cell, guide: list[np.ndarray], *, step_mm: float,
-                  check_step: float) -> list[np.ndarray] | None:
-    """Joint states covering ``guide`` as a chain of straight Cartesian moves.
-
-    The straight chord end to end is tried first, because one long ``L`` is what a robot
-    programmer would write.  Where the part is in the way the span is halved and each half
-    tried in turn, so the chain bends only where it has to and converges on the guide
-    itself -- whose own steps are a collision-check resolution apart and so are very nearly
-    straight already.  ``None`` means even that failed and the caller should keep the
-    joint-space route.
-
-    The endpoints are snapped back onto the guide's own states afterwards.  IK returns
-    whichever solution is nearest the seed rather than the exact state asked for, and a
-    linear run that ends a hair off where the next run begins is a discontinuity the
-    controller has no way to execute.
-    """
-    if len(guide) < 2:
-        return list(guide)
-
-    def span(lo: int, hi: int) -> list[np.ndarray] | None:
-        try:
-            chain = plan_linear(cell, cell.fk(guide[lo]), cell.fk(guide[hi]), guide[lo],
-                                step_mm=step_mm)
-        except PlanningError:
-            chain = None
-        if chain is not None and not _chain_collides(cell, chain, check_step):
-            if _joins(cell, chain, guide[lo], guide[hi], check_step):
-                chain[0], chain[-1] = guide[lo], guide[hi]
-                return chain
-        if hi - lo < 2:
-            return None
-        mid = (lo + hi) // 2
-        first, second = span(lo, mid), span(mid, hi)
-        if first is None or second is None:
-            return None
-        return first + second[1:]
-
-    return span(0, len(guide) - 1)
-
-
 def _chain_collides(cell: Cell, chain: list[np.ndarray], check_step: float) -> bool:
     """``plan_linear`` clears the points it places; this clears the gaps between them."""
     return any(cell.segment_collides(a, b, max_step=check_step)
                for a, b in zip(chain, chain[1:]))
 
 
-def _joins(cell: Cell, chain: list[np.ndarray], start: np.ndarray, end: np.ndarray,
-           check_step: float) -> bool:
-    """True when the chain's ends are close enough to the guide's to be snapped onto them.
+def _linear_allowed(cell: Cell, dense: list[np.ndarray], zone: "LinearZone",
+                    log=None) -> bool:
+    """Whether this leg earns linear motion at all, and the report explaining the verdict.
 
-    ``check_step`` is the resolution the whole route is collision-checked at, so a
-    displacement under it is smaller than anything the checking can resolve anyway.
+    Being near the panel is measured over the leg rather than over any one stretch of it.
+    The points are a collision-check step apart, so the share of them in range is how much
+    of the route runs near the panel, whether or not it does so in one go -- which matters
+    because the apex of a retract between two welds leaves the band for an instant and
+    would otherwise split an 85% leg into runs of 45% and 40% that a 50% threshold rejects
+    twice over.
+
+    Either test admits the leg: one stretch long enough in tool travel, or enough of the
+    leg in range whatever the stretches look like individually.  ``min_run_mm`` is what a
+    transit needs, since a sweeping move that clips the band for a moment is not working
+    near the panel; ``min_run_pct`` is what a hop from one weld to the next needs, being
+    entirely near the panel and far too short to pass any absolute threshold.
+
+    A leg that meets neither is planned as joint motion throughout.
     """
-    return (float(np.max(np.abs(chain[0] - start))) <= check_step
-            and float(np.max(np.abs(chain[-1] - end))) <= check_step)
-
-
-def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
-              min_run_mm: float, step_mm: float, check_step: float,
-              min_run_pct: float = 0.0, log=None) -> list[Run]:
-    """Split a joint-space route, re-planning its near-panel stretches as linear moves.
-
-    Close to the parts a joint-interpolated move is hard to reason about: the tool sweeps
-    an arc whose shape depends on the arm's configuration rather than on anything visible
-    in the cell.  A straight-line move is predictable, which is what you want where the
-    margin for error is small.  Far from the parts none of that matters and joint motion is
-    both faster and easier to plan.
-
-    So the route is measured, not assumed: every point within ``near_mm`` of a panel or a
-    piece of tooling is a candidate, maximal runs of those are found, and each run is
-    re-planned as a chain of straight moves.
-
-    A run qualifies on either of two counts, because a run can be worth converting for
-    either reason.  ``min_run_mm`` is an absolute length: a long sweeping transit that
-    clips the proximity band for a moment is not "working near the panel", and cutting it
-    into three phases to say so would cost a stop at each end for nothing.  But that test
-    alone measures the wrong thing on a short leg -- a 60 mm hop from one weld to the next
-    is near the panel for its whole length and is exactly the motion that should be
-    straight, yet no absolute threshold worth setting for transits will ever admit it.
-
-    ``min_run_pct`` is therefore asked about the leg rather than about the run: what share
-    of the measured points along it are in range at all.  Being near the panel is a
-    property of the move, and it does not stop being one because the clearance rose above
-    the band for an instant somewhere in the middle -- which is what the apex of a retract
-    between two welds looks like.  Measured per run, one such blip splits a leg that is
-    85% near the panel into two runs of 45% and 40%, and a 50% threshold then rejects
-    both.  Measured over the leg, the blip costs its own points and nothing else, and every
-    near-panel stretch of a qualifying leg is converted.  Either test is sufficient.
-
-    A run that cannot be linearised keeps its joint motion, so the worst case is the route
-    that would have been emitted anyway.
-    """
-    if near_mm <= 0.0 or len(path) < 2:
-        return [Run(PTP, list(path))]
-
-    dense: list[np.ndarray] = [np.asarray(path[0], dtype=float)]
-    for a, b in zip(path, path[1:]):
-        dense.extend(_resample(cell, np.asarray(a, dtype=float),
-                               np.asarray(b, dtype=float), check_step))
-        dense.append(np.asarray(b, dtype=float))
+    if not zone.enabled or len(dense) < 2:
+        return False
 
     if log and len(dense) > 200:
         log(f"      measuring clearance at {len(dense)} points along the route to find "
             f"its near-panel stretches")
-    near = [cell.clearance_mm(q) <= near_mm for q in dense]
-    # How much of the leg is in range at all, counted over its measured points rather than
-    # over any one stretch of them.  The points are a collision-check step apart, so this
-    # is how much of the route runs near the panel, whether or not it does so in one go.
+    near = [cell.clearance_mm(q) <= zone.near_mm for q in dense]
     in_range = 100.0 * sum(near) / len(near) if near else 0.0
-    leg_qualifies = min_run_pct > 0.0 and in_range >= min_run_pct
-    runs: list[Run] = []
-    # Tool travel of each near-panel stretch, in the units --near-panel-min-mm is quoted
-    # in.  Kept for the report: the verdict on a stretch is this number against that
-    # threshold, and a line that gives the verdict without the number cannot be acted on.
+    by_share = zone.min_run_pct > 0.0 and in_range >= zone.min_run_pct
+
     stretches: list[float] = []
-    kept = skipped = failed = 0
-    cursor = 0
     i = 0
     while i < len(dense):
         if not near[i]:
@@ -1011,48 +1124,68 @@ def linearise(cell: Cell, path: list[np.ndarray], *, near_mm: float,
         j = i
         while j + 1 < len(dense) and near[j + 1]:
             j += 1
-        travel = _tcp_travel(cell, dense[i:j + 1]) if j > i else 0.0
         if j > i:
-            stretches.append(travel)
-        if j > i and (travel >= min_run_mm or leg_qualifies):
-            chain = _linear_chain(cell, dense[i:j + 1], step_mm=step_mm,
-                                  check_step=check_step)
-            if chain is not None:
-                if i > cursor:
-                    runs.append(Run(PTP, dense[cursor:i + 1]))
-                runs.append(Run(LIN, chain))
-                cursor = j
-                kept += 1
-            else:
-                failed += 1
-        elif j > i:
-            skipped += 1
+            stretches.append(_tcp_travel(cell, dense[i:j + 1]))
         i = j + 1
 
-    if cursor < len(dense) - 1:
-        runs.append(Run(PTP, dense[cursor:]))
-    if not runs:
-        return [Run(PTP, list(path))]
-    if log and (kept or failed or skipped):
+    by_length = any(t >= zone.min_run_mm for t in stretches)
+    allowed = bool(by_length or by_share)
+
+    if log and (stretches or in_range > 0.0):
         note = [f"{in_range:.0f}% of the leg in range"]
         if stretches:
             note.append(f"longest stretch {max(stretches):.0f} mm of "
                         f"{sum(stretches):.0f} mm near the panel, against a "
-                        f"{min_run_mm:g} mm threshold")
-        note.append(f"{kept} near-panel stretches made linear")
-        if skipped:
-            note.append(f"{skipped} too brief to be worth it")
-        if failed:
-            note.append(f"{failed} with no straight route, left as joint motion")
+                        f"{zone.min_run_mm:g} mm threshold")
+        if allowed:
+            why = "on length" if by_length else f"on share against {zone.min_run_pct:g}%"
+            note.append(f"near-panel moves run under the linear profile ({why})")
+        else:
+            note.append("neither threshold met, so the leg stays joint motion throughout")
         log("      " + ", ".join(note))
+    return allowed
+
+
+def _split_runs(model: "MotionModel", pts: list[np.ndarray]) -> list[Run]:
+    """Group a finished path into runs of one motion type.
+
+    The type of a move is asked of the model, so it is decided by where the waypoints
+    ended up rather than by where they started -- the passes move them.  Consecutive runs
+    share their boundary point: it is the last waypoint of one and the first of the next,
+    which is what makes a waypoint's own marking the move that arrives at it.
+    """
+    if len(pts) < 2:
+        return [Run(PTP, list(pts))]
+    runs: list[Run] = []
+    start = 0
+    current = model.motion(pts[0], pts[1])
+    for k in range(1, len(pts) - 1):
+        nxt = model.motion(pts[k], pts[k + 1])
+        if nxt != current:
+            runs.append(Run(current, pts[start:k + 1]))
+            start, current = k, nxt
+    runs.append(Run(current, pts[start:]))
     return runs
 
 
-def validate(cell: Cell, path: list[np.ndarray], max_step: float = 0.05) -> str | None:
-    """Re-check a finished path; returns a description of the first bad move, or None."""
+
+def validate(cell: Cell, path: list[np.ndarray], max_step: float = 0.05, *,
+             motion: str = PTP, zone: "LinearZone | None" = None) -> str | None:
+    """Re-check a finished path; returns a description of the first bad move, or None.
+
+    ``motion`` is the profile the phase will be executed under, and it decides which path
+    each move is checked along: the joint chord for ``PTP``, the straight line the tool
+    really takes for ``LIN``.  Checking a linear move in joint space would be checking a
+    curve the robot does not follow, which is the one thing a final validation must not do.
+    """
+    linear = motion == LIN and zone is not None and zone.enabled
+    model = MotionModel(cell, max_step=max_step, zone=zone) if linear else None
+    fault = "reachable in a straight line" if linear else "collision free"
     for k, (a, b) in enumerate(zip(path, path[1:])):
-        if cell.segment_collides(a, b, max_step=max_step):
-            return f"move {k} -> {k + 1} is not collision free"
+        bad = ((not model.linear_ok(a, b)) if linear
+               else cell.segment_collides(a, b, max_step=max_step))
+        if bad:
+            return f"move {k} -> {k + 1} is not {fault}"
     return None
 
 
