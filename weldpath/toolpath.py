@@ -3,11 +3,14 @@
 Locators are visited in manifest order and one output segment is produced per consecutive
 pair, matching the sample output.
 
-Weld locators get a linear approach and depart of ``planning.linear_zone_mm``, so the gun
-slides onto and off the joint in a straight line instead of arriving on a curve.  Per the
-brief the gun is treated as stationary through the weld: the robot stops at the locator,
-the opening changes from ``gun_opening_arrive`` to ``gun_opening_leave``, and no motion is
-planned for the closing itself.
+A transit runs weld to weld and is free to curve away from the panel immediately.  Welds
+used to get a straight lead-in and lead-out of a fixed length along one fixed direction,
+which asked for a clear tunnel a weld set deep in panelling often has no room for; where a
+straight run near the panel is wanted it is now found by measuring the route, in
+:func:`~weldpath.planning.linearise`, rather than assumed at the weld.  Per the brief the
+gun is treated as stationary through the weld: the robot stops at the locator, the opening
+changes from ``gun_opening_arrive`` to ``gun_opening_leave``, and no motion is planned for
+the closing itself.
 """
 from __future__ import annotations
 
@@ -17,12 +20,7 @@ import numpy as np
 
 from .cell import Cell
 from .manifest import Locator, Manifest
-from .planning import (LIN, PTP, LinearZone, PlanningError, plan_freespace, plan_linear,
-                       validate)
-
-AXES = {"+x": np.array([1.0, 0, 0]), "-x": np.array([-1.0, 0, 0]),
-        "+y": np.array([0, 1.0, 0]), "-y": np.array([0, -1.0, 0]),
-        "+z": np.array([0, 0, 1.0]), "-z": np.array([0, 0, -1.0])}
+from .planning import (LIN, PTP, LinearZone, PlanningError, plan_freespace, validate)
 
 
 
@@ -54,40 +52,18 @@ class Segment:
     raw_phases: list[Phase] = field(default_factory=list)
 
 
-def retract_axis(override: str | None = None) -> np.ndarray:
-    """Direction, in a weld locator's own frame, that the robot retracts along.
-
-    The locator carries its own orientation, and its z axis is the one authored against the
-    joint, so the retract is defined relative to that rather than derived from the tool.
-    Deriving it from the gun's stroke -- as this did while the gun was prismatic -- made
-    the direction a property of the machine instead of the weld, and gave no answer at all
-    once the gun became angular.
-
-    The default is ``-x``.  Note that ``--weld-shift-mm`` still backs the tool off along the
-    locator's **z**, so the two are no longer the same direction; see the README.
-    """
-    return AXES[override.lower()] if override else AXES["-x"]
-
-
 # Headroom past the clearance a locator has to meet, so the report can distinguish a pose
 # that just scrapes past from one with room around it.  Without it the query stops at the
 # threshold and every success reads the same.
 CLEARANCE_REPORT_HEADROOM_MM = 25.0
 
 
-def offset_pose(pose: np.ndarray, axis_tcp: np.ndarray, distance: float) -> np.ndarray:
-    """Shift ``pose`` along a direction expressed in its own frame."""
-    out = np.array(pose, dtype=float).copy()
-    out[:3, 3] = out[:3, 3] + out[:3, :3] @ (axis_tcp * distance)
-    return out
-
-
 class ToolpathPlanner:
-    def __init__(self, cell: Cell, man: Manifest, *, approach_axis: str | None = None,
+    def __init__(self, cell: Cell, man: Manifest, *,
                  linear_step_mm: float = 50.0, ompl_attempts: int = 3,
                  ompl_runs: int = 1,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
-                 ompl_seconds: float = 5.0, linear_zone: bool = True,
+                 ompl_seconds: float = 5.0,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                  near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
                  near_panel_min_pct: float = 0.0,
@@ -97,10 +73,6 @@ class ToolpathPlanner:
         self.cell = cell
         self.man = man
         self.log = log
-        self.axis = retract_axis(approach_axis)
-        # 0 turns the straight lead-in and lead-out off entirely: the transit then runs
-        # weld to weld, free to curve away from the panel from the first millimetre.
-        self.linear_zone_mm = man.linear_zone_mm if linear_zone else 0.0
         self.linear_step_mm = linear_step_mm
         self.ompl_attempts = ompl_attempts
         self.ompl_runs = ompl_runs
@@ -267,9 +239,6 @@ class ToolpathPlanner:
         raise PlanningError(f"cannot place the robot at locator '{loc.name}' -- "
                             f"{detail}{hint}")
 
-    def _approach_pose(self, loc: Locator) -> np.ndarray:
-        return offset_pose(loc.pose_world, self.axis, self.linear_zone_mm)
-
     def _leave_opening(self, loc: Locator) -> float:
         """Gun opening in force as the robot leaves this locator."""
         return loc.gun_opening_leave if loc.is_weld else self.openings.get(loc.name, 0.0)
@@ -336,26 +305,7 @@ class ToolpathPlanner:
         phases: list[Phase] = []
         qa, qb = anchors[a.name], anchors[b.name]
         transit_start, transit_end = qa, qb
-
-        depart_states: list[np.ndarray] = []
-        approach_states: list[np.ndarray] = []
         leave_open, arrive_open = self._leave_opening(a), self._arrive_opening(b)
-
-        # Each stretch of motion is planned with the tip where it will actually be. The gun
-        # is 200 mm of swinging geometry, so a linear retract that clears with it closed can
-        # foul with it open, and planning both against one arbitrary opening proves nothing.
-        if a.is_weld and self.linear_zone_mm > 0:
-            with self.cell.gun_opening(leave_open):
-                depart_states = plan_linear(
-                    self.cell, a.pose_world, self._approach_pose(a), qa,
-                    step_mm=self.linear_step_mm)
-            transit_start = depart_states[-1]
-        if b.is_weld and self.linear_zone_mm > 0:
-            with self.cell.gun_opening(arrive_open):
-                approach_states = plan_linear(
-                    self.cell, self._approach_pose(b), b.pose_world, qb,
-                    step_mm=self.linear_step_mm)
-            transit_end = approach_states[0]
 
         # The robot holds still at a weld while the opening steps from arrive to leave, so
         # that is a phase boundary: same pose, new gun state.  That gun motion is not
@@ -364,8 +314,6 @@ class ToolpathPlanner:
         # collisions switched off.
         if a.is_weld:
             phases.append(Phase("weld", LIN, [qa], leave_open, True))
-        if depart_states:
-            phases.append(Phase("depart", LIN, depart_states, leave_open, True))
 
         # Phases up to here are shared with the unrefined copy: nothing optimises a linear
         # move, so it is the same motion in both files.
@@ -392,11 +340,6 @@ class ToolpathPlanner:
             if raw_legs is not None and i < len(raw_legs):
                 raw_phases.append(Phase("freespace", PTP, raw_legs[i], opening_mm, False))
 
-        if approach_states:
-            approach = Phase("approach", LIN, approach_states, arrive_open, True)
-            phases.append(approach)
-            if self.keep_unrefined:
-                raw_phases.append(approach)
 
         # The output is what the controller will execute, so check the reduced path rather
         # than trusting that reduction preserved what the planner found.  Checked per phase,
@@ -416,7 +359,7 @@ class ToolpathPlanner:
         # validation because this last step is the gun deliberately closing on the part.
         # This only rewrites the weld, depart and approach phases, which the unrefined copy
         # holds by reference rather than by value, so it lands on both at once.
-        self._restore_weld_poses(a, b, phases, qa, qb)
+        self._restore_weld_poses(a, phases, qa)
         return phases, raw_phases
 
     def _validate_junctions(self, phases: list[Phase]) -> str | None:
@@ -441,22 +384,26 @@ class ToolpathPlanner:
                                 f"collision free with the gun at {opening:g} mm")
         return None
 
-    def _restore_weld_poses(self, a: Locator, b: Locator, phases: list[Phase],
-                            qa: np.ndarray, qb: np.ndarray) -> None:
-        """Put the waypoints that sit *at* a weld back onto its imported pose."""
-        for loc, anchor, which in ((a, qa, "first"), (b, qb, "last")):
-            if not loc.is_weld or loc.pose_world_import is None:
-                continue
-            # Seeded from the planned anchor, so this stays on the same arm configuration;
-            # collision checking is off because contact with the panel is the point.
-            q = self.cell.solve_pose(loc.export_pose, [anchor],
-                                     require_collision_free=False, branch_seeds=0)
-            if q is None:
-                self.log(f"    ! cannot reach the imported pose of '{loc.name}'; "
-                         f"leaving it at the shifted pose")
-                continue
-            for ph in phases:
-                if which == "first" and ph.kind in ("weld", "depart"):
-                    ph.states[0] = q          # the weld itself, and where depart begins
-                elif which == "last" and ph.kind == "approach":
-                    ph.states[-1] = q
+    def _restore_weld_poses(self, a: Locator, phases: list[Phase],
+                            qa: np.ndarray) -> None:
+        """Put the waypoint that sits *at* a weld back onto its imported pose.
+
+        Only the departing weld has such a waypoint.  ``a`` is where this segment starts,
+        and the ``weld`` phase holds the robot there while the gun closes, so that is the
+        one state in the segment standing on the locator itself.  The arriving weld is
+        reached by the transit, whose last state is the planned -- shifted -- anchor, and
+        nothing here rewrites it; ``check_endpoints`` reports the resulting gap.
+        """
+        if not a.is_weld or a.pose_world_import is None:
+            return
+        # Seeded from the planned anchor, so this stays on the same arm configuration;
+        # collision checking is off because contact with the panel is the point.
+        q = self.cell.solve_pose(a.export_pose, [qa],
+                                 require_collision_free=False, branch_seeds=0)
+        if q is None:
+            self.log(f"    ! cannot reach the imported pose of '{a.name}'; "
+                     f"leaving it at the shifted pose")
+            return
+        for ph in phases:
+            if ph.kind == "weld":
+                ph.states[0] = q

@@ -22,18 +22,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="study directory containing manifest.json and meshes/")
 
     #region ###WELD HANDLING###
-    #WELD PULL BACK AXIS
-    p.add_argument("--approach-axis", default = "-z", choices=["+x", "-x", "+y", "-y", "+z", "-z"],
-                   help="direction in a weld locator's own frame that the straight "
-                        "lead-in and lead-out travel along (default: -z)")
-    #DISABLE LINEAR TUNNEL
-    p.add_argument("--no-linear-zone", dest="linear_zone", action="store_false",
-                   help="do not lead into or out of a weld in a straight line. Every "
-                        "millimetre of the manifest's linear_zone_mm has to be clear "
-                        "along one fixed direction, which a weld set deep in panelling "
-                        "may have no room for; without it the transit runs weld to weld "
-                        "and is free to curve away immediately, at the cost of the gun "
-                        "arriving on a curve rather than sliding on straight")
     #LINEAR TUNNEL STEP LENGTH
     p.add_argument("--linear-step-mm", type=float, default=50.0,
                    help="spacing of points along linear approach/depart moves "
@@ -409,12 +397,10 @@ def main(argv: list[str] | None = None) -> int:
     log("planning:")
     planner = ToolpathPlanner(
         cell, man,
-        approach_axis=args.approach_axis,
         linear_step_mm=args.linear_step_mm,
         ompl_attempts=args.ompl_attempts,
         ompl_runs=args.ompl_min_runs,
         ompl_seconds=args.ompl_seconds,
-        linear_zone=args.linear_zone,
         segment_length=args.segment_length_rad,
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,

@@ -102,7 +102,6 @@ class Manifest:
     directory: str
     units: str
     contact_ok_distance_mm: float
-    linear_zone_mm: float
     devices: list[Device]
     attachments: list[tuple[str, str]]
     gun_moving_links: list[str]
@@ -289,7 +288,6 @@ def load(directory: str) -> Manifest:
         directory=directory.replace("\\", "/"),
         units=raw.get("units", "mm"),
         contact_ok_distance_mm=float(planning.get("contact_ok_distance_mm", 0.0)),
-        linear_zone_mm=float(planning.get("linear_zone_mm", 0.0)),
         devices=devices,
         attachments=[(a["parent_link"], a["child_link"]) for a in raw.get("attachments", [])],
         gun_moving_links=list(raw.get("gun_moving_links", [])),

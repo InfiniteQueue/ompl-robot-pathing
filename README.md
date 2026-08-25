@@ -441,10 +441,10 @@ linear run that ends a hair off where the next run begins is a discontinuity the
 has no way to execute; the displacement allowed is one `--check-step-deg`, which is below
 what the collision checking can resolve anyway.
 
-This is separate from, and composes with, the fixed linear zone at a weld
-(`planning.linear_zone_mm`, see [Welds](#welds)): that one is a straight lead-in along one
-named axis, this one follows wherever the route goes. `--no-near-panel-linear` turns it
-off.
+This is now the only source of linear motion in a transit. Welds used to get a fixed
+straight lead-in and lead-out along one named axis as well; that has been removed, because
+where a straight run near the panel is wanted it is better found by measuring the route
+than assumed at the weld. `--no-near-panel-linear` turns this off.
 
 ## Velocity profile
 
@@ -510,9 +510,10 @@ dynamics for it.
 
 ## Welds
 
-At a weld locator the robot runs a straight `linear_zone_mm` approach, stops, and departs
-along the same line (unless `--no-linear-zone` is given, which removes both). Per the brief the gun is treated as stationary through the weld, and
-because the gun state defines a phase this comes out as a phase boundary:
+At a weld locator the robot stops. The transit runs weld to weld and is free to curve away
+from the panel immediately; there is no straight lead-in or lead-out. Per the brief the gun
+is treated as stationary through the weld, and because the gun state defines a phase this
+comes out as a phase boundary:
 
 | Phase | motion | contact_allowed | gun_opening_mm |
 | --- | --- | --- | --- |
@@ -617,23 +618,17 @@ probe only ever makes the answer more conservative, since a pair nothing is foun
 treated as clear at the probe used. If no probe succeeds the pair keeps its default margin
 and the start-state check has the final say, rather than a distance being invented for it.
 
-**The retract direction is relative to the weld locator, not the tool.** A weld leads in
-and out along the locator's own **−x**. This used to be derived from the gun's prismatic
-stroke axis, which made the direction a property of the machine rather than of the weld —
-and stopped yielding any answer at all once the gun became angular, silently falling back to
-tool −z. Override with `--approach-axis`, interpreted in the locator's frame.
+**There is no longer a linear zone at a weld.** A weld used to lead in and out along a
+fixed direction in the locator's own frame, for a fixed distance. Every millimetre of it had
+to be clear along that one direction with no freedom to curve, which a weld set deep in
+panelling may simply have no room for — the symptom was a segment failing partway along a
+300 mm linear move. The transit now runs weld to weld and can curve away from the panel
+immediately; straight running near the panel is found by measuring the route, in
+[Near-panel linear motion](#near-panel-linear-motion).
 
-Note that `--weld-shift-mm` still backs the tool off along the locator's **z**, so the shift
-and the retract are no longer the same axis. If z is not the panel normal for these welds
-then the shift is sliding the tool along the surface rather than off it, and wants revisiting
-too.
-
-**The linear zone can be turned off** with `--no-linear-zone`. Every millimetre of
-`linear_zone_mm` has to be clear along one fixed direction with no freedom to curve, which a
-weld set deep in panelling may simply have no room for — the symptom is a segment failing
-partway along a 300 mm linear move. Without it the transit runs weld to weld and can curve
-away from the panel immediately, at the cost of the gun arriving on a curve rather than
-sliding on straight.
+Note that `--weld-shift-mm` still backs the tool off along the locator's **z**. If z is not
+the panel normal for these welds then the shift is sliding the tool along the surface rather
+than off it, and wants revisiting.
 
 ### Penalising low clearance
 
@@ -871,9 +866,7 @@ correction is what keeps the false contact from disabling a real collision check
 
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--approach-axis` | -z | lead-in/lead-out direction at welds, in the locator's own frame |
-| `--no-linear-zone` | off | skip the straight lead-in and lead-out at welds entirely |
-| `--linear-step-mm` | 50 | point spacing on linear approach/depart |
+| `--linear-step-mm` | 50 | point spacing on a linear run |
 | `--check-step-deg` | 3 | collision checking resolution along a move |
 | `--segment-length-rad` | 0.02 | collision resolution inside the sampling planner |
 | `--ompl-attempts` | 20 | most freespace attempts before the fallback route |
