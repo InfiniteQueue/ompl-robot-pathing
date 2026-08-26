@@ -83,20 +83,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "run costs this long in the worst case, so it multiplies with "
                         "--phase-one-runs (default: 8)")
     #PHASE TWO: FIND ANY ROUTE AT ALL
-    p.add_argument("--phase-two-max-runs", type=int, default=8, metavar="N",
+    p.add_argument("--phase-two-max-runs", type=int, default=4, metavar="N",
                    help="most sampling-planner runs allowed in phase two, which is "
                         "entered only when phase one found nothing at all. Phase two "
                         "stops at the first solution rather than sampling for a better "
                         "one; if it too comes back empty the transit is retried through "
-                        "the fallback poses, starting again from phase one (default: 8)")
+                        "the fallback poses, starting again from phase one (default: 4)")
     #PHASE TWO RUN TIME
-    p.add_argument("--phase-two-solve-seconds", type=float, default=10.0,
+    p.add_argument("--phase-two-solve-seconds", type=float, default=12.0,
                    metavar="SECONDS",
                    help="how long one phase-two run may search. Worth setting higher than "
                         "--phase-one-solve-seconds: a transit that beat phase one is "
                         "usually one where restarting wastes the tree built so far, so a "
                         "longer single search helps where another short one does not "
-                        "(default: 10)")
+                        "(default: 12)")
     #endregion
     #region ###OPTIMISATION###
 
@@ -115,7 +115,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "stop-to-stop time the robot really pays for each one. The "
                         "earlier passes work on a densified path where a waypoint is a "
                         "sampling artefact rather than a stop; this one does not "
-                        "(default: 20)")
+                        "(default: 50)")
     #endregion
     #region ###LINEAR MOTION NEAR THE PARTS###
     #DISABLE LINEAR MOTION NEAR THE PARTS
@@ -150,20 +150,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "from one weld to the next being the case that matters. 0 leaves "
                         "--near-panel-min-mm as the only test (default: 50)")
     #PRICE OF REACHING INTO THE BAND FROM OUTSIDE IT
-    p.add_argument("--linear-crossing-penalty", type=float, default=3.0, metavar="X",
-                   help="multiply the travel time of a move that crosses into the "
-                        "proximity band by this, while the optimisation passes are "
+    p.add_argument("--linear-crossing-speed-mm-s", type=float, default=25.0,
+                   metavar="MM_S",
+                   help="cost a move that crosses into the proximity band as though the "
+                        "tool crawled at this speed, while the optimisation passes are "
                         "choosing between routes. A move is linear when either end is "
                         "near the parts, so left alone the passes delete the waypoint at "
                         "the edge of the band and reach in from open space on one long "
                         "straight sweep; this prices that against stopping at the edge "
                         "and running joint motion outside it. Charged on the crossing "
-                        "only, so linear motion inside the band is untouched, and on "
-                        "travel rather than on the whole move, so a short step across the "
-                        "edge pays little and a long reach pays for its length. A costing "
-                        "figure and nothing else: independent of --linear-speed-mm-s and "
+                        "only, so linear motion inside the band is untouched, and by "
+                        "distance, so a long reach pays for its length while a short step "
+                        "across the edge pays almost nothing. Lower bites harder, and "
+                        "wants to be well under --linear-speed-mm-s to have any effect. A "
+                        "costing figure and nothing else: independent of "
+                        "--linear-speed-mm-s, not a speed the robot ever runs at, and "
                         "absent from the exported cycle time. Compounds with the "
-                        "clearance penalty. 1 charges nothing (default: 3)")
+                        "clearance penalty. 0 charges nothing (default: 25)")
     #endregion
     #region ###COLLISION HULLS###
     #DROP TINY SHELLS
@@ -207,7 +210,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--panel-cell-mm", type=float, default=25, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls panel. This "
                         "is the geometry that is concave exactly where the welds are, so "
-                        "it is where a small cell is worth paying for (default: 30)")
+                        "it is where a small cell is worth paying for (default: 25)")
     #WELD PROXIMITY FOR SHELL SPLIT
     p.add_argument("--shell-split-weld-prox", type=float, default=5.0, metavar="MM",
                    help="only refine panel and tooling geometry within this many mm of "
@@ -253,7 +256,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "air, 0 means touching collides, negative tolerates that much "
                         "overlap (default: 5)")
     #CLEARANCE ON A MOVE TO OR FROM A WELD
-    p.add_argument("--weld-clearance-mm", type=float, default=-3.0, metavar="MM",
+    p.add_argument("--weld-clearance-mm", type=float, default=0.0, metavar="MM",
                    help="obstacle clearance used instead of --obstacle-clearance-mm on "
                         "any move starting or ending at a weld locator, where the gun "
                         "has to reach the panel (default: -3)")
@@ -497,7 +500,7 @@ def main(argv: list[str] | None = None) -> int:
         near_panel_min_mm=args.near_panel_min_mm,
         near_panel_min_pct=args.near_panel_min_pct,
         linear_speed_mm_s=args.linear_speed_mm_s,
-        linear_crossing_penalty=args.linear_crossing_penalty,
+        linear_crossing_speed_mm_s=args.linear_crossing_speed_mm_s,
         weld_clearance_mm=args.weld_clearance_mm,
         export_dir=directory if args.export_collision_geometry else None,
         keep_unrefined=args.unrefined_output,

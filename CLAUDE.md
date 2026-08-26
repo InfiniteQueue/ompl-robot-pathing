@@ -61,22 +61,23 @@ the way, so the joint values in between are whatever that line demands.
   the band, which the endpoint rule then reads as joint motion straight through the region
   the linear profile was chosen for. Replacements that take points out of the band without
   inheriting it are refused.
-- `--linear-crossing-penalty` is charged on **crossing** the edge of the band, and on
-  **travel** rather than on the whole move. Neither choice is arbitrary, and both were
-  arrived at by watching cheaper versions fail.
+- `--linear-crossing-speed-mm-s` is charged on **crossing** the edge of the band, and as
+  a **speed** rather than a multiplier. Neither choice is arbitrary, and both were arrived
+  at by watching cheaper versions fail.
   - A tax on every linear move cannot decide the question at all. `simplify` weighs a
     chord against the polyline it replaces, whose own near-panel hops are linear too, and
     since each retained hop pays its own ramps the polyline's linear part outweighs the
     chord's — so the chord's share of the tax is the smaller one and the collapse survives
     *any* multiplier. Measured: 10^6 on every linear move left the sweep untouched.
-  - Scoped to the crossing but applied to the whole cost, it is still a ratio both sides
-    carry, so it converges: ×10 shortened the sweep, ×50 shortened it no further, and the
-    entry never reached the band edge. Applied to cruise time only, the ramps stay out of
-    it, the two sides no longer travel the same distance outside the band, and the
-    preference stops cancelling — ×20 and ×10^4 settle on the same route.
-  - It is deliberately unitless and computed without reference to `--linear-speed-mm-s`.
-    The two still combine, by `max` in `_time_floor`: a cap slow enough to charge more
-    than the surcharge would simply wins. That is the higher of two independent claims,
-    not a coupling.
+  - A multiplier is a ratio both sides of the comparison carry, so even scoped to the
+    crossing it converges: ×10 shortened the sweep, ×50 shortened it no further, and the
+    entry never reached the band edge. Scaling cruise time instead of the whole cost only
+    delays that — it took ×20 to move the entry at all and was still a ratio. A speed
+    makes the charge absolute, set by how far the move runs, so it keeps biting: 50, 25
+    and 1 mm/s all settle on the same route.
+  - It is computed without reference to `--linear-speed-mm-s` and is not a speed the robot
+    ever runs at. The two still combine, by `max` in `_time_floor`: a cap slow enough to
+    charge more than the crossing speed would simply wins. That is the higher of two
+    independent claims, not a coupling.
 - Order in `_finish` is densify → gate → refine → split. The split is a reading of the
   finished path, not a decision imposed before it.

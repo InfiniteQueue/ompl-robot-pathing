@@ -48,6 +48,17 @@ from .scene import GROUP, TCP_LINK, SceneBuilder
 # until it ran out of floating point.
 MAX_TOOL_SUBDIVISION = 6
 
+# What the planner is asked to do, counted so a slow run can say where it went.  These are
+# the primitives everything else is built from: a state load pushes joints into the
+# environment, a clearance query adds a contact test over every convex piece within the
+# probe, and a collision test adds one at the planning margins.
+COUNTER_NAMES = ("state_loads", "clearance", "clearance_hits", "collision_tests", "fk")
+
+# States a cell remembers a clearance for before starting again.  Large enough that the
+# waypoints of a run stay resident, small enough that a long polish cannot exhaust memory
+# on candidates it drew once and threw away.
+CLEARANCE_CACHE_MAX = 250_000
+
 
 class Cell:
     """A loaded scene plus the collision and kinematics helpers the planner needs."""
@@ -68,6 +79,12 @@ class Cell:
         self.lower, self.upper = limits[:, 0], limits[:, 1]
         self._cm = env.getDiscreteContactManager()
         self._cm.setActiveCollisionObjects(env.getActiveLinkNames())
+        # Clearance is the dearest query in the planner -- a contact test over every
+        # convex piece within the probe, reduced in Python -- and the optimisation passes
+        # ask it of the same states repeatedly.  Keyed by the gun opening as well as the
+        # joint vector, since where the moving tip sits changes the answer.
+        self._clearance_cache: dict[tuple[float, bytes], float] = {}
+        self.counters = dict.fromkeys(COUNTER_NAMES, 0)
         self._state = None                      # keeps the SWIG state object alive
         self._revolute = [j.type == "revolute" for j in man.robot.joints
                           if j.type != "fixed"]
@@ -292,6 +309,8 @@ class Cell:
         pm.setActiveCollisionObjects(self.env.getActiveLinkNames())
         self._pm = pm
         self._probe_mm = float(probe_mm)
+        # Readings taken against the old manager, at whatever probe it had, do not carry.
+        self._clearance_cache.clear()
 
     @property
     def probe_mm(self) -> float:
@@ -310,10 +329,23 @@ class Cell:
         """
         if self._pm is None:
             return float("inf")
+        key = (self.gun_value, np.asarray(q, dtype=float).tobytes())
+        hit = self._clearance_cache.get(key)
+        if hit is not None:
+            self.counters["clearance_hits"] += 1
+            return hit
+        self.counters["clearance"] += 1
         # Deliberately not set_state: refreshing the planning manager's transforms costs as
         # much as the query itself and nothing here is going to ask it anything.
         self._load_state(q)
-        return self._clearance_now()
+        got = self._clearance_now()
+        if len(self._clearance_cache) >= CLEARANCE_CACHE_MAX:
+            # Relocation candidates are drawn at random and never revisited, so the cache
+            # grows with states that will never be asked for again.  Dropping the lot is
+            # fine: what matters is the waypoints, and they are re-measured on demand.
+            self._clearance_cache.clear()
+        self._clearance_cache[key] = got
+        return got
 
     def _clearance_now(self) -> float:
         """Clearance at the state already loaded.  Assumes ``set_state`` has just run."""
@@ -337,6 +369,7 @@ class Cell:
 
     # -- state / collision ---------------------------------------------------
     def _load_state(self, q: np.ndarray) -> None:
+        self.counters["state_loads"] += 1
         self.env.setState(self._state_names, self._state_values(q))
         # Must hold a reference: passing env.getState().link_transforms inline lets the
         # temporary die and the binding then reads freed memory.
@@ -347,6 +380,7 @@ class Cell:
         self._cm.setCollisionObjectsTransform(self._state.link_transforms)
 
     def in_collision(self, q: np.ndarray) -> bool:
+        self.counters["collision_tests"] += 1
         self.set_state(q)
         res = ContactResultMap()
         self._cm.contactTest(res, ContactRequest(ContactTestType_FIRST))
@@ -500,6 +534,7 @@ class Cell:
                         dtype=float)[:3, 3]
 
     def fk(self, q: np.ndarray, link: str = TCP_LINK) -> np.ndarray:
+        self.counters["fk"] += 1
         self.env.setState(self._state_names, self._state_values(q))
         self._state = self.env.getState()
         return np.array(self.env.getLinkTransform(link).matrix(), dtype=float)

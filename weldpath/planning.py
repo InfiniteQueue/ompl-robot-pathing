@@ -151,7 +151,8 @@ class MotionModel:
         straight sweep in from far outside.  What the route should do instead is stop at
         the edge: joint motion out to it, linear from there in.
 
-        Two things about how the surcharge is charged are load bearing:
+        Charged as a speed the move is costed at, and only on a move that crosses the
+        edge.  Both of those are load bearing:
 
         * **On the crossing only.**  A move wholly inside the band pays nothing, which is
           the point -- that motion is wanted.  A tax on every linear move cannot decide
@@ -160,21 +161,20 @@ class MotionModel:
           together, and since each retained hop pays its own pair of ramps the polyline's
           linear part outweighs the chord's.  The chord's share of such a tax is the
           smaller one, so the collapse survives any multiplier whatsoever.
-        * **On the travel, not on the whole move.**  The multiplier scales *cruise* time
-          and leaves the ramps alone.  Scaling the whole cost is a ratio that both sides
-          of the comparison carry, so it cancels: raising it shortens the sweep and then
-          stops responding, settling short of the edge however large it gets.  Scaling
-          travel does not cancel, because the two sides do not travel the same distance
-          outside the band.  The long reach in from open space pays for its length, while
-          the short step across the edge -- the move the route is supposed to keep -- stays
-          under its own ramp time and pays nothing at all until the multiplier is large.
+        * **As a speed, not a multiplier.**  A multiplier is a ratio that both sides of
+          the comparison carry, so it converges: raising it shortens the sweep and then
+          stops responding.  A speed makes the cost an absolute quantity set by how far
+          the move actually runs, so the long reach in from open space is charged for its
+          length while the short hop across the edge -- the move the route is supposed to
+          keep -- is charged for almost none of it.  That difference does not cancel, so
+          the setting keeps biting however far it is pushed.
 
-        Deliberately unitless and independent of ``linear_speed_mm_s``: it is a preference
-        used while choosing between routes, not a claim about how fast anything moves.
+        The figure is used for costing and nothing else: the robot is never scheduled by
+        it, and it is deliberately not a speed the cell obeys anywhere.
         """
-        if self.zone.crossing_penalty <= 1.0 or not self._crosses(a, b):
+        if self.zone.crossing_speed_mm_s <= 0.0 or not self._crosses(a, b):
             return 0.0
-        return self.cell.cruise_time(a, b) * self.zone.crossing_penalty
+        return _tcp_travel(self.cell, [a, b]) / self.zone.crossing_speed_mm_s
 
     def _time_floor(self, a: np.ndarray, b: np.ndarray) -> float:
         """Seconds this linear move is held to, over and above the joint limits.
@@ -182,7 +182,7 @@ class MotionModel:
         Two floors can apply and the higher wins, which is what keeps them independent of
         one another; either may be off without disturbing the other.  ``linear_speed_mm_s``
         is a prediction -- the same figure schedules the exported program -- while the
-        crossing surcharge is a preference and reaches nothing outside these passes.
+        crossing speed is a preference and reaches nothing outside these passes.
         """
         if self.zone is None or self.motion(a, b) == PTP:
             return 0.0
@@ -197,6 +197,48 @@ class MotionModel:
     def move_time(self, a: np.ndarray, b: np.ndarray) -> float:
         return max(self.cell.move_time(a, b), self._time_floor(a, b))
 
+    def _known_near(self, q: np.ndarray) -> bool | None:
+        """``near(q)`` if it has already been measured, else None.  Never measures."""
+        if self.zone is None:
+            return False
+        return self._near.get(np.asarray(q, dtype=float).tobytes())
+
+    def bound_time(self, a: np.ndarray, b: np.ndarray) -> float:
+        """A lower bound on the stop-to-stop cost, guaranteed not to measure clearance.
+
+        Bounds ``cost(a, b, stops=True)`` specifically.  It is built on the full move time,
+        ramps included, so it is *not* a bound on the cruise-only cost -- a caller
+        comparing against cruise figures wants ``cell.cruise_time`` instead, which is what
+        ``shortcut`` already uses.
+
+        The optimisation passes draw candidates at random and most of them lose, so they
+        reject on a bound before paying for the real thing.  For that to be worth doing the
+        bound has to be cheap, and :meth:`move_time` is not: it asks :meth:`motion` which
+        profile governs the move, and a state nothing has measured yet answers that with a
+        contact test over every convex piece within the probe -- on a candidate that is
+        about to be thrown away.
+
+        So this asks only what is already known.  Every clearance factor is at least 1, so
+        the joint-limit time alone is always a valid floor.  The tool speed cap can be
+        added on top of it whenever one end is *known* to be near, since the move is then
+        linear whatever the other end turns out to be -- and in a cell where the route
+        hugs the panels that is the common case, so the bound is usually as tight as the
+        real one for nothing.  Where neither end has been measured the cap is left out
+        rather than measured for: a looser bound rejects fewer candidates, which is a
+        cost, but a wrong one would reject a candidate that should have won.
+
+        The crossing surcharge is always left out.  ``_crosses`` compares both ends and so
+        cannot be answered from one of them, and since it only ever raises the cost,
+        omitting it keeps this below the true figure.  It is applied in full by
+        :meth:`cost`, on the candidates that get that far.
+        """
+        base = self.cell.move_time(a, b)
+        if self.zone is None or self.zone.linear_speed_mm_s <= 0.0:
+            return base
+        if not (self._known_near(a) or self._known_near(b)):
+            return base
+        return max(base, _tcp_travel(self.cell, [a, b]) / self.zone.linear_speed_mm_s)
+
     def cost(self, a: np.ndarray, b: np.ndarray, *, fa: float | None = None,
              fb: float | None = None, stops: bool = False) -> float:
         """Penalised time, with the tool speed cap folded in.
@@ -206,7 +248,7 @@ class MotionModel:
         this would let the passes trade a joint move for a linear one that is quicker on
         the joint limits and slower once the tool speed governs it.
 
-        The crossing surcharge rides on that same floor, so it too compounds with the
+        The crossing speed rides on that same floor, so it too compounds with the
         clearance penalty rather than adding to it: a move that both reaches into the band
         from outside and runs hard against a panel is charged for both.
         """
@@ -368,10 +410,13 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
         if not cell.within_limits(candidate):
             continue
         # Unpenalised time is a lower bound on penalised time, so this rejects most
-        # candidates before paying for a collision check or a clearance query.
+        # candidates before paying for a collision check or a clearance query.  It has to
+        # be ``bound_time`` rather than ``move_time`` to keep that promise: the latter
+        # settles the move's profile, which measures the candidate's clearance -- the
+        # dearest query there is, spent on a point that is usually about to be discarded.
         budget = costs[k - 1] + costs[k]
-        if (model.move_time(pts[k - 1], candidate)
-                + model.move_time(candidate, pts[k + 1])) >= budget - 1e-9:
+        if (model.bound_time(pts[k - 1], candidate)
+                + model.bound_time(candidate, pts[k + 1])) >= budget - 1e-9:
             continue
         if (model.demotes(pts[k - 1], candidate, [pts[k]])
                 or model.demotes(candidate, pts[k + 1], [pts[k]])):
@@ -1106,8 +1151,8 @@ class LinearZone:
     min_run_pct: float = 0.0        # ...or this much of the leg, whichever it meets first
     step_mm: float = 50.0           # sampling along a straight move when it is checked
     linear_speed_mm_s: float = 0.0  # tool speed cap; 0 leaves linear moves costed on joints
-    crossing_penalty: float = 1.0   # surcharge on the travel of a move that reaches into
-                                    # the band from outside it; 1 charges nothing
+    crossing_speed_mm_s: float = 0.0  # costing-only speed for a move that reaches into
+                                      # the band from outside it; 0 charges no surcharge
 
     @property
     def enabled(self) -> bool:
@@ -1144,6 +1189,24 @@ def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
     return _split_runs(model, refined)
 
 
+def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> None:
+    """What the passes actually asked of the cell, and how much of it was avoided.
+
+    The budgets are wall clock, so a pass that gets through five candidates in fifty
+    seconds has spent them somewhere.  These are the primitives it can have spent them on,
+    printed as a difference so each transit reports its own share.
+    """
+    counters = getattr(cell, "counters", None)
+    if not log or not counters or before is None:
+        return
+    d = {k: v - before.get(k, 0) for k, v in counters.items()}
+    asked = d["clearance"] + d["clearance_hits"]
+    served = 100.0 * d["clearance_hits"] / asked if asked else 0.0
+    log(f"      work: {d['clearance']} clearance queries ({served:.0f}% of {asked} served "
+        f"from cache), {d['collision_tests']} collision tests, {d['state_loads']} state "
+        f"loads, {d['fk']} forward kinematics, in {elapsed:.1f}s")
+
+
 def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
             shortcut_seconds: float, polish_seconds: float, check_step: float,
             log) -> list[Run]:
@@ -1163,12 +1226,15 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     split at the end is a reading of the finished path rather than a decision imposed on
     it.
     """
+    before, t0 = getattr(cell, "counters", None), time.time()
+    before = dict(before) if before is not None else None
     dense = _densify(cell, path, check_step)
     allowed = zone is not None and _linear_allowed(cell, dense, zone, log=log)
     model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
     refined = _refine(model, dense, shortcut_seconds=shortcut_seconds,
                       polish_seconds=polish_seconds, log=log)
     runs = _split_runs(model, refined)
+    _report_work(cell, before, time.time() - t0, log)
     if log:
         lin = sum(1 for r in runs if r.motion == LIN)
         if lin:
