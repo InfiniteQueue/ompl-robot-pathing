@@ -136,19 +136,66 @@ class MotionModel:
         return not _chain_collides(self.cell, chain, self.max_step)
 
     # -- what it costs ------------------------------------------------------
-    def _cartesian_floor(self, a: np.ndarray, b: np.ndarray) -> float:
-        """Seconds the tool speed cap imposes on a linear move, or 0 where none applies."""
-        if self.zone is None or self.zone.linear_speed_mm_s <= 0.0:
+    def _crosses(self, a: np.ndarray, b: np.ndarray) -> bool:
+        """Whether this move reaches into the band from outside it, or back out."""
+        return self.zone is not None and self.near(a) != self.near(b)
+
+    def _crossing_floor(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Seconds a move that reaches into the band from outside it is held to.
+
+        Joint motion is wanted outside the band, but the profile rule makes a move linear
+        when *either* end is near, so a chord reaching in from open space is linear over
+        its whole length.  ``demotes`` does not object -- it refuses replacements that
+        come out ``PTP``, and this one does not -- so nothing stops the optimisation
+        passes deleting the waypoint at the edge of the band and handing back one long
+        straight sweep in from far outside.  What the route should do instead is stop at
+        the edge: joint motion out to it, linear from there in.
+
+        Two things about how the surcharge is charged are load bearing:
+
+        * **On the crossing only.**  A move wholly inside the band pays nothing, which is
+          the point -- that motion is wanted.  A tax on every linear move cannot decide
+          this question at all: ``simplify`` weighs the chord against the polyline it
+          would replace, whose own near-panel hops are linear too, so both sides scale
+          together, and since each retained hop pays its own pair of ramps the polyline's
+          linear part outweighs the chord's.  The chord's share of such a tax is the
+          smaller one, so the collapse survives any multiplier whatsoever.
+        * **On the travel, not on the whole move.**  The multiplier scales *cruise* time
+          and leaves the ramps alone.  Scaling the whole cost is a ratio that both sides
+          of the comparison carry, so it cancels: raising it shortens the sweep and then
+          stops responding, settling short of the edge however large it gets.  Scaling
+          travel does not cancel, because the two sides do not travel the same distance
+          outside the band.  The long reach in from open space pays for its length, while
+          the short step across the edge -- the move the route is supposed to keep -- stays
+          under its own ramp time and pays nothing at all until the multiplier is large.
+
+        Deliberately unitless and independent of ``linear_speed_mm_s``: it is a preference
+        used while choosing between routes, not a claim about how fast anything moves.
+        """
+        if self.zone.crossing_penalty <= 1.0 or not self._crosses(a, b):
             return 0.0
-        if self.motion(a, b) == PTP:
+        return self.cell.cruise_time(a, b) * self.zone.crossing_penalty
+
+    def _time_floor(self, a: np.ndarray, b: np.ndarray) -> float:
+        """Seconds this linear move is held to, over and above the joint limits.
+
+        Two floors can apply and the higher wins, which is what keeps them independent of
+        one another; either may be off without disturbing the other.  ``linear_speed_mm_s``
+        is a prediction -- the same figure schedules the exported program -- while the
+        crossing surcharge is a preference and reaches nothing outside these passes.
+        """
+        if self.zone is None or self.motion(a, b) == PTP:
             return 0.0
-        return _tcp_travel(self.cell, [a, b]) / self.zone.linear_speed_mm_s
+        floor = self._crossing_floor(a, b)
+        if self.zone.linear_speed_mm_s > 0.0:
+            floor = max(floor, _tcp_travel(self.cell, [a, b]) / self.zone.linear_speed_mm_s)
+        return floor
 
     def cruise_time(self, a: np.ndarray, b: np.ndarray) -> float:
-        return max(self.cell.cruise_time(a, b), self._cartesian_floor(a, b))
+        return max(self.cell.cruise_time(a, b), self._time_floor(a, b))
 
     def move_time(self, a: np.ndarray, b: np.ndarray) -> float:
-        return max(self.cell.move_time(a, b), self._cartesian_floor(a, b))
+        return max(self.cell.move_time(a, b), self._time_floor(a, b))
 
     def cost(self, a: np.ndarray, b: np.ndarray, *, fa: float | None = None,
              fb: float | None = None, stops: bool = False) -> float:
@@ -158,10 +205,14 @@ class MotionModel:
         the two are combined by scaling rather than by replacement.  Optimising without
         this would let the passes trade a joint move for a linear one that is quicker on
         the joint limits and slower once the tool speed governs it.
+
+        The crossing surcharge rides on that same floor, so it too compounds with the
+        clearance penalty rather than adding to it: a move that both reaches into the band
+        from outside and runs hard against a panel is charged for both.
         """
         penalised = self.cell.segment_cost(a, b, max_step=self.max_step,
                                            fa=fa, fb=fb, stops=stops)
-        floor = self._cartesian_floor(a, b)
+        floor = self._time_floor(a, b)
         if floor <= 0.0:
             return penalised
         raw = self.cell.move_time(a, b) if stops else self.cell.cruise_time(a, b)
@@ -1055,6 +1106,8 @@ class LinearZone:
     min_run_pct: float = 0.0        # ...or this much of the leg, whichever it meets first
     step_mm: float = 50.0           # sampling along a straight move when it is checked
     linear_speed_mm_s: float = 0.0  # tool speed cap; 0 leaves linear moves costed on joints
+    crossing_penalty: float = 1.0   # surcharge on the travel of a move that reaches into
+                                    # the band from outside it; 1 charges nothing
 
     @property
     def enabled(self) -> bool:

@@ -53,7 +53,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="joint-space resolution used when checking a move for collision; "
                         "smaller is safer and slower (default: 3)")
     #COLLISION STEP RESOLUTION AT THE TOOL
-    p.add_argument("--check-step-mm", type=float, default=10.0, metavar="MM",
+    p.add_argument("--check-step-mm", type=float, default=7.0, metavar="MM",
                    help="tool-space companion to --check-step-deg, applied as well as it "
                         "rather than instead of it. A joint step means different distances "
                         "at different poses -- a few degrees is millimetres at the wrist "
@@ -62,7 +62,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "less than --check-step-deg alone would, and costs nothing where "
                         "the two agree. 0 turns this off (default: 10)")
     #COLLISION CHECK RESOLUTION
-    p.add_argument("--segment-length-rad", type=float, default=0.02,
+    p.add_argument("--segment-length-rad", type=float, default=0.03,
                    help="collision checking resolution for the sampling planner "
                         "(default: 0.02)")
 #endregion
@@ -109,7 +109,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="time budget for shortcutting each freespace transit; longer "
                         "budgets keep shortening with diminishing returns (default: 20)")
     #POLISH PASS TIME
-    p.add_argument("--polish-seconds", type=float, default=20.0, metavar="SECONDS",
+    p.add_argument("--polish-seconds", type=float, default=50.0, metavar="SECONDS",
                    help="time budget for the final pass over each transit's emitted "
                         "waypoints, which removes and relocates them under the full "
                         "stop-to-stop time the robot really pays for each one. The "
@@ -149,12 +149,27 @@ def build_parser() -> argparse.ArgumentParser:
                         "out linear however completely it runs alongside the panel -- a hop "
                         "from one weld to the next being the case that matters. 0 leaves "
                         "--near-panel-min-mm as the only test (default: 50)")
+    #PRICE OF REACHING INTO THE BAND FROM OUTSIDE IT
+    p.add_argument("--linear-crossing-penalty", type=float, default=3.0, metavar="X",
+                   help="multiply the travel time of a move that crosses into the "
+                        "proximity band by this, while the optimisation passes are "
+                        "choosing between routes. A move is linear when either end is "
+                        "near the parts, so left alone the passes delete the waypoint at "
+                        "the edge of the band and reach in from open space on one long "
+                        "straight sweep; this prices that against stopping at the edge "
+                        "and running joint motion outside it. Charged on the crossing "
+                        "only, so linear motion inside the band is untouched, and on "
+                        "travel rather than on the whole move, so a short step across the "
+                        "edge pays little and a long reach pays for its length. A costing "
+                        "figure and nothing else: independent of --linear-speed-mm-s and "
+                        "absent from the exported cycle time. Compounds with the "
+                        "clearance penalty. 1 charges nothing (default: 3)")
     #endregion
     #region ###COLLISION HULLS###
     #DROP TINY SHELLS
-    p.add_argument("--min-shell-mm", type=float, default=20.0,
+    p.add_argument("--min-shell-mm", type=float, default=10.0,
                    help="drop collision shells smaller than this across their bounding "
-                        "box diagonal (default: 20)")
+                        "box diagonal (default: 10)")
     #SHELL COUNT CAP PER LINK
     p.add_argument("--max-shells", type=int, default=1500,
                    help="keep at most this many convex shells per link; fewer is faster "
@@ -166,12 +181,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "follows recesses instead of bridging them. Smaller is more "
                         "accurate and slower; 0 disables (default: 50)")
     #WHEN A SHELL NEEDS REFINING AT ALL
-    p.add_argument("--hull-fill", type=float, default=0.85, metavar="F",
+    p.add_argument("--hull-fill", type=float, default=0.75, metavar="F",
                    help="how much of its own bounding box a shell must fill before a "
                         "single hull is accepted for it; below this it is split by "
                         "--hull-cell-mm. Raise it towards 1 for geometry whose recesses "
                         "matter, such as panelling full of shallow bowls that a hull "
-                        "would skin over (default: 0.85)")
+                        "would skin over (default: 0.75)")
     #CELL SIZE: ARM
     p.add_argument("--robot-cell-mm", type=float, default=0, metavar="MM",
                    help="--hull-cell-mm for the arm's own links. The arm never comes close "
@@ -183,16 +198,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "where it makes contact, so refining it buys accuracy nowhere and "
                         "costs shells everywhere (default: 100)")
     #CELL SIZE: TOOLING
-    p.add_argument("--tooling-cell-mm", type=float, default=30, metavar="MM",
+    p.add_argument("--tooling-cell-mm", type=float, default=25, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls tooling. "
                         "These are the largest meshes in the cell and refinement runs "
                         "after --max-shells, so a small cell here dominates both "
-                        "preparation and every later collision check (default: 30)")
+                        "preparation and every later collision check (default: 25)")
     #CELL SIZE: PANELS
-    p.add_argument("--panel-cell-mm", type=float, default=40, metavar="MM",
+    p.add_argument("--panel-cell-mm", type=float, default=25, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls panel. This "
                         "is the geometry that is concave exactly where the welds are, so "
-                        "it is where a small cell is worth paying for (default: 40)")
+                        "it is where a small cell is worth paying for (default: 30)")
     #WELD PROXIMITY FOR SHELL SPLIT
     p.add_argument("--shell-split-weld-prox", type=float, default=5.0, metavar="MM",
                    help="only refine panel and tooling geometry within this many mm of "
@@ -287,12 +302,12 @@ def build_parser() -> argparse.ArgumentParser:
     #region ###STEPPED CLEARANCE PENALTY###
     #USE THE STEPPED CURVE INSTEAD
     p.add_argument("--stepped-penalty", type=boolean, nargs="?", const=True,
-                   default=False, metavar="BOOL",
+                   default=True, metavar="BOOL",
                    help="true uses the stepped exponential penalty curve instead of the "
                         "power curve above. Every --clearance-penalty-* option is ignored "
                         "when it is on, apart from --no-clearance-penalty, which still "
                         "turns all penalties off. Takes true/false (yes/no, on/off, 1/0); "
-                        "passing the flag with no value means true (default: false)")
+                        "passing the flag with no value means true (default: True)")
     #STRENGTH AT TOUCHING
     p.add_argument("--stepped-penalty-multiplier", type=float, default=8.0, metavar="N",
                    help="penalty at zero clearance: a second spent touching costs as much "
@@ -482,6 +497,7 @@ def main(argv: list[str] | None = None) -> int:
         near_panel_min_mm=args.near_panel_min_mm,
         near_panel_min_pct=args.near_panel_min_pct,
         linear_speed_mm_s=args.linear_speed_mm_s,
+        linear_crossing_penalty=args.linear_crossing_penalty,
         weld_clearance_mm=args.weld_clearance_mm,
         export_dir=directory if args.export_collision_geometry else None,
         keep_unrefined=args.unrefined_output,
