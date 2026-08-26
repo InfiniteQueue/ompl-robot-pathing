@@ -591,6 +591,34 @@ _SOLVER_SIGNATURE = (10, 0, 1)          # max_solutions, simplify, optimize
 _planning_time_warned = False
 
 
+@dataclass
+class OmplBudget:
+    """How many sampling-planner runs a transit gets, and how long each may search.
+
+    Two phases, because the two things a run can be for are not the same job.
+
+    **Phase one is a choice between routes.**  RRTConnect returns the first path it finds
+    and which homotopy class that lands in is luck; no later pass can move a route to the
+    other side of an obstacle, so solving several times and keeping the cheapest is the
+    only stage that can choose at all.  Every run is spent whether or not earlier ones
+    succeeded -- stopping at the first success is exactly what this phase exists not to do.
+
+    **Phase two is a search for any route at all**, and only runs when phase one came back
+    empty.  It stops at the first solution, there being nothing to choose between, and it
+    carries its own per-run budget: a transit that beat phase one is usually one where
+    restarting the tree is the problem, so the time that helps is a longer single search
+    rather than another shake of the sampler.
+    """
+    phase_one_runs: int = 5
+    phase_one_seconds: float = DEFAULT_PLANNING_TIME
+    phase_two_max_runs: int = 15
+    phase_two_seconds: float = DEFAULT_PLANNING_TIME
+
+    @property
+    def worst_case_runs(self) -> int:
+        return max(self.phase_one_runs, 0) + max(self.phase_two_max_runs, 0)
+
+
 def _set_planning_time(profile: OMPLRealVectorMoveProfile, seconds: float) -> bool:
     """Set the solver's per-run time limit.  Returns False if it could not be done.
 
@@ -716,11 +744,10 @@ def _endpoint_block(cell: Cell, qa: np.ndarray, qb: np.ndarray) -> str | None:
     return None
 
 
-def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
-                     runs: int, segment_length: float, check_step: float,
+def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget,
+                     segment_length: float, check_step: float,
                      fallback_via: list[np.ndarray] | None,
                      shortcut_seconds: float, polish_seconds: float,
-                     planning_time: float = DEFAULT_PLANNING_TIME,
                      zone: LinearZone | None = None, log=print,
                      record: list | None = None) -> list[Run]:
     """Collision-free joint path from ``qa`` to ``qb`` at the gun's current opening.
@@ -736,12 +763,11 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
         # caller's next candidate opening, or the two-leg split, is the only way on.
         raise PlanningError(blocked)
     try:
-        return _plan_direct(cell, qa, qb, attempts=attempts, runs=runs,
+        return _plan_direct(cell, qa, qb, ompl=ompl,
                             segment_length=segment_length, check_step=check_step,
                             shortcut_seconds=shortcut_seconds,
                             polish_seconds=polish_seconds,
-                            planning_time=planning_time, zone=zone, log=log,
-                            record=record)
+                            zone=zone, log=log, record=record)
     except PlanningError:
         if not fallback_via:
             raise
@@ -757,14 +783,14 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
             # Planned without a linear zone: the two legs are joined below and the whole
             # route is split afterwards, so splitting each half here would put a phase
             # boundary at the fallback pose whether the geometry called for one or not.
-            first = _plan_direct(cell, qa, mid, attempts=attempts, runs=runs,
+            first = _plan_direct(cell, qa, mid, ompl=ompl,
                                  segment_length=segment_length, check_step=check_step,
                                  shortcut_seconds=0.0, polish_seconds=0.0,
-                                 planning_time=planning_time, log=log, record=halves)
-            second = _plan_direct(cell, mid, qb, attempts=attempts, runs=runs,
+                                 log=log, record=halves)
+            second = _plan_direct(cell, mid, qb, ompl=ompl,
                                   segment_length=segment_length, check_step=check_step,
                                   shortcut_seconds=0.0, polish_seconds=0.0,
-                                  planning_time=planning_time, log=log, record=halves)
+                                  log=log, record=halves)
         except PlanningError:
             continue
         if len(halves) == 2:
@@ -777,8 +803,8 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: in
     raise PlanningError("freespace transit failed, including via fallback poses")
 
 
-def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int = 3,
-                   runs: int = 1, segment_length: float = 0.02,
+def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
+                   ompl: OmplBudget | None = None, segment_length: float = 0.02,
                    check_step: float = 0.05,
                    fallback_via: list[np.ndarray] | None = None,
                    shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
@@ -803,15 +829,16 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int 
     returned it, one entry per returned leg and in the same order.  Failed attempts leave
     nothing behind: only the openings that were actually used contribute.
     """
+    ompl = ompl or OmplBudget()
+
     def attempt(opening, a, b, budget, into=None):
         with cell.gun_opening(opening):
-            return _plan_at_opening(cell, a, b, attempts=attempts, runs=runs,
+            return _plan_at_opening(cell, a, b, ompl=ompl,
                                     segment_length=segment_length,
                                     check_step=check_step, fallback_via=fallback_via,
                                     shortcut_seconds=budget,
                                     polish_seconds=polish_seconds if budget else 0.0,
-                                    planning_time=planning_time, zone=zone, log=log,
-                                    record=into)
+                                    zone=zone, log=log, record=into)
 
     candidates = _opening_candidates(cell, openings)
 
@@ -890,10 +917,42 @@ def _opening_candidates(cell: Cell, openings: list[float] | None) -> list[float 
     return out
 
 
-def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
-                 runs: int, segment_length: float, check_step: float,
+def _ompl_run(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, segment_length: float,
+              planning_time: float, check_step: float, label: str, log
+              ) -> tuple[float, float, list[np.ndarray]] | None:
+    """One sampling-planner solve, scored and reported.  ``None`` when it did not solve.
+
+    The planner's own message for a failure is left on ``_ompl_run.message`` rather than
+    returned: only the last one is ever quoted, and threading it back through every caller
+    to say the same thing is noise.
+    """
+    profiles = ProfileDictionary()
+    profiles.addProfile(OMPL_NAMESPACE, "DEFAULT",
+                        _ompl_profile(segment_length, planning_time, log))
+    request = PlannerRequest()
+    request.env = cell.env
+    request.instructions = _make_program(cell, qa, qb)
+    request.profiles = profiles
+    t0 = time.time()
+    response = OMPLMotionPlanner(OMPL_NAMESPACE).solve(request)
+    dt = time.time() - t0
+    if not response.successful:
+        _ompl_run.message = str(response.message)
+        log(f"      {label}: {_ompl_run.message} ({dt:.1f}s)")
+        return None
+    raw = _extract(response.results)
+    cost, plain = _path_cost(cell, raw, check_step)
+    log(f"      {label}: solved in {dt:.1f}s ({len(raw)} raw points, "
+        f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
+    return cost, plain, raw
+
+
+_ompl_run.message = ""
+
+
+def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget,
+                 segment_length: float, check_step: float,
                  shortcut_seconds: float, polish_seconds: float,
-                 planning_time: float = DEFAULT_PLANNING_TIME,
                  zone: LinearZone | None = None, log=print,
                  record: list | None = None) -> list[Run]:
     if not cell.segment_collides(qa, qb, max_step=check_step):
@@ -929,37 +988,36 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, attempts: int,
     # only stage that can make that choice at all.
     candidates: list[tuple[float, float, list[np.ndarray]]] = []
     last = ""
-    total = max(runs, attempts)
-    log(f"      planning with OMPL: up to {total} runs of {planning_time:g}s each, "
-        f"stopping at {runs} once one has solved")
-    for attempt in range(1, total + 1):
-        profiles = ProfileDictionary()
-        profiles.addProfile(OMPL_NAMESPACE, "DEFAULT",
-                            _ompl_profile(segment_length, planning_time, log))
-        request = PlannerRequest()
-        request.env = cell.env
-        request.instructions = _make_program(cell, qa, qb)
-        request.profiles = profiles
-        t0 = time.time()
-        response = OMPLMotionPlanner(OMPL_NAMESPACE).solve(request)
-        dt = time.time() - t0
-        if response.successful:
-            raw = _extract(response.results)
-            cost, plain = _path_cost(cell, raw, check_step)
-            candidates.append((cost, plain, raw))
-            log(f"      OMPL run {attempt}: solved in {dt:.1f}s ({len(raw)} raw points, "
-                f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
-        else:
-            last = str(response.message)
-            log(f"      OMPL run {attempt}: {last} ({dt:.1f}s)")
-        # The minimum is a floor, not a cap: keep going past it only while nothing at all
-        # has solved, up to the attempts limit.
-        if attempt >= runs and candidates:
-            break
+
+    def run(planning_time: float, label: str) -> bool:
+        nonlocal last
+        found = _ompl_run(cell, qa, qb, segment_length=segment_length,
+                          planning_time=planning_time, check_step=check_step,
+                          label=label, log=log)
+        if found is None:
+            last = _ompl_run.message
+            return False
+        candidates.append(found)
+        return True
+
+    if ompl.phase_one_runs > 0:
+        log(f"      phase 1: {ompl.phase_one_runs} runs of "
+            f"{ompl.phase_one_seconds:g}s each, keeping the cheapest that solves")
+        for attempt in range(1, ompl.phase_one_runs + 1):
+            run(ompl.phase_one_seconds, f"phase 1 run {attempt}")
+
+    if not candidates and ompl.phase_two_max_runs > 0:
+        # Nothing to choose between at this point, so the goal changes from a good route to
+        # any route, and the first one that arrives ends the phase.
+        log(f"      phase 2: up to {ompl.phase_two_max_runs} runs of "
+            f"{ompl.phase_two_seconds:g}s each, stopping at the first solution")
+        for attempt in range(1, ompl.phase_two_max_runs + 1):
+            if run(ompl.phase_two_seconds, f"phase 2 run {attempt}"):
+                break
 
     if not candidates:
         raise PlanningError(
-            f"freespace transit failed after {max(runs, attempts)} attempts: {last}")
+            f"freespace transit failed after {ompl.worst_case_runs} attempts: {last}")
 
     cost, plain, raw = min(candidates, key=lambda c: c[0])
     _capture(record, raw)

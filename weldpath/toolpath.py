@@ -20,7 +20,8 @@ import numpy as np
 
 from .cell import Cell
 from .manifest import Locator, Manifest
-from .planning import (LIN, PTP, LinearZone, PlanningError, plan_freespace, validate)
+from .planning import (LIN, PTP, LinearZone, OmplBudget, PlanningError, plan_freespace,
+                       validate)
 
 
 
@@ -60,10 +61,8 @@ CLEARANCE_REPORT_HEADROOM_MM = 25.0
 
 class ToolpathPlanner:
     def __init__(self, cell: Cell, man: Manifest, *,
-                 linear_step_mm: float = 50.0, ompl_attempts: int = 3,
-                 ompl_runs: int = 1,
+                 linear_step_mm: float = 50.0, ompl: OmplBudget | None = None,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
-                 ompl_seconds: float = 5.0,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                  near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
                  near_panel_min_pct: float = 0.0, linear_speed_mm_s: float = 0.0,
@@ -74,9 +73,7 @@ class ToolpathPlanner:
         self.man = man
         self.log = log
         self.linear_step_mm = linear_step_mm
-        self.ompl_attempts = ompl_attempts
-        self.ompl_runs = ompl_runs
-        self.ompl_seconds = ompl_seconds
+        self.ompl = ompl or OmplBudget()
         self.segment_length = segment_length
         self.check_step = np.deg2rad(check_step_deg)
         self.shortcut_seconds = shortcut_seconds
@@ -323,11 +320,10 @@ class ToolpathPlanner:
         raw_legs: list | None = [] if self.keep_unrefined else None
         legs = plan_freespace(
             self.cell, transit_start, transit_end,
-            attempts=self.ompl_attempts, runs=self.ompl_runs,
-            segment_length=self.segment_length,
+            ompl=self.ompl, segment_length=self.segment_length,
             check_step=self.check_step, fallback_via=[self.start_q],
             shortcut_seconds=self.shortcut_seconds,
-            polish_seconds=self.polish_seconds, planning_time=self.ompl_seconds,
+            polish_seconds=self.polish_seconds,
             zone=self.zone,
             openings=self._transit_openings(a, b, leave_open, arrive_open),
             record=raw_legs, log=self.log)

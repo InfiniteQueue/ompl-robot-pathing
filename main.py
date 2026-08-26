@@ -47,24 +47,35 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: 0.02)")
 #endregion
     #region ###PATHFINDING###
-    #MAX OMPL (pathfinding) ATTEMPTS
-    p.add_argument("--ompl-attempts", type=int, default=20,
-                   help="most freespace planning attempts per segment, used to retry a "
-                        "transit that keeps failing (default: 20)")
-    #MIN OMPL ATTEMPTS
-    p.add_argument("--ompl-min-runs", type=int, default=5, metavar="N",
-                   help="always run the sampling planner at least this many times per "
-                        "transit and keep the lowest-penalty solution, rather than taking "
-                        "the first one that works. The planner returns whichever route it "
-                        "stumbles on first, and no later pass can move a route to the "
-                        "other side of an obstacle, so this is the only stage that can "
-                        "choose between them. Costs a full solve per run (default: 5)")
-    #OMPL ATTEMPT MAX TIME
-    p.add_argument("--ompl-seconds", type=float, default=10.0, metavar="SECONDS",
-                   help="how long one sampling-planner run may search before giving up. "
-                        "Raise it for a transit that keeps failing, where restarting the "
-                        "search wastes the tree built so far; every run costs this long in "
-                        "the worst case, so it multiplies with --ompl-min-runs "
+    #PHASE ONE: CHOOSE BETWEEN ROUTES
+    p.add_argument("--phase-one-runs", type=int, default=7, metavar="N",
+                   help="sampling-planner runs made per transit in phase one. Every one "
+                        "is spent whether or not earlier runs succeeded, and the "
+                        "lowest-penalty solution of the set is the one that ships. The "
+                        "planner returns whichever route it stumbles on first, and no "
+                        "later pass can move a route to the other side of an obstacle, so "
+                        "this is the only stage that can choose between them "
+                        "(default: 7)")
+    #PHASE ONE RUN TIME
+    p.add_argument("--phase-one-solve-seconds", type=float, default=8.0,
+                   metavar="SECONDS",
+                   help="how long one phase-one run may search before giving up. Every "
+                        "run costs this long in the worst case, so it multiplies with "
+                        "--phase-one-runs (default: 8)")
+    #PHASE TWO: FIND ANY ROUTE AT ALL
+    p.add_argument("--phase-two-max-runs", type=int, default=8, metavar="N",
+                   help="most sampling-planner runs allowed in phase two, which is "
+                        "entered only when phase one found nothing at all. Phase two "
+                        "stops at the first solution rather than sampling for a better "
+                        "one; if it too comes back empty the transit is retried through "
+                        "the fallback poses, starting again from phase one (default: 8)")
+    #PHASE TWO RUN TIME
+    p.add_argument("--phase-two-solve-seconds", type=float, default=10.0,
+                   metavar="SECONDS",
+                   help="how long one phase-two run may search. Worth setting higher than "
+                        "--phase-one-solve-seconds: a transit that beat phase one is "
+                        "usually one where restarting wastes the tree built so far, so a "
+                        "longer single search helps where another short one does not "
                         "(default: 10)")
     #endregion
     #region ###OPTIMISATION###
@@ -94,7 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "re-planning the stretches that run close to the parts as straight "
                         "moves")
     #WHAT COUNTS AS NEAR A PART
-    p.add_argument("--near-panel-mm", type=float, default=120.0, metavar="MM",
+    p.add_argument("--near-panel-mm", type=float, default=50.0, metavar="MM",
                    help="clearance from a panel or from tooling at or under which a "
                         "transit counts as working near the parts, and is re-planned as "
                         "linear motion. Larger means more of the route comes out linear, "
@@ -108,7 +119,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "this length still qualifies on --near-panel-min-pct "
                         "(default: 100)")
     #...OR THIS MUCH OF THE MOVE, HOWEVER SHORT
-    p.add_argument("--near-panel-min-pct", type=float, default=50.0, metavar="PCT",
+    p.add_argument("--near-panel-min-pct", type=float, default=60.0, metavar="PCT",
                    help="if this much of a move is within --near-panel-mm of the parts, "
                         "every near-panel stretch of it is made linear however short each "
                         "one is. Measured over the whole move, not over each stretch: time "
@@ -228,9 +239,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="clearance at and above which there is no penalty; the curve "
                         "starts here (default: 200)")
     #PENALTY CURVE PEAK
-    p.add_argument("--clearance-penalty-min-mm", type=float, default=0.0, metavar="MM",
+    p.add_argument("--clearance-penalty-min-mm", type=float, default=-5.0, metavar="MM",
                    help="clearance at and below which the penalty is at its peak "
-                        "(default: 0)")
+                        "(default: -5)")
     #PENALTY PEAK STRENGTH
     p.add_argument("--clearance-penalty-multiplier", type=float, default=8.0,
                    metavar="N",
@@ -252,6 +263,36 @@ def build_parser() -> argparse.ArgumentParser:
                         "further and planning runs faster. Truncates the shallow end of "
                         "the curve without reshaping the rest, so the penalty steps "
                         "abruptly at this distance; 0 uses the maximum (default: 0)")
+    #endregion
+    #region ###STEPPED CLEARANCE PENALTY###
+    #USE THE STEPPED CURVE INSTEAD
+    p.add_argument("--stepped-penalty", action="store_true",
+                   help="use the stepped exponential penalty curve instead of the power "
+                        "curve above. Every --clearance-penalty-* option is ignored when "
+                        "this is set, apart from --no-clearance-penalty, which still "
+                        "turns all penalties off (default: off)")
+    #STRENGTH AT TOUCHING
+    p.add_argument("--stepped-penalty-multiplier", type=float, default=8.0, metavar="N",
+                   help="penalty at zero clearance: a second spent touching costs as much "
+                        "as N seconds in open space (default: 8)")
+    #WHERE THE PENALTY IS SPENT
+    p.add_argument("--stepped-penalty-zero-mm", type=float, default=200.0, metavar="MM",
+                   help="clearance at which the penalty reaches 1x and stops mattering. "
+                        "Also how far the proximity query has to see, so lowering it "
+                        "speeds planning up (default: 200)")
+    #STEP LENGTH
+    p.add_argument("--stepped-penalty-step-mm", type=float, default=25.0, metavar="MM",
+                   help="how much extra clearance counts as one step of falloff "
+                        "(default: 25)")
+    #STEP FACTOR
+    p.add_argument("--stepped-penalty-step-factor", type=float, default=0.7, metavar="F",
+                   help="what one step multiplies the penalty by: 0.7 means each "
+                        "--stepped-penalty-step-mm of extra clearance costs 70%% of what "
+                        "the step before it did. Must be between 0 and 1; smaller falls "
+                        "off faster and so concentrates the penalty near the part. Holds "
+                        "of the curve's exponential term rather than of the multiplier "
+                        "exactly, since a quantity scaled by a constant factor per step "
+                        "never reaches zero (default: 0.7)")
     #endregion
     #region ###VELOCITY PROFILE###
     #JOINT VELOCITY LIMITS
@@ -316,8 +357,9 @@ def main(argv: list[str] | None = None) -> int:
     from weldpath import cell as cell_mod
     from weldpath import manifest as manifest_mod
     from weldpath import output as output_mod
-    from weldpath.penalty import ClearancePenalty
+    from weldpath.penalty import ClearancePenalty, SteppedPenalty
     from weldpath import profile as profile_mod
+    from weldpath.planning import OmplBudget
     from weldpath.toolpath import ToolpathPlanner
 
     t0 = time.time()
@@ -352,13 +394,21 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        penalty = ClearancePenalty(
-            max_mm=args.clearance_penalty_max_mm,
-            min_mm=args.clearance_penalty_min_mm,
-            multiplier=args.clearance_penalty_multiplier,
-            cutoff_mm=args.clearance_penalty_cutoff_mm,
-            exponent=args.clearance_penalty_exponent,
-            enabled=args.clearance_penalty)
+        if args.stepped_penalty:
+            penalty = SteppedPenalty(
+                multiplier=args.stepped_penalty_multiplier,
+                zero_mm=args.stepped_penalty_zero_mm,
+                step_mm=args.stepped_penalty_step_mm,
+                step_factor=args.stepped_penalty_step_factor,
+                enabled=args.clearance_penalty)
+        else:
+            penalty = ClearancePenalty(
+                max_mm=args.clearance_penalty_max_mm,
+                min_mm=args.clearance_penalty_min_mm,
+                multiplier=args.clearance_penalty_multiplier,
+                cutoff_mm=args.clearance_penalty_cutoff_mm,
+                exponent=args.clearance_penalty_exponent,
+                enabled=args.clearance_penalty)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -398,9 +448,10 @@ def main(argv: list[str] | None = None) -> int:
     planner = ToolpathPlanner(
         cell, man,
         linear_step_mm=args.linear_step_mm,
-        ompl_attempts=args.ompl_attempts,
-        ompl_runs=args.ompl_min_runs,
-        ompl_seconds=args.ompl_seconds,
+        ompl=OmplBudget(phase_one_runs=args.phase_one_runs,
+                        phase_one_seconds=args.phase_one_solve_seconds,
+                        phase_two_max_runs=args.phase_two_max_runs,
+                        phase_two_seconds=args.phase_two_solve_seconds),
         segment_length=args.segment_length_rad,
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,
