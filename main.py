@@ -97,6 +97,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "usually one where restarting wastes the tree built so far, so a "
                         "longer single search helps where another short one does not "
                         "(default: 12)")
+    #EFFORT ONCE THE PREFERRED ANSWER HAS FAILED
+    p.add_argument("--fallback-runs", type=int, default=1, metavar="N",
+                   help="sampling-planner runs allowed per phase once the preferred gun "
+                        "opening has failed -- the retried openings, and the legs of a "
+                        "two-leg split through a fallback pose. Nearly the whole worst "
+                        "case sits in that tail, and it is where the full budget buys "
+                        "least: phase one's expense buys a choice between routes, and by "
+                        "then the question is whether there is a route at all. 0 spends "
+                        "the full --phase-one-runs and --phase-two-max-runs everywhere, "
+                        "which is roughly 35 minutes on a transit that ends up failing "
+                        "against about 8 at the default (default: 1)")
     #endregion
     #region ###OPTIMISATION###
 
@@ -196,10 +207,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "enough to the parts for hull error to decide anything, so this is "
                         "the first thing to switch off (default: 0, i.e. off)")
     #CELL SIZE: GUN
-    p.add_argument("--gun-cell-mm", type=float, default=100, metavar="MM",
+    p.add_argument("--gun-cell-mm", type=float, default=200, metavar="MM",
                    help="--hull-cell-mm for the gun body and moving tip. The gun is convex "
                         "where it makes contact, so refining it buys accuracy nowhere and "
-                        "costs shells everywhere (default: 100)")
+                        "costs shells everywhere (default: 200)")
     #CELL SIZE: TOOLING
     p.add_argument("--tooling-cell-mm", type=float, default=25, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls tooling. "
@@ -273,7 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="do not penalise routes that run close to the panels and "
                         "tooling; only hard collisions are avoided")
     #PENALTY CURVE START
-    p.add_argument("--clearance-penalty-max-mm", type=float, default=200.0, metavar="MM",
+    p.add_argument("--clearance-penalty-max-mm", type=float, default=100.0, metavar="MM",
                    help="clearance at and above which there is no penalty; the curve "
                         "starts here (default: 200)")
     #PENALTY CURVE PEAK
@@ -316,7 +327,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="penalty at zero clearance: a second spent touching costs as much "
                         "as N seconds in open space (default: 8)")
     #WHERE THE PENALTY IS SPENT
-    p.add_argument("--stepped-penalty-zero-mm", type=float, default=200.0, metavar="MM",
+    p.add_argument("--stepped-penalty-zero-mm", type=float, default=100.0, metavar="MM",
                    help="clearance at which the penalty reaches 1x and stops mattering. "
                         "Also how far the proximity query has to see, so lowering it "
                         "speeds planning up (default: 200)")
@@ -492,6 +503,7 @@ def main(argv: list[str] | None = None) -> int:
                         phase_one_seconds=args.phase_one_solve_seconds,
                         phase_two_max_runs=args.phase_two_max_runs,
                         phase_two_seconds=args.phase_two_solve_seconds),
+        fallback_runs=args.fallback_runs,
         segment_length=args.segment_length_rad,
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,

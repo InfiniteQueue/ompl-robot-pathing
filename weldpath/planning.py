@@ -15,7 +15,7 @@ from __future__ import annotations
 import ctypes
 import struct
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import numpy as np
 
@@ -714,6 +714,23 @@ class OmplBudget:
     def worst_case_runs(self) -> int:
         return max(self.phase_one_runs, 0) + max(self.phase_two_max_runs, 0)
 
+    def capped(self, runs: int) -> "OmplBudget":
+        """This budget with each phase held to at most ``runs`` attempts.
+
+        For the work a transit only reaches once its preferred answer has failed.  Phase
+        one's expense buys a choice between homotopy classes, and that is worth paying on
+        the route the transit is most likely to ship; by the third gun opening, or by a
+        leg of a two-leg split that exists only because nothing else reached at all, the
+        question has already collapsed to whether there is a route.  Spending the full
+        budget there costs the great majority of the worst case and decides very little.
+
+        ``runs <= 0`` leaves the budget alone, which is the old exhaustive behaviour.
+        """
+        if runs <= 0:
+            return self
+        return replace(self, phase_one_runs=min(self.phase_one_runs, runs),
+                       phase_two_max_runs=min(self.phase_two_max_runs, runs))
+
 
 def _set_planning_time(profile: OMPLRealVectorMoveProfile, seconds: float) -> bool:
     """Set the solver's per-run time limit.  Returns False if it could not be done.
@@ -903,6 +920,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    ompl: OmplBudget | None = None, segment_length: float = 0.02,
                    check_step: float = 0.05,
                    fallback_via: list[np.ndarray] | None = None,
+                   fallback_runs: int = 0,
                    shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                    planning_time: float = DEFAULT_PLANNING_TIME,
                    openings: list[float] | None = None,
@@ -924,12 +942,17 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     ``record``, if given, is extended with each leg's route as the sampling planner
     returned it, one entry per returned leg and in the same order.  Failed attempts leave
     nothing behind: only the openings that were actually used contribute.
+
+    ``fallback_runs`` caps the sampling-planner budget for everything past the first
+    attempt at the preferred opening -- see ``OmplBudget.capped``.  That tail is where
+    nearly all of the worst case sits, and it is also where the full budget buys least.
     """
     ompl = ompl or OmplBudget()
+    reduced = ompl.capped(fallback_runs)
 
-    def attempt(opening, a, b, budget, into=None):
+    def attempt(opening, a, b, budget, into=None, effort=None):
         with cell.gun_opening(opening):
-            return _plan_at_opening(cell, a, b, ompl=ompl,
+            return _plan_at_opening(cell, a, b, ompl=effort or ompl,
                                     segment_length=segment_length,
                                     check_step=check_step, fallback_via=fallback_via,
                                     shortcut_seconds=budget,
@@ -944,9 +967,10 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     for n, opening in enumerate(candidates):
         try:
             if n:
-                log(f"      retrying with the gun at {opening:g} mm")
+                log(f"      retrying with the gun at {opening:g} mm{_effort_note(reduced, ompl)}")
             raw: list = []
-            leg = attempt(opening, qa, qb, shortcut_seconds, raw)
+            leg = attempt(opening, qa, qb, shortcut_seconds, raw,
+                          effort=ompl if n == 0 else reduced)
             if record is not None:
                 record.extend(raw)
             return [(leg, opening)]
@@ -969,7 +993,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                     continue
             raw_first: list = []
             try:
-                first = attempt(first_open, qa, mid, 0.0, raw_first)
+                first = attempt(first_open, qa, mid, 0.0, raw_first, effort=reduced)
             except PlanningError:
                 continue
             for second_open in candidates:
@@ -977,7 +1001,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                     continue                    # already ruled out as a single opening
                 raw_second: list = []
                 try:
-                    second = attempt(second_open, mid, qb, 0.0, raw_second)
+                    second = attempt(second_open, mid, qb, 0.0, raw_second,
+                                     effort=reduced)
                 except PlanningError:
                     continue
                 if record is not None:
@@ -996,6 +1021,14 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                           check_step=check_step, log=log)
                 return [(first, first_open), (second, second_open)]
     raise last or PlanningError("freespace transit failed at every gun opening")
+
+
+def _effort_note(reduced: OmplBudget, full: OmplBudget) -> str:
+    """How the reduced budget differs, for the log line that announces a retry."""
+    if reduced is full:
+        return ""
+    return (f", at up to {reduced.phase_one_runs} run"
+            f"{'' if reduced.phase_one_runs == 1 else 's'} per phase")
 
 
 def _opening_candidates(cell: Cell, openings: list[float] | None) -> list[float | None]:
