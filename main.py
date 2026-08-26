@@ -13,6 +13,26 @@ import sys
 import time
 
 
+TRUE_WORDS = ("true", "yes", "on", "1")
+FALSE_WORDS = ("false", "no", "off", "0")
+
+
+def boolean(text: str) -> bool:
+    """Parse a spelled-out boolean argument value.
+
+    Written out rather than left as a bare flag where the setting selects between two
+    models that both exist: "--stepped-penalty false" says which curve is in force, where
+    the absence of a flag only says which one is not.
+    """
+    word = str(text).strip().lower()
+    if word in TRUE_WORDS:
+        return True
+    if word in FALSE_WORDS:
+        return False
+    raise argparse.ArgumentTypeError(
+        f"expected one of {', '.join(TRUE_WORDS + FALSE_WORDS)}, got {text!r}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="weldpath",
@@ -266,11 +286,13 @@ def build_parser() -> argparse.ArgumentParser:
     #endregion
     #region ###STEPPED CLEARANCE PENALTY###
     #USE THE STEPPED CURVE INSTEAD
-    p.add_argument("--stepped-penalty", action="store_true",
-                   help="use the stepped exponential penalty curve instead of the power "
-                        "curve above. Every --clearance-penalty-* option is ignored when "
-                        "this is set, apart from --no-clearance-penalty, which still "
-                        "turns all penalties off (default: off)")
+    p.add_argument("--stepped-penalty", type=boolean, nargs="?", const=True,
+                   default=False, metavar="BOOL",
+                   help="true uses the stepped exponential penalty curve instead of the "
+                        "power curve above. Every --clearance-penalty-* option is ignored "
+                        "when it is on, apart from --no-clearance-penalty, which still "
+                        "turns all penalties off. Takes true/false (yes/no, on/off, 1/0); "
+                        "passing the flag with no value means true (default: false)")
     #STRENGTH AT TOUCHING
     p.add_argument("--stepped-penalty-multiplier", type=float, default=8.0, metavar="N",
                    help="penalty at zero clearance: a second spent touching costs as much "

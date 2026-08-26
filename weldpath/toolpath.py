@@ -262,7 +262,8 @@ class ToolpathPlanner:
                 self.log(f"  ! {exc}")
 
         segments: list[Segment] = []
-        for a, b in zip(locators, locators[1:]):
+        pairs = list(zip(locators, locators[1:]))
+        for index, (a, b) in enumerate(pairs):
             seg = Segment(a.name, b.name)
             self.log(f"  segment {a.name} -> {b.name}")
             try:
@@ -271,7 +272,8 @@ class ToolpathPlanner:
                 if b.name not in anchors:
                     raise PlanningError(f"no reachable joint solution for '{b.name}'")
                 with self._clearance_for(a, b):
-                    seg.phases, seg.raw_phases = self._plan_pair(a, b, anchors)
+                    seg.phases, seg.raw_phases = self._plan_pair(
+                        a, b, anchors, final=index == len(pairs) - 1)
             except PlanningError as exc:
                 seg.error = str(exc)
                 self.log(f"    ! {exc}")
@@ -295,7 +297,7 @@ class ToolpathPlanner:
             return [arrive_open, leave_open]
         return [leave_open, arrive_open]
 
-    def _plan_pair(self, a: Locator, b: Locator, anchors
+    def _plan_pair(self, a: Locator, b: Locator, anchors, final: bool = False
                    ) -> tuple[list[Phase], list[Phase]]:
         # The path starts at the first locator, not at start_state. start_state is still
         # used to seed inverse kinematics and as a known-clear pose to route a difficult
@@ -358,6 +360,22 @@ class ToolpathPlanner:
         # This only rewrites the weld, depart and approach phases, which the unrefined copy
         # holds by reference rather than by value, so it lands on both at once.
         self._restore_weld_poses(a, phases, qa)
+
+        # A weld the tour ends on is never any segment's ``a``, so it never gets a phase of
+        # its own and its imported pose would appear nowhere at all -- the run would stop on
+        # the stand-off, a weld shift short of the weld it names.  Only the last segment
+        # needs this: every other arriving weld is the next segment's departing one.  Built
+        # after validation for the same reason as the restore above, so the short move onto
+        # the panel is neither planned nor checked.
+        if final and b.is_weld:
+            q = self._imported_state(b, qb)
+            if q is not None:
+                closing = Phase("weld", LIN, [q], self._leave_opening(b), True)
+                phases.append(closing)
+                if self.keep_unrefined:
+                    # By reference, as the opening weld phase is: nothing optimises it, so
+                    # the two files describe the same motion here.
+                    raw_phases.append(closing)
         return phases, raw_phases
 
     def _validate_junctions(self, phases: list[Phase]) -> str | None:
@@ -382,6 +400,21 @@ class ToolpathPlanner:
                                 f"collision free with the gun at {opening:g} mm")
         return None
 
+    def _imported_state(self, loc: Locator, seed: np.ndarray) -> np.ndarray | None:
+        """Joint state standing on a weld's imported pose, or None if it cannot be reached.
+
+        Seeded from the planned anchor, so this stays on the same arm configuration;
+        collision checking is off because contact with the panel is the point.
+        """
+        if not loc.is_weld or loc.pose_world_import is None:
+            return None
+        q = self.cell.solve_pose(loc.export_pose, [seed],
+                                 require_collision_free=False, branch_seeds=0)
+        if q is None:
+            self.log(f"    ! cannot reach the imported pose of '{loc.name}'; "
+                     f"leaving it at the shifted pose")
+        return q
+
     def _restore_weld_poses(self, a: Locator, phases: list[Phase],
                             qa: np.ndarray) -> None:
         """Put the waypoint that sits *at* a weld back onto its imported pose.
@@ -390,17 +423,11 @@ class ToolpathPlanner:
         and the ``weld`` phase holds the robot there while the gun closes, so that is the
         one state in the segment standing on the locator itself.  The arriving weld is
         reached by the transit, whose last state is the planned -- shifted -- anchor, and
-        nothing here rewrites it; ``check_endpoints`` reports the resulting gap.
+        nothing here rewrites it: that stand-off is the gun clear of the panel, and it is
+        half of the pair the weld sits between.
         """
-        if not a.is_weld or a.pose_world_import is None:
-            return
-        # Seeded from the planned anchor, so this stays on the same arm configuration;
-        # collision checking is off because contact with the panel is the point.
-        q = self.cell.solve_pose(a.export_pose, [qa],
-                                 require_collision_free=False, branch_seeds=0)
+        q = None if not a.is_weld else self._imported_state(a, qa)
         if q is None:
-            self.log(f"    ! cannot reach the imported pose of '{a.name}'; "
-                     f"leaving it at the shifted pose")
             return
         for ph in phases:
             if ph.kind == "weld":

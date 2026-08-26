@@ -12,9 +12,11 @@ easy to get wrong:
   millimetres in the fourth column, in the same frame as the manifest's
   ``locators[].pose_world``, so the consumer can place it back in the cell untransformed.
 
-``is_weld`` marks a waypoint standing at a locator the study declared a weld.  Only a
-segment's own two ends can carry it -- every other waypoint is one the planner invented --
-and it is written on the first copy of a shared boundary point rather than on both.
+``is_weld`` marks the waypoints standing on a weld's imported pose.  There is exactly one
+per weld in the study: the ``weld`` phase holds the robot still while the gun steps from
+its arrive opening to its leave opening, and that phase's single waypoint is the only one
+placed on the locator itself.  The waypoints either side of it are the stand-off the
+transit was planned to, a ``--weld-shift`` clear of the panel.
 
 ``gun_opening_mm`` and ``contact_allowed`` belong to the phase: a phase is a run of
 waypoints sharing one motion type and one gun state.  ``motion`` and ``gun_opening_mm``
@@ -106,11 +108,15 @@ def build_document(cell: Cell, man: Manifest, segments: list[Segment],
     """
     out_segments = []
     scales = _joint_scales(cell, man)
-    welds = {loc.name for loc in man.locators if loc.is_weld}
 
     for seg in segments:
         phases = []
         for ph in (seg.raw_phases if unrefined else seg.phases):
+            # The ``weld`` phase is the one waypoint in a segment that stands on a locator's
+            # imported pose; every other copy of that locator is the stand-off the transit
+            # was planned to.  Marking the phase rather than a position in the list is what
+            # keeps the count honest: one phase per weld, so one mark per weld.
+            weld_phase = ph.kind == "weld"
             poses = [_pose_rows(cell, q) for q in ph.states]
             positions = [np.array([r[0][3], r[1][3], r[2][3]]) for r in poses]
             times = timing.phase_times(ph.motion, ph.states, positions)
@@ -126,10 +132,7 @@ def build_document(cell: Cell, man: Manifest, segments: list[Segment],
                     # describes the move that leaves it, there being no move into it.
                     "motion": ph.motion,
                     "gun_opening_mm": opening,
-                    # Set below, once the segment's phases are all built: whether a
-                    # waypoint stands at a weld is a fact about the segment's ends, not
-                    # about the phase it happens to have been emitted in.
-                    "is_weld": False,
+                    "is_weld": weld_phase,
                 }
                 for q, rows, t in zip(ph.states, poses, times)
             ]
@@ -139,18 +142,6 @@ def build_document(cell: Cell, man: Manifest, segments: list[Segment],
                 "gun_opening_mm": opening,
                 "waypoints": waypoints,
             })
-        # A segment runs from one locator to the next, so its first and last waypoints are
-        # the only ones standing at a locator at all; everything between them is a point
-        # the planner invented.  Marked on the first occurrence rather than on every copy:
-        # consecutive phases share their boundary point, so the pose at a weld is written
-        # twice when the weld opens a segment, and a consumer counting welds should not see
-        # it twice.  The weld itself is the same locator at the end of the previous
-        # segment and the start of this one, and is marked in both -- that is one weld
-        # arrived at and then left, not two.
-        placed = [w for phase in phases for w in phase["waypoints"]]
-        if placed:
-            placed[0]["is_weld"] = seg.source in welds
-            placed[-1]["is_weld"] = seg.target in welds
         entry = {"from": seg.source, "to": seg.target, "phases": phases}
         if seg.error:
             entry["error"] = seg.error
