@@ -15,12 +15,47 @@ means the exported OBJs drop straight on top of the source meshes in a viewer.
 """
 from __future__ import annotations
 
+import json
 import os
 import time
 
 import numpy as np
 
+from .meshprep import CACHE_DIRNAME
+
 DIRNAME = "collision_geometry"
+
+# The index that lets a re-export skip links whose file is already correct.  It lives with
+# the decomposition cache rather than in the export directory: the export directory is the
+# caller's and holds deliverables, and this is bookkeeping.  Keyed by absolute output path,
+# so exporting the same scene to several directories does not have them fight over one
+# entry.
+CACHE_NAME = "export_index.json"
+# Bumped when something that changes an exported file changes and the key would not
+# otherwise notice it -- the hull routine, the OBJ header, the units written.
+_CACHE_VERSION = 1
+
+# _insert below is an incremental insertion sized for the job it has here: the points
+# Tesseract hands back are already a hull's vertices, forty or so and well separated.  Fed
+# a raw concave shell instead -- many points sitting within eps of a face -- it does not
+# merely slow down, it diverges.  One 362-point shell of Assy_ST200_RH came back with
+# 24,670,533 triangles after 109 seconds, where a hull of n points holds at most 2n - 4,
+# here 720.  Size is not the trigger: a 1270-point shell alongside it hulled in 0.1s.
+#
+# So a large point set is cut down first, and cut down provably: the hull of a subset is
+# contained in the hull of the whole, so a point inside that subset hull cannot be a vertex
+# of the full one.  Taking the extremes along a spread of directions gives a subset hull
+# already close to the answer, and what survives the cull is the true vertex set plus
+# whatever lies within TOLERANCE of a face.  That shell then hulls in 0.029s.
+#
+# The cull is not free -- it is itself two hulls of up to 2 * DIRECTIONS points -- so it is
+# only worth doing where the insertion might be in trouble.  Below HULL_CULL_MIN the point
+# set is no bigger than the seed the cull would build, and the insertion runs alone.  The
+# hulls this module exports are normally well under it; callers feeding raw shells in pass
+# a lower bar.
+DIRECTIONS = 160
+TOLERANCE = 1e-6            # of the shell's own diagonal, so micrometres on a 300 mm part
+HULL_CULL_MIN = 96
 
 
 def _ring(P: np.ndarray) -> list[int]:
@@ -61,7 +96,7 @@ def _outward(V: np.ndarray, F: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return normal, np.einsum("ij,ij->i", normal, V[F[:, 0]])
 
 
-def _hull(V: np.ndarray) -> list[tuple[int, int, int]]:
+def _insert(V: np.ndarray) -> list[tuple[int, int, int]]:
     """Convex hull of ``V`` as a triangle list, by incremental insertion.
 
     The points handed back by Tesseract are already a hull's vertices, so hulling them
@@ -130,6 +165,58 @@ def _hull(V: np.ndarray) -> list[tuple[int, int, int]]:
         N = np.concatenate([N[~seen], Nf])
         O = np.concatenate([O[~seen], Of])
     return [(int(i), int(j), int(k)) for i, j, k in F]
+
+
+def _directions(n: int) -> np.ndarray:
+    """``n`` roughly equidistant unit vectors, by the Fibonacci spiral."""
+    i = np.arange(n) + 0.5
+    phi = np.arccos(1.0 - 2.0 * i / n)
+    theta = np.pi * (1.0 + 5.0 ** 0.5) * i
+    return np.column_stack([np.cos(theta) * np.sin(phi),
+                            np.sin(theta) * np.sin(phi), np.cos(phi)])
+
+
+_DIRS = _directions(DIRECTIONS)
+
+
+def _sane(tris, n: int) -> bool:
+    """Euler's bound: a convex hull of ``n`` points has at most ``2n - 4`` faces."""
+    return len(tris) <= max(2 * n - 4, 2)
+
+
+def _hull(V: np.ndarray, cull_min: int | None = None) -> list[tuple[int, int, int]]:
+    """Convex hull of ``V``, with the interior of the point set removed first.
+
+    See HULL_CULL_MIN for why the cull is conditional and what it is defending
+    against.  ``cull_min`` lowers that bar for a caller that knows its input is raw
+    concave geometry rather than the hull vertices this module usually sees.
+    """
+    n = len(V)
+    span = float(np.linalg.norm(V.max(axis=0) - V.min(axis=0))) if n else 0.0
+    if n < (HULL_CULL_MIN if cull_min is None else cull_min) or span <= 0.0:
+        return _insert(V)
+    proj = V @ _DIRS.T
+    seed = np.unique(np.concatenate([proj.argmax(axis=0), proj.argmin(axis=0)]))
+    if len(seed) < 4:
+        return _insert(V)
+    tris = _insert(V[seed])
+    if not tris:
+        return _insert(V)
+    N, O = _outward(V[seed], np.asarray(tris, dtype=np.int64))
+    outside = np.zeros(n, dtype=bool)
+    for lo in range(0, n, 4096):        # the height table is n x faces; keep it small
+        chunk = V[lo:lo + 4096]
+        outside[lo:lo + 4096] = ((chunk @ N.T) - O).max(axis=1) > TOLERANCE * span
+    keep = np.unique(np.concatenate([seed, np.nonzero(outside)[0]]))
+    final = _insert(V[keep])
+    if not _sane(final, len(keep)):
+        # The cull did not remove enough to keep the insertion in hand.  The seed hull
+        # is a valid hull of a subset, so falling back to it under-claims rather than
+        # returning nonsense -- but it has never been needed, so say so if it ever is.
+        print("    ! degenerate hull on %d points, falling back to the %d-point seed"
+              % (len(keep), len(seed)), flush=True)
+        return [(int(seed[a]), int(seed[b]), int(seed[c])) for a, b, c in tris]
+    return [(int(keep[a]), int(keep[b]), int(keep[c])) for a, b, c in final]
 
 
 def _vertices(mesh) -> np.ndarray:
@@ -207,6 +294,61 @@ def _safe(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)[:60]
 
 
+def _index_path(man) -> str:
+    return os.path.join(man.directory, CACHE_DIRNAME, CACHE_NAME).replace("\\", "/")
+
+
+def _load_index(man) -> dict:
+    try:
+        with open(_index_path(man), "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_index(man, index: dict) -> None:
+    try:
+        path = _index_path(man)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(index, fh, indent=1)
+    except OSError:
+        pass                # an index that cannot be written is a slow export, not a fault
+
+
+def _link_key(man, scene, transforms, name: str, unit: float) -> list:
+    """What an exported file depends on, cheap enough to be worth asking every time.
+
+    Deliberately not a hash of the vertices.  Reading them goes through :func:`_vertices`,
+    which unwraps the binding's points one at a time, and paying that for every link is a
+    good part of the work the index exists to avoid.  The decomposition's own output stands
+    in for the geometry instead: ``meshprep.prepare`` rewrites ``<link>.obj`` whenever any
+    setting that could change the shells changes, so that file's size and mtime carry all
+    of it.
+
+    The transforms are here because :func:`export` writes world coordinates at the current
+    state, so the same hulls at a different start pose are a different file.  Each collision
+    origin is here too: those place the pieces against each other inside the one file.
+
+    The gap this leaves: a link with no entry in the decomposition cache, whose geometry
+    changed without its transforms moving, reads as current.  Deleting its OBJ rebuilds it,
+    a missing file never being reused.
+    """
+    try:
+        st = os.stat(os.path.join(man.directory, CACHE_DIRNAME, f"{name}.obj"))
+        sig = [int(st.st_size), int(st.st_mtime)]
+    except OSError:
+        sig = None
+    try:
+        tf = np.round(np.array(transforms[name].matrix(), dtype=float), 9).tolist()
+    except Exception:
+        tf = "identity"
+    link = scene.getLink(name)
+    origins = [np.round(np.array(c.origin.matrix(), dtype=float), 9).tolist()
+               for c in link.collision]
+    return [_CACHE_VERSION, sig, round(float(unit), 9), tf, origins]
+
+
 def export_pair(env, man, directory: str, links: tuple[str, str], tag: str,
                 log=print) -> str | None:
     """Write the two links of a blocked pair, as they sit right now, into one OBJ.
@@ -247,6 +389,10 @@ def export(env, man, directory: str, log=print) -> str:
 
     Returns the directory written.  Each convex piece is its own ``o hull_NNNNN`` group,
     so the group count is the number of shapes that link contributes to a collision check.
+
+    A link whose file is already correct is left alone rather than rewritten -- see
+    :func:`_link_key` for what "correct" is judged on.  Rebuilding one is not cheap, and
+    the files land in a directory of the caller's that they may well be looking at.
     """
     out_dir = os.path.join(directory, DIRNAME).replace("\\", "/")
     os.makedirs(out_dir, exist_ok=True)
@@ -257,11 +403,20 @@ def export(env, man, directory: str, log=print) -> str:
     transforms = state.link_transforms
     unit = 1.0 / man.scale                      # metres back to the manifest's units
 
-    written = 0
+    index = _load_index(man)
+    written = reused = 0
     for name in list(env.getLinkNames()):
         t0 = time.time()
         link = scene.getLink(name)
         if link is None or not len(link.collision):
+            continue
+
+        path = os.path.join(out_dir, f"{name}.obj").replace("\\", "/")
+        key = _link_key(man, scene, transforms, name, unit)
+        entry = index.get(path)
+        if entry is not None and entry.get("key") == key and os.path.isfile(path):
+            log(f"  = {name:<22} already current ({entry['pieces']} convex pieces)")
+            reused += 1
             continue
 
         log(f"  . {name:<22} hulling {len(link.collision)} collision geometries; each "
@@ -270,7 +425,6 @@ def export(env, man, directory: str, log=print) -> str:
         if not hulls:
             continue
 
-        path = os.path.join(out_dir, f"{name}.obj").replace("\\", "/")
         faces = _write_obj(path, [
             f"weldpath collision geometry for link {name}",
             f"{len(hulls)} convex pieces, world coordinates at the current state, "
@@ -278,7 +432,10 @@ def export(env, man, directory: str, log=print) -> str:
         ], [("hull_%05d" % i, h) for i, h in enumerate(hulls)])
         log("  > %-22s %d convex pieces, %d triangles (%.1fs)"
             % (name, len(hulls), faces, time.time() - t0))
+        index[path] = {"key": key, "pieces": len(hulls), "triangles": faces}
         written += 1
 
-    log(f"wrote collision geometry for {written} links to {out_dir}")
+    _save_index(man, index)
+    log(f"wrote collision geometry for {written} links to {out_dir}"
+        + (f", leaving {reused} already current" if reused else ""))
     return out_dir

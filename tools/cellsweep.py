@@ -60,69 +60,12 @@ def cached_load(path: str):
 meshprep.load_obj = cached_load
 
 
-# hullexport._hull is an incremental insertion sized for its own job: the points Tesseract
-# hands back are already a hull's vertices, forty or so of them and well separated.  Here
-# it is given the raw concave shell instead, and on geometry with many points sitting
-# within eps of a face it does not merely slow down -- it diverges.  One 362-point shell
-# of Assy_ST200_RH came back with 24,670,533 triangles after 109 seconds, where a hull of
-# n points can have at most 2n - 4, here 720.  Size is not the trigger: a 1270-point shell
-# alongside it hulls correctly in 0.1s.
-#
-# So the point set is cut down first, and cut down provably: the hull of a subset is
-# contained in the hull of the whole, so a point inside that subset hull cannot be a vertex
-# of the full one.  Taking the extremes along a spread of directions gives a subset hull
-# that is already nearly the answer, and what survives the cull is the true vertex set plus
-# whatever lies within TOLERANCE of a face.  That removes the near-coplanar crowd the
-# degeneracy feeds on, and the same shell then hulls in 0.029s.
-DIRECTIONS = 160
-TOLERANCE = 1e-6          # of the shell's own diagonal, so micrometres on a 300 mm part
-
-
-def _directions(n: int) -> np.ndarray:
-    """``n`` roughly equidistant unit vectors, by the Fibonacci spiral."""
-    i = np.arange(n) + 0.5
-    phi = np.arccos(1.0 - 2.0 * i / n)
-    theta = np.pi * (1.0 + 5.0 ** 0.5) * i
-    return np.column_stack([np.cos(theta) * np.sin(phi),
-                            np.sin(theta) * np.sin(phi), np.cos(phi)])
-
-
-_DIRS = _directions(DIRECTIONS)
-
-
-def _sane(tris, n: int) -> bool:
-    """Euler's bound: a convex hull of ``n`` points has at most ``2n - 4`` triangles."""
-    return len(tris) <= max(2 * n - 4, 2)
-
-
-def fast_hull(V: np.ndarray, threshold: int = 16) -> list[tuple[int, int, int]]:
-    """``hullexport._hull``, with the interior of the point set removed first."""
-    n = len(V)
-    span = float(np.linalg.norm(V.max(axis=0) - V.min(axis=0))) if n else 0.0
-    if n <= threshold or span <= 0.0:
-        return hullexport._hull(V)
-    proj = V @ _DIRS.T
-    seed = np.unique(np.concatenate([proj.argmax(axis=0), proj.argmin(axis=0)]))
-    if len(seed) < 4:
-        return hullexport._hull(V)
-    tris = hullexport._hull(V[seed])
-    if not tris:
-        return hullexport._hull(V)
-    N, O = hullexport._outward(V[seed], np.asarray(tris, dtype=np.int64))
-    outside = np.zeros(n, dtype=bool)
-    for lo in range(0, n, 4096):            # the height table is n x faces; keep it small
-        chunk = V[lo:lo + 4096]
-        outside[lo:lo + 4096] = ((chunk @ N.T) - O).max(axis=1) > TOLERANCE * span
-    keep = np.unique(np.concatenate([seed, np.nonzero(outside)[0]]))
-    final = hullexport._hull(V[keep])
-    if not _sane(final, len(keep)):
-        # The cull did not remove enough to keep the insertion in hand.  The seed hull is
-        # a valid hull of a subset, so falling back to it under-claims rather than
-        # returning nonsense -- but it has never been needed, so say so if it ever is.
-        print("    ! degenerate hull on %d points, falling back to the %d-point seed"
-              % (len(keep), len(seed)), flush=True)
-        return [(int(seed[a]), int(seed[b]), int(seed[c])) for a, b, c in tris]
-    return [(int(keep[a]), int(keep[b]), int(keep[c])) for a, b, c in final]
+# hullexport._hull culls the interior of a large point set before hulling it, which is
+# what makes the raw concave shells here tractable -- see HULL_CULL_MIN there for the
+# divergence it defends against.  Its own bar is set for the hull vertices Tesseract
+# hands that module; these shells are raw geometry, so the cull is asked for from much
+# lower down.
+CULL_MIN = 16
 
 
 def read_groups(path: str):
@@ -161,7 +104,7 @@ def sweep(stem: str, cells, out_dir: str, scratch: str):
         groups = read_groups(tmp)
         hulls, verts = [], 0
         for name, V, _tris in groups:
-            tris = fast_hull(V)
+            tris = hullexport._hull(V, cull_min=CULL_MIN)
             if not tris:
                 continue
             hulls.append((name.replace("shell", "hull"), (V, tris)))
