@@ -90,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "one; if it too comes back empty the transit is retried through "
                         "the fallback poses, starting again from phase one (default: 4)")
     #PHASE TWO RUN TIME
-    p.add_argument("--phase-two-solve-seconds", type=float, default=20.0,
+    p.add_argument("--phase-two-solve-seconds", type=float, default=15.0,
                    metavar="SECONDS",
                    help="how long one phase-two run may search. Worth setting higher than "
                         "--phase-one-solve-seconds: a transit that beat phase one is "
@@ -249,7 +249,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--shell-split-weld-prox", type=float, default=5.0, metavar="MM",
                    help="only refine panel and tooling geometry within this many mm of "
                         "the gun, as the gun sits when it is at a weld; beyond it the cell "
-                        "is scaled by --far-cell-factor. Measured from the gun's own "
+                        "is set by --tooling-far-cell-mm and --panel-far-cell-mm. "
+                        "Measured from the gun's own "
                         "surface, not from the weld point, so the C-frame's throat and "
                         "back are covered rather than a sphere around the electrodes. "
                         "Refinement runs after --max-shells, so confining it is the "
@@ -266,12 +267,37 @@ def build_parser() -> argparse.ArgumentParser:
                         "--gun-cell-mm above 0 to do anything at all. 0 refines everywhere "
                         "(default: 50)")
     #HOW COARSE THE GEOMETRY AWAY FROM THE WELDS AND THE TCP GETS
-    p.add_argument("--far-cell-factor", type=float, default=6.0, metavar="N",
-                   help="multiplier on the cell size beyond --shell-split-weld-prox and "
-                        "--shell-split-tcp-prox; 0 "
-                        "makes each far shell a single hull, which is coarser still and "
-                        "can "
-                        "bridge back across the welds (default: 6)")
+    p.add_argument("--far-cell-mm", type=float, default=300.0, metavar="MM",
+                   help="cell size used beyond --shell-split-weld-prox and "
+                        "--shell-split-tcp-prox, for links in no category of their own. "
+                        "An absolute size rather than a multiple of the near cell: how "
+                        "coarse the far side of a part may be is a property of that part, "
+                        "and tightening the near side is no reason for the far side to "
+                        "follow it down. 0 makes each far shell a single hull, which is "
+                        "coarser still and can bridge back across the welds "
+                        "(default: 300)")
+    #FAR CELL SIZE: ARM
+    p.add_argument("--robot-far-cell-mm", type=float, default=0, metavar="MM",
+                   help="--far-cell-mm for the arm's own links. Inert while "
+                        "--robot-cell-mm is 0, since nothing on the arm is refined at all "
+                        "(default: 0, i.e. one hull)")
+    #FAR CELL SIZE: GUN
+    p.add_argument("--gun-far-cell-mm", type=float, default=360, metavar="MM",
+                   help="--far-cell-mm for the gun body and moving tip, i.e. the part of "
+                        "the gun further than --shell-split-tcp-prox from the tool centre "
+                        "point. The C-frame and the servo behind it never approach "
+                        "anything the electrodes have not reached first (default: 360)")
+    #FAR CELL SIZE: TOOLING
+    p.add_argument("--tooling-far-cell-mm", type=float, default=150, metavar="MM",
+                   help="--far-cell-mm for static objects the manifest calls tooling. "
+                        "These are the largest meshes in the cell, so this is the value "
+                        "that decides most of the shell count (default: 150)")
+    #FAR CELL SIZE: PANELS
+    p.add_argument("--panel-far-cell-mm", type=float, default=90, metavar="MM",
+                   help="--far-cell-mm for static objects the manifest calls panel. The "
+                        "part of a panel away from every weld still has to be traversed, "
+                        "so it is worth keeping finer than the tooling around it "
+                        "(default: 90)")
     #HOW FAR A CELL REACHES PAST ITS OWN BOUNDS
     p.add_argument("--hull-cell-overlap", type=float, default=0.02, metavar="F",
                    help="how far past its own bounds a cell claims triangles, as a "
@@ -488,6 +514,9 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     log(penalty.describe())
 
+    far_per_category = {"robot": args.robot_far_cell_mm, "gun": args.gun_far_cell_mm,
+                        "tooling": args.tooling_far_cell_mm,
+                        "panel": args.panel_far_cell_mm}
     per_category = {"robot": args.robot_cell_mm, "gun": args.gun_cell_mm,
                     "tooling": args.tooling_cell_mm, "panel": args.panel_cell_mm}
 
@@ -499,7 +528,8 @@ def main(argv: list[str] | None = None) -> int:
                               hull_per_category=per_category,
                               weld_proximity_mm=args.shell_split_weld_prox,
                               tcp_proximity_mm=args.shell_split_tcp_prox,
-                              far_cell_factor=args.far_cell_factor,
+                              far_cell_mm=args.far_cell_mm,
+                              far_per_category=far_per_category,
                               hull_overlap=args.hull_cell_overlap,
                               obstacle_clearance_mm=args.obstacle_clearance_mm,
                               tcp_check_mm=args.check_step_mm,

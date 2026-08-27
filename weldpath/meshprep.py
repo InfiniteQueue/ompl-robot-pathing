@@ -271,7 +271,7 @@ def _box_distances(lo: np.ndarray, hi: np.ndarray, points: np.ndarray) -> np.nda
 
 def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
                      points: np.ndarray | None, radius: float,
-                     far_factor: float,
+                     far_cell: float,
                      overlap: float = DEFAULT_OVERLAP) -> tuple[np.ndarray, list[np.ndarray]]:
     """Grid-split a shell, finely near ``points`` and coarsely everywhere else.
 
@@ -295,13 +295,16 @@ def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
     so the surface is covered exactly once and covered completely.
 
     Overlapping them was expensive in the one place it could least be afforded.  Material
-    just outside the radius was hulled twice: once on the fine grid, and again on the grid
-    ``far_factor`` times coarser -- and that coarse copy sits directly over the weld, which
-    is precisely where a hull claiming space it should not is worst.
+    just outside the radius was hulled twice: once on the fine grid, and again on the
+    coarse one -- and that coarse copy sits directly over the weld, which is precisely
+    where a hull claiming space it should not is worst.
 
-    ``far_factor`` scales the cell used beyond the radius.  Deliberately a coarser grid
-    rather than a single hull: one hull of everything far can bridge back *across* the
-    near region, which is safe but can wall off an approach that was actually available.
+    ``far_cell`` is the cell used beyond the radius, in the same units as ``cell`` and
+    independent of it: how coarse the far side may be is a property of the part, not a
+    ratio of how fine the near side has to be.  Deliberately a coarser grid rather than a
+    single hull: one hull of everything far can bridge back *across* the near region,
+    which is safe but can wall off an approach that was actually available.  0 asks for
+    that single hull anyway.
 
     Classification happens before ``split_by_grid`` subdivides, so it is the original
     triangles that are sorted, and an oversized one is sorted by the distance from its
@@ -313,14 +316,14 @@ def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
     if points is None or len(points) == 0 or radius <= 0.0:
         return split_by_grid(V, tris, cell, overlap)
 
-    coarse = cell * far_factor
+    coarse = far_cell
     lo = V[np.unique(tris)].min(axis=0)
     hi = V[np.unique(tris)].max(axis=0)
     # Distance from each point to the shell's box: no triangle can be nearer than this, so
     # a shell every point is clear of skips the per-triangle measurement entirely.
     box = np.linalg.norm(np.maximum(np.maximum(lo - points, points - hi), 0.0), axis=1)
     if float(box.min()) > radius + cell:
-        return split_by_grid(V, tris, coarse, overlap) if far_factor > 0 else (V, [tris])
+        return split_by_grid(V, tris, coarse, overlap) if far_cell > 0 else (V, [tris])
 
     corners = np.stack((V[tris[:, 0]], V[tris[:, 1]], V[tris[:, 2]]))
     t_lo, t_hi = corners.min(axis=0), corners.max(axis=0)
@@ -332,7 +335,7 @@ def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
         V, cut = split_by_grid(V, near, cell, overlap)
         pieces += cut
     if len(far):
-        if far_factor > 0:
+        if far_cell > 0:
             V, cut = split_by_grid(V, far, coarse, overlap)
             pieces += cut
         else:
@@ -344,7 +347,7 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
                      min_extent: float = 40.0, max_shells: int = 80,
                      hull_cell: float = 0.0, fill_threshold: float = 0.75,
                      focus_points: np.ndarray | None = None,
-                     focus_radius: float = 0.0, far_factor: float = 4.0,
+                     focus_radius: float = 0.0, far_cell: float = 0.0,
                      overlap: float = DEFAULT_OVERLAP) -> dict:
     """Split ``src`` into connected shells and write them as ``o`` groups into ``dst``.
 
@@ -403,7 +406,7 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
                 refined.append((vids, tris))
                 continue
             V, pieces = split_near_focus(V, tris, hull_cell, focus_points,
-                                         focus_radius, far_factor, overlap)
+                                         focus_radius, far_cell, overlap)
             if len(pieces) < 2:
                 refined.append((vids, tris))
                 continue
@@ -454,7 +457,7 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             hull_cell: float = 0.0, fill: float = DEFAULT_FILL,
             cells: dict[str, float] | None = None,
             focus: dict[str, tuple[np.ndarray, float]] | None = None,
-            far_factor: float = 4.0,
+            far_cells: dict[str, float] | None = None, far_cell: float = 0.0,
             overlap: float = DEFAULT_OVERLAP) -> dict[str, str]:
     """Convex-decompose every mesh that needs it, reusing cached results.
 
@@ -465,6 +468,11 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
     radius to hold to -- the welds for a panel, the tool centre point for the gun.  The
     points must be in the same frame and units as that link's source mesh, which is the
     caller's business to establish; a link with no entry refines everywhere.
+
+    ``far_cells`` maps a link to the cell size to use beyond that radius, falling back to
+    ``far_cell``.  It is an absolute size rather than a multiple of the link's own cell:
+    the two answer different questions, and tightening the near side is not a reason for
+    the far side to follow it down.
     """
     focus = {k: (np.asarray(pts, dtype=float).reshape(-1, 3), float(r))
              for k, (pts, r) in (focus or {}).items() if pts is not None and len(pts)}
@@ -482,6 +490,7 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
     out: dict[str, str] = {}
     for link, rel in mesh_rel_paths.items():
         cell = float((cells or {}).get(link, hull_cell))
+        far = float((far_cells or {}).get(link, far_cell))
         threshold = float(fill)
         points, radius = focus.get(link, (None, 0.0))
         settings = [round(float(min_extent), 4), int(max_shells), round(float(scale), 9),
@@ -501,7 +510,11 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             # cache prepared before this option existed stays valid while it is left off.
             digest = hashlib.sha1(
                 np.round(np.sort(points, axis=0), 3).tobytes()).hexdigest()[:12]
-            settings += [round(radius, 4), round(float(far_factor), 4), digest,
+            settings += [round(radius, 4),
+                         # "abs" marks the far cell as a size rather than the multiple of
+                         # the near cell it used to be, so a cache holding a factor of 6
+                         # is not mistaken for one holding a 6 mm cell.
+                         "abs", round(far, 4), digest,
                          # The near and far sets no longer overlap, so geometry cached while
                          # they did holds a coarse duplicate of the refined material.
                          "disjoint"]
@@ -522,9 +535,11 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
         stats = decompose_to_obj(src, dst, scale, min_extent=min_extent,
                                  max_shells=max_shells, hull_cell=cell,
                                  fill_threshold=threshold, focus_points=points,
-                                 focus_radius=radius, far_factor=far_factor,
+                                 focus_radius=radius, far_cell=far,
                                  overlap=overlap)
-        near = f" within {radius:g} mm of a focus point" if radius > 0.0 else ""
+        near = ((f" within {radius:g} mm of a focus point, "
+                 + (f"{far:g} mm beyond it" if far > 0.0 else "one hull beyond it"))
+                if radius > 0.0 else "")
         refined = (f", {stats['shells_refined']} split at {cell:g} mm below "
                    f"{threshold:g} fill{near}" if stats["shells_refined"] else "")
         log("  + %-22s %d tris, %d shells -> %d kept%s (%.1fs)"

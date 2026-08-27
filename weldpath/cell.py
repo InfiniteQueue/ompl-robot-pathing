@@ -755,7 +755,8 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
                               hull_cell: float, hull_fill: float,
                               hull_per_category, weld_proximity: float = 0.0,
                               tcp_proximity: float = 0.0,
-                              far_cell_factor: float = 4.0,
+                              far_cell_mm: float = 0.0,
+                              far_per_category=None,
                               hull_overlap: float | None = None) -> dict[str, str]:
     from . import meshprep
 
@@ -770,14 +771,21 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
             rel[s.name] = s.mesh
     log("preparing collision geometry (convex decomposition):")
     focus = refinement_focus(man, weld_proximity, tcp_proximity, log=log)
+    # Only the categories that actually have geometry, so the line names what is there.
+    present = set(hull_categories(man).values())
+    far_resolved = {c: float((far_per_category or {}).get(c) if
+                             (far_per_category or {}).get(c) is not None
+                             else far_cell_mm)
+                    for c in present}
     if focus:
         if weld_proximity > 0.0:
             log(f"  panels and tooling refined within {weld_proximity:g} mm of the gun "
                 f"at a weld")
         if tcp_proximity > 0.0:
             log(f"  the gun refined within {tcp_proximity:g} mm of the tool centre point")
-        log(f"  elsewhere the cell is {far_cell_factor:g}x as coarse"
-            if far_cell_factor > 0 else "  elsewhere a shell is left as one hull")
+        log("  elsewhere: " + ", ".join(
+            f"{category} {size:g} mm" if size > 0 else f"{category} one hull"
+            for category, size in sorted(far_resolved.items())))
     if hull_cell > 0.0:
         log(f"  cells claim triangles {overlap:g} of a cell past their own bounds, so a "
             f"cell's hull spans about {1.0 + 2.0 * overlap:.2f}x the cell")
@@ -785,7 +793,8 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
                             min_extent=min_extent, max_shells=max_shells,
                             hull_cell=hull_cell, fill=hull_fill,
                             cells=hull_cells(man, hull_cell, hull_per_category),
-                            focus=focus, far_factor=far_cell_factor,
+                            focus=focus, far_cell=far_cell_mm,
+                            far_cells=hull_cells(man, far_cell_mm, far_per_category),
                             overlap=overlap)
 
 
@@ -1040,7 +1049,8 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
           min_shell_mm: float = 40.0, max_shells: int = 80,
           hull_cell_mm: float = 0.0, hull_fill: float = 0.75,
           hull_per_category=None, weld_proximity_mm: float = 0.0,
-          tcp_proximity_mm: float = 0.0, far_cell_factor: float = 4.0,
+          tcp_proximity_mm: float = 0.0, far_cell_mm: float = 0.0,
+          far_per_category=None,
           hull_overlap: float | None = None,
           obstacle_clearance_mm: float = 0.0, tcp_check_mm: float = 0.0,
           export_dir: str | None = None,
@@ -1048,7 +1058,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
     """Prepare geometry, emit URDF/SRDF, load the environment and generate the ACM."""
     collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm,
                                           hull_fill, hull_per_category, weld_proximity_mm,
-                                          tcp_proximity_mm, far_cell_factor,
+                                          tcp_proximity_mm, far_cell_mm, far_per_category,
                                           hull_overlap)
     velocity = {}
     if dynamics is not None:
