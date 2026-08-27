@@ -337,8 +337,35 @@ def _hop(model: "MotionModel", a: np.ndarray, b: np.ndarray,
     return model.cost(a, b, fa=fa, fb=fb, stops=True)
 
 
+@dataclass
+class Relocation:
+    """How far ``polish`` displaces a waypoint, and how that distance is drawn.
+
+    Distances are approximate tool travel in the manifest's units, not joint angles: the
+    step is normalised through ``Cell.weights``, which is TCP travel per radian measured
+    at the start pose, so a draw of 30 means "move the tool about 30 mm" whichever joints
+    happen to carry it.
+
+    ``exponent`` shapes the draw between the two, as ``min + (max - min) * x ** e`` for x
+    uniform on [0, 1).  At 1 that is the flat draw this pass has always used, where a 5 mm
+    nudge and a 150 mm shove are equally likely.  Above 1 it crowds towards ``min``, which
+    is what a route already near its answer wants: most attempts then probe around the
+    point instead of throwing it across the cell.  Below 1 it crowds towards ``max``.
+    """
+    min_mm: float = 5.0
+    max_mm: float = 150.0
+    exponent: float = 1.0
+
+    def draw(self, scale: float) -> tuple[float, float, float]:
+        """``(low, span, exponent)`` in scene units, ready for the sampling loop."""
+        lo = max(self.min_mm, 0.0) * scale
+        hi = max(self.max_mm, self.min_mm) * scale
+        return lo, hi - lo, max(self.exponent, 1e-6)
+
+
 def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float = 5.0,
            rng: np.random.Generator | None = None,
+           relocate: Relocation | None = None,
            log=None) -> list[np.ndarray]:
     """Remove and relocate waypoints of the reduced path, judged on penalised time.
 
@@ -355,7 +382,8 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
     * **relocate** -- displace a waypoint and keep it if the pair of moves through it gets
       quicker.  This is the move that can unpick a cluster the removal test alone cannot:
       shifting a point away from a panel can be what makes its neighbour droppable, so a
-      removal sweep follows every accepted relocation.
+      removal sweep follows every accepted relocation.  How far it displaces, and how
+      that distance is drawn between the bounds, is ``relocate``.
 
     ``simplify`` already applies the same removal test greedily, so this is a second,
     non-greedy opinion on it rather than the first -- what is new here is the relocation,
@@ -367,6 +395,10 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
 
     cell = model.cell
     rng = rng or np.random.default_rng(1)
+    # Hoisted out of the loop: this draws tens of thousands of times against a budget
+    # measured in seconds, and a flat draw should not pay for a power that does nothing.
+    low, span, exponent = (relocate or Relocation()).draw(cell.man.scale)
+    flat = abs(exponent - 1.0) < 1e-9
     pts = [np.asarray(p, dtype=float).copy() for p in path]
     fac = [model.penalty_factor(p) for p in pts]
     costs = [_hop(model, pts[i], pts[i + 1], fac[i], fac[i + 1])
@@ -405,7 +437,9 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
         reach = float(np.linalg.norm(direction * cell.weights))
         if reach <= 0.0:
             continue
-        candidate = np.clip(pts[k] + direction * (float(rng.uniform(0.005, 0.15)) / reach),
+        x = float(rng.random())
+        step = low + span * (x if flat else x ** exponent)
+        candidate = np.clip(pts[k] + direction * (step / reach),
                             cell.lower, cell.upper)
         if not cell.within_limits(candidate):
             continue
@@ -445,7 +479,8 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
 
 
 def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: float,
-            polish_seconds: float, log) -> list[np.ndarray]:
+            polish_seconds: float, relocate: "Relocation | None" = None,
+            log=print) -> list[np.ndarray]:
     """The whole post-processing chain, in the order the three passes need to run.
 
     Shortcutting reshapes the route while it is still dense, reduction picks which of those
@@ -454,9 +489,11 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     """
     log(f"      refining {len(path)} points: up to {shortcut_seconds:g}s shortcutting "
         f"then {polish_seconds:g}s polishing, both spent in full")
-    improved = shortcut(model, path, time_budget=shortcut_seconds, log=log)
+    improved = shortcut(model, path, time_budget=shortcut_seconds, relocate=relocate,
+                        log=log)
     reduced = simplify(model, improved)
-    return polish(model, reduced, time_budget=polish_seconds, log=log)
+    return polish(model, reduced, time_budget=polish_seconds, relocate=relocate,
+                  log=log)
 
 
 def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.ndarray]:
@@ -484,6 +521,7 @@ def _densify(cell: Cell, path: list[np.ndarray], step: float) -> list[np.ndarray
 
 def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float = 2.0,
              rng: np.random.Generator | None = None,
+             relocate: Relocation | None = None,
              log=None) -> list[np.ndarray]:
     """Reshape a path to take less time, penalised for running close to the parts.
 
@@ -537,6 +575,7 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
                    for k in range(i, j))
 
     rng = rng or np.random.default_rng(0)
+    draw = (relocate or Relocation()).draw(model.cell.man.scale)
     before = span_cost(0, len(dense) - 1)
     deadline = time.time() + time_budget
     tried = cuts = moves = 0
@@ -546,7 +585,7 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
         if rng.random() < 0.5:
             cuts += _try_cut(model, dense, fac, rng, penalised, span_cost)
         else:
-            moves += _try_relocate(model, dense, fac, rng, penalised, step_cost)
+            moves += _try_relocate(model, dense, fac, rng, penalised, step_cost, draw)
 
     if log:
         after = span_cost(0, len(dense) - 1)
@@ -589,18 +628,24 @@ def _try_cut(model: "MotionModel", dense, fac, rng, penalised, span_cost) -> int
     return 1
 
 
-def _try_relocate(model: "MotionModel", dense, fac, rng, penalised, step_cost) -> int:
+def _try_relocate(model: "MotionModel", dense, fac, rng, penalised, step_cost,
+                  draw: tuple[float, float, float] | None = None) -> int:
     """Displace one interior waypoint and keep the move if it lowers the local cost.
 
     The displacement is drawn in joint space but scaled by the cell's joint weights, so a
     given attempt moves the tool about as far whichever joints it uses -- otherwise almost
     every sample would be a wrist twiddle that changes nothing.
+
+    ``draw`` is ``Relocation.draw``'s ``(low, span, exponent)``, already in scene units;
+    the caller hoists it out of its own loop.
     """
     if len(dense) < 3:
         return 0
     cell = model.cell
     k = int(rng.integers(1, len(dense) - 1))        # endpoints are fixed by the caller
-    target = float(rng.uniform(0.005, 0.15))        # metres of tool travel
+    low, span, exponent = draw or Relocation().draw(cell.man.scale)
+    x = float(rng.random())
+    target = low + span * (x if exponent == 1.0 else x ** exponent)
     direction = rng.normal(size=len(dense[k]))
     reach = float(np.linalg.norm(direction * cell.weights))
     if reach <= 0.0:
@@ -861,7 +906,8 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
                      segment_length: float, check_step: float,
                      fallback_via: list[np.ndarray] | None,
                      shortcut_seconds: float, polish_seconds: float,
-                     zone: LinearZone | None = None, log=print,
+                     zone: LinearZone | None = None,
+                     relocate: "Relocation | None" = None, log=print,
                      record: list | None = None) -> list[Run]:
     """Collision-free joint path from ``qa`` to ``qb`` at the gun's current opening.
 
@@ -880,7 +926,7 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
                             segment_length=segment_length, check_step=check_step,
                             shortcut_seconds=shortcut_seconds,
                             polish_seconds=polish_seconds,
-                            zone=zone, log=log, record=record)
+                            zone=zone, relocate=relocate, log=log, record=record)
     except PlanningError:
         if not fallback_via:
             raise
@@ -911,7 +957,8 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
         # Refine the joined route rather than each leg: the detour through the fallback
         # pose is exactly the kind of corner these passes exist to cut.
         joined = first[0].states + second[0].states[1:]
-        return _finish(cell, joined, zone=zone, shortcut_seconds=shortcut_seconds,
+        return _finish(cell, joined, zone=zone, relocate=relocate,
+                       shortcut_seconds=shortcut_seconds,
                        polish_seconds=polish_seconds, check_step=check_step, log=log)
     raise PlanningError("freespace transit failed, including via fallback poses")
 
@@ -925,6 +972,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    planning_time: float = DEFAULT_PLANNING_TIME,
                    openings: list[float] | None = None,
                    zone: LinearZone | None = None,
+                   relocate: "Relocation | None" = None,
                    record: list | None = None,
                    log=print) -> list[tuple[list[Run], float | None]]:
     """Plan a transit, choosing a gun opening for it when the natural one will not do.
@@ -957,7 +1005,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                     check_step=check_step, fallback_via=fallback_via,
                                     shortcut_seconds=budget,
                                     polish_seconds=polish_seconds if budget else 0.0,
-                                    zone=zone, log=log, record=into)
+                                    zone=zone, relocate=relocate, log=log, record=into)
 
     candidates = _opening_candidates(cell, openings)
 
@@ -967,7 +1015,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     for n, opening in enumerate(candidates):
         try:
             if n:
-                log(f"      retrying with the gun at {opening:g} mm{_effort_note(reduced, ompl)}")
+                log(f"      retrying with the gun at {opening:g} mm"
+                    f"{_effort_note(reduced, ompl)}")
             raw: list = []
             leg = attempt(opening, qa, qb, shortcut_seconds, raw,
                           effort=ompl if n == 0 else reduced)
@@ -1010,12 +1059,12 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                 log(f"      no single gun opening reaches; changing from "
                     f"{first_open:g} mm to {second_open:g} mm at fallback pose {i + 1}")
                 with cell.gun_opening(first_open):
-                    first = _refine_runs(cell, first, zone=zone,
+                    first = _refine_runs(cell, first, zone=zone, relocate=relocate,
                                          shortcut_seconds=shortcut_seconds,
                                          polish_seconds=polish_seconds,
                                          check_step=check_step, log=log)
                 with cell.gun_opening(second_open):
-                    second = _refine_runs(cell, second, zone=zone,
+                    second = _refine_runs(cell, second, zone=zone, relocate=relocate,
                                           shortcut_seconds=shortcut_seconds,
                                           polish_seconds=polish_seconds,
                                           check_step=check_step, log=log)
@@ -1082,7 +1131,8 @@ _ompl_run.message = ""
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget,
                  segment_length: float, check_step: float,
                  shortcut_seconds: float, polish_seconds: float,
-                 zone: LinearZone | None = None, log=print,
+                 zone: LinearZone | None = None,
+                 relocate: "Relocation | None" = None, log=print,
                  record: list | None = None) -> list[Run]:
     if not cell.segment_collides(qa, qb, max_step=check_step):
         # A clear straight line is normally the best answer there is, and a sampling
@@ -1091,7 +1141,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         # this one does, the same pass that stands other routes off is given a chance to
         # bow it away -- there is nothing for OMPL to do here, but plenty for relocation.
         def straight() -> list[Run]:
-            return _finish(cell, _capture(record, [qa, qb]), zone=zone,
+            return _finish(cell, _capture(record, [qa, qb]), zone=zone, relocate=relocate,
                            shortcut_seconds=0.0, polish_seconds=0.0,
                            check_step=check_step, log=log)
 
@@ -1106,7 +1156,8 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         # The unrefined route stays the bare straight line; _finish fills the interior in,
         # which a two-point path needs before relocation has anything to move.
         _capture(record, [qa, qb])
-        return _finish(cell, [qa, qb], zone=zone, shortcut_seconds=shortcut_seconds,
+        return _finish(cell, [qa, qb], zone=zone, relocate=relocate,
+                       shortcut_seconds=shortcut_seconds,
                        polish_seconds=polish_seconds, check_step=check_step, log=log)
 
     # RRTConnect returns the first path it finds, and which homotopy class that lands in
@@ -1155,7 +1206,8 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         log(f"      keeping the best of {len(candidates)} solutions: cost {cost:.2f} s "
             f"against {worst:.2f} s for the worst")
     # Shortcut before reducing: the dense path gives the cuts somewhere to land.
-    out = _finish(cell, raw, zone=zone, shortcut_seconds=shortcut_seconds,
+    out = _finish(cell, raw, zone=zone, relocate=relocate,
+                  shortcut_seconds=shortcut_seconds,
                   polish_seconds=polish_seconds, check_step=check_step, log=log)
     log(f"      reduced to {sum(len(r.states) for r in out)} points in "
         f"{len(out)} run{'' if len(out) == 1 else 's'}")
@@ -1204,7 +1256,7 @@ def _flatten(runs: list[Run]) -> list[np.ndarray]:
 
 def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
                  shortcut_seconds: float, polish_seconds: float, check_step: float,
-                 log) -> list[Run]:
+                 relocate: "Relocation | None" = None, log=print) -> list[Run]:
     """Optimise an already-split route and split it again.
 
     Used where a leg was planned without a refinement budget and is being refined
@@ -1218,7 +1270,7 @@ def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
     allowed = zone is not None and _linear_allowed(cell, pts, zone, log=log)
     model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
     refined = _refine(model, pts, shortcut_seconds=shortcut_seconds,
-                      polish_seconds=polish_seconds, log=log)
+                      polish_seconds=polish_seconds, relocate=relocate, log=log)
     return _split_runs(model, refined)
 
 
@@ -1242,7 +1294,7 @@ def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> Non
 
 def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
             shortcut_seconds: float, polish_seconds: float, check_step: float,
-            log) -> list[Run]:
+            relocate: "Relocation | None" = None, log=print) -> list[Run]:
     """Densify a freshly planned route, optimise it, then split it by motion type.
 
     The route arrives as the handful of states the sampling planner happened to stop at,
@@ -1265,7 +1317,7 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     allowed = zone is not None and _linear_allowed(cell, dense, zone, log=log)
     model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
     refined = _refine(model, dense, shortcut_seconds=shortcut_seconds,
-                      polish_seconds=polish_seconds, log=log)
+                      polish_seconds=polish_seconds, relocate=relocate, log=log)
     runs = _split_runs(model, refined)
     _report_work(cell, before, time.time() - t0, log)
     if log:

@@ -20,7 +20,8 @@ import numpy as np
 
 from .cell import Cell
 from .manifest import Locator, Manifest
-from .planning import (LIN, PTP, LinearZone, OmplBudget, PlanningError, plan_freespace,
+from .planning import (LIN, PTP, LinearZone, OmplBudget, PlanningError, Relocation,
+                       plan_freespace,
                        validate)
 
 
@@ -62,7 +63,7 @@ CLEARANCE_REPORT_HEADROOM_MM = 25.0
 class ToolpathPlanner:
     def __init__(self, cell: Cell, man: Manifest, *,
                  linear_step_mm: float = 50.0, ompl: OmplBudget | None = None,
-                 fallback_runs: int = 0,
+                 fallback_runs: int = 0, relocate: Relocation | None = None,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                  near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
@@ -77,6 +78,9 @@ class ToolpathPlanner:
         self.linear_step_mm = linear_step_mm
         self.ompl = ompl or OmplBudget()
         self.fallback_runs = fallback_runs
+        # How far the shortcut and polish passes displace a waypoint when they try
+        # relocating one, and how the distance is drawn between those bounds.
+        self.relocate = relocate or Relocation()
         self.segment_length = segment_length
         self.check_step = np.deg2rad(check_step_deg)
         self.shortcut_seconds = shortcut_seconds
@@ -328,7 +332,7 @@ class ToolpathPlanner:
             self.cell, transit_start, transit_end,
             ompl=self.ompl, segment_length=self.segment_length,
             check_step=self.check_step, fallback_via=[self.start_q],
-            fallback_runs=self.fallback_runs,
+            fallback_runs=self.fallback_runs, relocate=self.relocate,
             shortcut_seconds=self.shortcut_seconds,
             polish_seconds=self.polish_seconds,
             zone=self.zone,

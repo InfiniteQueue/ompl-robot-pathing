@@ -90,7 +90,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "one; if it too comes back empty the transit is retried through "
                         "the fallback poses, starting again from phase one (default: 4)")
     #PHASE TWO RUN TIME
-    p.add_argument("--phase-two-solve-seconds", type=float, default=12.0,
+    p.add_argument("--phase-two-solve-seconds", type=float, default=20.0,
                    metavar="SECONDS",
                    help="how long one phase-two run may search. Worth setting higher than "
                         "--phase-one-solve-seconds: a transit that beat phase one is "
@@ -127,6 +127,29 @@ def build_parser() -> argparse.ArgumentParser:
                         "earlier passes work on a densified path where a waypoint is a "
                         "sampling artefact rather than a stop; this one does not "
                         "(default: 50)")
+    #HOW FAR A RELOCATION MOVES A WAYPOINT
+    p.add_argument("--relocate-min-mm", type=float, default=5.0, metavar="MM",
+                   help="shortest displacement the shortcut and polish passes try when "
+                        "relocating a waypoint, as approximate tool travel rather than "
+                        "joint angle. Below the resolution at which a move changes "
+                        "anything, an attempt is a collision check spent to learn "
+                        "nothing (default: 5)")
+    p.add_argument("--relocate-max-mm", type=float, default=150.0, metavar="MM",
+                   help="longest displacement those passes try. This is what lets a "
+                        "waypoint leave the neighbourhood it was sampled in, so it has "
+                        "to cover the distance from a route to the one beside it; too "
+                        "small and polish can only ever tidy the route it was given "
+                        "(default: 150)")
+    #SHAPE OF THE DRAW BETWEEN THEM
+    p.add_argument("--relocate-exponent", type=float, default=1.0, metavar="E",
+                   help="shape of the distance draw between --relocate-min-mm and "
+                        "--relocate-max-mm, as min + (max - min) * x**E for x uniform on "
+                        "[0, 1). 1 is flat, and what these passes have always used: a "
+                        "5 mm nudge and a 150 mm shove equally likely. Above 1 crowds "
+                        "the draw towards the minimum, spending most attempts probing "
+                        "around a waypoint rather than throwing it across the cell, "
+                        "which suits a route already near its answer; below 1 crowds it "
+                        "towards the maximum (default: 1)")
     #endregion
     #region ###LINEAR MOTION NEAR THE PARTS###
     #DISABLE LINEAR MOTION NEAR THE PARTS
@@ -207,10 +230,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "enough to the parts for hull error to decide anything, so this is "
                         "the first thing to switch off (default: 0, i.e. off)")
     #CELL SIZE: GUN
-    p.add_argument("--gun-cell-mm", type=float, default=200, metavar="MM",
-                   help="--hull-cell-mm for the gun body and moving tip. The gun is convex "
-                        "where it makes contact, so refining it buys accuracy nowhere and "
-                        "costs shells everywhere (default: 200)")
+    p.add_argument("--gun-cell-mm", type=float, default=60, metavar="MM",
+                   help="--hull-cell-mm for the gun body and moving tip. Reduces webbing around the "
+                        "electrodes at lower values "
+                        " (default: 60)")
     #CELL SIZE: TOOLING
     p.add_argument("--tooling-cell-mm", type=float, default=25, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls tooling. "
@@ -218,7 +241,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "after --max-shells, so a small cell here dominates both "
                         "preparation and every later collision check (default: 25)")
     #CELL SIZE: PANELS
-    p.add_argument("--panel-cell-mm", type=float, default=25, metavar="MM",
+    p.add_argument("--panel-cell-mm", type=float, default=15, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls panel. This "
                         "is the geometry that is concave exactly where the welds are, so "
                         "it is where a small cell is worth paying for (default: 25)")
@@ -234,14 +257,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "decides anything. Allow for the approach as well as the weld "
                         "itself. 0 refines everywhere (default: 5)")
     #TCP PROXIMITY FOR SHELL SPLIT
-    p.add_argument("--shell-split-tcp-prox", type=float, default=20.0, metavar="MM",
+    p.add_argument("--shell-split-tcp-prox", type=float, default=50.0, metavar="MM",
                    help="only refine the gun body and moving tip within this many mm of "
                         "the tool centre point. The gun and the TCP are rigid with respect "
                         "to each other, so unlike a weld this stays meaningful wherever the "
                         "arm carries them. Allow for the electrode stroke as well as the "
                         "approach, since the tip travels relative to the body. Needs "
                         "--gun-cell-mm above 0 to do anything at all. 0 refines everywhere "
-                        "(default: 20)")
+                        "(default: 50)")
     #HOW COARSE THE GEOMETRY AWAY FROM THE WELDS AND THE TCP GETS
     p.add_argument("--far-cell-factor", type=float, default=6.0, metavar="N",
                    help="multiplier on the cell size beyond --shell-split-weld-prox and "
@@ -410,7 +433,7 @@ def main(argv: list[str] | None = None) -> int:
     from weldpath import output as output_mod
     from weldpath.penalty import ClearancePenalty, SteppedPenalty
     from weldpath import profile as profile_mod
-    from weldpath.planning import OmplBudget
+    from weldpath.planning import OmplBudget, Relocation
     from weldpath.toolpath import ToolpathPlanner
 
     t0 = time.time()
@@ -504,6 +527,8 @@ def main(argv: list[str] | None = None) -> int:
                         phase_two_max_runs=args.phase_two_max_runs,
                         phase_two_seconds=args.phase_two_solve_seconds),
         fallback_runs=args.fallback_runs,
+        relocate=Relocation(min_mm=args.relocate_min_mm, max_mm=args.relocate_max_mm,
+                            exponent=args.relocate_exponent),
         segment_length=args.segment_length_rad,
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,
