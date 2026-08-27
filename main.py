@@ -83,14 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "run costs this long in the worst case, so it multiplies with "
                         "--phase-one-runs (default: 8)")
     #PHASE TWO: FIND ANY ROUTE AT ALL
-    p.add_argument("--phase-two-max-runs", type=int, default=0, metavar="N",
+    p.add_argument("--phase-two-max-runs", type=int, default=2, metavar="N",
                    help="most sampling-planner runs allowed in phase two, which is "
                         "entered only when phase one found nothing at all. Phase two "
                         "stops at the first solution rather than sampling for a better "
                         "one; if it too comes back empty the transit is retried through "
                         "the fallback poses, starting again from phase one (default: 4)")
     #PHASE TWO RUN TIME
-    p.add_argument("--phase-two-solve-seconds", type=float, default=60.0,
+    p.add_argument("--phase-two-solve-seconds", type=float, default=25.0,
                    metavar="SECONDS",
                    help="how long one phase-two run may search. Worth setting higher than "
                         "--phase-one-solve-seconds: a transit that beat phase one is "
@@ -120,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="time budget for shortcutting each freespace transit; longer "
                         "budgets keep shortening with diminishing returns (default: 20)")
     #POLISH PASS TIME
-    p.add_argument("--polish-seconds", type=float, default=50.0, metavar="SECONDS",
+    p.add_argument("--polish-seconds", type=float, default=20.0, metavar="SECONDS",
                    help="time budget for the final pass over each transit's emitted "
                         "waypoints, which removes and relocates them under the full "
                         "stop-to-stop time the robot really pays for each one. The "
@@ -272,7 +272,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "is the geometry that is concave exactly where the welds are, so "
                         "it is where a small cell is worth paying for (default: 25)")
     #FAR CELL SIZE: PANELS
-    p.add_argument("--panel-far-cell-mm", type=float, default=50, metavar="MM",
+    p.add_argument("--panel-far-cell-mm", type=float, default=40, metavar="MM",
                    help="--far-cell-mm for static objects the manifest calls panel. The "
                         "part of a panel away from every weld still has to be traversed, "
                         "so it is worth keeping finer than the tooling around it "
@@ -299,14 +299,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "--gun-cell-mm above 0 to do anything at all. 0 refines everywhere "
                         "(default: 50)")
     #HOW FAR A CELL REACHES PAST ITS OWN BOUNDS
-    p.add_argument("--hull-cell-overlap", type=float, default=0.02, metavar="F",
+    p.add_argument("--hull-cell-overlap", type=float, default=0.00, metavar="F",
                    help="how far past its own bounds a cell claims triangles, as a "
                         "fraction of the cell. A cell's hull ends up spanning about "
                         "1 + 2F cells, so every increment inflates every hull. It is only "
                         "a numerical margin -- at 0 a triangle still lands in one cell "
                         "and that cell's hull contains it, so the surface stays covered "
                         "-- and it exists so hulls with exactly coplanar faces are not "
-                        "decided apart by round-off (default: 0.02)")
+                        "decided apart by round-off (default: 0.00)")
     #endregion
     #region ###CLEARANCE FROM THE PARTS###
     #CLEARANCE EVERYWHERE
