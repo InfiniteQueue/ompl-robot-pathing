@@ -1318,7 +1318,9 @@ def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
     model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
     refined = _refine(model, pts, shortcut_seconds=shortcut_seconds,
                       polish_seconds=polish_seconds, relocate=relocate, log=log)
-    return _split_runs(model, refined)
+    runs = _split_runs(model, refined)
+    _verify_runs(model, runs, "refined leg", log=log)
+    return runs
 
 
 def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> None:
@@ -1366,6 +1368,7 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     refined = _refine(model, dense, shortcut_seconds=shortcut_seconds,
                       polish_seconds=polish_seconds, relocate=relocate, log=log)
     runs = _split_runs(model, refined)
+    _verify_runs(model, runs, "planned route", log=log)
     _report_work(cell, before, time.time() - t0, log)
     if log:
         lin = sum(1 for r in runs if r.motion == LIN)
@@ -1374,6 +1377,33 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
             log(f"      {lin} linear runs over {moves} moves, "
                 f"{len(runs) - lin} joint runs, {len(refined)} waypoints")
     return runs
+
+
+def _verify_runs(model: "MotionModel", runs: list[Run], where: str, log=None) -> None:
+    """Check a finished route along the path each of its moves will really take.
+
+    The optimisation passes check the moves they *propose*; a move none of them touched
+    keeps whatever guarantee the route arrived with, and a route from the sampling planner
+    arrives guaranteed in joint space.  ``_split_runs`` then labels moves from where their
+    ends sit, so a move only ever checked as a joint chord can leave here described as a
+    straight line.  Only the linear runs are swept: a joint move is covered either by the
+    planner that produced it or by the pass that replaced it.
+
+    This is the check ``toolpath.validate`` makes at the end of the run, brought forward to
+    where it can still be acted on.  Raised from ``_finish`` it is a ``PlanningError`` like
+    any other and the caller retries at the next gun opening or through a fallback pose;
+    raised at the end it ends the run.
+    """
+    for run in runs:
+        if run.motion != LIN:
+            continue
+        for k, (a, b) in enumerate(zip(run.states, run.states[1:])):
+            if model.blocked(a, b):
+                if log:
+                    log(f"      ! the finished route is not traversable in a straight line "
+                        f"at move {k} -> {k + 1} of a linear run; discarding it")
+                raise PlanningError(
+                    f"{where}: a linear run is not traversable at move {k} -> {k + 1}")
 
 
 def _tcp_travel(cell: Cell, states: list[np.ndarray]) -> float:
