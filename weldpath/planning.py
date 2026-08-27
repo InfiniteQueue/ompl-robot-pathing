@@ -115,25 +115,58 @@ class MotionModel:
         T[:3, 3] /= self.cell.man.scale
         return T
 
-    def linear_ok(self, a: np.ndarray, b: np.ndarray) -> bool:
-        """Can the tool run straight from ``a`` to ``b``?
+    def linear_chain(self, a: np.ndarray, b: np.ndarray) -> list[np.ndarray] | None:
+        """The states the tool passes through running straight from ``a`` to ``b``.
+
+        ``None`` when it cannot get there: no inverse kinematics somewhere along the line,
+        or a collision in the joint gaps between the samples.
 
         Under a linear profile the controller drives the tool along the straight line and
         solves inverse kinematics as it goes, so that line -- not the joint chord between
         the same two states -- is what has to be reachable and clear.  A joint-space check
         here would be checking a path the robot does not take, and for the long chords the
         shortcut pass proposes the two are nowhere near each other.
+
+        The chain is returned rather than reduced to a verdict because a caller that
+        installs the interior of a move needs the points on *this* curve.  Interpolating
+        the joint chord instead would verify one path and commit another.
         """
         try:
             chain = plan_linear(self.cell, self._pose_mm(a), self._pose_mm(b), a,
                                 step_mm=self.zone.step_mm)
         except PlanningError:
-            return False                    # no inverse kinematics somewhere along it
+            return None                     # no inverse kinematics somewhere along it
         # Inverse kinematics returns the solution nearest its seed rather than the state
         # asked for, so pin the ends back before checking the gaps between the samples.
         chain[0] = np.asarray(a, dtype=float)
         chain[-1] = np.asarray(b, dtype=float)
-        return not _chain_collides(self.cell, chain, self.max_step)
+        return None if _chain_collides(self.cell, chain, self.max_step) else chain
+
+    def linear_ok(self, a: np.ndarray, b: np.ndarray) -> bool:
+        """Can the tool run straight from ``a`` to ``b``?"""
+        return self.linear_chain(a, b) is not None
+
+    def clear_path(self, a: np.ndarray, b: np.ndarray) -> list[np.ndarray] | None:
+        """The interior points of this move, or ``None`` if the move is unusable.
+
+        :meth:`blocked` with the route kept instead of thrown away, for the one caller that
+        installs that route rather than only asking whether the move is allowed.  The
+        distinction is the whole point of it: a joint move follows the joint chord, which
+        ``_resample`` describes exactly, but a linear move follows the Cartesian line, and
+        filling that stretch with joint-space interpolation puts points on a curve the tool
+        never passes through.
+
+        Not used by :meth:`blocked` itself, which is asked tens of thousands of times a
+        pass and wants a verdict without building a point list to reach it.
+        """
+        if self.motion(a, b) == PTP:
+            if self.cell.segment_collides(a, b, max_step=self.max_step):
+                return None
+            return _resample(self.cell, a, b, self.max_step)
+        chain = self.linear_chain(a, b)
+        if chain is None:
+            return None
+        return [np.asarray(q, dtype=float) for q in chain[1:-1]]
 
     # -- what it costs ------------------------------------------------------
     def _crosses(self, a: np.ndarray, b: np.ndarray) -> bool:
@@ -620,9 +653,13 @@ def _try_cut(model: "MotionModel", dense, fac, rng, penalised, span_cost) -> int
         return 0
     if model.demotes(dense[i], dense[j], dense[i + 1:j]):
         return 0
-    if model.blocked(dense[i], dense[j]):
+    # The interior is asked of the model rather than interpolated here.  Under a linear
+    # profile the check above runs along the Cartesian line, and joint-space points would
+    # not lie on it: the pass would verify one curve and install another, leaving moves
+    # that claim to be straight lines nobody ever checked.
+    points = model.clear_path(dense[i], dense[j])
+    if points is None:
         return 0
-    points = _resample(model.cell, dense[i], dense[j], model.max_step)
     if penalised:
         factors = [model.penalty_factor(p) for p in points]
         chain = [dense[i]] + points + [dense[j]]
