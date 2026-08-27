@@ -486,9 +486,19 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     Shortcutting reshapes the route while it is still dense, reduction picks which of those
     points are actually worth stopping at, and polishing then judges those stops under the
     time they really cost.
+
+    Both budgets are zero on a leg planned inside the two-leg fallback search, which is
+    trying gun openings in pairs and would otherwise refine legs it is about to discard.
+    Such a leg is refined once a pair is settled on, by ``_refine_runs``, so the pass is
+    deferred rather than skipped -- and it says so, since "0s, both spent in full" reads
+    as a budget that was consumed.
     """
-    log(f"      refining {len(path)} points: up to {shortcut_seconds:g}s shortcutting "
-        f"then {polish_seconds:g}s polishing, both spent in full")
+    if shortcut_seconds <= 0 and polish_seconds <= 0:
+        log(f"      leaving {len(path)} points unrefined for now: no budget at this "
+            f"stage, and the route may yet be discarded")
+    else:
+        log(f"      refining {len(path)} points: up to {shortcut_seconds:g}s shortcutting "
+            f"then {polish_seconds:g}s polishing, both spent in full")
     improved = shortcut(model, path, time_budget=shortcut_seconds, relocate=relocate,
                         log=log)
     reduced = simplify(model, improved)
