@@ -222,16 +222,31 @@ def split_by_grid(V: np.ndarray, tris: np.ndarray, cell: float,
     is returned alongside the pieces; existing indices keep their meaning.
 
     Triangles are assigned by centroid, and also to any neighbouring cell within
-    ``overlap`` of a cell width.  That padding is a numerical margin, not a coverage one:
-    at an overlap of zero a triangle still lands in exactly one cell, and that cell's hull
-    is built from its vertices, so the triangle is inside it and the surface is covered
-    either way.  What the margin buys is that two hulls whose faces are exactly coplanar
-    are not decided apart by round-off, and that a cell catching two near-collinear
-    triangles has enough points to hull with.
+    ``overlap`` of a cell width.  That padding buys nothing measurable and is best left at
+    zero.  It was justified here on two grounds, and both were tested and failed:
 
-    So it is worth thousandths of a cell and costs dearly above that: the centroids
-    assigned to one cell span ``1 + 2 * overlap`` cells before the triangles' own reach is
-    added, and all of that is space the hull claims with no material in it.
+    * *That coverage would otherwise be lost to round-off between coplanar faces.*  It is
+      not.  A triangle is assigned whole and its cell's hull is built from that triangle's
+      own vertices, so the triangle is inside the hull by construction -- containment of
+      the identical float coordinates, not a comparison that round-off can decide either
+      way.  Sampling 60,000 points over the surface of an axis-aligned bracket, the worst
+      case the claim describes, put every one of them inside some hull at overlap zero, at
+      every cell size tried.
+    * *That a cell catching two near-collinear triangles needs the extra points to hull
+      with.*  The reverse: the pad is where degenerate pieces come from.  A cell that only
+      exists because material reached into it holds just that sliver -- often a single
+      coplanar face -- and hulls to a two-triangle sheet.  On the same bracket at a 60 mm
+      cell, overlap 0 gave no degenerate pieces and overlap 0.02 gave twenty.
+
+    What it does cost is certain.  The centroids assigned to one cell span
+    ``1 + 2 * overlap`` cells before the triangles' own reach is added, so every hull
+    claims that much more empty space.  Worse, a flat face lying on a cell boundary -- and
+    ``origin`` puts one there by construction, on the shell's own minimum -- has all of its
+    triangles copied into the neighbouring cell, which then hulls the same material a
+    second time.  Parts are modelled axis-aligned with features on round coordinates, so
+    this is the common case rather than the corner one: 27.6% of the 7495 hulls on one
+    ST200 casting were duplicates of another, half-metre hulls among them, and tilting the
+    test bracket off the axes dropped its duplicate share from 50% to 6%.
     """
     V, tris = subdivide_to(V, tris, cell)
     P = V[np.unique(tris)]
