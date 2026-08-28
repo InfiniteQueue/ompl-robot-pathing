@@ -1399,11 +1399,56 @@ def _verify_runs(model: "MotionModel", runs: list[Run], where: str, log=None) ->
             continue
         for k, (a, b) in enumerate(zip(run.states, run.states[1:])):
             if model.blocked(a, b):
+                fault = _linear_fault(model, a, b)
                 if log:
                     log(f"      ! the finished route is not traversable in a straight line "
                         f"at move {k} -> {k + 1} of a linear run; discarding it")
+                    log(f"        {fault}")
                 raise PlanningError(
-                    f"{where}: a linear run is not traversable at move {k} -> {k + 1}")
+                    f"{where}: a linear run is not traversable at move {k} -> {k + 1} "
+                    f"({fault})")
+
+
+def _linear_fault(model: "MotionModel", a: np.ndarray, b: np.ndarray) -> str:
+    """Why this move is not traversable in a straight line, said in enough detail to act on.
+
+    "not traversable" covers three quite different faults, and they want different fixes.
+    The move may be too coarse to have been checked as a line in the first place: below
+    ``--linear-step-mm`` of tool travel ``plan_linear`` places no station between the ends,
+    so the linear test reduces to the joint one and the two cannot disagree -- a refusal
+    therefore means the step carried the tool further than that, which is a property of
+    how the route was spaced rather than of the geometry.  The line may have no inverse
+    kinematics somewhere along it, which is a reachability problem.  Or it may be clear at
+    every station and blocked in a gap between two of them, which is geometry.
+
+    Whether the joint chord is clear separates the last case again: a chord that is also
+    blocked means the route was never sound, while a clear one means the two curves have
+    parted company over this step, and that is what densifying more finely would fix.
+
+    Only ever called on a move that has already failed, so it re-does the work the verdict
+    came from.  That is one repeat per discarded route, against the difference between
+    knowing a route failed and knowing why.
+    """
+    cell = model.cell
+    pa, pb = model._pose_mm(a), model._pose_mm(b)
+    travel = float(np.linalg.norm(pb[:3, 3] - pa[:3, 3]))
+    step = model.zone.step_mm if model.zone is not None else 0.0
+    chord = ("clear" if not cell.segment_collides(a, b, max_step=model.max_step)
+             else "also blocked")
+    head = (f"{travel:.0f} mm of tool travel against a {step:g} mm linear step, "
+            f"joint chord {chord}")
+    try:
+        chain = plan_linear(cell, pa, pb, a, step_mm=step)
+    except PlanningError as exc:
+        return f"{head}; {exc}"
+    chain[0] = np.asarray(a, dtype=float)
+    chain[-1] = np.asarray(b, dtype=float)
+    gap = next((j for j, (x, y) in enumerate(zip(chain, chain[1:]))
+                if cell.segment_collides(x, y, max_step=model.max_step)), None)
+    if gap is None:                     # the verdict has changed under us; say so plainly
+        return f"{head}; no fault found on a second look"
+    return (f"{head}; clear at all {len(chain)} stations but blocked between "
+            f"{gap} and {gap + 1}")
 
 
 def _tcp_travel(cell: Cell, states: list[np.ndarray]) -> float:
