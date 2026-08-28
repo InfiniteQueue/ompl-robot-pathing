@@ -302,11 +302,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--hull-cell-overlap", type=float, default=0.00, metavar="F",
                    help="how far past its own bounds a cell claims triangles, as a "
                         "fraction of the cell. A cell's hull ends up spanning about "
-                        "1 + 2F cells, so every increment inflates every hull. It is only "
-                        "a numerical margin -- at 0 a triangle still lands in one cell "
-                        "and that cell's hull contains it, so the surface stays covered "
-                        "-- and it exists so hulls with exactly coplanar faces are not "
-                        "decided apart by round-off (default: 0.00)")
+                        "1 + 2F cells, so every increment inflates every hull. Coverage "
+                        "does not need it -- at 0 a triangle still lands in one cell and "
+                        "that cell's hull contains it -- and the round-off argument for "
+                        "it did not survive being measured: see split_by_grid. What it "
+                        "does buy is duplicate hulls, a flat face on a cell boundary "
+                        "being claimed whole by both sides (default: 0.00)")
     #endregion
     #region ###CLEARANCE FROM THE PARTS###
     #CLEARANCE EVERYWHERE
@@ -337,9 +338,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="clearance at and above which there is no penalty; the curve "
                         "starts here (default: 200)")
     #PENALTY CURVE PEAK
-    p.add_argument("--clearance-penalty-min-mm", type=float, default=-5.0, metavar="MM",
+    p.add_argument("--clearance-penalty-min-mm", type=float, default=0.0, metavar="MM",
                    help="clearance at and below which the penalty is at its peak "
-                        "(default: -5)")
+                        "(default: 0)")
     #PENALTY PEAK STRENGTH
     p.add_argument("--clearance-penalty-multiplier", type=float, default=8.0,
                    metavar="N",
