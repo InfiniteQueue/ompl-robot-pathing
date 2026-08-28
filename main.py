@@ -83,14 +83,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "run costs this long in the worst case, so it multiplies with "
                         "--phase-one-runs (default: 8)")
     #PHASE TWO: FIND ANY ROUTE AT ALL
-    p.add_argument("--phase-two-max-runs", type=int, default=2, metavar="N",
+    p.add_argument("--phase-two-max-runs", type=int, default=10, metavar="N",
                    help="most sampling-planner runs allowed in phase two, which is "
                         "entered only when phase one found nothing at all. Phase two "
                         "stops at the first solution rather than sampling for a better "
                         "one; if it too comes back empty the transit is retried through "
                         "the fallback poses, starting again from phase one (default: 4)")
     #PHASE TWO RUN TIME
-    p.add_argument("--phase-two-solve-seconds", type=float, default=25.0,
+    p.add_argument("--phase-two-solve-seconds", type=float, default=50.0,
                    metavar="SECONDS",
                    help="how long one phase-two run may search. Worth setting higher than "
                         "--phase-one-solve-seconds: a transit that beat phase one is "
