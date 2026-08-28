@@ -70,6 +70,10 @@ class CartesianBudget:
     branch_seeds: int = 8           # scattered seeds tried when the continuing one fails
     seed: int = 0
 
+    @property
+    def enabled(self) -> bool:
+        return self.seconds > 0.0 and self.max_iters > 0
+
 
 # ---------------------------------------------------------------------------
 # pose helpers
@@ -304,7 +308,7 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
         # rather than waiting for a sample to fall between them.
         j = b.nearest(pose)
         cursor, cursor_pose, cursor_index = a.nodes[new].q, pose, new
-        while True:
+        while time.perf_counter() < deadline:
             step = _steer(cell, zone, max_step, budget, cursor, cursor_pose,
                           b.nodes[j].pose, reach_mm=budget.extend_mm, rng=rng)
             if step is None:

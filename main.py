@@ -97,6 +97,39 @@ def build_parser() -> argparse.ArgumentParser:
                         "usually one where restarting wastes the tree built so far, so a "
                         "longer single search helps where another short one does not "
                         "(default: 12)")
+    #CARTESIAN TREE, BETWEEN THE TWO PHASES
+    p.add_argument("--cartesian-seconds", type=float, default=60.0, metavar="SECONDS",
+                   help="how long the Cartesian tree may search a transit that phase one "
+                        "could not solve. It runs between the two phases and only where "
+                        "--near-panel-mm is in force, so a cell whose transits solve never "
+                        "reaches it. Unlike the sampling planner it searches the space the "
+                        "tool moves in: every edge it builds is a straight tool move, "
+                        "checked along the line the tool really takes. That makes it a "
+                        "specialist rather than a replacement -- every route it can find "
+                        "is also a joint-space route, so it searches strictly less than "
+                        "phase two does -- but it concentrates the search into the "
+                        "corridor beside the panel, which is where uniform joint sampling "
+                        "spends everything and finds nothing. 0 turns it off (default: 60)")
+    #HOW FAR ONE EXTEND REACHES
+    p.add_argument("--cartesian-extend-mm", type=float, default=120.0, metavar="MM",
+                   help="furthest one extend of the Cartesian tree drives the tool. Short "
+                        "extends explore reliably but grow the tree slowly; long ones "
+                        "cover ground but are refused whole the moment any station on "
+                        "them fails, wasting the inverse kinematics already spent on the "
+                        "stations before it (default: 120)")
+    #HOW FAR OUTSIDE THE ENDPOINTS IT LOOKS
+    p.add_argument("--cartesian-margin-mm", type=float, default=150.0, metavar="MM",
+                   help="how far outside the box spanned by the two endpoints the tree "
+                        "samples for a way round. A detour has to leave the straight line "
+                        "to be worth finding, but one that leaves it by more than the "
+                        "fixture is deep is not a detour (default: 150)")
+    #HOW FAR THE TOOL MAY BE TURNED OFF THE DIRECT INTERPOLATION
+    p.add_argument("--cartesian-tilt-deg", type=float, default=30.0, metavar="DEG",
+                   help="how far off the interpolation between the two endpoint "
+                        "orientations a sampled orientation may be turned. A tool square "
+                        "to the panel at a weld is square to it most of the way in, and "
+                        "sampling orientations freely would spend nearly the whole budget "
+                        "on ones no route uses (default: 30)")
     #EFFORT ONCE THE PREFERRED ANSWER HAS FAILED
     p.add_argument("--fallback-runs", type=int, default=1, metavar="N",
                    help="sampling-planner runs allowed per phase once the preferred gun "
@@ -460,6 +493,7 @@ def main(argv: list[str] | None = None) -> int:
     from weldpath import output as output_mod
     from weldpath.penalty import ClearancePenalty, SteppedPenalty
     from weldpath import profile as profile_mod
+    from weldpath.cartesian import CartesianBudget
     from weldpath.planning import OmplBudget, Relocation
     from weldpath.toolpath import ToolpathPlanner
 
@@ -557,6 +591,10 @@ def main(argv: list[str] | None = None) -> int:
                         phase_one_seconds=args.phase_one_solve_seconds,
                         phase_two_max_runs=args.phase_two_max_runs,
                         phase_two_seconds=args.phase_two_solve_seconds),
+        cartesian=CartesianBudget(seconds=args.cartesian_seconds,
+                                  extend_mm=args.cartesian_extend_mm,
+                                  margin_mm=args.cartesian_margin_mm,
+                                  tilt_deg=args.cartesian_tilt_deg),
         fallback_runs=args.fallback_runs,
         relocate=Relocation(min_mm=args.relocate_min_mm, max_mm=args.relocate_max_mm,
                             exponent=args.relocate_exponent),

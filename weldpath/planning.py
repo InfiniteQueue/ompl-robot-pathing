@@ -954,6 +954,7 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
                      fallback_via: list[np.ndarray] | None,
                      shortcut_seconds: float, polish_seconds: float,
                      zone: LinearZone | None = None,
+                     cartesian: "CartesianBudget | None" = None,
                      relocate: "Relocation | None" = None, log=print,
                      record: list | None = None) -> list[Run]:
     """Collision-free joint path from ``qa`` to ``qb`` at the gun's current opening.
@@ -973,7 +974,8 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
                             segment_length=segment_length, check_step=check_step,
                             shortcut_seconds=shortcut_seconds,
                             polish_seconds=polish_seconds,
-                            zone=zone, relocate=relocate, log=log, record=record)
+                            zone=zone, cartesian=cartesian,
+                            relocate=relocate, log=log, record=record)
     except PlanningError:
         if not fallback_via:
             raise
@@ -1019,6 +1021,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    planning_time: float = DEFAULT_PLANNING_TIME,
                    openings: list[float] | None = None,
                    zone: LinearZone | None = None,
+                   cartesian: "CartesianBudget | None" = None,
                    relocate: "Relocation | None" = None,
                    record: list | None = None,
                    log=print) -> list[tuple[list[Run], float | None]]:
@@ -1052,7 +1055,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                     check_step=check_step, fallback_via=fallback_via,
                                     shortcut_seconds=budget,
                                     polish_seconds=polish_seconds if budget else 0.0,
-                                    zone=zone, relocate=relocate, log=log, record=into)
+                                    zone=zone, cartesian=cartesian,
+                                    relocate=relocate, log=log, record=into)
 
     candidates = _opening_candidates(cell, openings)
 
@@ -1179,6 +1183,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
                  segment_length: float, check_step: float,
                  shortcut_seconds: float, polish_seconds: float,
                  zone: LinearZone | None = None,
+                 cartesian: "CartesianBudget | None" = None,
                  relocate: "Relocation | None" = None, log=print,
                  record: list | None = None) -> list[Run]:
     if not cell.segment_collides(qa, qb, max_step=check_step):
@@ -1232,6 +1237,37 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
             f"{ompl.phase_one_seconds:g}s each, keeping the cheapest that solves")
         for attempt in range(1, ompl.phase_one_runs + 1):
             run(ompl.phase_one_seconds, f"phase 1 run {attempt}")
+
+    if not candidates and cartesian is not None and cartesian.enabled \
+            and zone is not None and zone.enabled:
+        # Between the two phases rather than in place of either.  Every route this finds
+        # is also a joint-space route -- a path of straight tool moves is still a path
+        # through joint space -- so as a fallback it searches a strict *subset* of what
+        # phase two searches and cannot stand in for it.  What it has instead is guidance:
+        # steering along the tool's own line, with orientations drawn near the endpoints',
+        # concentrates the search into the corridor beside the panel, which is exactly
+        # where uniform joint sampling spends its whole budget and finds nothing.
+        #
+        # It goes before phase two because phase two is the expensive half of the worst
+        # case, so a transit this solves is one whose failure never has to be paid for.
+        # It is gated on the zone because a route made of straight moves only earns its
+        # cost where linear motion was wanted in the first place; with no band in force
+        # there is nothing here that phase two would not do better.
+        from .cartesian import plan_cartesian    # deferred: cartesian.py reads this module
+        log(f"      cartesian tree: up to {cartesian.seconds:g}s searching the space the "
+            f"tool moves in, where phase one searched the joints")
+        t0 = time.time()
+        try:
+            route = plan_cartesian(cell, qa, qb, zone=zone, max_step=check_step,
+                                   budget=cartesian, log=log)
+        except PlanningError as exc:
+            log(f"      {exc} ({time.time() - t0:.1f}s)")
+        else:
+            cost, plain = _path_cost(cell, route, check_step)
+            log(f"      cartesian tree: solved in {time.time() - t0:.1f}s "
+                f"({len(route)} points, cost {cost:.2f} s against {plain:.2f} s "
+                f"unpenalised)")
+            candidates.append((cost, plain, route))
 
     if not candidates and ompl.phase_two_max_runs > 0:
         # Nothing to choose between at this point, so the goal changes from a good route to
