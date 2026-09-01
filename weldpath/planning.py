@@ -1168,6 +1168,31 @@ def _opening_candidates(cell: Cell, openings: list[float] | None) -> list[float 
     return out
 
 
+def _route_fault(cell: Cell, path: list[np.ndarray], check_step: float) -> str | None:
+    """The first move of a raw planner route that is not clear here, or ``None``.
+
+    A sampling planner validates its own route, but not under this criterion.  OMPL walks
+    a uniform joint-space grid at ``--segment-length-rad``; ``segment_collides`` walks the
+    same kind of grid and then bisects wherever the tool moves further than
+    ``--check-step-mm``, which where the arm is long is several times finer.  So a route
+    can be valid to the planner and blocked here.
+
+    Nothing downstream re-establishes the difference.  ``_path_cost`` scores the route with
+    ``segment_cost``, which says outright that it assumes the segment already known clear,
+    and the refinement passes only ever check the moves they propose -- so a blocked
+    stretch that no cut or relocation happened to land on is refined, split and shipped,
+    and is caught, if at all, only by ``_verify_runs`` at the very end.
+
+    Rejecting it here costs one sweep and hands the failure to the retries the caller
+    already has: another run of phase one, phase two, the Cartesian tree, or the next gun
+    opening.  A run that solves into a blocked route has not solved.
+    """
+    for k, (a, b) in enumerate(zip(path, path[1:])):
+        if cell.segment_collides(a, b, max_step=check_step):
+            return f"move {k} -> {k + 1} of {len(path)} points is blocked"
+    return None
+
+
 def _ompl_run(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, segment_length: float,
               planning_time: float, check_step: float, label: str, log
               ) -> tuple[float, float, list[np.ndarray]] | None:
@@ -1192,6 +1217,12 @@ def _ompl_run(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, segment_length: flo
         log(f"      {label}: {_ompl_run.message} ({dt:.1f}s)")
         return None
     raw = _extract(response.results)
+    fault = _route_fault(cell, raw, check_step)
+    if fault is not None:
+        _ompl_run.message = (f"returned a route that is not clear under this cell's own "
+                             f"check ({fault})")
+        log(f"      {label}: {_ompl_run.message} ({dt:.1f}s)")
+        return None
     cost, plain = _path_cost(cell, raw, check_step)
     log(f"      {label}: solved in {dt:.1f}s ({len(raw)} raw points, "
         f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
@@ -1439,12 +1470,23 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
 def _verify_runs(model: "MotionModel", runs: list[Run], where: str, log=None) -> None:
     """Check a finished route along the path each of its moves will really take.
 
-    The optimisation passes check the moves they *propose*; a move none of them touched
-    keeps whatever guarantee the route arrived with, and a route from the sampling planner
-    arrives guaranteed in joint space.  ``_split_runs`` then labels moves from where their
-    ends sit, so a move only ever checked as a joint chord can leave here described as a
-    straight line.  Only the linear runs are swept: a joint move is covered either by the
-    planner that produced it or by the pass that replaced it.
+    The optimisation passes check the moves they *propose*, and only those.  ``shortcut``
+    never offers an adjacent pair -- ``_try_cut`` returns early on ``j - i < 2`` -- and
+    ``simplify``'s reach loop runs ``while j > i + 1``, so the pair it finally settles on
+    is appended without a check.  A move that came out of ``_densify`` and that nothing
+    happened to replace therefore leaves here carrying only the guarantee the route
+    arrived with.
+
+    That guarantee is weaker than this module's.  A sampling planner validates a uniform
+    joint-space grid at ``--segment-length-rad``; ``segment_collides`` lays down the same
+    kind of grid and then bisects it again wherever the tool travels further than
+    ``--check-step-mm``, which where the arm is long is several times finer.  So a route
+    can be valid to the planner and blocked here.
+
+    Both profiles are swept, each along the path it will really take: the Cartesian line
+    for ``LIN``, the joint chord for ``PTP``.  Sweeping only the linear runs, as this once
+    did, did not make the joint runs sound -- it only meant nobody had looked at them, and
+    a blocked move landing in one left no trace at all.
 
     This is the check ``toolpath.validate`` makes at the end of the run, brought forward to
     where it can still be acted on.  Raised from ``_finish`` it is a ``PlanningError`` like
@@ -1452,18 +1494,57 @@ def _verify_runs(model: "MotionModel", runs: list[Run], where: str, log=None) ->
     raised at the end it ends the run.
     """
     for run in runs:
-        if run.motion != LIN:
-            continue
+        linear = run.motion == LIN
+        kind = "linear" if linear else "joint"
         for k, (a, b) in enumerate(zip(run.states, run.states[1:])):
-            if model.blocked(a, b):
-                fault = _linear_fault(model, a, b)
-                if log:
-                    log(f"      ! the finished route is not traversable in a straight line "
-                        f"at move {k} -> {k + 1} of a linear run; discarding it")
-                    log(f"        {fault}")
-                raise PlanningError(
-                    f"{where}: a linear run is not traversable at move {k} -> {k + 1} "
-                    f"({fault})")
+            if not model.blocked(a, b):
+                continue
+            fault = (_linear_fault(model, a, b) if linear
+                     else _joint_fault(model, a, b))
+            how = ("in a straight line" if linear else "as a joint move")
+            if log:
+                log(f"      ! the finished route is not traversable {how} "
+                    f"at move {k} -> {k + 1} of a {kind} run; discarding it")
+                log(f"        {fault}")
+            raise PlanningError(
+                f"{where}: a {kind} run is not traversable at move {k} -> {k + 1} "
+                f"({fault})")
+
+
+def _joint_fault(model: "MotionModel", a: np.ndarray, b: np.ndarray) -> str:
+    """Why this joint move is blocked, and whether a coarser check could have seen it.
+
+    ``segment_collides`` is two tests at once: a uniform grid at ``--check-step-deg``, and
+    a bisection of that grid wherever the tool moves further than ``--check-step-mm``
+    between samples.  A move can pass the first and fail the second, and that is exactly
+    the move a sampling planner hands over believing it valid -- OMPL checks a uniform
+    joint-space grid and nothing else.
+
+    Saying which of the two tripped separates a route that was never clear from one this
+    module is merely the first to look at closely enough, and those want different fixes.
+    """
+    cell = model.cell
+    travel = _tcp_travel(cell, [a, b])
+    span = float(np.max(np.abs(np.asarray(b, dtype=float) - np.asarray(a, dtype=float))))
+    head = (f"{travel:.0f} mm of tool travel over {np.degrees(span):.1f} deg of joint "
+            f"motion, against a {model.tool_step:g} mm tool step")
+    if _grid_blocked(cell, a, b, model.max_step):
+        return f"{head}; blocked on the joint grid alone, so the route was never clear"
+    return (f"{head}; clear on the joint grid alone -- only the tool-space subdivision "
+            f"sees it, and that is finer than the sampling planner ever checked")
+
+
+def _grid_blocked(cell: Cell, a: np.ndarray, b: np.ndarray, max_step: float) -> bool:
+    """The uniform joint-space half of ``segment_collides``, without the tool bisection.
+
+    Mirrors that method's base grid rather than calling it with the tool step turned off,
+    which would mean writing to a field the whole cell shares.
+    """
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    delta = b - a
+    n = max(2, int(np.ceil(float(np.max(np.abs(delta))) / max_step)) + 1)
+    return any(cell.in_collision(a + t * delta) for t in np.linspace(0.0, 1.0, n))
 
 
 def _linear_fault(model: "MotionModel", a: np.ndarray, b: np.ndarray) -> str:
