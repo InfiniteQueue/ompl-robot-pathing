@@ -70,7 +70,7 @@ class ToolpathPlanner:
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                  near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
                  near_panel_min_pct: float = 0.0, linear_speed_mm_s: float = 0.0,
-                 linear_crossing_speed_mm_s: float = 0.0,
+                 linear_crossing_penalty_s: float = 0.0,
                  weld_clearance_mm: float | None = None,
                  export_dir: str | None = None,
                  keep_unrefined: bool = False, log=print):
@@ -96,7 +96,7 @@ class ToolpathPlanner:
         self.zone = LinearZone(near_mm=near_panel_mm, min_run_mm=near_panel_min_mm,
                                min_run_pct=near_panel_min_pct,
                                linear_speed_mm_s=linear_speed_mm_s,
-                               crossing_speed_mm_s=linear_crossing_speed_mm_s)
+                               crossing_penalty_s=linear_crossing_penalty_s)
         # Every locator reports its measured clearance against the one it has to meet,
         # placed or not, so the query has to see past the larger threshold with room to
         # spare.  A probe that stops at the threshold can only ever answer "at least the

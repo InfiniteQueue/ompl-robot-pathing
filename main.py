@@ -215,23 +215,25 @@ def build_parser() -> argparse.ArgumentParser:
                         "from one weld to the next being the case that matters. 0 leaves "
                         "--near-panel-min-mm as the only test (default: 50)")
     #PRICE OF REACHING INTO THE BAND FROM OUTSIDE IT
-    p.add_argument("--linear-crossing-speed-mm-s", type=float, default=25.0,
-                   metavar="MM_S",
-                   help="cost a move that crosses into the proximity band as though the "
-                        "tool crawled at this speed, while the optimisation passes are "
-                        "choosing between routes. A move is linear when either end is "
-                        "near the parts, so left alone the passes delete the waypoint at "
-                        "the edge of the band and reach in from open space on one long "
-                        "straight sweep; this prices that against stopping at the edge "
-                        "and running joint motion outside it. Charged on the crossing "
-                        "only, so linear motion inside the band is untouched, and by "
-                        "distance, so a long reach pays for its length while a short step "
-                        "across the edge pays almost nothing. Lower bites harder, and "
-                        "wants to be well under --linear-speed-mm-s to have any effect. A "
-                        "costing figure and nothing else: independent of "
-                        "--linear-speed-mm-s, not a speed the robot ever runs at, and "
-                        "absent from the exported cycle time. Compounds with the "
-                        "clearance penalty. 0 charges nothing (default: 25)")
+    p.add_argument("--linear-crossing-penalty-s", type=float, default=100.0,
+                   metavar="SECONDS",
+                   help="add this flat surcharge to any move that reaches into the "
+                        "proximity band from outside it, while the optimisation passes "
+                        "are choosing between routes. The same figure for every crossing "
+                        "however long the move, so it prices how many times the route "
+                        "enters the band and nothing else: a route that dips in and out "
+                        "repeatedly pays per dip, while a change that leaves the crossing "
+                        "count alone is left alone. In particular, deleting a waypoint "
+                        "from inside the band crosses once either way, so this cancels "
+                        "and the decision falls back to ordinary time -- which is what "
+                        "clears out the near-coincident pairs of vias that used to sit "
+                        "either side of the edge costing a stop apiece. What holds a "
+                        "linear sweep back from growing outward is --linear-speed-mm-s: "
+                        "growing it turns a joint hop into a linear one, so the cap lands "
+                        "on one side of the comparison and does not cancel. A costing "
+                        "figure and nothing else: not time the robot spends, absent from "
+                        "the exported cycle time, and not scaled by the clearance "
+                        "penalty. 0 charges nothing (default: 100)")
     #endregion
     #region ###COLLISION HULLS###
     #DROP TINY SHELLS
@@ -603,7 +605,7 @@ def main(argv: list[str] | None = None) -> int:
         near_panel_min_mm=args.near_panel_min_mm,
         near_panel_min_pct=args.near_panel_min_pct,
         linear_speed_mm_s=args.linear_speed_mm_s,
-        linear_crossing_speed_mm_s=args.linear_crossing_speed_mm_s,
+        linear_crossing_penalty_s=args.linear_crossing_penalty_s,
         weld_clearance_mm=args.weld_clearance_mm,
         export_dir=directory if args.export_collision_geometry else None,
         keep_unrefined=args.unrefined_output,
