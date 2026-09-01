@@ -61,23 +61,35 @@ the way, so the joint values in between are whatever that line demands.
   the band, which the endpoint rule then reads as joint motion straight through the region
   the linear profile was chosen for. Replacements that take points out of the band without
   inheriting it are refused.
-- `--linear-crossing-speed-mm-s` is charged on **crossing** the edge of the band, and as
-  a **speed** rather than a multiplier. Neither choice is arbitrary, and both were arrived
-  at by watching cheaper versions fail.
-  - A tax on every linear move cannot decide the question at all. `simplify` weighs a
-    chord against the polyline it replaces, whose own near-panel hops are linear too, and
-    since each retained hop pays its own ramps the polyline's linear part outweighs the
-    chord's — so the chord's share of the tax is the smaller one and the collapse survives
-    *any* multiplier. Measured: 10^6 on every linear move left the sweep untouched.
-  - A multiplier is a ratio both sides of the comparison carry, so even scoped to the
-    crossing it converges: ×10 shortened the sweep, ×50 shortened it no further, and the
-    entry never reached the band edge. Scaling cruise time instead of the whole cost only
-    delays that — it took ×20 to move the entry at all and was still a ratio. A speed
-    makes the charge absolute, set by how far the move runs, so it keeps biting: 50, 25
-    and 1 mm/s all settle on the same route.
-  - It is computed without reference to `--linear-speed-mm-s` and is not a speed the robot
-    ever runs at. The two still combine, by `max` in `_time_floor`: a cap slow enough to
-    charge more than the crossing speed would simply wins. That is the higher of two
-    independent claims, not a coupling.
+- `--linear-crossing-penalty-s` is a **flat** surcharge on each move that reaches into
+  the band from outside it — the same figure however long the move. It therefore prices
+  how many times the route enters the band and nothing else. This replaced
+  `--linear-crossing-speed-mm-s`, which charged the crossing move by its length.
+  - What the flat charge does *not* do is the point of it. Deleting a waypoint from
+    inside the band crosses the edge once either way, so the charge appears on both sides
+    of `simplify`'s comparison and cancels exactly, leaving the decision to ordinary time
+    — where one fewer stop is one fewer pair of ramps. Those deletions are wanted: they
+    do not move where linear motion begins, which stays at the last waypoint outside the
+    band regardless, and the pairs of near-coincident vias straddling the edge cost a
+    stop apiece for nothing.
+  - What holds a linear sweep back from growing outward is `--linear-speed-mm-s`, and it
+    does so structurally rather than by being tuned to. Growing the sweep converts a
+    *joint* hop into a linear one, so the cap lands on one side of the comparison and not
+    the other and does not cancel. A rearrangement wholly inside the band converts
+    nothing, and a straight line is never longer than the polyline it replaces, so the
+    cap correctly stays out of it. The length-based charge could not tell the two apart,
+    because it read the crossing move's total length, which grows under both.
+  - The earlier note here said a multiplier "cannot decide the question at all" and that
+    the collapse survives *any* multiplier, measured at 10^6. That holds only where both
+    sides of the comparison are wholly linear, which is the in-band case — there the
+    factor is exact and cancels at every magnitude. Where the polyline still contains a
+    joint hop, which is the sweep-growing case, it lands on one side only: measured on a
+    stub fixture, ×1 deletes the edge waypoint and ×10 already refuses to. So the
+    original measurement was sound and the generalisation drawn from it was not.
+  - It is not scaled by the clearance penalty. That penalty is a multiplier on time spent
+    near the parts; a fixed preference is not time, so every caller adds this outside its
+    own factor arithmetic — `MotionModel.cost`, `simplify`'s `polyline_cost`, and both
+    sides of `shortcut`'s comparison. Charged on the same footing everywhere or it would
+    not cancel where it is supposed to.
 - Order in `_finish` is densify → gate → refine → split. The split is a reading of the
   finished path, not a decision imposed before it.

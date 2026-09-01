@@ -195,56 +195,65 @@ class MotionModel:
         """Whether this move reaches into the band from outside it, or back out."""
         return self.zone is not None and self.near(a) != self.near(b)
 
-    def _crossing_floor(self, a: np.ndarray, b: np.ndarray) -> float:
-        """Seconds a move that reaches into the band from outside it is held to.
+    def crossing_penalty(self, a: np.ndarray, b: np.ndarray) -> float:
+        """A flat surcharge on a move that reaches into the band from outside it.
 
-        Joint motion is wanted outside the band, but the profile rule makes a move linear
-        when *either* end is near, so a chord reaching in from open space is linear over
-        its whole length.  ``demotes`` does not object -- it refuses replacements that
-        come out ``PTP``, and this one does not -- so nothing stops the optimisation
-        passes deleting the waypoint at the edge of the band and handing back one long
-        straight sweep in from far outside.  What the route should do instead is stop at
-        the edge: joint motion out to it, linear from there in.
+        Added, not scaled, and the same for every crossing however long the move is.  What
+        that buys is a charge that prices the *number* of times a route enters the band
+        and nothing else -- so a route that dips in and out repeatedly pays for each dip,
+        while a decision that leaves the crossing count alone is left alone.
 
-        Charged as a speed the move is costed at, and only on a move that crosses the
-        edge.  Both of those are load bearing:
+        That is the whole of it, and it is worth being clear about what it therefore does
+        not do, because the setting it replaces tried to do it.  Deleting a waypoint from
+        inside the band leaves the crossing count unchanged -- one crossing before, one
+        after -- so this cancels exactly and the decision falls back to ordinary time,
+        where one fewer stop is one fewer pair of ramps.  That is the intent: such a
+        deletion does not move where linear motion begins, which stays at the last
+        waypoint outside the band either way, and the pair of near-coincident vias it used
+        to leave straddling the edge cost a stop apiece for nothing.
 
-        * **On the crossing only.**  A move wholly inside the band pays nothing, which is
-          the point -- that motion is wanted.  A tax on every linear move cannot decide
-          this question at all: ``simplify`` weighs the chord against the polyline it
-          would replace, whose own near-panel hops are linear too, so both sides scale
-          together, and since each retained hop pays its own pair of ramps the polyline's
-          linear part outweighs the chord's.  The chord's share of such a tax is the
-          smaller one, so the collapse survives any multiplier whatsoever.
-        * **As a speed, not a multiplier.**  A multiplier is a ratio that both sides of
-          the comparison carry, so it converges: raising it shortens the sweep and then
-          stops responding.  A speed makes the cost an absolute quantity set by how far
-          the move actually runs, so the long reach in from open space is charged for its
-          length while the short hop across the edge -- the move the route is supposed to
-          keep -- is charged for almost none of it.  That difference does not cancel, so
-          the setting keeps biting however far it is pushed.
+        What still holds the sweep back is the tool speed cap, and it does so for a
+        structural reason rather than by being tuned to.  A deletion that grows the sweep
+        outward converts a *joint* hop into a linear one, so the cap lands on one side of
+        the comparison and not the other and does not cancel; a deletion inside the band
+        moves no such boundary, and a straight line is never longer than the polyline it
+        replaces, so the cap correctly stays out of it.  The old charge could not tell
+        those two apart, because it read the crossing move's total length -- which grows
+        under both -- rather than what the length was doing.
 
         The figure is used for costing and nothing else: the robot is never scheduled by
-        it, and it is deliberately not a speed the cell obeys anywhere.
+        it, and it never reaches the exported program.
+
+        Deliberately not scaled by the clearance penalty.  That penalty is a multiplier on
+        *time spent* near the parts; a fixed preference is not time, and compounding the
+        two would make the charge depend on where the crossing happens to sit rather than
+        on the fact that it happened.  Every caller therefore adds this outside its own
+        factor arithmetic.
         """
-        if self.zone.crossing_speed_mm_s <= 0.0 or not self._crosses(a, b):
+        if self.zone is None or self.zone.crossing_penalty_s <= 0.0:
             return 0.0
-        return _tcp_travel(self.cell, [a, b]) / self.zone.crossing_speed_mm_s
+        return self.zone.crossing_penalty_s if self._crosses(a, b) else 0.0
 
     def _time_floor(self, a: np.ndarray, b: np.ndarray) -> float:
         """Seconds this linear move is held to, over and above the joint limits.
 
-        Two floors can apply and the higher wins, which is what keeps them independent of
-        one another; either may be off without disturbing the other.  ``linear_speed_mm_s``
-        is a prediction -- the same figure schedules the exported program -- while the
-        crossing speed is a preference and reaches nothing outside these passes.
+        The tool speed cap and nothing else.  It is a prediction -- the same figure
+        schedules the exported program -- so it belongs in the move's time, where a
+        preference does not: :meth:`crossing_penalty` is added to the cost by the callers
+        instead of raising the time here.
+
+        This is also what actually resists a linear sweep growing outward.  Such a growth
+        turns a joint hop into a linear one, so the cap applies to the replacement and not
+        to what it replaced; a rearrangement wholly inside the band converts nothing, and
+        a straight line is never longer than the polyline it replaces, so the cap has
+        nothing to say about it.  The discrimination falls out of the profile rule rather
+        than being tuned in.
         """
         if self.zone is None or self.motion(a, b) == PTP:
             return 0.0
-        floor = self._crossing_floor(a, b)
-        if self.zone.linear_speed_mm_s > 0.0:
-            floor = max(floor, _tcp_travel(self.cell, [a, b]) / self.zone.linear_speed_mm_s)
-        return floor
+        if self.zone.linear_speed_mm_s <= 0.0:
+            return 0.0
+        return _tcp_travel(self.cell, [a, b]) / self.zone.linear_speed_mm_s
 
     def cruise_time(self, a: np.ndarray, b: np.ndarray) -> float:
         return max(self.cell.cruise_time(a, b), self._time_floor(a, b))
@@ -282,7 +291,7 @@ class MotionModel:
         rather than measured for: a looser bound rejects fewer candidates, which is a
         cost, but a wrong one would reject a candidate that should have won.
 
-        The crossing surcharge is always left out.  ``_crosses`` compares both ends and so
+        The crossing penalty is always left out.  ``_crosses`` compares both ends and so
         cannot be answered from one of them, and since it only ever raises the cost,
         omitting it keeps this below the true figure.  It is applied in full by
         :meth:`cost`, on the candidates that get that far.
@@ -303,19 +312,18 @@ class MotionModel:
         this would let the passes trade a joint move for a linear one that is quicker on
         the joint limits and slower once the tool speed governs it.
 
-        The crossing speed rides on that same floor, so it too compounds with the
-        clearance penalty rather than adding to it: a move that both reaches into the band
-        from outside and runs hard against a panel is charged for both.
+        The crossing penalty is added afterwards rather than folded into the floor, so it
+        is not multiplied by the clearance factor: it is a fixed preference about how many
+        times the route enters the band, not time spent anywhere.
         """
         penalised = self.cell.segment_cost(a, b, max_step=self.max_step,
                                            fa=fa, fb=fb, stops=stops)
         floor = self._time_floor(a, b)
-        if floor <= 0.0:
-            return penalised
-        raw = self.cell.move_time(a, b) if stops else self.cell.cruise_time(a, b)
-        if raw <= 0.0:
-            return max(penalised, floor)
-        return penalised * max(1.0, floor / raw)
+        if floor > 0.0:
+            raw = self.cell.move_time(a, b) if stops else self.cell.cruise_time(a, b)
+            penalised = (max(penalised, floor) if raw <= 0.0
+                         else penalised * max(1.0, floor / raw))
+        return penalised + self.crossing_penalty(a, b)
 
     # -- pass-through -------------------------------------------------------
     def penalty_factor(self, q: np.ndarray) -> float:
@@ -361,7 +369,12 @@ def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
     def polyline_cost(i: int, j: int) -> float:
         # Each retained hop is its own stop-to-stop move.  The hops are short, so the
         # endpoint factors describe them well enough without sampling their interiors.
+        # The crossing penalty is added outside the factor, exactly as ``cost`` adds it to
+        # the chord: charged on the same footing on both sides or it would not cancel when
+        # the two arrangements cross the band the same number of times, which is the one
+        # thing it is supposed to do.
         return sum(model.move_time(path[k], path[k + 1]) * max(factor(k), factor(k + 1))
+                   + model.crossing_penalty(path[k], path[k + 1])
                    for k in range(i, j))
 
     out = [path[0]]
@@ -633,7 +646,8 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
     fac = [model.penalty_factor(p) if penalised else 1.0 for p in dense]
 
     def step_cost(x: np.ndarray, y: np.ndarray, fx: float, fy: float) -> float:
-        return model.cruise_time(x, y) * max(fx, fy)
+        # Outside the factor, on the same footing as everywhere else it is charged.
+        return model.cruise_time(x, y) * max(fx, fy) + model.crossing_penalty(x, y)
 
     def span_cost(i: int, j: int) -> float:
         return sum(step_cost(dense[k], dense[k + 1], fac[k], fac[k + 1])
@@ -687,6 +701,7 @@ def _try_cut(model: "MotionModel", dense, fac, rng, penalised, span_cost) -> int
         chain = [dense[i]] + points + [dense[j]]
         chain_f = [fac[i]] + factors + [fac[j]]
         direct = sum(model.cruise_time(x, y) * max(fx, fy)
+                     + model.crossing_penalty(x, y)
                      for x, y, fx, fy in zip(chain, chain[1:], chain_f, chain_f[1:]))
         if direct >= span - 1e-9:
             return 0
@@ -1371,8 +1386,8 @@ class LinearZone:
     min_run_mm: float = 0.0         # shortest stretch worth converting, in tool travel
     min_run_pct: float = 0.0        # ...or this much of the leg, whichever it meets first
     linear_speed_mm_s: float = 0.0  # tool speed cap; 0 leaves linear moves costed on joints
-    crossing_speed_mm_s: float = 0.0  # costing-only speed for a move that reaches into
-                                      # the band from outside it; 0 charges no surcharge
+    crossing_penalty_s: float = 0.0  # flat costing-only surcharge on each move that
+                                     # reaches into the band from outside it; 0 charges none
 
     @property
     def enabled(self) -> bool:
