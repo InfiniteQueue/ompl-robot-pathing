@@ -153,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="time budget for shortcutting each freespace transit; longer "
                         "budgets keep shortening with diminishing returns (default: 20)")
     #POLISH PASS TIME
-    p.add_argument("--polish-seconds", type=float, default=20.0, metavar="SECONDS",
+    p.add_argument("--polish-seconds", type=float, default=50.0, metavar="SECONDS",
                    help="time budget for the final pass over each transit's emitted "
                         "waypoints, which removes and relocates them under the full "
                         "stop-to-stop time the robot really pays for each one. The "
