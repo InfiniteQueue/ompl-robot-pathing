@@ -60,7 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "whichever profile is in force. 0 turns this off, which drops "
                         "both back to --check-step-deg alone (default: 7)")
     #COLLISION CHECK RESOLUTION
-    p.add_argument("--segment-length-rad", type=float, default=0.03,
+    p.add_argument("--segment-length-rad", type=float, default=0.02,
                    help="collision checking resolution for the sampling planner "
                         "(default: 0.02)")
 #endregion
