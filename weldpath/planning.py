@@ -62,6 +62,28 @@ class MotionModel:
         # environment, which costs far more than everything else these passes do.
         self._near: dict[bytes, bool] = {}
 
+    @property
+    def tool_step(self) -> float:
+        """How far the tool may move between two samples, in manifest units.
+
+        The same figure for both profiles, and deliberately so.  A joint move is checked by
+        ``segment_collides``, which subdivides wherever the tool travels further than
+        ``Cell.tcp_check_mm`` between samples.  A linear move is checked in two stages --
+        stations placed along the Cartesian line, then those same joint gaps between them
+        -- and until this was shared the first stage ran on its own, coarser number.  That
+        let the finer one be gated by the coarser: an 87 mm move took stations at 0%, 50%
+        and 100%, the gaps between them were checked densely on the joint chord, and a
+        fixture that the *line* entered from 16% to 34% was never sampled at all.
+
+        Zero means the tool-space criterion is switched off, which this reads literally:
+        the stations collapse onto the two ends and a linear move is then checked exactly
+        as a joint move is, by ``--check-step-deg`` alone.  That is the same reduction
+        turning it off already causes for joint moves, rather than a hidden default that
+        would keep a promise the setting says is no longer being made.
+        """
+        step = float(getattr(self.cell, "tcp_check_mm", 0.0))
+        return step if step > 0.0 else float("inf")
+
     # -- which profile ------------------------------------------------------
     def near(self, q: np.ndarray) -> bool:
         if self.zone is None:
@@ -133,7 +155,7 @@ class MotionModel:
         """
         try:
             chain = plan_linear(self.cell, self._pose_mm(a), self._pose_mm(b), a,
-                                step_mm=self.zone.step_mm)
+                                step_mm=self.tool_step)
         except PlanningError:
             return None                     # no inverse kinematics somewhere along it
         # Inverse kinematics returns the solution nearest its seed rather than the state
@@ -1258,7 +1280,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
             f"tool moves in, where phase one searched the joints")
         t0 = time.time()
         try:
-            route = plan_cartesian(cell, qa, qb, zone=zone, max_step=check_step,
+            route = plan_cartesian(cell, qa, qb, max_step=check_step,
                                    budget=cartesian, log=log)
         except PlanningError as exc:
             log(f"      {exc} ({time.time() - t0:.1f}s)")
@@ -1317,7 +1339,6 @@ class LinearZone:
     near_mm: float = 0.0            # clearance at or under which the route counts as near
     min_run_mm: float = 0.0         # shortest stretch worth converting, in tool travel
     min_run_pct: float = 0.0        # ...or this much of the leg, whichever it meets first
-    step_mm: float = 50.0           # sampling along a straight move when it is checked
     linear_speed_mm_s: float = 0.0  # tool speed cap; 0 leaves linear moves costed on joints
     crossing_speed_mm_s: float = 0.0  # costing-only speed for a move that reaches into
                                       # the band from outside it; 0 charges no surcharge
@@ -1450,7 +1471,7 @@ def _linear_fault(model: "MotionModel", a: np.ndarray, b: np.ndarray) -> str:
 
     "not traversable" covers three quite different faults, and they want different fixes.
     The move may be too coarse to have been checked as a line in the first place: below
-    ``--linear-step-mm`` of tool travel ``plan_linear`` places no station between the ends,
+    ``--check-step-mm`` of tool travel ``plan_linear`` places no station between the ends,
     so the linear test reduces to the joint one and the two cannot disagree -- a refusal
     therefore means the step carried the tool further than that, which is a property of
     how the route was spaced rather than of the geometry.  The line may have no inverse
@@ -1468,7 +1489,7 @@ def _linear_fault(model: "MotionModel", a: np.ndarray, b: np.ndarray) -> str:
     cell = model.cell
     pa, pb = model._pose_mm(a), model._pose_mm(b)
     travel = float(np.linalg.norm(pb[:3, 3] - pa[:3, 3]))
-    step = model.zone.step_mm if model.zone is not None else 0.0
+    step = model.tool_step
     chord = ("clear" if not cell.segment_collides(a, b, max_step=model.max_step)
              else "also blocked")
     head = (f"{travel:.0f} mm of tool travel against a {step:g} mm linear step, "

@@ -41,12 +41,6 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("directory",
                    help="study directory containing manifest.json and meshes/")
 
-    #region ###WELD HANDLING###
-    #LINEAR TUNNEL STEP LENGTH
-    p.add_argument("--linear-step-mm", type=float, default=50.0,
-                   help="spacing of points along linear approach/depart moves "
-                        "(default: 50)")
-#endregion
     #region ###COLLISIONS###
     #COLLISION JOINT STEP RESOLUTION
     p.add_argument("--check-step-deg", type=float, default=3.0,
@@ -60,7 +54,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "and a hand's breadth at the base -- so an interval that carries "
                         "the gun further than this is split and rechecked. Never checks "
                         "less than --check-step-deg alone would, and costs nothing where "
-                        "the two agree. 0 turns this off (default: 10)")
+                        "the two agree. Governs linear moves as well: the stations "
+                        "a straight move is checked at are spaced by this too, so one "
+                        "number decides how far the tool may travel between samples "
+                        "whichever profile is in force. 0 turns this off, which drops "
+                        "both back to --check-step-deg alone (default: 7)")
     #COLLISION CHECK RESOLUTION
     p.add_argument("--segment-length-rad", type=float, default=0.03,
                    help="collision checking resolution for the sampling planner "
@@ -586,7 +584,6 @@ def main(argv: list[str] | None = None) -> int:
     log("planning:")
     planner = ToolpathPlanner(
         cell, man,
-        linear_step_mm=args.linear_step_mm,
         ompl=OmplBudget(phase_one_runs=args.phase_one_runs,
                         phase_one_seconds=args.phase_one_solve_seconds,
                         phase_two_max_runs=args.phase_two_max_runs,

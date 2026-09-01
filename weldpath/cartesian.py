@@ -42,7 +42,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .cell import Cell
-from .planning import LinearZone, PlanningError, interpolate_pose
+from .planning import PlanningError, interpolate_pose
 
 __all__ = ["CartesianBudget", "plan_cartesian"]
 
@@ -179,7 +179,7 @@ class _Tree:
 # ---------------------------------------------------------------------------
 # the extend
 # ---------------------------------------------------------------------------
-def _steer(cell: Cell, zone: LinearZone, max_step: float, budget: CartesianBudget,
+def _steer(cell: Cell, step_mm: float, max_step: float, budget: CartesianBudget,
            q_from: np.ndarray, pose_from: np.ndarray, pose_to: np.ndarray, *,
            reach_mm: float, rng: np.random.Generator
            ) -> tuple[list[np.ndarray], np.ndarray] | None:
@@ -212,7 +212,7 @@ def _steer(cell: Cell, zone: LinearZone, max_step: float, budget: CartesianBudge
         return None
 
     span = dist * t
-    n = max(1, int(np.ceil(span / max(zone.step_mm, 1e-6))))
+    n = max(1, int(np.ceil(span / max(step_mm, 1e-6))))
 
     chain = [np.asarray(q_from, dtype=float)]
     current = chain[0]
@@ -262,7 +262,7 @@ def _sample(rng: np.random.Generator, pa: np.ndarray, pb: np.ndarray,
 
 
 def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
-                   zone: LinearZone, max_step: float,
+                   max_step: float,
                    budget: CartesianBudget | None = None, log=None) -> list[np.ndarray]:
     """A route from ``qa`` to ``qb`` whose every move is a straight line of the tool.
 
@@ -270,14 +270,19 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     away half of what is known.  The trees swap each iteration, so whichever is having the
     easier time of it keeps being the one that explores.
 
-    The states come back dense -- every station the search validated, at ``step_mm``
-    spacing -- and consecutive states are pairwise checked along the Cartesian line
-    between them.  Reducing that to the few points a controller needs is the reduction
-    passes' job, not this one's, and they already work under the linear profile.
+    Stations along each edge are spaced by ``Cell.tcp_check_mm`` -- the same tool-space
+    step the joint-space check subdivides on, read from the cell rather than passed in so
+    that there is one number and no way for a caller to hand this a coarser one.
+
+    The states come back dense -- every station the search validated -- and consecutive
+    states are pairwise checked along the Cartesian line between them.  Reducing that to
+    the few points a controller needs is the reduction passes' job, not this one's, and
+    they already work under the linear profile.
     """
     budget = budget or CartesianBudget()
     rng = np.random.default_rng(budget.seed)
     deadline = time.perf_counter() + budget.seconds
+    step_mm = float(getattr(cell, "tcp_check_mm", 0.0)) or float("inf")
 
     pa, pb = pose_mm(cell, qa), pose_mm(cell, qb)
     if cell.in_collision(qa) or cell.in_collision(qb):
@@ -295,7 +300,7 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                   else _sample(rng, pa, pb, budget))
 
         i = a.nearest(target)
-        grown = _steer(cell, zone, max_step, budget, a.nodes[i].q, a.nodes[i].pose,
+        grown = _steer(cell, step_mm, max_step, budget, a.nodes[i].q, a.nodes[i].pose,
                        target, reach_mm=budget.extend_mm, rng=rng)
         if grown is None:
             a, b, forward = b, a, not forward
@@ -309,7 +314,7 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
         j = b.nearest(pose)
         cursor, cursor_pose, cursor_index = a.nodes[new].q, pose, new
         while time.perf_counter() < deadline:
-            step = _steer(cell, zone, max_step, budget, cursor, cursor_pose,
+            step = _steer(cell, step_mm, max_step, budget, cursor, cursor_pose,
                           b.nodes[j].pose, reach_mm=budget.extend_mm, rng=rng)
             if step is None:
                 break

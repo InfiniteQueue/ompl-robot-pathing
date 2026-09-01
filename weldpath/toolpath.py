@@ -7,7 +7,7 @@ A transit runs weld to weld and is free to curve away from the panel immediately
 used to get a straight lead-in and lead-out of a fixed length along one fixed direction,
 which asked for a clear tunnel a weld set deep in panelling often has no room for; where a
 straight run near the panel is wanted it is now found by measuring the route, in
-:func:`~weldpath.planning.linearise`, rather than assumed at the weld.  Per the brief the
+:func:`~weldpath.planning._finish`, rather than assumed at the weld.  Per the brief the
 gun is treated as stationary through the weld: the robot stops at the locator, the opening
 changes from ``gun_opening_arrive`` to ``gun_opening_leave``, and no motion is planned for
 the closing itself.
@@ -63,7 +63,7 @@ CLEARANCE_REPORT_HEADROOM_MM = 25.0
 
 class ToolpathPlanner:
     def __init__(self, cell: Cell, man: Manifest, *,
-                 linear_step_mm: float = 50.0, ompl: OmplBudget | None = None,
+                 ompl: OmplBudget | None = None,
                  cartesian: CartesianBudget | None = None,
                  fallback_runs: int = 0, relocate: Relocation | None = None,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
@@ -77,7 +77,6 @@ class ToolpathPlanner:
         self.cell = cell
         self.man = man
         self.log = log
-        self.linear_step_mm = linear_step_mm
         self.ompl = ompl or OmplBudget()
         # Only ever reached when the sampling planner's first phase came back empty, and
         # only where the near-panel band is in force.  A cell whose transits solve never
@@ -95,7 +94,7 @@ class ToolpathPlanner:
         # linear motion instead of joint motion.  The clearance query has to be able to
         # see that far, which it will not do on the penalty's probe alone.
         self.zone = LinearZone(near_mm=near_panel_mm, min_run_mm=near_panel_min_mm,
-                               min_run_pct=near_panel_min_pct, step_mm=linear_step_mm,
+                               min_run_pct=near_panel_min_pct,
                                linear_speed_mm_s=linear_speed_mm_s,
                                crossing_speed_mm_s=linear_crossing_speed_mm_s)
         # Every locator reports its measured clearance against the one it has to meet,
