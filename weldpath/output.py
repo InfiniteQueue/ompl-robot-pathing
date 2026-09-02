@@ -161,10 +161,20 @@ def check_endpoints(document: dict, man: Manifest, tol_mm: float = 1.0) -> list[
     required to begin at the first locator rather than at the robot's start pose, so both
     ends are worth asserting rather than assuming.
 
-    Welds are checked against their *imported* pose, which is what the file claims and what
-    the consumer will place back in the cell -- not the shifted pose used for planning.
+    Checked against the pose the segment was *planned* to reach, which for a shifted weld
+    is ``pose_world`` and not ``export_pose``.  ``shift_weld_locators`` backs a weld off
+    along its own approach axis so the pose is reachable without the gun entering the
+    sheet, and it moves the planner, the collision checks and the emitted ``tcp_world_mm``
+    together -- so an endpoint landing exactly on target sits ``--weld-shift-mm`` away from
+    the imported pose by construction.  Comparing against the imported one therefore
+    reported the shift itself, on every weld-to-weld segment of every solve, and reported
+    it as a failure to arrive.
+
+    The imported pose is still the one the exported program names; it is simply not what
+    this is asking about.  The question here is whether the segment runs between the two
+    locators it claims to, and that is answered against where those locators were planned.
     """
-    poses = {loc.name: np.array(loc.export_pose, dtype=float) for loc in man.locators}
+    poses = {loc.name: np.array(loc.pose_world, dtype=float) for loc in man.locators}
     problems = []
 
     def position(waypoint) -> np.ndarray:
