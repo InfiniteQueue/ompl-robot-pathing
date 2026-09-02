@@ -66,7 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
 #endregion
     #region ###PATHFINDING###
     #PHASE ONE: CHOOSE BETWEEN ROUTES
-    p.add_argument("--phase-one-runs", type=int, default=5, metavar="N",
+    p.add_argument("--phase-one-runs", type=int, default=7, metavar="N",
                    help="sampling-planner runs made per transit in phase one. Every one "
                         "is spent whether or not earlier runs succeeded, and the "
                         "lowest-penalty solution of the set is the one that ships. The "
@@ -79,7 +79,7 @@ def build_parser() -> argparse.ArgumentParser:
                    metavar="SECONDS",
                    help="how long one phase-one run may search before giving up. Every "
                         "run costs this long in the worst case, so it multiplies with "
-                        "--phase-one-runs (default: 8)")
+                        "--phase-one-runs (default: 15)")
     #PHASE TWO: FIND ANY ROUTE AT ALL
     p.add_argument("--phase-two-max-runs", type=int, default=3, metavar="N",
                    help="most sampling-planner runs allowed in phase two, which is "

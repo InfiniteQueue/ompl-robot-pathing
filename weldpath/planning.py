@@ -1352,8 +1352,8 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         # cost where linear motion was wanted in the first place; with no band in force
         # there is nothing here that phase two would not do better.
         from .cartesian import plan_cartesian    # deferred: cartesian.py reads this module
-        log(f"      cartesian tree: up to {cartesian.seconds:g}s searching the space the "
-            f"tool moves in, where phase one searched the joints")
+        log(f"      cartesian tree: up to {cartesian.seconds:g}s searching linear space "
+            f"for a solution")
         t0 = time.time()
         try:
             route = plan_cartesian(cell, qa, qb, max_step=check_step,
