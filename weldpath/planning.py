@@ -407,7 +407,11 @@ def _hop(model: "MotionModel", a: np.ndarray, b: np.ndarray,
 
 @dataclass
 class Relocation:
-    """How far ``polish`` displaces a waypoint, and how that distance is drawn.
+    """How ``polish`` draws a relocation: how far, shaped how, and how many at least.
+
+    Carried on this object rather than threaded as its own argument because it reaches
+    every caller of ``polish`` already, and because it describes the same sampling loop
+    the distances do.
 
     Distances are approximate tool travel in the manifest's units, not joint angles: the
     step is normalised through ``Cell.weights``, which is TCP travel per radian measured
@@ -423,6 +427,7 @@ class Relocation:
     min_mm: float = 5.0
     max_mm: float = 150.0
     exponent: float = 1.0
+    min_attempts: int = 20          # polish only; shortcut's loop is timed alone
 
     def draw(self, scale: float) -> tuple[float, float, float]:
         """``(low, span, exponent)`` in scene units, ready for the sampling loop."""
@@ -457,6 +462,20 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
     non-greedy opinion on it rather than the first -- what is new here is the relocation,
     and the sweep that follows it.  Every replacement is collision checked before it is
     kept, so the result stays traversable.
+
+    ``Relocation.min_attempts`` is a floor on the sampling loop that outlasts the clock:
+    the pass keeps drawing until it has made that many attempts however long they take.
+    A relocation is a random draw, so a budget that expires early does not return a route
+    judged and kept -- it returns one barely sampled, and on a slow leg, where each
+    attempt costs a collision check along a Cartesian line, that is exactly where the
+    clock runs out first.  The floor is what stops the pass being quietly skipped on the
+    legs that most need it.
+
+    What it does not override is a caller declining the pass.  ``time_budget <= 0`` is not
+    a clock that ran out; it is ``--no-shortcut``, or a leg inside the two-leg fallback
+    search that is deferring its refinement to ``_refine_runs`` and may yet be discarded.
+    Those return untouched, and the leg that is kept meets the floor when it is really
+    refined.
     """
     if len(path) < 3 or time_budget <= 0:
         return [np.asarray(p, dtype=float).copy() for p in path]
@@ -465,7 +484,9 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
     rng = rng or np.random.default_rng(1)
     # Hoisted out of the loop: this draws tens of thousands of times against a budget
     # measured in seconds, and a flat draw should not pay for a power that does nothing.
-    low, span, exponent = (relocate or Relocation()).draw(cell.man.scale)
+    relocate = relocate or Relocation()
+    low, span, exponent = relocate.draw(cell.man.scale)
+    floor = max(0, int(relocate.min_attempts))
     flat = abs(exponent - 1.0) < 1e-9
     pts = [np.asarray(p, dtype=float).copy() for p in path]
     fac = [model.penalty_factor(p) for p in pts]
@@ -475,10 +496,16 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
     deadline = time.time() + time_budget
     dropped = moved = tried = 0
 
+    def unfinished() -> bool:
+        """Whether the pass may keep working: the floor outranks the clock."""
+        return tried < floor or time.time() < deadline
+
     def drop_sweep() -> None:
         nonlocal dropped
         k = 1
-        while k < len(pts) - 1 and time.time() < deadline:
+        # Under the same rule as the sampling loop, so that a relocation accepted past
+        # the deadline still gets the removal sweep the pass promises follows every one.
+        while k < len(pts) - 1 and unfinished():
             if model.demotes(pts[k - 1], pts[k + 1], [pts[k]]):
                 k += 1
                 continue
@@ -496,7 +523,7 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
             # to a different neighbour and deserves its own test.
 
     drop_sweep()
-    while time.time() < deadline and len(pts) > 2:
+    while unfinished() and len(pts) > 2:
         tried += 1
         k = int(rng.integers(1, len(pts) - 1))
         # Drawn in joint space but scaled through the cell's joint weights, so an attempt
@@ -540,9 +567,12 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
     if log:
         after = sum(costs)
         gain = 100.0 * (1.0 - after / before) if before > 0 else 0.0
+        over = time.time() - deadline
+        held = (f", held past its {time_budget:g}s budget by {over:.1f}s to reach the "
+                f"{floor}-attempt floor" if over > 0.05 and floor else "")
         log(f"      polish: dropped {dropped} and relocated {moved} waypoints from "
             f"{tried} attempts, penalised time {before:.2f} -> {after:.2f} s "
-            f"({gain:.0f}% better), {len(pts)} points")
+            f"({gain:.0f}% better), {len(pts)} points{held}")
     return pts
 
 

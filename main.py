@@ -158,6 +158,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "earlier passes work on a densified path where a waypoint is a "
                         "sampling artefact rather than a stop; this one does not "
                         "(default: 50)")
+    #POLISH PASS MINIMUM ATTEMPTS
+    p.add_argument("--polish-min-attempts", type=int, default=20, metavar="N",
+                   help="fewest relocation attempts the polish pass must make on a "
+                        "transit, whatever --polish-seconds says. The floor outranks the "
+                        "clock: the pass keeps drawing until it has made this many, "
+                        "however long they take. A relocation is a random draw, so a "
+                        "budget that expires early hands back a route barely sampled "
+                        "rather than one judged and kept -- and that happens first on "
+                        "exactly the slow legs that most need the pass, where every "
+                        "attempt costs a collision check along a Cartesian line. Does "
+                        "not override a caller declining the pass: --no-shortcut and a "
+                        "leg deferring its refinement still skip it entirely. 0 leaves "
+                        "the clock in sole charge (default: 20)")
     #HOW FAR A RELOCATION MOVES A WAYPOINT
     p.add_argument("--relocate-min-mm", type=float, default=5.0, metavar="MM",
                    help="shortest displacement the shortcut and polish passes try when "
@@ -595,7 +608,8 @@ def main(argv: list[str] | None = None) -> int:
                                   margin_mm=args.cartesian_margin_mm,
                                   tilt_deg=args.cartesian_tilt_deg),
         fallback_runs=args.fallback_runs,
-        relocate=Relocation(min_mm=args.relocate_min_mm, max_mm=args.relocate_max_mm,
+        relocate=Relocation(min_attempts=args.polish_min_attempts,
+                            min_mm=args.relocate_min_mm, max_mm=args.relocate_max_mm,
                             exponent=args.relocate_exponent),
         segment_length=args.segment_length_rad,
         check_step_deg=args.check_step_deg,
