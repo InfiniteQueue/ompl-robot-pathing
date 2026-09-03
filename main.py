@@ -128,6 +128,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "to the panel at a weld is square to it most of the way in, and "
                         "sampling orientations freely would spend nearly the whole budget "
                         "on ones no route uses (default: 30)")
+    p.add_argument("--extra-gun-openings", type=int, default=0, metavar="N",
+                   help="further gun openings to try on a transit, beyond the departure "
+                        "and arrival openings and the closed, widest and half-open ones "
+                        "always tried. Each is placed in the middle of the widest range "
+                        "no opening has been tried in yet, so the openings spread over "
+                        "the gun's travel rather than clustering. They are tried last, "
+                        "after every named opening has failed, and each one costs a "
+                        "further pass over the fallback poses (default: 0)")
+    p.add_argument("--gun-opening-round-mm", type=float, default=5.0, metavar="MM",
+                   help="multiple that --extra-gun-openings values are rounded to, so "
+                        "that the program commands round figures. An opening that rounds "
+                        "onto one already being tried is dropped, so a coarse setting "
+                        "over a narrow range yields fewer openings than asked for. 0 "
+                        "rounds nothing (default: 5)")
     #EFFORT ONCE THE PREFERRED ANSWER HAS FAILED
     p.add_argument("--fallback-runs", type=int, default=1, metavar="N",
                    help="sampling-planner runs allowed per phase once the preferred gun "
@@ -608,6 +622,8 @@ def main(argv: list[str] | None = None) -> int:
                                   margin_mm=args.cartesian_margin_mm,
                                   tilt_deg=args.cartesian_tilt_deg),
         fallback_runs=args.fallback_runs,
+        extra_openings=args.extra_gun_openings,
+        opening_round_mm=args.gun_opening_round_mm,
         relocate=Relocation(min_attempts=args.polish_min_attempts,
                             min_mm=args.relocate_min_mm, max_mm=args.relocate_max_mm,
                             exponent=args.relocate_exponent),

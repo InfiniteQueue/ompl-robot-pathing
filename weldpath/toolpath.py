@@ -66,6 +66,7 @@ class ToolpathPlanner:
                  ompl: OmplBudget | None = None,
                  cartesian: CartesianBudget | None = None,
                  fallback_runs: int = 0, relocate: Relocation | None = None,
+                 extra_openings: int = 0, opening_round_mm: float = 5.0,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                  near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
@@ -83,6 +84,10 @@ class ToolpathPlanner:
         # pays for it.
         self.cartesian = cartesian
         self.fallback_runs = fallback_runs
+        # Openings to try beyond the four the transit's own ends and the gun's shape name,
+        # and the multiple the chosen values are rounded to.  See _bisect_openings.
+        self.extra_openings = extra_openings
+        self.opening_round_mm = opening_round_mm
         # How far the shortcut and polish passes displace a waypoint when they try
         # relocating one, and how the distance is drawn between those bounds.
         self.relocate = relocate or Relocation()
@@ -333,16 +338,18 @@ class ToolpathPlanner:
                           arrive_open: float) -> list[float]:
         """Gun openings to try for the transit between two locators, best first.
 
-        The weld end is the constrained one: its opening is process data, and it is the
-        opening the anchor and the linear approach were actually proved reachable at.  Try
-        the free end's opening first and the planner spends a full time budget discovering
-        that the pose it has to finish at was never checked in that gun state.
+        The departure opening leads: it is the one already in force, so using it costs no
+        gun change at the start of the move, and it is the state the robot was proved to
+        stand at ``a`` in.  The arrival opening follows, being the state it has to be
+        holding by the time it reaches ``b``.
 
-        With a weld at both ends or neither, the departure opening leads: it is the one
-        already in force, so using it costs no gun change at the start of the move.
+        This used to put the arrival opening first where ``b`` was a weld and ``a`` was
+        not, on the grounds that a weld's opening is process data and the pose was only
+        ever checked in it.  That reasoning still holds for the destination pose; what it
+        did not account for is that the transit has to leave ``a`` as well as arrive at
+        ``b``, and the same argument applies at that end.  The order is now uniform, and
+        the arrival opening is still tried second rather than not at all.
         """
-        if b.is_weld and not a.is_weld:
-            return [arrive_open, leave_open]
         return [leave_open, arrive_open]
 
     def _plan_pair(self, a: Locator, b: Locator, anchors, final: bool = False
@@ -379,6 +386,8 @@ class ToolpathPlanner:
             polish_seconds=self.polish_seconds,
             zone=self.zone,
             openings=self._transit_openings(a, b, leave_open, arrive_open),
+            extra_openings=self.extra_openings,
+            opening_round_mm=self.opening_round_mm,
             record=raw_legs, log=self.log)
         for i, (runs, opening) in enumerate(legs):
             opening_mm = 0.0 if opening is None else opening

@@ -1086,6 +1086,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                    planning_time: float = DEFAULT_PLANNING_TIME,
                    openings: list[float] | None = None,
+                   extra_openings: int = 0, opening_round_mm: float = 0.0,
                    zone: LinearZone | None = None,
                    cartesian: "CartesianBudget | None" = None,
                    relocate: "Relocation | None" = None,
@@ -1124,7 +1125,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                     zone=zone, cartesian=cartesian,
                                     relocate=relocate, log=log, record=into)
 
-    candidates = _opening_candidates(cell, openings)
+    candidates = _opening_candidates(cell, openings, extra_openings,
+                                     opening_round_mm)
 
     # One opening for the whole transit, in preference order: changing the gun is a real
     # operation on the machine, so it is a last resort rather than a free parameter.
@@ -1222,8 +1224,48 @@ def _effort_note(reduced: OmplBudget, full: OmplBudget) -> str:
             f"{'' if reduced.phase_one_runs == 1 else 's'} per phase")
 
 
-def _opening_candidates(cell: Cell, openings: list[float] | None) -> list[float | None]:
-    """Openings to try for a transit, most preferred first and without duplicates."""
+def _bisect_openings(out: list[float], extra: int, round_mm: float,
+                     widest: float) -> None:
+    """Append ``extra`` further openings, each halving the widest untried gap so far.
+
+    The named openings answer where the gun has to be; these answer where else it might
+    usefully be, and there is no geometry here to reason from -- the tip is 200 mm of
+    swing and which openings clear a fixture is not a function of the number.  So the
+    openings are chosen to cover the range rather than to be individually plausible: take
+    the widest stretch nothing has been tried in and try its middle, which is the choice
+    that leaves the largest remaining hole as small as possible.
+
+    Rounding to ``round_mm`` is what keeps the values sayable on the shop floor -- 45 mm
+    rather than 43.7 mm -- at the cost of the split being slightly off centre.  A rounded
+    value that lands on an opening already in the list is dropped and the next widest gap
+    taken instead, so the count is a ceiling: a coarse rounding over a narrow range runs
+    out of distinct openings before it runs out of attempts.
+    """
+    for _ in range(max(extra, 0)):
+        known = sorted(out)
+        gaps = sorted(zip(known, known[1:]), key=lambda g: g[1] - g[0], reverse=True)
+        for lo, hi in gaps:
+            mid = (lo + hi) / 2.0
+            if round_mm > 0.0:
+                mid = round(mid / round_mm) * round_mm
+            mid = float(min(max(mid, 0.0), widest))
+            if any(abs(mid - seen) < 1e-6 for seen in out):
+                continue                       # rounded onto a neighbour: try a wider gap
+            out.append(mid)
+            break
+        else:
+            return                             # every gap is narrower than the rounding
+
+
+def _opening_candidates(cell: Cell, openings: list[float] | None, extra: int = 0,
+                        round_mm: float = 0.0) -> list[float | None]:
+    """Openings to try for a transit, most preferred first and without duplicates.
+
+    ``openings`` are the two the transit's own ends ask for, departure first.  After them
+    come closed, widest and half open -- the three that between them cover the useful
+    shapes of the gun -- and then ``extra`` further openings bisecting whatever range is
+    left, as described in ``_bisect_openings``.
+    """
     if not cell.gun_joint_name:
         return [None]
     widest = cell.man.gun_opening_max
@@ -1234,6 +1276,7 @@ def _opening_candidates(cell: Cell, openings: list[float] | None) -> list[float 
         value = float(min(max(value, 0.0), widest))
         if not any(abs(value - seen) < 1e-6 for seen in out):
             out.append(value)
+    _bisect_openings(out, extra, round_mm, widest)
     return out
 
 
