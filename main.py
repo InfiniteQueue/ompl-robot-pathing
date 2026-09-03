@@ -96,7 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "longer single search helps where another short one does not "
                         "(default: 12)")
     #CARTESIAN TREE, BETWEEN THE TWO PHASES
-    p.add_argument("--cartesian-seconds", type=float, default=60.0, metavar="SECONDS",
+    p.add_argument("--cartesian-seconds", type=float, default=90.0, metavar="SECONDS",
                    help="how long the Cartesian tree may search a transit that phase one "
                         "could not solve. It runs between the two phases and only where "
                         "--near-panel-mm is in force, so a cell whose transits solve never "
@@ -107,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "is also a joint-space route, so it searches strictly less than "
                         "phase two does -- but it concentrates the search into the "
                         "corridor beside the panel, which is where uniform joint sampling "
-                        "spends everything and finds nothing. 0 turns it off (default: 60)")
+                        "spends everything and finds nothing. 0 turns it off (default: 90)")
     #HOW FAR ONE EXTEND REACHES
     p.add_argument("--cartesian-extend-mm", type=float, default=120.0, metavar="MM",
                    help="furthest one extend of the Cartesian tree drives the tool. Short "
