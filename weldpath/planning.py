@@ -1018,7 +1018,7 @@ def _endpoint_block(cell: Cell, qa: np.ndarray, qb: np.ndarray) -> str | None:
 
 def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget,
                      segment_length: float, check_step: float,
-                     fallback_via: list[np.ndarray] | None,
+                     via: np.ndarray | None,
                      shortcut_seconds: float, polish_seconds: float,
                      zone: LinearZone | None = None,
                      cartesian: "CartesianBudget | None" = None,
@@ -1026,57 +1026,56 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
                      record: list | None = None) -> list[Run]:
     """Collision-free joint path from ``qa`` to ``qb`` at the gun's current opening.
 
-    If the direct transit cannot be found, the move is retried in two legs through each
-    of ``fallback_via`` -- normally the cell's start pose.  Routing a difficult transit
-    through a known-clear pose is what a robot programmer would do by hand, and it turns
-    a long detour around the panels into two easy problems.
+    ``via`` is the fallback pose to route through, or ``None`` for the direct transit.
+    Which of the two is wanted is the caller's decision rather than this function's:
+    ``plan_freespace`` works through every gun opening directly before it works through
+    any of them via a fallback pose, so that the cheap answer is exhausted everywhere
+    before the expensive one is started anywhere.
+
+    Routing through a via is what a robot programmer would do by hand -- it turns a long
+    detour around the panels into two easy problems -- but it costs two full solves rather
+    than one, which is why it is not tried until directness has been given up on.
     """
     blocked = _endpoint_block(cell, qa, qb)
     if blocked:
-        # Nothing downstream can rescue this: every route at this opening ends here.  The
-        # caller's next candidate opening, or the two-leg split, is the only way on.
+        # Nothing downstream can rescue this: every route at this opening ends here,
+        # whether or not it goes by way of a via.  The caller's next candidate opening, or
+        # the two-leg split, is the only way on.
         raise PlanningError(blocked)
-    try:
+
+    if via is None:
         return _plan_direct(cell, qa, qb, ompl=ompl,
                             segment_length=segment_length, check_step=check_step,
                             shortcut_seconds=shortcut_seconds,
                             polish_seconds=polish_seconds,
                             zone=zone, cartesian=cartesian,
                             relocate=relocate, log=log, record=record)
-    except PlanningError:
-        if not fallback_via:
-            raise
 
-    for i, mid in enumerate(fallback_via):
-        if cell.in_collision(mid):
-            continue
-        log(f"      retrying via fallback pose {i + 1}/{len(fallback_via)}")
-        # The halves are recorded jointly below: this is still one leg of the output, and
-        # the fallback pose is an implementation detail of how it was found.
-        halves: list[list[np.ndarray]] = []
-        try:
-            # Planned without a linear zone: the two legs are joined below and the whole
-            # route is split afterwards, so splitting each half here would put a phase
-            # boundary at the fallback pose whether the geometry called for one or not.
-            first = _plan_direct(cell, qa, mid, ompl=ompl,
-                                 segment_length=segment_length, check_step=check_step,
-                                 shortcut_seconds=0.0, polish_seconds=0.0,
-                                 log=log, record=halves)
-            second = _plan_direct(cell, mid, qb, ompl=ompl,
-                                  segment_length=segment_length, check_step=check_step,
-                                  shortcut_seconds=0.0, polish_seconds=0.0,
-                                  log=log, record=halves)
-        except PlanningError:
-            continue
-        if len(halves) == 2:
-            _capture(record, halves[0] + halves[1][1:])
-        # Refine the joined route rather than each leg: the detour through the fallback
-        # pose is exactly the kind of corner these passes exist to cut.
-        joined = first[0].states + second[0].states[1:]
-        return _finish(cell, joined, zone=zone, relocate=relocate,
-                       shortcut_seconds=shortcut_seconds,
-                       polish_seconds=polish_seconds, check_step=check_step, log=log)
-    raise PlanningError("freespace transit failed, including via fallback poses")
+    if cell.in_collision(via):
+        raise PlanningError("the fallback pose is in collision with the gun at this "
+                            "opening")
+    # The halves are recorded jointly below: this is still one leg of the output, and the
+    # fallback pose is an implementation detail of how it was found.
+    halves: list[list[np.ndarray]] = []
+    # Planned without a linear zone: the two legs are joined below and the whole route is
+    # split afterwards, so splitting each half here would put a phase boundary at the
+    # fallback pose whether the geometry called for one or not.
+    first = _plan_direct(cell, qa, via, ompl=ompl,
+                         segment_length=segment_length, check_step=check_step,
+                         shortcut_seconds=0.0, polish_seconds=0.0,
+                         log=log, record=halves)
+    second = _plan_direct(cell, via, qb, ompl=ompl,
+                          segment_length=segment_length, check_step=check_step,
+                          shortcut_seconds=0.0, polish_seconds=0.0,
+                          log=log, record=halves)
+    if len(halves) == 2:
+        _capture(record, halves[0] + halves[1][1:])
+    # Refine the joined route rather than each leg: the detour through the fallback
+    # pose is exactly the kind of corner these passes exist to cut.
+    joined = first[0].states + second[0].states[1:]
+    return _finish(cell, joined, zone=zone, relocate=relocate,
+                   shortcut_seconds=shortcut_seconds,
+                   polish_seconds=polish_seconds, check_step=check_step, log=log)
 
 
 def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
@@ -1115,11 +1114,11 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     ompl = ompl or OmplBudget()
     reduced = ompl.capped(fallback_runs)
 
-    def attempt(opening, a, b, budget, into=None, effort=None):
+    def attempt(opening, a, b, budget, into=None, effort=None, via=None):
         with cell.gun_opening(opening):
             return _plan_at_opening(cell, a, b, ompl=effort or ompl,
                                     segment_length=segment_length,
-                                    check_step=check_step, fallback_via=fallback_via,
+                                    check_step=check_step, via=via,
                                     shortcut_seconds=budget,
                                     polish_seconds=polish_seconds if budget else 0.0,
                                     zone=zone, cartesian=cartesian,
@@ -1129,24 +1128,37 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
 
     # One opening for the whole transit, in preference order: changing the gun is a real
     # operation on the machine, so it is a last resort rather than a free parameter.
+    #
+    # Directness is the outer question and the gun opening the inner one.  Every opening is
+    # tried as a single move before any of them is tried as a detour, because a detour
+    # costs two full solves against one and the cheapest thing that can still work should
+    # be exhausted first.  The old order asked both questions at once -- each opening
+    # direct, then immediately that same opening through every via -- which spent the
+    # whole two-leg budget at the preferred opening before so much as looking at the next.
     last = None
-    for n, opening in enumerate(candidates):
-        try:
-            if n:
-                log(f"      retrying with the gun at {opening:g} mm"
-                    f"{_effort_note(reduced, ompl)}")
-            raw: list = []
-            leg = attempt(opening, qa, qb, shortcut_seconds, raw,
-                          effort=ompl if n == 0 else reduced)
-            if record is not None:
-                record.extend(raw)
-            return [(leg, opening)]
-        except PlanningError as exc:
-            # Said out loud because the endpoint screen rejects an opening in microseconds
-            # and would otherwise pass in silence, where a failed OMPL run announces itself
-            # at length.  Both reach the same place: this opening is not the one.
-            log(f"      the gun at {opening:g} mm will not do: {exc}")
-            last = exc
+    routes: list = [None] + list(fallback_via or [])
+    for v, via in enumerate(routes):
+        if v:
+            log(f"      retrying via fallback pose {v}/{len(routes) - 1}")
+        for n, opening in enumerate(candidates):
+            preferred = v == 0 and n == 0
+            try:
+                if not preferred:
+                    log(f"      retrying{_gun_note(opening)}"
+                        f"{_effort_note(reduced, ompl)}")
+                raw: list = []
+                leg = attempt(opening, qa, qb, shortcut_seconds, raw,
+                              effort=ompl if preferred else reduced, via=via)
+                if record is not None:
+                    record.extend(raw)
+                return [(leg, opening)]
+            except PlanningError as exc:
+                # Said out loud because the endpoint screen rejects an opening in
+                # microseconds and would otherwise pass in silence, where a failed OMPL run
+                # announces itself at length.  Both reach the same place: this opening is
+                # not the one.
+                log(f"      no route{_gun_note(opening)}: {exc}")
+                last = exc
 
     if len(candidates) < 2 or not fallback_via:
         raise last or PlanningError("freespace transit failed")
@@ -1160,7 +1172,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                     continue
             raw_first: list = []
             try:
-                first = attempt(first_open, qa, mid, 0.0, raw_first, effort=reduced)
+                first = attempt(first_open, qa, mid, 0.0, raw_first, effort=reduced,
+                                via=None)
             except PlanningError:
                 continue
             for second_open in candidates:
@@ -1169,7 +1182,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                 raw_second: list = []
                 try:
                     second = attempt(second_open, mid, qb, 0.0, raw_second,
-                                     effort=reduced)
+                                     effort=reduced, via=None)
                 except PlanningError:
                     continue
                 if record is not None:
@@ -1189,6 +1202,16 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                           check_step=check_step, log=log)
                 return [(first, first_open), (second, second_open)]
     raise last or PlanningError("freespace transit failed at every gun opening")
+
+
+def _gun_note(opening: float | None) -> str:
+    """" with the gun at 40 mm", or nothing at all where the cell has no gun joint.
+
+    ``_opening_candidates`` returns ``[None]`` for a cell without one, and there is no
+    opening to name in that case -- naming one anyway raised a TypeError out of the format
+    string, turning a transit that merely failed into a crash.
+    """
+    return "" if opening is None else f" with the gun at {opening:g} mm"
 
 
 def _effort_note(reduced: OmplBudget, full: OmplBudget) -> str:
