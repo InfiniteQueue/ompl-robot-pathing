@@ -1050,7 +1050,7 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
     for i, mid in enumerate(fallback_via):
         if cell.in_collision(mid):
             continue
-        log(f"      retrying via fallback pose {i + 1}")
+        log(f"      retrying via fallback pose {i + 1}/{len(fallback_via)}")
         # The halves are recorded jointly below: this is still one leg of the output, and
         # the fallback pose is an implementation detail of how it was found.
         halves: list[list[np.ndarray]] = []
@@ -1175,7 +1175,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                 if record is not None:
                     record.extend(raw_first + raw_second)
                 log(f"      no single gun opening reaches; changing from "
-                    f"{first_open:g} mm to {second_open:g} mm at fallback pose {i + 1}")
+                    f"{first_open:g} mm to {second_open:g} mm at fallback pose "
+                    f"{i + 1}/{len(fallback_via)}")
                 with cell.gun_opening(first_open):
                     first = _refine_runs(cell, first, zone=zone, relocate=relocate,
                                          shortcut_seconds=shortcut_seconds,
