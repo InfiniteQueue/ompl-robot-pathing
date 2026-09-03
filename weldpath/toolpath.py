@@ -22,6 +22,7 @@ from .cell import Cell
 from .manifest import Locator, Manifest
 from .cartesian import CartesianBudget
 from .planning import (LIN, PTP, LinearZone, OmplBudget, PlanningError, Relocation,
+                       unique_openings,
                        plan_freespace,
                        validate)
 
@@ -210,7 +211,11 @@ class ToolpathPlanner:
         if loc.is_weld or not self.cell.gun_joint_name:
             return [declared]
         widest = self.man.gun_opening_max
-        return [declared, widest, widest / 2.0]
+        # Deduped for the same reason a transit's list is: a gun with no travel to speak of
+        # collapses all three of these onto zero, and solving the same pose three times
+        # over means three identical failures, three diagnoses and three geometry exports
+        # before the locator is given up on.
+        return unique_openings([declared, widest, widest / 2.0], widest)
 
     def _diagnose(self, loc: Locator, seed: np.ndarray, tag: str = "",
                   opening: float = 0.0) -> str:

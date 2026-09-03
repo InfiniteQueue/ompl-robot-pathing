@@ -1179,7 +1179,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
             except PlanningError:
                 continue
             for second_open in candidates:
-                if second_open == first_open:
+                if abs(second_open - first_open) < OPENING_TOL_MM:
                     continue                    # already ruled out as a single opening
                 raw_second: list = []
                 try:
@@ -1224,6 +1224,31 @@ def _effort_note(reduced: OmplBudget, full: OmplBudget) -> str:
             f"{'' if reduced.phase_one_runs == 1 else 's'} per phase")
 
 
+# Two openings closer together than this are the same command as far as the machine is
+# concerned: the gun is a mechanism with backlash, not a number.  Anything nearer is a
+# rounding artefact -- widest/2 landing on a declared opening, or a bisection rounding onto
+# its own neighbour -- and trying it twice buys a second identical failure at full price.
+OPENING_TOL_MM = 1e-6
+
+
+def unique_openings(values: list[float], limit: float | None = None) -> list[float]:
+    """``values`` in order, without repeats, optionally clamped to ``0 .. limit``.
+
+    Every list of openings that gets walked goes through here, so that "have we tried this
+    one already" is answered the same way everywhere.  Order is preserved because these
+    lists are preference orders: the first survivor of a duplicate pair is the one whose
+    reason for being tried came first.
+    """
+    out: list[float] = []
+    for value in values:
+        value = float(value)
+        if limit is not None:
+            value = min(max(value, 0.0), limit)
+        if not any(abs(value - seen) < OPENING_TOL_MM for seen in out):
+            out.append(value)
+    return out
+
+
 def _bisect_openings(out: list[float], extra: int, round_mm: float,
                      widest: float) -> None:
     """Append ``extra`` further openings, each halving the widest untried gap so far.
@@ -1249,7 +1274,7 @@ def _bisect_openings(out: list[float], extra: int, round_mm: float,
             if round_mm > 0.0:
                 mid = round(mid / round_mm) * round_mm
             mid = float(min(max(mid, 0.0), widest))
-            if any(abs(mid - seen) < 1e-6 for seen in out):
+            if any(abs(mid - seen) < OPENING_TOL_MM for seen in out):
                 continue                       # rounded onto a neighbour: try a wider gap
             out.append(mid)
             break
@@ -1271,11 +1296,7 @@ def _opening_candidates(cell: Cell, openings: list[float] | None, extra: int = 0
     widest = cell.man.gun_opening_max
     wanted = list(openings or [])
     wanted += [0.0, widest, widest / 2.0]
-    out: list[float] = []
-    for value in wanted:
-        value = float(min(max(value, 0.0), widest))
-        if not any(abs(value - seen) < 1e-6 for seen in out):
-            out.append(value)
+    out = unique_openings(wanted, widest)
     _bisect_openings(out, extra, round_mm, widest)
     return out
 
