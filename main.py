@@ -13,6 +13,34 @@ import sys
 import time
 
 
+def _line_buffer_output() -> None:
+    """Make stdout and stderr line buffered, whatever they are attached to.
+
+    Python chooses its buffering from what the stream is: a console is line buffered, a
+    pipe is block buffered at 8 KB.  Under a caller that reads our output as it arrives -
+    the Process Simulate plugin, which redirects both streams and shows them in its log -
+    the second of those means the run appears to print nothing for hours and then
+    everything at once, because the buffer is only flushed when it fills or when we exit.
+
+    Line buffering here rather than ``flush=True`` at each print: it is one decision in
+    one place, it cannot be forgotten by a print added later, and it applies to anything
+    else that writes to these streams.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        # None under a windowed build with no console; already replaced by something
+        # without reconfigure() under a test harness.
+        if stream is None or not hasattr(stream, "reconfigure"):
+            continue
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (ValueError, OSError):
+            # A stream that will not take it still works; it is just buffered as before.
+            pass
+
+
+_line_buffer_output()
+
+
 TRUE_WORDS = ("true", "yes", "on", "1")
 FALSE_WORDS = ("false", "no", "off", "0")
 
