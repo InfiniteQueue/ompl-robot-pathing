@@ -170,8 +170,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "onto one already being tried is dropped, so a coarse setting "
                         "over a narrow range yields fewer openings than asked for. 0 "
                         "rounds nothing (default: 5)")
+    #FALLBACK POSES
+    #HOW FAR A FALLBACK POSE STAYS OFF THE PARTS
+    p.add_argument("--fallback-distance-mm", type=float, default=100.0, metavar="MM",
+                   help="how much room a fallback pose has to leave between every part of "
+                        "the robot and gun and the nearest panel or tooling, measured on "
+                        "the convex hulls the planner collides against. A pose that is "
+                        "merely collision free is not enough: the point of routing a "
+                        "difficult transit through one is that the arm has room to "
+                        "manoeuvre when it gets there (default: 100)")
+    #HOW FAR EACH SEARCH STEP MOVES
+    p.add_argument("--fallback-step-mm", type=float, default=40.0, metavar="MM",
+                   help="distance each step of the fallback-pose search moves the tool, "
+                        "for every method that searches by stepping. Smaller finds a pose "
+                        "closer in and costs more inverse-kinematics solves to reach the "
+                        "same distance out (default: 40)")
     #EFFORT ONCE THE PREFERRED ANSWER HAS FAILED
-    p.add_argument("--fallback-runs", type=int, default=1, metavar="N",
+    p.add_argument("--fallback-runs", type=int, default=3, metavar="N",
                    help="sampling-planner runs allowed per phase once the preferred gun "
                         "opening has failed -- the retried openings, and the legs of a "
                         "two-leg split through a fallback pose. Nearly the whole worst "
@@ -650,6 +665,8 @@ def main(argv: list[str] | None = None) -> int:
                                   margin_mm=args.cartesian_margin_mm,
                                   tilt_deg=args.cartesian_tilt_deg),
         fallback_runs=args.fallback_runs,
+        fallback_mm=args.fallback_distance_mm,
+        fallback_step_mm=args.fallback_step_mm,
         extra_openings=args.extra_gun_openings,
         opening_round_mm=args.gun_opening_round_mm,
         relocate=Relocation(min_attempts=args.polish_min_attempts,

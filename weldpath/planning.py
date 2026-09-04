@@ -1081,7 +1081,7 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
 def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    ompl: OmplBudget | None = None, segment_length: float = 0.02,
                    check_step: float = 0.05,
-                   fallback_via: list[np.ndarray] | None = None,
+                   fallback_via=None,
                    fallback_runs: int = 0,
                    shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                    planning_time: float = DEFAULT_PLANNING_TIME,
@@ -1111,6 +1111,12 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     ``fallback_runs`` caps the sampling-planner budget for everything past the first
     attempt at the preferred opening -- see ``OmplBudget.capped``.  That tail is where
     nearly all of the worst case sits, and it is also where the full budget buys least.
+
+    ``fallback_via`` is either the poses to detour through or a zero-argument callable
+    returning them.  The callable form exists because finding them is now a search of its
+    own -- see :mod:`weldpath.fallback` -- and most transits solve at the first opening and
+    never need one.  It is called at most once, and only after every opening has been tried
+    directly, so a transit that solves pays nothing for the search it did not use.
     """
     ompl = ompl or OmplBudget()
     reduced = ompl.capped(fallback_runs)
@@ -1137,11 +1143,29 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     # be exhausted first.  The old order asked both questions at once -- each opening
     # direct, then immediately that same opening through every via -- which spent the
     # whole two-leg budget at the preferred opening before so much as looking at the next.
+    resolved: list | None = None
+
+    def vias() -> list:
+        """The fallback poses, found on first use and remembered."""
+        nonlocal resolved
+        if resolved is None:
+            got = fallback_via() if callable(fallback_via) else fallback_via
+            resolved = list(got or [])
+        return resolved
+
+    def routes():
+        """``None`` for the direct route, then one entry per fallback pose.
+
+        A generator rather than a list so that ``vias()`` is not reached until the direct
+        route has been tried at every opening and failed.
+        """
+        yield None
+        yield from vias()
+
     last = None
-    routes: list = [None] + list(fallback_via or [])
-    for v, via in enumerate(routes):
+    for v, via in enumerate(routes()):
         if v:
-            log(f"      retrying via fallback pose {v}/{len(routes) - 1}")
+            log(f"      retrying via fallback pose {v}/{len(vias())}")
         for n, opening in enumerate(candidates):
             preferred = v == 0 and n == 0
             try:
@@ -1162,12 +1186,12 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                 log(f"      no route{_gun_note(opening)}: {exc}")
                 last = exc
 
-    if len(candidates) < 2 or not fallback_via:
+    if len(candidates) < 2 or not vias():
         raise last or PlanningError("freespace transit failed")
 
     # No single opening reaches: split the move and change the gun partway, at a pose the
     # robot is already passing through and stationary at.
-    for i, mid in enumerate(fallback_via):
+    for i, mid in enumerate(vias()):
         for first_open in candidates:
             with cell.gun_opening(first_open):
                 if cell.in_collision(mid):
@@ -1191,7 +1215,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                     record.extend(raw_first + raw_second)
                 log(f"      no single gun opening reaches; changing from "
                     f"{first_open:g} mm to {second_open:g} mm at fallback pose "
-                    f"{i + 1}/{len(fallback_via)}")
+                    f"{i + 1}/{len(vias())}")
                 with cell.gun_opening(first_open):
                     first = _refine_runs(cell, first, zone=zone, relocate=relocate,
                                          shortcut_seconds=shortcut_seconds,
