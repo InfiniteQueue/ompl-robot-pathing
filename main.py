@@ -394,12 +394,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "wanted; prefer the per-category options (default: 0, i.e. off)")
     p.add_argument("--robot-enclosed-mm", type=float, default=None, metavar="MM",
                    help="--enclosed-probe-mm for the arm's own links (default: unset)")
-    p.add_argument("--gun-enclosed-mm", type=float, default=None, metavar="MM",
+    p.add_argument("--gun-enclosed-mm", type=float, default=40, metavar="MM",
                    help="--enclosed-probe-mm for the gun body and moving tip. This is the "
                         "geometry the filter was written for: the body is a hollow casing "
                         "packed with internals, and it is only 232 mm across its narrow "
                         "axis on the sample cell, so nothing inside it is far enough from "
-                        "the surface to be culled by margin alone (default: unset)")
+                        "the surface to be culled by margin alone (default: 40)")
     p.add_argument("--tooling-enclosed-mm", type=float, default=None, metavar="MM",
                    help="--enclosed-probe-mm for static objects the manifest calls "
                         "tooling. These are the largest meshes in the cell, so the "
@@ -410,7 +410,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "A panel is a skin rather than an assembly, so there is usually "
                         "nothing sealed inside it to find (default: unset)")
     #SCREENING RESOLUTION
-    p.add_argument("--enclosed-voxel-mm", type=float, default=8.0, metavar="MM",
+    p.add_argument("--enclosed-voxel-mm", type=float, default=12.0, metavar="MM",
                    help="voxel size the reachability screen runs at. It decides what "
                         "counts as a hole: a gap narrower than about this reads as closed "
                         "however the CAD tessellated it. Smaller is more faithful and "
@@ -418,14 +418,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "4 mm gave the same answer to within 2%% of components, at 7.6 s "
                         "against 23 s. Coarsened automatically where a mesh is too large "
                         "for the grid to fit in memory, which is reported when it happens "
-                        "(default: 8)")
+                        "(default: 12)")
     #SIZE BACKSTOP
-    p.add_argument("--enclosed-keep-mm", type=float, default=250.0, metavar="MM",
+    p.add_argument("--enclosed-keep-mm", type=float, default=0, metavar="MM",
                    help="never drop a shell whose bounding-box diagonal reaches this, "
                         "however sealed it looks. Something this large reading as "
                         "unreachable is more often a rasterisation the geometry defeated "
                         "than a part sealed inside a casing, and the count is reported so "
-                        "the two can be told apart. 0 removes the backstop (default: 250)")
+                        "the two can be told apart. 0 removes the backstop (default: 500)")
     #INSPECTION
     p.add_argument("--export-enclosed", action="store_true",
                    help="write what the reachability screen discarded to "
