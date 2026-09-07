@@ -347,9 +347,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "--robot-cell-mm is 0, since nothing on the arm is refined at all "
                         "(default: 0, i.e. one hull)")
     #CELL SIZE: GUN
-    p.add_argument("--gun-cell-mm", type=float, default=80, metavar="MM",
+    p.add_argument("--gun-cell-mm", type=float, default=40, metavar="MM",
                    help="--hull-cell-mm for the gun body and moving tip. Reduces "
-                        "webbing around the electrodes at lower values (default: 80)")
+                        "webbing around the electrodes at lower values (default: 40)")
     #FAR CELL SIZE: GUN
     p.add_argument("--gun-far-cell-mm", type=float, default=360, metavar="MM",
                    help="--far-cell-mm for the gun body and moving tip, i.e. the part of "
@@ -378,6 +378,61 @@ def build_parser() -> argparse.ArgumentParser:
                         "part of a panel away from every weld still has to be traversed, "
                         "so it is worth keeping finer than the tooling around it "
                         "(default: 40)")
+    #region ###UNREACHABLE SHELLS###
+    #PROBE RADIUS PER CATEGORY
+    p.add_argument("--enclosed-probe-mm", type=float, default=0, metavar="MM",
+                   help="drop shells that nothing of this radius can reach from outside "
+                        "the link. Assembled CAD carries every solid in the assembly, and "
+                        "on a gun body most of them are motors, cabling and brackets "
+                        "sealed inside a casing the robot only ever touches from outside "
+                        "-- a third of the components on the sample gun. Set it to the "
+                        "radius of the smallest feature that must still be able to reach "
+                        "in. Unlike --min-shell-mm this removes real material, so a shell "
+                        "wrongly called sealed is a collision that will not be reported; "
+                        "read --enclosed-keep-mm and --export-enclosed before trusting it. "
+                        "Applies to every category at once, which is rarely what is "
+                        "wanted; prefer the per-category options (default: 0, i.e. off)")
+    p.add_argument("--robot-enclosed-mm", type=float, default=None, metavar="MM",
+                   help="--enclosed-probe-mm for the arm's own links (default: unset)")
+    p.add_argument("--gun-enclosed-mm", type=float, default=None, metavar="MM",
+                   help="--enclosed-probe-mm for the gun body and moving tip. This is the "
+                        "geometry the filter was written for: the body is a hollow casing "
+                        "packed with internals, and it is only 232 mm across its narrow "
+                        "axis on the sample cell, so nothing inside it is far enough from "
+                        "the surface to be culled by margin alone (default: unset)")
+    p.add_argument("--tooling-enclosed-mm", type=float, default=None, metavar="MM",
+                   help="--enclosed-probe-mm for static objects the manifest calls "
+                        "tooling. These are the largest meshes in the cell, so the "
+                        "screening grid is coarsest here and the answer least precise "
+                        "(default: unset)")
+    p.add_argument("--panel-enclosed-mm", type=float, default=None, metavar="MM",
+                   help="--enclosed-probe-mm for static objects the manifest calls panel. "
+                        "A panel is a skin rather than an assembly, so there is usually "
+                        "nothing sealed inside it to find (default: unset)")
+    #SCREENING RESOLUTION
+    p.add_argument("--enclosed-voxel-mm", type=float, default=8.0, metavar="MM",
+                   help="voxel size the reachability screen runs at. It decides what "
+                        "counts as a hole: a gap narrower than about this reads as closed "
+                        "however the CAD tessellated it. Smaller is more faithful and "
+                        "costs time and memory as its cube; on the sample gun 8 mm and "
+                        "4 mm gave the same answer to within 2%% of components, at 7.6 s "
+                        "against 23 s. Coarsened automatically where a mesh is too large "
+                        "for the grid to fit in memory, which is reported when it happens "
+                        "(default: 8)")
+    #SIZE BACKSTOP
+    p.add_argument("--enclosed-keep-mm", type=float, default=250.0, metavar="MM",
+                   help="never drop a shell whose bounding-box diagonal reaches this, "
+                        "however sealed it looks. Something this large reading as "
+                        "unreachable is more often a rasterisation the geometry defeated "
+                        "than a part sealed inside a casing, and the count is reported so "
+                        "the two can be told apart. 0 removes the backstop (default: 250)")
+    #INSPECTION
+    p.add_argument("--export-enclosed", action="store_true",
+                   help="write what the reachability screen discarded to "
+                        "<study>/convex_cache/<link>.sealed.obj, so a probe can be looked "
+                        "at rather than believed. This is the one hull filter that can "
+                        "lose a real collision, so look once per new part")
+    #endregion
     #WELD PROXIMITY FOR SHELL SPLIT
     p.add_argument("--shell-split-weld-prox", type=float, default=60.0, metavar="MM", #consider moving up to 100/150
                    help="only refine panel and tooling geometry within this many mm of "
@@ -622,6 +677,9 @@ def main(argv: list[str] | None = None) -> int:
                         "panel": args.panel_far_cell_mm}
     per_category = {"robot": args.robot_cell_mm, "gun": args.gun_cell_mm,
                     "tooling": args.tooling_cell_mm, "panel": args.panel_cell_mm}
+    enclosed_per_category = {"robot": args.robot_enclosed_mm, "gun": args.gun_enclosed_mm,
+                             "tooling": args.tooling_enclosed_mm,
+                             "panel": args.panel_enclosed_mm}
 
     try:
         cell = cell_mod.build(man, log=log, min_shell_mm=args.min_shell_mm,
@@ -634,6 +692,11 @@ def main(argv: list[str] | None = None) -> int:
                               far_cell_mm=args.far_cell_mm,
                               far_per_category=far_per_category,
                               hull_overlap=args.hull_cell_overlap,
+                              enclosed_per_category=enclosed_per_category,
+                              enclosed_probe_mm=args.enclosed_probe_mm,
+                              enclosed_voxel_mm=args.enclosed_voxel_mm,
+                              enclosed_keep_mm=args.enclosed_keep_mm,
+                              enclosed_dump=args.export_enclosed,
                               obstacle_clearance_mm=args.obstacle_clearance_mm,
                               tcp_check_mm=args.check_step_mm,
                               export_dir=(directory if args.export_collision_geometry

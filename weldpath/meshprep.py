@@ -372,12 +372,36 @@ def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
     return V, pieces, near_pieces
 
 
+def _write_groups(dst: str, V: np.ndarray, F: np.ndarray,
+                  groups: list[tuple[np.ndarray, np.ndarray]], scale: float,
+                  src: str) -> None:
+    """Write each group as its own ``o`` block, which is one convex hull to Tesseract."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "w", encoding="utf-8") as fh:
+        fh.write("# weldpath convex-decomposition source=%s\n" % os.path.basename(src))
+        fh.write("# %d triangles, %d groups, units=metres\n" % (len(F), len(groups)))
+        offset = 1
+        for gi, (vids, tris) in enumerate(groups):
+            remap = {int(v): i + offset for i, v in enumerate(vids)}
+            fh.write("o shell_%05d\n" % gi)
+            for v in vids:
+                x, y, z = V[v] * scale
+                fh.write("v %.6f %.6f %.6f\n" % (x, y, z))
+            for tri in tris:
+                fh.write("f %d %d %d\n"
+                         % (remap[int(tri[0])], remap[int(tri[1])], remap[int(tri[2])]))
+            offset += len(vids)
+
+
 def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
                      min_extent: float = 40.0, max_shells: int = 80,
                      hull_cell: float = 0.0, fill_threshold: float = 0.75,
                      focus_points: np.ndarray | None = None,
                      focus_radius: float = 0.0, far_cell: float = 0.0,
-                     overlap: float = DEFAULT_OVERLAP) -> dict:
+                     overlap: float = DEFAULT_OVERLAP,
+                     enclosed_probe: float = 0.0, enclosed_voxel: float = 0.0,
+                     enclosed_keep: float = 0.0,
+                     enclosed_dump: str | None = None) -> dict:
     """Split ``src`` into connected shells and write them as ``o`` groups into ``dst``.
 
     Every shell becomes a convex hull, and each hull is a collision pair to test, so the
@@ -387,6 +411,11 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
     only the ``max_shells`` largest survive.  On the sample cell this takes the gun from
     948 shells to 80 and a collision check from 2.8 ms to 1.6 ms, which is the difference
     between the sampling planner timing out and solving in a few seconds.
+
+    A third filter joins them when ``enclosed_probe`` is set: shells nothing of that radius
+    can reach from outside the link are dropped, which on assembled CAD is most of what the
+    file contains.  See :mod:`weldpath.enclosed` -- in particular for why this one can lose
+    a real collision where the other two cannot, and what ``enclosed_keep`` does about it.
     """
     t0 = time.time()
     V, F = load_obj(src)
@@ -394,8 +423,29 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
     labels = connected_shells(V, F)
     unique = np.unique(labels)
 
+    # Before ``min_extent``, and so before the cap: what cannot be touched is not geometry
+    # this cell has any use for, and letting it compete for a place under ``max_shells``
+    # would mean the cap spent on parts nothing can reach.
+    sealed: set = set()
+    enc_stats: dict = {}
+    if enclosed_probe > 0.0:
+        from . import enclosed as _enclosed
+        sealed, enc_stats = _enclosed.sealed_labels(
+            V, F, labels, probe=enclosed_probe,
+            voxel=enclosed_voxel if enclosed_voxel > 0.0 else enclosed_probe,
+            keep_extent=enclosed_keep)
+        if enclosed_dump and sealed:
+            # What was discarded, written beside the kept geometry so a change of probe can
+            # be looked at rather than believed.  This filter removes real material, which
+            # none of the others do, so it is the one that has to be inspectable.
+            _write_groups(enclosed_dump, V, F,
+                          [(np.unique(F[labels == lab]), F[labels == lab])
+                           for lab in sorted(sealed)], scale, src)
+
     candidates: list[tuple[float, np.ndarray, np.ndarray, tuple]] = []
     for lab in unique:
+        if int(lab) in sealed:
+            continue
         tris = F[labels == lab]
         vids = np.unique(tris)
         P = V[vids]
@@ -451,22 +501,7 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
             refined.extend((np.unique(piece), piece) for piece in pieces)
         groups = refined
 
-    os.makedirs(os.path.dirname(dst), exist_ok=True)
-    with open(dst, "w", encoding="utf-8") as fh:
-        fh.write("# weldpath convex-decomposition source=%s\n" % os.path.basename(src))
-        fh.write("# %d triangles, %d shells (%d after dedupe), units=metres\n"
-                 % (len(F), len(unique), len(groups)))
-        offset = 1
-        for gi, (vids, tris) in enumerate(groups):
-            remap = {int(v): i + offset for i, v in enumerate(vids)}
-            fh.write("o shell_%05d\n" % gi)
-            for v in vids:
-                x, y, z = V[v] * scale
-                fh.write("v %.6f %.6f %.6f\n" % (x, y, z))
-            for tri in tris:
-                fh.write("f %d %d %d\n"
-                         % (remap[int(tri[0])], remap[int(tri[1])], remap[int(tri[2])]))
-            offset += len(vids)
+    _write_groups(dst, V, F, groups, scale, src)
 
     return {
         "triangles": int(len(F)),
@@ -480,6 +515,9 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
         # refinement gate is one hull that was never sorted either way.
         "shells_near_focus": int(near_hulls),
         "shells_far_focus": int(far_hulls),
+        # Absent entirely when no probe was given, so a cache entry can be told apart from
+        # one where the filter ran and found nothing to drop.
+        **({"enclosed": enc_stats} if enc_stats else {}),
         "seconds": round(time.time() - t0, 2),
     }
 
@@ -516,13 +554,41 @@ def _focus_share(stats: dict) -> str:
             f"{100.0 * near / (near + far):.0f}% of those near the focus")
 
 
+def _enclosed_share(stats: dict) -> str:
+    """What the enclosure filter discarded on one link, as a phrase.
+
+    Empty when no probe was given.  When one was and it dropped nothing the phrase still
+    appears, saying so: a filter that ran and found nothing is a different fact from a
+    filter that was switched off, and only one of them is a reason to widen the probe.
+    """
+    enc = stats.get("enclosed")
+    if not enc:
+        return ""
+    total = int(stats.get("shells", 0)) or 1
+    out = (f", {enc['sealed']} sealed inside ({100.0 * enc['sealed'] / total:.0f}% of "
+           f"shells, {100.0 * enc['sealed_triangles'] / max(int(stats.get('triangles', 1)), 1):.0f}% "
+           f"of triangles) dropped as unreachable by a {enc['probe']:g} mm probe")
+    if enc.get("kept_large"):
+        # Named on the line rather than left to the stats file.  These are components the
+        # flood called sealed and the size backstop overruled, which is the one number that
+        # says the two disagree -- and disagreement here is the signal that the probe or
+        # the voxel is wrong, not a detail.
+        out += (f" ({enc['kept_large']} spared by the size backstop)")
+    if enc.get("coarsened"):
+        out += f" [screened at {enc['voxel']:.0f} mm, coarsened to fit memory]"
+    return out
+
+
 def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             log=print, min_extent: float = 40.0, max_shells: int = 80,
             hull_cell: float = 0.0, fill: float = DEFAULT_FILL,
             cells: dict[str, float] | None = None,
             focus: dict[str, tuple[np.ndarray, float]] | None = None,
             far_cells: dict[str, float] | None = None, far_cell: float = 0.0,
-            overlap: float = DEFAULT_OVERLAP) -> dict[str, str]:
+            overlap: float = DEFAULT_OVERLAP,
+            enclosed_probes: dict[str, float] | None = None,
+            enclosed_voxel: float = 0.0, enclosed_keep: float = 0.0,
+            enclosed_dump: bool = False) -> dict[str, str]:
     """Convex-decompose every mesh that needs it, reusing cached results.
 
     ``mesh_rel_paths`` maps link name -> mesh path relative to ``directory``.
@@ -537,6 +603,12 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
     ``far_cell``.  It is an absolute size rather than a multiple of the link's own cell:
     the two answer different questions, and tightening the near side is not a reason for
     the far side to follow it down.
+
+    ``enclosed_probes`` maps a link to the radius of the smallest thing that could reach
+    into it; shells nothing that size can touch from outside are dropped before anything
+    else looks at them.  Per link and off by default, because it is per link that the
+    question makes sense -- a gun body is full of motors and a panel is not -- and because
+    it is the one filter here that can remove geometry a collision needed.
     """
     focus = {k: (np.asarray(pts, dtype=float).reshape(-1, 3), float(r))
              for k, (pts, r) in (focus or {}).items() if pts is not None and len(pts)}
@@ -555,6 +627,7 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
     for link, rel in mesh_rel_paths.items():
         cell = float((cells or {}).get(link, hull_cell))
         far = float((far_cells or {}).get(link, far_cell))
+        probe = float((enclosed_probes or {}).get(link, 0.0))
         threshold = float(fill)
         points, radius = focus.get(link, (None, 0.0))
         settings = [round(float(min_extent), 4), int(max_shells), round(float(scale), 9),
@@ -582,17 +655,28 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
                          # The near and far sets no longer overlap, so geometry cached while
                          # they did holds a coarse duplicate of the refined material.
                          "disjoint"]
+        if probe > 0.0:
+            # Appended only where the filter is on, so every cache built before it existed
+            # stays valid.  The voxel is in the key as well as the probe: it is a screening
+            # resolution, not a tolerance, and a coarser one genuinely keeps different
+            # shells rather than the same ones measured more loosely.
+            settings += ["sealed", round(probe, 4), round(float(enclosed_voxel), 4),
+                         round(float(enclosed_keep), 4)]
         src = os.path.join(directory, rel).replace("\\", "/")
         if not os.path.isfile(src):
             log(f"  ! missing mesh for {link}: {rel}")
             continue
         dst = os.path.join(cache_dir, f"{link}.obj").replace("\\", "/")
+        # Beside the kept geometry, in the cache the run owns -- never in the study's own
+        # mesh directory, which is the customer's input.
+        dump = os.path.join(cache_dir, f"{link}.sealed.obj").replace("\\", "/")
         sig = _signature(src)
         cached = index.get(link)
         if (cached and cached.get("sig") == sig and cached.get("settings") == settings
                 and os.path.isfile(dst)):
             log(f"  = {link:<22} cached ({cached['stats']['shells_kept']} shells"
-                f"{_focus_share(cached['stats'])})")
+                f"{_focus_share(cached['stats'])}"
+                f"{_enclosed_share(cached['stats'])})")
             out[link] = dst
             continue
         log(f"  . {link:<22} decomposing {os.path.getsize(src) / 1e6:.1f} MB of "
@@ -601,15 +685,19 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
                                  max_shells=max_shells, hull_cell=cell,
                                  fill_threshold=threshold, focus_points=points,
                                  focus_radius=radius, far_cell=far,
-                                 overlap=overlap)
+                                 overlap=overlap, enclosed_probe=probe,
+                                 enclosed_voxel=enclosed_voxel,
+                                 enclosed_keep=enclosed_keep,
+                                 enclosed_dump=(dump if enclosed_dump and probe > 0.0
+                                                else None))
         near = ((f" within {radius:g} mm of a focus point, "
                  + (f"{far:g} mm beyond it" if far > 0.0 else "one hull beyond it"))
                 if radius > 0.0 else "")
         refined = (f", {stats['shells_refined']} split at {cell:g} mm below "
                    f"{threshold:g} fill{near}" if stats["shells_refined"] else "")
-        log("  + %-22s %d tris, %d shells -> %d kept%s%s (%.1fs)"
+        log("  + %-22s %d tris, %d shells -> %d kept%s%s%s (%.1fs)"
             % (link, stats["triangles"], stats["shells"], stats["shells_kept"],
-               refined, _focus_share(stats), stats["seconds"]))
+               _enclosed_share(stats), refined, _focus_share(stats), stats["seconds"]))
         index[link] = {"sig": sig, "settings": settings, "stats": stats}
         out[link] = dst
 

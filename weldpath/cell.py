@@ -757,7 +757,12 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
                               tcp_proximity: float = 0.0,
                               far_cell_mm: float = 0.0,
                               far_per_category=None,
-                              hull_overlap: float | None = None) -> dict[str, str]:
+                              hull_overlap: float | None = None,
+                              enclosed_per_category=None,
+                              enclosed_probe_mm: float = 0.0,
+                              enclosed_voxel_mm: float = 0.0,
+                              enclosed_keep_mm: float = 0.0,
+                              enclosed_dump: bool = False) -> dict[str, str]:
     from . import meshprep
 
     overlap = meshprep.DEFAULT_OVERLAP if hull_overlap is None else float(hull_overlap)
@@ -789,13 +794,32 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
     if hull_cell > 0.0:
         log(f"  cells claim triangles {overlap:g} of a cell past their own bounds, so a "
             f"cell's hull spans about {1.0 + 2.0 * overlap:.2f}x the cell")
+    # Reuses the cell resolver because the question has the same shape -- a per-category
+    # figure over a global one -- but the global default is 0, so a category nobody named
+    # is left alone.  This filter deletes geometry, and switching it on for a link is a
+    # decision about that link.
+    probes = {k: v for k, v in
+              hull_cells(man, enclosed_probe_mm, enclosed_per_category).items() if v > 0}
+    if probes:
+        by_category: dict[str, float] = {}
+        categories = hull_categories(man)
+        for name, value in probes.items():
+            by_category[categories[name]] = value
+        log("  dropping shells no probe can reach from outside the link: "
+            + ", ".join(f"{c} {v:g} mm" for c, v in sorted(by_category.items()))
+            + f", screened on a {enclosed_voxel_mm:g} mm voxel"
+            + (f", never above {enclosed_keep_mm:g} mm across" if enclosed_keep_mm > 0
+               else ", with no size backstop"))
     return meshprep.prepare(man.directory, rel, man.scale, log=log,
                             min_extent=min_extent, max_shells=max_shells,
                             hull_cell=hull_cell, fill=hull_fill,
                             cells=hull_cells(man, hull_cell, hull_per_category),
                             focus=focus, far_cell=far_cell_mm,
                             far_cells=hull_cells(man, far_cell_mm, far_per_category),
-                            overlap=overlap)
+                            overlap=overlap, enclosed_probes=probes,
+                            enclosed_voxel=enclosed_voxel_mm,
+                            enclosed_keep=enclosed_keep_mm,
+                            enclosed_dump=enclosed_dump)
 
 
 # Probe distance for the exact re-measurement.  Generous on purpose: a pair the hulls
@@ -1052,6 +1076,9 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
           tcp_proximity_mm: float = 0.0, far_cell_mm: float = 0.0,
           far_per_category=None,
           hull_overlap: float | None = None,
+          enclosed_per_category=None, enclosed_probe_mm: float = 0.0,
+          enclosed_voxel_mm: float = 0.0,
+          enclosed_keep_mm: float = 0.0, enclosed_dump: bool = False,
           obstacle_clearance_mm: float = 0.0, tcp_check_mm: float = 0.0,
           export_dir: str | None = None,
           penalty=None, dynamics=None) -> Cell:
@@ -1059,7 +1086,10 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
     collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm,
                                           hull_fill, hull_per_category, weld_proximity_mm,
                                           tcp_proximity_mm, far_cell_mm, far_per_category,
-                                          hull_overlap)
+                                          hull_overlap, enclosed_per_category,
+                                          enclosed_probe_mm,
+                                          enclosed_voxel_mm, enclosed_keep_mm,
+                                          enclosed_dump)
     velocity = {}
     if dynamics is not None:
         velocity = {n: float(v) for n, v in zip(man.robot_joint_names, dynamics.velocity)}
