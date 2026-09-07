@@ -38,6 +38,13 @@ FILL = 0.75                # --hull-fill
 OVERLAP = 0.02             # --hull-cell-overlap
 SCALE = 1.0                # source units, so the output overlays the source
 
+# --enclosed-probe-mm and friends.  Off by default, as on the command line: the point of
+# running it here is to see what a probe would have thrown away *before* a run relies on
+# it, so the discarded shells are written out as their own file next to each sweep.
+ENCLOSED_PROBE = 0.0
+ENCLOSED_VOXEL = 8.0       # --enclosed-voxel-mm
+ENCLOSED_KEEP = 250.0      # --enclosed-keep-mm
+
 
 # One parse per mesh instead of one per cell size: the largest of these is 149 MB, and
 # decompose_to_obj would otherwise re-read it eight times.  Copies go out rather than the
@@ -91,16 +98,25 @@ def read_groups(path: str):
     return groups
 
 
-def sweep(stem: str, cells, out_dir: str, scratch: str):
+def sweep(stem: str, cells, out_dir: str, scratch: str, probe: float = 0.0):
     src = os.path.join(MESH_DIR, stem + ".obj")
     rows = []
     for cell in cells:
         t0 = time.time()
         tmp = os.path.join(scratch, "shells_%s_%g.obj" % (stem, cell))
+        # The discarded shells go to the scratch directory and are hulled into the output
+        # like any other geometry, so what the probe removed can be loaded beside what it
+        # kept.  Written once per cell size rather than once per mesh because the file is
+        # cheap and having it match the sweep it belongs to is worth more than the bytes.
+        cut = os.path.join(scratch, "sealed_%s_%g.obj" % (stem, cell)) if probe > 0 else None
         stats = meshprep.decompose_to_obj(src, tmp, SCALE, min_extent=MIN_EXTENT,
                                           max_shells=MAX_SHELLS, hull_cell=cell,
                                           fill_threshold=FILL, focus_points=None,
-                                          focus_radius=0.0, overlap=OVERLAP)
+                                          focus_radius=0.0, overlap=OVERLAP,
+                                          enclosed_probe=probe,
+                                          enclosed_voxel=ENCLOSED_VOXEL,
+                                          enclosed_keep=ENCLOSED_KEEP,
+                                          enclosed_dump=cut)
         groups = read_groups(tmp)
         hulls, verts = [], 0
         for name, V, _tris in groups:
@@ -114,15 +130,39 @@ def sweep(stem: str, cells, out_dir: str, scratch: str):
             "weldpath convex collision geometry, source=%s.obj" % stem,
             "hull-cell-mm=%g, hull-fill=%g, min-shell-mm=%g, max-shells=%d, overlap=%g"
             % (cell, FILL, MIN_EXTENT, MAX_SHELLS, OVERLAP),
+            "enclosed-probe-mm=%g, enclosed-voxel-mm=%g, enclosed-keep-mm=%g"
+            % (probe, ENCLOSED_VOXEL, ENCLOSED_KEEP),
             "refinement unfocused; %d hulls, %d triangles of source mesh"
             % (len(hulls), stats["triangles"]),
             "units are the source mesh's own, so this overlays it directly",
         ], hulls)
         os.remove(tmp)
+        enc = stats.get("enclosed") or {}
+        if cut and os.path.isfile(cut):
+            groups = read_groups(cut)
+            cuts = []
+            for name, V, _tris in groups:
+                tris = hullexport._hull(V, cull_min=CULL_MIN)
+                if tris:
+                    cuts.append((name.replace("shell", "sealed"), (V, tris)))
+            hullexport._write_obj(
+                os.path.join(out_dir, "%s_cell%03gmm_discarded.obj" % (stem, cell)),
+                ["what --enclosed-probe-mm %g discarded from %s.obj" % (probe, stem),
+                 "%d shells, %.1f%% of the source triangles, screened on a %g mm voxel"
+                 % (enc.get("sealed", 0),
+                    100.0 * enc.get("sealed_triangles", 0) / max(stats["triangles"], 1),
+                    enc.get("voxel", ENCLOSED_VOXEL)),
+                 "NOT collision geometry: this is the material the probe removed",
+                 "units are the source mesh's own, so this overlays it directly"], cuts)
+            os.remove(cut)
         dt = time.time() - t0
         rows.append((cell, len(hulls), verts, faces, dt))
-        print("    %5.0f mm -> %5d hulls, %7d verts, %7d tris  (%5.1fs)"
-              % (cell, len(hulls), verts, faces, dt), flush=True)
+        print("    %5.0f mm -> %5d hulls, %7d verts, %7d tris  (%5.1fs)%s"
+              % (cell, len(hulls), verts, faces, dt,
+                 ("  [%d sealed shells dropped, %.0f%% of triangles]"
+                  % (enc["sealed"],
+                     100.0 * enc["sealed_triangles"] / max(stats["triangles"], 1)))
+                 if enc else ""), flush=True)
     return rows
 
 
@@ -131,6 +171,10 @@ if __name__ == "__main__":
     os.makedirs(OUT_DIR, exist_ok=True)
     stems = sys.argv[1].split(",") if len(sys.argv) > 1 else MESHES
     cells = [float(c) for c in sys.argv[2].split(",")] if len(sys.argv) > 2 else CELLS
+    # Third argument is --enclosed-probe-mm.  Given one, each sweep also writes a
+    # `_discarded` file holding exactly what the probe threw away, which is the thing to
+    # look at before a run is allowed to depend on it.
+    probe = float(sys.argv[3]) if len(sys.argv) > 3 else ENCLOSED_PROBE
     for stem in stems:
         print("  %s" % stem, flush=True)
-        sweep(stem, cells, OUT_DIR, scratch)
+        sweep(stem, cells, OUT_DIR, scratch, probe)

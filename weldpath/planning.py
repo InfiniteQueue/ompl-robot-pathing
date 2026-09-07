@@ -1081,11 +1081,12 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
 def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    ompl: OmplBudget | None = None, segment_length: float = 0.02,
                    check_step: float = 0.05,
-                   fallback_via: list[np.ndarray] | None = None,
+                   fallback_via=None,
                    fallback_runs: int = 0,
                    shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                    planning_time: float = DEFAULT_PLANNING_TIME,
                    openings: list[float] | None = None,
+                   extra_openings: int = 0, opening_round_mm: float = 0.0,
                    zone: LinearZone | None = None,
                    cartesian: "CartesianBudget | None" = None,
                    relocate: "Relocation | None" = None,
@@ -1110,6 +1111,12 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     ``fallback_runs`` caps the sampling-planner budget for everything past the first
     attempt at the preferred opening -- see ``OmplBudget.capped``.  That tail is where
     nearly all of the worst case sits, and it is also where the full budget buys least.
+
+    ``fallback_via`` is either the poses to detour through or a zero-argument callable
+    returning them.  The callable form exists because finding them is now a search of its
+    own -- see :mod:`weldpath.fallback` -- and most transits solve at the first opening and
+    never need one.  It is called at most once, and only after every opening has been tried
+    directly, so a transit that solves pays nothing for the search it did not use.
     """
     ompl = ompl or OmplBudget()
     reduced = ompl.capped(fallback_runs)
@@ -1124,7 +1131,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                     zone=zone, cartesian=cartesian,
                                     relocate=relocate, log=log, record=into)
 
-    candidates = _opening_candidates(cell, openings)
+    candidates = _opening_candidates(cell, openings, extra_openings,
+                                     opening_round_mm)
 
     # One opening for the whole transit, in preference order: changing the gun is a real
     # operation on the machine, so it is a last resort rather than a free parameter.
@@ -1135,11 +1143,29 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     # be exhausted first.  The old order asked both questions at once -- each opening
     # direct, then immediately that same opening through every via -- which spent the
     # whole two-leg budget at the preferred opening before so much as looking at the next.
+    resolved: list | None = None
+
+    def vias() -> list:
+        """The fallback poses, found on first use and remembered."""
+        nonlocal resolved
+        if resolved is None:
+            got = fallback_via() if callable(fallback_via) else fallback_via
+            resolved = list(got or [])
+        return resolved
+
+    def routes():
+        """``None`` for the direct route, then one entry per fallback pose.
+
+        A generator rather than a list so that ``vias()`` is not reached until the direct
+        route has been tried at every opening and failed.
+        """
+        yield None
+        yield from vias()
+
     last = None
-    routes: list = [None] + list(fallback_via or [])
-    for v, via in enumerate(routes):
+    for v, via in enumerate(routes()):
         if v:
-            log(f"      retrying via fallback pose {v}/{len(routes) - 1}")
+            log(f"      retrying via fallback pose {v}/{len(vias())}")
         for n, opening in enumerate(candidates):
             preferred = v == 0 and n == 0
             try:
@@ -1160,12 +1186,12 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                 log(f"      no route{_gun_note(opening)}: {exc}")
                 last = exc
 
-    if len(candidates) < 2 or not fallback_via:
+    if len(candidates) < 2 or not vias():
         raise last or PlanningError("freespace transit failed")
 
     # No single opening reaches: split the move and change the gun partway, at a pose the
     # robot is already passing through and stationary at.
-    for i, mid in enumerate(fallback_via):
+    for i, mid in enumerate(vias()):
         for first_open in candidates:
             with cell.gun_opening(first_open):
                 if cell.in_collision(mid):
@@ -1177,7 +1203,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
             except PlanningError:
                 continue
             for second_open in candidates:
-                if second_open == first_open:
+                if abs(second_open - first_open) < OPENING_TOL_MM:
                     continue                    # already ruled out as a single opening
                 raw_second: list = []
                 try:
@@ -1189,7 +1215,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                     record.extend(raw_first + raw_second)
                 log(f"      no single gun opening reaches; changing from "
                     f"{first_open:g} mm to {second_open:g} mm at fallback pose "
-                    f"{i + 1}/{len(fallback_via)}")
+                    f"{i + 1}/{len(vias())}")
                 with cell.gun_opening(first_open):
                     first = _refine_runs(cell, first, zone=zone, relocate=relocate,
                                          shortcut_seconds=shortcut_seconds,
@@ -1222,18 +1248,80 @@ def _effort_note(reduced: OmplBudget, full: OmplBudget) -> str:
             f"{'' if reduced.phase_one_runs == 1 else 's'} per phase")
 
 
-def _opening_candidates(cell: Cell, openings: list[float] | None) -> list[float | None]:
-    """Openings to try for a transit, most preferred first and without duplicates."""
+# Two openings closer together than this are the same command as far as the machine is
+# concerned: the gun is a mechanism with backlash, not a number.  Anything nearer is a
+# rounding artefact -- widest/2 landing on a declared opening, or a bisection rounding onto
+# its own neighbour -- and trying it twice buys a second identical failure at full price.
+OPENING_TOL_MM = 1e-6
+
+
+def unique_openings(values: list[float], limit: float | None = None) -> list[float]:
+    """``values`` in order, without repeats, optionally clamped to ``0 .. limit``.
+
+    Every list of openings that gets walked goes through here, so that "have we tried this
+    one already" is answered the same way everywhere.  Order is preserved because these
+    lists are preference orders: the first survivor of a duplicate pair is the one whose
+    reason for being tried came first.
+    """
+    out: list[float] = []
+    for value in values:
+        value = float(value)
+        if limit is not None:
+            value = min(max(value, 0.0), limit)
+        if not any(abs(value - seen) < OPENING_TOL_MM for seen in out):
+            out.append(value)
+    return out
+
+
+def _bisect_openings(out: list[float], extra: int, round_mm: float,
+                     widest: float) -> None:
+    """Append ``extra`` further openings, each halving the widest untried gap so far.
+
+    The named openings answer where the gun has to be; these answer where else it might
+    usefully be, and there is no geometry here to reason from -- the tip is 200 mm of
+    swing and which openings clear a fixture is not a function of the number.  So the
+    openings are chosen to cover the range rather than to be individually plausible: take
+    the widest stretch nothing has been tried in and try its middle, which is the choice
+    that leaves the largest remaining hole as small as possible.
+
+    Rounding to ``round_mm`` is what keeps the values sayable on the shop floor -- 45 mm
+    rather than 43.7 mm -- at the cost of the split being slightly off centre.  A rounded
+    value that lands on an opening already in the list is dropped and the next widest gap
+    taken instead, so the count is a ceiling: a coarse rounding over a narrow range runs
+    out of distinct openings before it runs out of attempts.
+    """
+    for _ in range(max(extra, 0)):
+        known = sorted(out)
+        gaps = sorted(zip(known, known[1:]), key=lambda g: g[1] - g[0], reverse=True)
+        for lo, hi in gaps:
+            mid = (lo + hi) / 2.0
+            if round_mm > 0.0:
+                mid = round(mid / round_mm) * round_mm
+            mid = float(min(max(mid, 0.0), widest))
+            if any(abs(mid - seen) < OPENING_TOL_MM for seen in out):
+                continue                       # rounded onto a neighbour: try a wider gap
+            out.append(mid)
+            break
+        else:
+            return                             # every gap is narrower than the rounding
+
+
+def _opening_candidates(cell: Cell, openings: list[float] | None, extra: int = 0,
+                        round_mm: float = 0.0) -> list[float | None]:
+    """Openings to try for a transit, most preferred first and without duplicates.
+
+    ``openings`` are the two the transit's own ends ask for, departure first.  After them
+    come closed, widest and half open -- the three that between them cover the useful
+    shapes of the gun -- and then ``extra`` further openings bisecting whatever range is
+    left, as described in ``_bisect_openings``.
+    """
     if not cell.gun_joint_name:
         return [None]
     widest = cell.man.gun_opening_max
     wanted = list(openings or [])
     wanted += [0.0, widest, widest / 2.0]
-    out: list[float] = []
-    for value in wanted:
-        value = float(min(max(value, 0.0), widest))
-        if not any(abs(value - seen) < 1e-6 for seen in out):
-            out.append(value)
+    out = unique_openings(wanted, widest)
+    _bisect_openings(out, extra, round_mm, widest)
     return out
 
 

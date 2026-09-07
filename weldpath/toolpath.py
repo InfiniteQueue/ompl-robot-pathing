@@ -21,7 +21,9 @@ import numpy as np
 from .cell import Cell
 from .manifest import Locator, Manifest
 from .cartesian import CartesianBudget
+from .fallback import FallbackFinder
 from .planning import (LIN, PTP, LinearZone, OmplBudget, PlanningError, Relocation,
+                       unique_openings,
                        plan_freespace,
                        validate)
 
@@ -66,6 +68,8 @@ class ToolpathPlanner:
                  ompl: OmplBudget | None = None,
                  cartesian: CartesianBudget | None = None,
                  fallback_runs: int = 0, relocate: Relocation | None = None,
+                 extra_openings: int = 0, opening_round_mm: float = 5.0,
+                 fallback_mm: float = 100.0, fallback_step_mm: float = 40.0,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                  near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
@@ -83,6 +87,10 @@ class ToolpathPlanner:
         # pays for it.
         self.cartesian = cartesian
         self.fallback_runs = fallback_runs
+        # Openings to try beyond the four the transit's own ends and the gun's shape name,
+        # and the multiple the chosen values are rounded to.  See _bisect_openings.
+        self.extra_openings = extra_openings
+        self.opening_round_mm = opening_round_mm
         # How far the shortcut and polish passes displace a waypoint when they try
         # relocating one, and how the distance is drawn between those bounds.
         self.relocate = relocate or Relocation()
@@ -116,40 +124,27 @@ class ToolpathPlanner:
         self.start_q = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
         # Gun opening each locator turned out to be reachable at, filled in by run().
         self.openings: dict[str, float] = {}
-        # Poses to route a difficult transit through; filled in by run() once the locators
-        # have been solved, since they are locator configurations rather than a constant.
-        self.fallback_via: list[np.ndarray] = []
+        # Poses to route a difficult transit through are searched for per transit and only
+        # when one is needed; see weldpath.fallback and _fallback_for.
+        self.fallback = FallbackFinder(cell, man, fallback_mm=fallback_mm,
+                                       step_mm=fallback_step_mm, log=self.log)
 
-    def _fallback_poses(self, anchors: dict[str, np.ndarray]) -> list[np.ndarray]:
-        """Poses worth routing a difficult transit through, most preferred first.
+    def _fallback_for(self, a: Locator, b: Locator, qa: np.ndarray, qb: np.ndarray):
+        """A callable giving this transit its fallback poses, run only if it is asked.
 
-        The first via, in the configuration the robot actually reaches it in -- which is
-        what ``anchors`` holds, inverse kinematics having been solved for it and seeded
-        from ``start_state`` through the chain of locators before it.
+        Handed to ``plan_freespace`` rather than a list because the search costs real time
+        -- three methods, each solving inverse kinematics at every step it takes -- and
+        most transits solve at the first gun opening and never reach for a detour.  The
+        planner calls this once, after every opening has failed directly.
 
-        A via is a pose the path already visits in open space, so it is known reachable,
-        known clear, and known to be somewhere the job wants the robot to be.  A weld is
-        not a candidate: it is a pose at the panel, which is the last place to send a
-        transit that is struggling for room.
-
-        ``start_state`` is deliberately not used here.  It is a seed for inverse
-        kinematics and the manifest makes no claim that it is a home position, a staging
-        pose, or related to the path at all -- so routing through it was reading a promise
-        into the file that the file does not make.  Where there is no via to use, this
-        returns nothing and the two-leg fallback is simply unavailable, rather than
-        substituting a pose whose suitability nothing has established.
+        This replaces taking the study's first via and routing everything through it.  That
+        was one pose for the whole run, chosen without reference to either end of the move
+        it was rescuing or to how much room there was around it; it was only ever a guess
+        that a pose the path already visited would be a clear one.
         """
-        for loc in self.man.locators:
-            if loc.is_weld:
-                continue
-            q = anchors.get(loc.name)
-            if q is None:
-                continue
-            self.log(f"  difficult transits will be routed through via '{loc.name}'")
-            return [q]
-        self.log("  no via is available to route difficult transits through; transits "
-                 "that need one will fail rather than detour through the seed pose")
-        return []
+        def find() -> list[np.ndarray]:
+            return self.fallback.poses(qa, qb, a.pose_world, b.pose_world)
+        return find
 
     def _clearance_for(self, *locators: Locator):
         """Clearance context for work that touches these locators.
@@ -205,7 +200,11 @@ class ToolpathPlanner:
         if loc.is_weld or not self.cell.gun_joint_name:
             return [declared]
         widest = self.man.gun_opening_max
-        return [declared, widest, widest / 2.0]
+        # Deduped for the same reason a transit's list is: a gun with no travel to speak of
+        # collapses all three of these onto zero, and solving the same pose three times
+        # over means three identical failures, three diagnoses and three geometry exports
+        # before the locator is given up on.
+        return unique_openings([declared, widest, widest / 2.0], widest)
 
     def _diagnose(self, loc: Locator, seed: np.ndarray, tag: str = "",
                   opening: float = 0.0) -> str:
@@ -307,7 +306,7 @@ class ToolpathPlanner:
                 seed = anchors[loc.name]
             except PlanningError as exc:
                 self.log(f"  ! {exc}")
-        self.fallback_via = self._fallback_poses(anchors)
+        self.fallback.announce()
 
         segments: list[Segment] = []
         pairs = list(zip(locators, locators[1:]))
@@ -333,16 +332,18 @@ class ToolpathPlanner:
                           arrive_open: float) -> list[float]:
         """Gun openings to try for the transit between two locators, best first.
 
-        The weld end is the constrained one: its opening is process data, and it is the
-        opening the anchor and the linear approach were actually proved reachable at.  Try
-        the free end's opening first and the planner spends a full time budget discovering
-        that the pose it has to finish at was never checked in that gun state.
+        The departure opening leads: it is the one already in force, so using it costs no
+        gun change at the start of the move, and it is the state the robot was proved to
+        stand at ``a`` in.  The arrival opening follows, being the state it has to be
+        holding by the time it reaches ``b``.
 
-        With a weld at both ends or neither, the departure opening leads: it is the one
-        already in force, so using it costs no gun change at the start of the move.
+        This used to put the arrival opening first where ``b`` was a weld and ``a`` was
+        not, on the grounds that a weld's opening is process data and the pose was only
+        ever checked in it.  That reasoning still holds for the destination pose; what it
+        did not account for is that the transit has to leave ``a`` as well as arrive at
+        ``b``, and the same argument applies at that end.  The order is now uniform, and
+        the arrival opening is still tried second rather than not at all.
         """
-        if b.is_weld and not a.is_weld:
-            return [arrive_open, leave_open]
         return [leave_open, arrive_open]
 
     def _plan_pair(self, a: Locator, b: Locator, anchors, final: bool = False
@@ -350,7 +351,7 @@ class ToolpathPlanner:
         # The path starts at the first locator, not at start_state. start_state seeds
         # inverse kinematics and sets the gun's initial opening; it never contributes a
         # waypoint of its own, and it is not what a difficult transit detours through --
-        # see _fallback_poses.
+        # see weldpath.fallback.
         phases: list[Phase] = []
         qa, qb = anchors[a.name], anchors[b.name]
         transit_start, transit_end = qa, qb
@@ -373,12 +374,15 @@ class ToolpathPlanner:
             self.cell, transit_start, transit_end,
             ompl=self.ompl, cartesian=self.cartesian,
             segment_length=self.segment_length,
-            check_step=self.check_step, fallback_via=self.fallback_via,
+            check_step=self.check_step,
+            fallback_via=self._fallback_for(a, b, transit_start, transit_end),
             fallback_runs=self.fallback_runs, relocate=self.relocate,
             shortcut_seconds=self.shortcut_seconds,
             polish_seconds=self.polish_seconds,
             zone=self.zone,
             openings=self._transit_openings(a, b, leave_open, arrive_open),
+            extra_openings=self.extra_openings,
+            opening_round_mm=self.opening_round_mm,
             record=raw_legs, log=self.log)
         for i, (runs, opening) in enumerate(legs):
             opening_mm = 0.0 if opening is None else opening
