@@ -287,8 +287,14 @@ def _box_distances(lo: np.ndarray, hi: np.ndarray, points: np.ndarray) -> np.nda
 def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
                      points: np.ndarray | None, radius: float,
                      far_cell: float,
-                     overlap: float = DEFAULT_OVERLAP) -> tuple[np.ndarray, list[np.ndarray]]:
+                     overlap: float = DEFAULT_OVERLAP
+                     ) -> tuple[np.ndarray, list[np.ndarray], int]:
     """Grid-split a shell, finely near ``points`` and coarsely everywhere else.
+
+    Returns the vertices, the pieces, and how many leading pieces came from the fine set.
+    The near pieces are emitted first, so that one number splits the list; the caller wants
+    it to report what share of the hulls the focus radius actually bought, which is the
+    figure that says whether the radius is set anywhere useful.
 
     Refinement is only ever worth its cost where two pieces of geometry actually come
     close, and that is a local business: a few hundred millimetres around each weld on a
@@ -329,7 +335,10 @@ def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
     is returned with the pieces.
     """
     if points is None or len(points) == 0 or radius <= 0.0:
-        return split_by_grid(V, tris, cell, overlap)
+        # No focus, so neither bucket applies: this shell is refined uniformly and the
+        # caller does not ask for a split it did not request.
+        V, pieces = split_by_grid(V, tris, cell, overlap)
+        return V, pieces, 0
 
     coarse = far_cell
     lo = V[np.unique(tris)].min(axis=0)
@@ -338,7 +347,10 @@ def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
     # a shell every point is clear of skips the per-triangle measurement entirely.
     box = np.linalg.norm(np.maximum(np.maximum(lo - points, points - hi), 0.0), axis=1)
     if float(box.min()) > radius + cell:
-        return split_by_grid(V, tris, coarse, overlap) if far_cell > 0 else (V, [tris])
+        if far_cell > 0:
+            V, pieces = split_by_grid(V, tris, coarse, overlap)
+            return V, pieces, 0
+        return V, [tris], 0
 
     corners = np.stack((V[tris[:, 0]], V[tris[:, 1]], V[tris[:, 2]]))
     t_lo, t_hi = corners.min(axis=0), corners.max(axis=0)
@@ -346,16 +358,18 @@ def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
     pieces: list[np.ndarray] = []
     near = tris[nearest <= radius + cell]
     far = tris[nearest > radius + cell]
+    near_pieces = 0
     if len(near):
         V, cut = split_by_grid(V, near, cell, overlap)
         pieces += cut
+        near_pieces = len(cut)
     if len(far):
         if far_cell > 0:
             V, cut = split_by_grid(V, far, coarse, overlap)
             pieces += cut
         else:
             pieces.append(far)
-    return V, pieces
+    return V, pieces, near_pieces
 
 
 def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
@@ -412,6 +426,11 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
     # Refine the shells a single hull represents badly.  Done after the cap, so the cap
     # still means "this many parts" and refinement is priced separately.
     split_shells = 0
+    # Counted only where a focus is actually in play.  Without one every hull is refined
+    # the same way, so "near" and "far" are not two things and reporting a share of them
+    # would invent a distinction the run never made.
+    focused = (focus_points is not None and len(focus_points) and focus_radius > 0.0)
+    near_hulls = far_hulls = 0
     if hull_cell > 0:
         refined: list[tuple[np.ndarray, np.ndarray]] = []
         for vids, tris in groups:
@@ -420,12 +439,15 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
             if diagonal <= hull_cell or hull_fill(V, tris, weld) >= fill_threshold:
                 refined.append((vids, tris))
                 continue
-            V, pieces = split_near_focus(V, tris, hull_cell, focus_points,
-                                         focus_radius, far_cell, overlap)
+            V, pieces, near = split_near_focus(V, tris, hull_cell, focus_points,
+                                               focus_radius, far_cell, overlap)
             if len(pieces) < 2:
                 refined.append((vids, tris))
                 continue
             split_shells += 1
+            if focused:
+                near_hulls += near
+                far_hulls += len(pieces) - near
             refined.extend((np.unique(piece), piece) for piece in pieces)
         groups = refined
 
@@ -452,6 +474,12 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
         "shells_dropped_small": int(dropped_small),
         "shells_kept": len(groups),
         "shells_refined": int(split_shells),
+        # Hulls the splitting produced, sorted by which side of the focus radius their
+        # material fell.  Both 0 where nothing was split or no focus was given, and their
+        # sum is below ``shells_kept``: a shell small enough or solid enough to pass the
+        # refinement gate is one hull that was never sorted either way.
+        "shells_near_focus": int(near_hulls),
+        "shells_far_focus": int(far_hulls),
         "seconds": round(time.time() - t0, 2),
     }
 
@@ -465,6 +493,27 @@ def _signature(path: str) -> list:
 
 
 DEFAULT_FILL = 0.75
+
+
+def _focus_share(stats: dict) -> str:
+    """What share of the split hulls landed inside the focus radius, as a phrase.
+
+    Empty where the question does not arise -- nothing was split, or no focus was given --
+    rather than "0%", which would read as a focus that caught nothing when in fact none
+    was asked for.  Cached entries written before this was recorded also come back empty,
+    which is why the summary counts how many links could not answer.
+    """
+    near = int(stats.get("shells_near_focus", 0))
+    far = int(stats.get("shells_far_focus", 0))
+    if near + far <= 0:
+        return ""
+    # The count goes in front of the share deliberately.  Without it the percentage reads
+    # as a share of the kept total, and on a link whose CAD arrives already decomposed it
+    # is nothing of the sort -- 32 hulls out of 1021 on one gun body, so the figure
+    # describes 3% of the geometry and moving it moves almost nothing.  The denominator
+    # has to be visible next to the number or the number argues for the wrong lever.
+    return (f", {near + far} of them from splitting, "
+            f"{100.0 * near / (near + far):.0f}% of those near the focus")
 
 
 def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
@@ -542,7 +591,8 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
         cached = index.get(link)
         if (cached and cached.get("sig") == sig and cached.get("settings") == settings
                 and os.path.isfile(dst)):
-            log(f"  = {link:<22} cached ({cached['stats']['shells_kept']} shells)")
+            log(f"  = {link:<22} cached ({cached['stats']['shells_kept']} shells"
+                f"{_focus_share(cached['stats'])})")
             out[link] = dst
             continue
         log(f"  . {link:<22} decomposing {os.path.getsize(src) / 1e6:.1f} MB of "
@@ -557,15 +607,33 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
                 if radius > 0.0 else "")
         refined = (f", {stats['shells_refined']} split at {cell:g} mm below "
                    f"{threshold:g} fill{near}" if stats["shells_refined"] else "")
-        log("  + %-22s %d tris, %d shells -> %d kept%s (%.1fs)"
+        log("  + %-22s %d tris, %d shells -> %d kept%s%s (%.1fs)"
             % (link, stats["triangles"], stats["shells"], stats["shells_kept"],
-               refined, stats["seconds"]))
+               refined, _focus_share(stats), stats["seconds"]))
         index[link] = {"sig": sig, "settings": settings, "stats": stats}
         out[link] = dst
 
     with open(index_path, "w", encoding="utf-8") as fh:
         json.dump(index, fh, indent=1)
-    shells = sum(int(index[l]["stats"]["shells_kept"]) for l in out if l in index)
-    log(f"  {shells} convex shells over {len(out)} links; every collision check from here "
-        f"on is against these")
+    entries = [index[l]["stats"] for l in out if l in index]
+    shells = sum(int(s["shells_kept"]) for s in entries)
+    near = sum(int(s.get("shells_near_focus", 0)) for s in entries)
+    far = sum(int(s.get("shells_far_focus", 0)) for s in entries)
+    # A link that was split under a focus but reports neither count was cached before the
+    # counts existed.  Named rather than folded in, because it is missing from the ratio's
+    # denominator as well as its numerator and would drag the figure either way.
+    stale = sum(1 for s in entries if s.get("shells_refined")
+                and s.get("shells_near_focus") is None and focus)
+    share = ""
+    if near + far > 0:
+        share = (f", {near + far} of them from splitting a focused shell and "
+                 f"{100.0 * near / (near + far):.0f}% of those near a focus point"
+                 + (f" (excluding {stale} link{'' if stale == 1 else 's'} cached before "
+                    f"this was recorded)" if stale else ""))
+    elif stale:
+        share = (f", none of which report where they fell relative to the focus: all "
+                 f"{stale} split link{'' if stale == 1 else 's'} were cached before this "
+                 f"was recorded")
+    log(f"  {shells} convex shells over {len(out)} links{share}; every collision check "
+        f"from here on is against these")
     return out
