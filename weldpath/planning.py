@@ -427,7 +427,7 @@ class Relocation:
     min_mm: float = 5.0
     max_mm: float = 150.0
     exponent: float = 1.0
-    min_attempts: int = 20          # polish only; shortcut's loop is timed alone
+    min_attempts: int = 20          # polish is the only pass that relocates
 
     def draw(self, scale: float) -> tuple[float, float, float]:
         """``(low, span, exponent)`` in scene units, ready for the sampling loop."""
@@ -597,8 +597,7 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     else:
         log(f"      refining {len(path)} points: up to {shortcut_seconds:g}s shortcutting "
             f"then {polish_seconds:g}s polishing, both spent in full")
-    improved = shortcut(model, path, time_budget=shortcut_seconds, relocate=relocate,
-                        log=log)
+    improved = shortcut(model, path, time_budget=shortcut_seconds, log=log)
     reduced = simplify(model, improved)
     return polish(model, reduced, time_budget=polish_seconds, relocate=relocate,
                   log=log)
@@ -629,23 +628,29 @@ def _densify(cell: Cell, path: list[np.ndarray], step: float) -> list[np.ndarray
 
 def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float = 2.0,
              rng: np.random.Generator | None = None,
-             relocate: Relocation | None = None,
              log=None) -> list[np.ndarray]:
     """Reshape a path to take less time, penalised for running close to the parts.
 
     ``simplify`` can only delete waypoints that a straight move already bypasses, so it
     never changes the route: a sampled path that swings the arm around the base to reach a
-    point beside it keeps that swing.  This pass reshapes the route instead, using two
-    moves that between them can both shorten and stand off:
+    point beside it keeps that swing.  This pass reshapes the route instead, by one move:
 
     * **cut** -- replace a stretch of path with the straight move between its ends, when
-      that move is collision free and cheaper.  This is what removes gross detours, but it
-      can only ever remove path, so on its own it cannot move away from an obstacle.
-    * **relocate** -- displace a single waypoint and keep it if both neighbouring moves
-      stay clear and the pair gets cheaper.  This is what gives the clearance penalty
-      teeth: pushing a waypoint away from a panel costs a little travel and saves a lot of
-      penalty, so it wins.  Every waypoint is eligible except the two endpoints, which are
-      the states handed in and belong to the locators either side.
+      that move is collision free and cheaper.  This is what removes gross detours.
+
+    It used to offer a second move, **relocate**, which displaced one point of the dense
+    path and kept it if the pair of steps through it got cheaper.  On a dense path that
+    move cannot do the job it was there for, and the reason is the cost function rather
+    than the geometry.  A step is charged at ``max`` of the factors at its two ends, so
+    displacing a single point changes nothing unless that point is a *strict* local
+    maximum of the penalty -- otherwise both maxima stay pinned by the neighbours it did
+    not move, and the only effect is the extra travel of a detour out and straight back,
+    which the triangle inequality guarantees loses.  The points are a collision-check step
+    apart and clearance varies smoothly over that distance, so strict local maxima are
+    rare and shallow.  Measured on a real leg it kept 1 of some 15 draws while cuts kept 8
+    of 15, and each losing draw still paid for its collision checks.  ``polish`` keeps its
+    own relocation, where the points are real stops far enough apart for one to move
+    independently of its neighbours, and there it earns its place.
 
     Cost is **time**, under the same joint velocity limits the output is scheduled with, so
     a wide J1 excursion is cut before a wrist rotation that covers the same angle far
@@ -684,24 +689,20 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
                    for k in range(i, j))
 
     rng = rng or np.random.default_rng(0)
-    draw = (relocate or Relocation()).draw(model.cell.man.scale)
     before = span_cost(0, len(dense) - 1)
     deadline = time.time() + time_budget
-    tried = cuts = moves = 0
+    tried = cuts = 0
 
     while time.time() < deadline and len(dense) > 2:
         tried += 1
-        if rng.random() < 0.5:
-            cuts += _try_cut(model, dense, fac, rng, penalised, span_cost)
-        else:
-            moves += _try_relocate(model, dense, fac, rng, penalised, step_cost, draw)
+        cuts += _try_cut(model, dense, fac, rng, penalised, span_cost)
 
     if log:
         after = span_cost(0, len(dense) - 1)
         gain = 100.0 * (1.0 - after / before) if before > 0 else 0.0
         detail = "penalised cruise time" if penalised else "cruise time"
-        log(f"      shortcut: {cuts} cuts and {moves} relocations kept from {tried} "
-            f"attempts, {detail} {before:.2f} -> {after:.2f} s ({gain:.0f}% better)")
+        log(f"      shortcut: {cuts} cuts kept from {tried} attempts, "
+            f"{detail} {before:.2f} -> {after:.2f} s ({gain:.0f}% better)")
     return dense
 
 
@@ -739,58 +740,6 @@ def _try_cut(model: "MotionModel", dense, fac, rng, penalised, span_cost) -> int
         factors = [1.0] * len(points)
     dense[i + 1:j] = points
     fac[i + 1:j] = factors
-    return 1
-
-
-def _try_relocate(model: "MotionModel", dense, fac, rng, penalised, step_cost,
-                  draw: tuple[float, float, float] | None = None) -> int:
-    """Displace one interior waypoint and keep the move if it lowers the local cost.
-
-    The displacement is drawn in joint space but scaled by the cell's joint weights, so a
-    given attempt moves the tool about as far whichever joints it uses -- otherwise almost
-    every sample would be a wrist twiddle that changes nothing.
-
-    ``draw`` is ``Relocation.draw``'s ``(low, span, exponent)``, already in scene units;
-    the caller hoists it out of its own loop.
-    """
-    if len(dense) < 3:
-        return 0
-    cell = model.cell
-    k = int(rng.integers(1, len(dense) - 1))        # endpoints are fixed by the caller
-    low, span, exponent = draw or Relocation().draw(cell.man.scale)
-    x = float(rng.random())
-    target = low + span * (x if exponent == 1.0 else x ** exponent)
-    direction = rng.normal(size=len(dense[k]))
-    reach = float(np.linalg.norm(direction * cell.weights))
-    if reach <= 0.0:
-        return 0
-    candidate = dense[k] + direction * (target / reach)
-    candidate = np.clip(candidate, cell.lower, cell.upper)
-    if not cell.within_limits(candidate):
-        return 0
-
-    before = (step_cost(dense[k - 1], dense[k], fac[k - 1], fac[k])
-              + step_cost(dense[k], dense[k + 1], fac[k], fac[k + 1]))
-    # Cheapest possible replacement, ignoring any penalty, as an early reject.
-    floor = (cell.cruise_time(dense[k - 1], candidate)
-             + cell.cruise_time(candidate, dense[k + 1]))
-    if floor >= before - 1e-9:
-        return 0
-    if (model.demotes(dense[k - 1], candidate, [dense[k]])
-            or model.demotes(candidate, dense[k + 1], [dense[k]])):
-        return 0
-    if model.blocked(dense[k - 1], candidate):
-        return 0
-    if model.blocked(candidate, dense[k + 1]):
-        return 0
-
-    f = model.penalty_factor(candidate) if penalised else 1.0
-    after = (step_cost(dense[k - 1], candidate, fac[k - 1], f)
-             + step_cost(candidate, dense[k + 1], f, fac[k + 1]))
-    if after >= before - 1e-9:
-        return 0
-    dense[k] = candidate
-    fac[k] = f
     return 1
 
 
