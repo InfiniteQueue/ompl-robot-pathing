@@ -330,12 +330,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "coarser still and can bridge back across the welds "
                         "(default: 300)")
     #WHEN A SHELL NEEDS REFINING AT ALL
-    p.add_argument("--hull-fill", type=float, default=0.75, metavar="F",
+    p.add_argument("--hull-fill", type=float, default=0.85, metavar="F",
                    help="how much of its own bounding box a shell must fill before a "
                         "single hull is accepted for it; below this it is split by "
                         "--hull-cell-mm. Raise it towards 1 for geometry whose recesses "
                         "matter, such as panelling full of shallow bowls that a hull "
-                        "would skin over (default: 0.75)")
+                        "would skin over (default: 0.85)")
     #CELL SIZE: ARM
     p.add_argument("--robot-cell-mm", type=float, default=0, metavar="MM",
                    help="--hull-cell-mm for the arm's own links. The arm never comes close "
@@ -347,9 +347,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "--robot-cell-mm is 0, since nothing on the arm is refined at all "
                         "(default: 0, i.e. one hull)")
     #CELL SIZE: GUN
-    p.add_argument("--gun-cell-mm", type=float, default=40, metavar="MM",
+    p.add_argument("--gun-cell-mm", type=float, default=60, metavar="MM",
                    help="--hull-cell-mm for the gun body and moving tip. Reduces "
-                        "webbing around the electrodes at lower values (default: 40)")
+                        "webbing around the electrodes at lower values (default: 60)")
     #FAR CELL SIZE: GUN
     p.add_argument("--gun-far-cell-mm", type=float, default=360, metavar="MM",
                    help="--far-cell-mm for the gun body and moving tip, i.e. the part of "
@@ -378,6 +378,46 @@ def build_parser() -> argparse.ArgumentParser:
                         "part of a panel away from every weld still has to be traversed, "
                         "so it is worth keeping finer than the tooling around it "
                         "(default: 40)")
+    #region ###HULL MERGING###
+    #MERGE CELL PER CATEGORY
+    p.add_argument("--merge-cell-mm", type=float, default=0, metavar="MM",
+                   help="beyond the focus radius, pool the geometry and re-cut it on a "
+                        "grid of this size, so one hull covers everything in a cell "
+                        "whatever solid it came from. This is the only step that can "
+                        "*reduce* a hull count set by how the CAD was assembled: every "
+                        "other option here can divide a shell but never combine two, so a "
+                        "link that arrives already decomposed pays one hull per solid "
+                        "however coarse the cell is. On the sample gun body 895 of 997 "
+                        "components are smaller than --gun-cell-mm and no splitting "
+                        "option touches them at all. Merging only ever adds space -- a "
+                        "hull over pooled material contains the hulls it replaces -- so "
+                        "it can report a collision that is not there but never miss one "
+                        "that is, which is the opposite trade from --enclosed-probe-mm. "
+                        "How much it adds is bounded by the cell. Applies to every "
+                        "category at once; prefer the per-category options "
+                        "(default: 0, i.e. off)")
+    p.add_argument("--robot-merge-mm", type=float, default=None, metavar="MM",
+                   help="--merge-cell-mm for the arm's own links. The arm never comes "
+                        "close to anything, so it tolerates the coarsest merge in the "
+                        "cell (default: unset)")
+    p.add_argument("--gun-merge-mm", type=float, default=120, metavar="MM",
+                   help="--merge-cell-mm for the gun body and moving tip. This is the "
+                        "geometry it was written for: 99%% of the gun's components sit "
+                        "beyond --shell-split-tcp-prox, and merging the far ones at "
+                        "120 mm takes the body from about 2000 hulls to about 110. Weigh "
+                        "it against transit -- the far body is what sweeps past the "
+                        "tooling, and a merged hull claims the space between the solids "
+                        "it covers (default: unset)")
+    p.add_argument("--tooling-merge-mm", type=float, default=None, metavar="MM",
+                   help="--merge-cell-mm for static objects the manifest calls tooling. "
+                        "These are the largest meshes in the cell and set most of the "
+                        "total hull count (default: unset)")
+    p.add_argument("--panel-merge-mm", type=float, default=None, metavar="MM",
+                   help="--merge-cell-mm for static objects the manifest calls panel. "
+                        "The panel is the one part the gun has to reach into, so space "
+                        "claimed here is the most likely to block a real weld "
+                        "(default: unset)")
+    #endregion
     #region ###UNREACHABLE SHELLS###
     #PROBE RADIUS PER CATEGORY
     p.add_argument("--enclosed-probe-mm", type=float, default=0, metavar="MM",
@@ -425,7 +465,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "however sealed it looks. Something this large reading as "
                         "unreachable is more often a rasterisation the geometry defeated "
                         "than a part sealed inside a casing, and the count is reported so "
-                        "the two can be told apart. 0 removes the backstop (default: 500)")
+                        "the two can be told apart. 0 removes the backstop (default: 0)")
     #INSPECTION
     p.add_argument("--export-enclosed", action="store_true",
                    help="write what the reachability screen discarded to "
@@ -446,7 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "decides anything. Allow for the approach as well as the weld "
                         "itself. 0 refines everywhere (default: 60)")
     #TCP PROXIMITY FOR SHELL SPLIT
-    p.add_argument("--shell-split-tcp-prox", type=float, default=50.0, metavar="MM",
+    p.add_argument("--shell-split-tcp-prox", type=float, default=175.0, metavar="MM",
                    help="only refine the gun body and moving tip within this many mm of "
                         "the tool centre point. The gun and the TCP are rigid with respect "
                         "to each other, so unlike a weld this stays meaningful wherever the "
@@ -529,18 +569,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "turns all penalties off. Takes true/false (yes/no, on/off, 1/0); "
                         "passing the flag with no value means true (default: True)")
     #STRENGTH AT TOUCHING
-    p.add_argument("--stepped-penalty-multiplier", type=float, default=8.0, metavar="N",
+    p.add_argument("--stepped-penalty-multiplier", type=float, default=14.0, metavar="N", #was 8
                    help="penalty at zero clearance: a second spent touching costs as much "
-                        "as N seconds in open space (default: 8)")
+                        "as N seconds in open space (default: 14)")
     #WHERE THE PENALTY IS SPENT
-    p.add_argument("--stepped-penalty-zero-mm", type=float, default=100.0, metavar="MM",
+    p.add_argument("--stepped-penalty-zero-mm", type=float, default=50.0, metavar="MM", #was 100
                    help="clearance at which the penalty reaches 1x and stops mattering. "
                         "Also how far the proximity query has to see, so lowering it "
-                        "speeds planning up (default: 100)")
+                        "speeds planning up (default: 50)")
     #STEP LENGTH
-    p.add_argument("--stepped-penalty-step-mm", type=float, default=25.0, metavar="MM",
+    p.add_argument("--stepped-penalty-step-mm", type=float, default=3.0, metavar="MM", #was 25
                    help="how much extra clearance counts as one step of falloff "
-                        "(default: 25)")
+                        "(default: 3)")
     #STEP FACTOR
     p.add_argument("--stepped-penalty-step-factor", type=float, default=0.7, metavar="F",
                    help="what one step multiplies the penalty by: 0.7 means each "
@@ -677,6 +717,8 @@ def main(argv: list[str] | None = None) -> int:
                         "panel": args.panel_far_cell_mm}
     per_category = {"robot": args.robot_cell_mm, "gun": args.gun_cell_mm,
                     "tooling": args.tooling_cell_mm, "panel": args.panel_cell_mm}
+    merge_per_category = {"robot": args.robot_merge_mm, "gun": args.gun_merge_mm,
+                          "tooling": args.tooling_merge_mm, "panel": args.panel_merge_mm}
     enclosed_per_category = {"robot": args.robot_enclosed_mm, "gun": args.gun_enclosed_mm,
                              "tooling": args.tooling_enclosed_mm,
                              "panel": args.panel_enclosed_mm}
@@ -692,6 +734,8 @@ def main(argv: list[str] | None = None) -> int:
                               far_cell_mm=args.far_cell_mm,
                               far_per_category=far_per_category,
                               hull_overlap=args.hull_cell_overlap,
+                              merge_cell_mm=args.merge_cell_mm,
+                              merge_per_category=merge_per_category,
                               enclosed_per_category=enclosed_per_category,
                               enclosed_probe_mm=args.enclosed_probe_mm,
                               enclosed_voxel_mm=args.enclosed_voxel_mm,

@@ -372,6 +372,58 @@ def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
     return V, pieces, near_pieces
 
 
+def merge_far(V: np.ndarray, groups: list[tuple[np.ndarray, np.ndarray]],
+              points: np.ndarray | None, radius: float, near_cell: float,
+              merge_cell: float, overlap: float = DEFAULT_OVERLAP
+              ) -> tuple[np.ndarray, list[tuple[np.ndarray, np.ndarray]], int]:
+    """Wrap everything beyond the focus in one grid, across component boundaries.
+
+    Splitting can only ever divide a shell.  Nothing in the pipeline before this could
+    *combine* two, because refinement runs inside a loop over connected components and a
+    component is what becomes an ``o`` group and therefore a hull.  So a link whose CAD
+    arrives already decomposed pays one hull per solid however coarse the cell is set --
+    on the sample gun body, 895 of 997 components are smaller than the cell and no value
+    of ``hull_cell`` or ``far_cell`` touches them at all.
+
+    This pools the far groups' triangles and re-cuts them on a single grid, so one hull
+    covers whatever falls in its cell no matter which solid it came from.  That is the
+    same convex bridging a hull already does within a shell -- the wrap that closes a
+    recess -- extended to the gaps between shells.
+
+    The error runs the safe way.  A hull over pooled material contains the union of the
+    hulls it replaces, so merging only ever *adds* space: it can report a collision that
+    is not there, never miss one that is.  How much it adds is bounded by the cell, since
+    ``split_by_grid`` bisects oversized triangles down to it first.
+
+    Groups within ``radius + near_cell`` of a focus point are left exactly as they were,
+    so the geometry nearest the work is untouched.  With no focus given every group is
+    pooled, which is the whole-link case.
+
+    Returns the vertices, the new group list, and how many groups went into the pool.
+    """
+    if merge_cell <= 0.0 or not groups:
+        return V, groups, 0
+
+    focused = points is not None and len(points) and radius > 0.0
+    if focused:
+        # One call over every group's box rather than one per group: _box_distances is
+        # chunked over the boxes it is given, and handing it them one at a time throws
+        # that away for a thousand round trips.
+        lo = np.array([V[vids].min(axis=0) for vids, _ in groups])
+        hi = np.array([V[vids].max(axis=0) for vids, _ in groups])
+        keep = _box_distances(lo, hi, points) <= radius + near_cell
+    else:
+        keep = np.zeros(len(groups), dtype=bool)
+
+    near = [g for g, k in zip(groups, keep) if k]
+    far = [tris for (_, tris), k in zip(groups, keep) if not k]
+    if not far:
+        return V, groups, 0
+
+    V, pieces = split_by_grid(V, np.concatenate(far), merge_cell, overlap)
+    return V, near + [(np.unique(p), p) for p in pieces], len(far)
+
+
 def _write_groups(dst: str, V: np.ndarray, F: np.ndarray,
                   groups: list[tuple[np.ndarray, np.ndarray]], scale: float,
                   src: str) -> None:
@@ -398,7 +450,7 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
                      hull_cell: float = 0.0, fill_threshold: float = 0.75,
                      focus_points: np.ndarray | None = None,
                      focus_radius: float = 0.0, far_cell: float = 0.0,
-                     overlap: float = DEFAULT_OVERLAP,
+                     overlap: float = DEFAULT_OVERLAP, merge_cell: float = 0.0,
                      enclosed_probe: float = 0.0, enclosed_voxel: float = 0.0,
                      enclosed_keep: float = 0.0,
                      enclosed_dump: str | None = None) -> dict:
@@ -501,6 +553,13 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
             refined.extend((np.unique(piece), piece) for piece in pieces)
         groups = refined
 
+    # Last, because it works on whatever the rest produced.  Splitting can only divide, so
+    # every filter and refinement above leaves the count at one hull per surviving solid
+    # at best; this is the only step that can bring two together.
+    before = len(groups)
+    V, groups, pooled = merge_far(V, groups, focus_points, focus_radius, hull_cell,
+                                  merge_cell, overlap)
+
     _write_groups(dst, V, F, groups, scale, src)
 
     return {
@@ -515,6 +574,10 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
         # refinement gate is one hull that was never sorted either way.
         "shells_near_focus": int(near_hulls),
         "shells_far_focus": int(far_hulls),
+        # What the merge pooled and what it left.  Both absent where no merge cell was
+        # given, so a cache entry can tell "did not merge" from "merged nothing".
+        **({"merged_from": int(pooled),
+            "merged_to": int(len(groups) - (before - pooled))} if pooled else {}),
         # Absent entirely when no probe was given, so a cache entry can be told apart from
         # one where the filter ran and found nothing to drop.
         **({"enclosed": enc_stats} if enc_stats else {}),
@@ -579,6 +642,20 @@ def _enclosed_share(stats: dict) -> str:
     return out
 
 
+def _merge_share(stats: dict) -> str:
+    """What the merge pooled on one link, as a phrase.
+
+    Reports the two counts rather than a ratio.  The ratio is the striking number and the
+    one that misleads: a link is not "96% smaller", it has traded a count set by how the
+    CAD was assembled for one set by the cell, and those are not the same quantity
+    measured twice.
+    """
+    got = int(stats.get("merged_from", 0))
+    if not got:
+        return ""
+    return f", {got} of them merged into {int(stats.get('merged_to', 0))}"
+
+
 def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             log=print, min_extent: float = 40.0, max_shells: int = 80,
             hull_cell: float = 0.0, fill: float = DEFAULT_FILL,
@@ -586,6 +663,7 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             focus: dict[str, tuple[np.ndarray, float]] | None = None,
             far_cells: dict[str, float] | None = None, far_cell: float = 0.0,
             overlap: float = DEFAULT_OVERLAP,
+            merge_cells: dict[str, float] | None = None, merge_cell: float = 0.0,
             enclosed_probes: dict[str, float] | None = None,
             enclosed_voxel: float = 0.0, enclosed_keep: float = 0.0,
             enclosed_dump: bool = False) -> dict[str, str]:
@@ -609,6 +687,11 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
     else looks at them.  Per link and off by default, because it is per link that the
     question makes sense -- a gun body is full of motors and a panel is not -- and because
     it is the one filter here that can remove geometry a collision needed.
+
+    ``merge_cells`` maps a link to the cell its far geometry is pooled and re-cut on, so
+    one hull covers everything in a cell whatever solid it came from.  It is the only step
+    that reduces a hull count set by how the CAD was assembled rather than by how the part
+    is shaped -- see :func:`merge_far`.
     """
     focus = {k: (np.asarray(pts, dtype=float).reshape(-1, 3), float(r))
              for k, (pts, r) in (focus or {}).items() if pts is not None and len(pts)}
@@ -628,6 +711,7 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
         cell = float((cells or {}).get(link, hull_cell))
         far = float((far_cells or {}).get(link, far_cell))
         probe = float((enclosed_probes or {}).get(link, 0.0))
+        merge = float((merge_cells or {}).get(link, merge_cell))
         threshold = float(fill)
         points, radius = focus.get(link, (None, 0.0))
         settings = [round(float(min_extent), 4), int(max_shells), round(float(scale), 9),
@@ -655,6 +739,11 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
                          # The near and far sets no longer overlap, so geometry cached while
                          # they did holds a coarse duplicate of the refined material.
                          "disjoint"]
+        if merge > 0.0:
+            # Appended only where merging is on, so caches built before it stay valid.
+            # The near cell and the radius are already in the key above, and they decide
+            # which groups are pooled, so they need no second mention here.
+            settings += ["merge", round(merge, 4)]
         if probe > 0.0:
             # Appended only where the filter is on, so every cache built before it existed
             # stays valid.  The voxel is in the key as well as the probe: it is a screening
@@ -676,7 +765,8 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
                 and os.path.isfile(dst)):
             log(f"  = {link:<22} cached ({cached['stats']['shells_kept']} shells"
                 f"{_focus_share(cached['stats'])}"
-                f"{_enclosed_share(cached['stats'])})")
+                f"{_enclosed_share(cached['stats'])}"
+                f"{_merge_share(cached['stats'])})")
             out[link] = dst
             continue
         log(f"  . {link:<22} decomposing {os.path.getsize(src) / 1e6:.1f} MB of "
@@ -685,7 +775,8 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
                                  max_shells=max_shells, hull_cell=cell,
                                  fill_threshold=threshold, focus_points=points,
                                  focus_radius=radius, far_cell=far,
-                                 overlap=overlap, enclosed_probe=probe,
+                                 overlap=overlap, merge_cell=merge,
+                                 enclosed_probe=probe,
                                  enclosed_voxel=enclosed_voxel,
                                  enclosed_keep=enclosed_keep,
                                  enclosed_dump=(dump if enclosed_dump and probe > 0.0
@@ -695,9 +786,10 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
                 if radius > 0.0 else "")
         refined = (f", {stats['shells_refined']} split at {cell:g} mm below "
                    f"{threshold:g} fill{near}" if stats["shells_refined"] else "")
-        log("  + %-22s %d tris, %d shells -> %d kept%s%s%s (%.1fs)"
+        log("  + %-22s %d tris, %d shells -> %d kept%s%s%s%s (%.1fs)"
             % (link, stats["triangles"], stats["shells"], stats["shells_kept"],
-               _enclosed_share(stats), refined, _focus_share(stats), stats["seconds"]))
+               _enclosed_share(stats), refined, _focus_share(stats),
+               _merge_share(stats), stats["seconds"]))
         index[link] = {"sig": sig, "settings": settings, "stats": stats}
         out[link] = dst
 

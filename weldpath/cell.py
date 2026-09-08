@@ -758,6 +758,7 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
                               far_cell_mm: float = 0.0,
                               far_per_category=None,
                               hull_overlap: float | None = None,
+                              merge_cell_mm: float = 0.0, merge_per_category=None,
                               enclosed_per_category=None,
                               enclosed_probe_mm: float = 0.0,
                               enclosed_voxel_mm: float = 0.0,
@@ -798,6 +799,16 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
     # figure over a global one -- but the global default is 0, so a category nobody named
     # is left alone.  This filter deletes geometry, and switching it on for a link is a
     # decision about that link.
+    merges = {k: v for k, v in
+              hull_cells(man, merge_cell_mm, merge_per_category).items() if v > 0}
+    if merges:
+        by_cat: dict[str, float] = {}
+        for name, value in merges.items():
+            by_cat[hull_categories(man)[name]] = value
+        log("  beyond the focus, one hull per cell across whatever solids fall in it: "
+            + ", ".join(f"{c} {v:g} mm" for c, v in sorted(by_cat.items()))
+            + " -- the only step that can bring two shells together, and the only one "
+              "that claims space rather than giving it up")
     probes = {k: v for k, v in
               hull_cells(man, enclosed_probe_mm, enclosed_per_category).items() if v > 0}
     if probes:
@@ -816,7 +827,8 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
                             cells=hull_cells(man, hull_cell, hull_per_category),
                             focus=focus, far_cell=far_cell_mm,
                             far_cells=hull_cells(man, far_cell_mm, far_per_category),
-                            overlap=overlap, enclosed_probes=probes,
+                            overlap=overlap, merge_cells=merges,
+                            merge_cell=merge_cell_mm, enclosed_probes=probes,
                             enclosed_voxel=enclosed_voxel_mm,
                             enclosed_keep=enclosed_keep_mm,
                             enclosed_dump=enclosed_dump)
@@ -1076,6 +1088,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
           tcp_proximity_mm: float = 0.0, far_cell_mm: float = 0.0,
           far_per_category=None,
           hull_overlap: float | None = None,
+          merge_cell_mm: float = 0.0, merge_per_category=None,
           enclosed_per_category=None, enclosed_probe_mm: float = 0.0,
           enclosed_voxel_mm: float = 0.0,
           enclosed_keep_mm: float = 0.0, enclosed_dump: bool = False,
@@ -1086,7 +1099,8 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
     collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm,
                                           hull_fill, hull_per_category, weld_proximity_mm,
                                           tcp_proximity_mm, far_cell_mm, far_per_category,
-                                          hull_overlap, enclosed_per_category,
+                                          hull_overlap, merge_cell_mm,
+                                          merge_per_category, enclosed_per_category,
                                           enclosed_probe_mm,
                                           enclosed_voxel_mm, enclosed_keep_mm,
                                           enclosed_dump)
