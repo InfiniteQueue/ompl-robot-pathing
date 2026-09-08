@@ -824,8 +824,22 @@ def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
     i, j = sorted(rng.integers(0, len(dense), size=2))
     if j - i < 2:
         return 0
-    lo = max([m for m in marks if m <= i], default=0)
-    hi = min([m for m in marks if m >= j], default=len(dense) - 1)
+    # How wide the comparison has to be.  Under the whole-move rule a cut that swallows an
+    # anchor merges two moves, and the merged move is charged at the worst state of both,
+    # which cannot be seen from i..j alone -- so the region runs out to the anchors either
+    # side.  Under the per-sub-step rule cost is a plain sum over steps, so
+    #
+    #     span_cost(lo, hi) = span_cost(lo, i) + span_cost(i, j) + span_cost(j, hi)
+    #
+    # the outer stretches appear identically on both sides of every test below and cancel.
+    # Widening there would cost four passes over roughly twice the ground for an answer
+    # already in hand, and each step of a pass prices a move -- which on a linear leg is
+    # forward kinematics.
+    if whole:
+        lo = max([m for m in marks if m <= i], default=0)
+        hi = min([m for m in marks if m >= j], default=len(dense) - 1)
+    else:
+        lo, hi = i, j
     before = span_cost(lo, hi)
     # A lower bound on what the region can cost once cut, used to reject cheaply.  Two
     # things make it a bound rather than the answer: every factor is at least 1, so the
@@ -833,7 +847,7 @@ def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
     # the region at i and j can only lower it, since a maximum over part of a move never
     # exceeds the maximum over the whole.  The real figure is taken below, after the
     # replacement exists.
-    outer = span_cost(lo, i) + span_cost(j, hi)
+    outer = span_cost(lo, i) + span_cost(j, hi) if whole else 0.0
     if outer + model.cell.cruise_time(dense[i], dense[j]) >= before - 1e-9:
         return 0
     if model.demotes(dense[i], dense[j], dense[i + 1:j]):
@@ -858,18 +872,19 @@ def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
         if outer + middle >= before - 1e-9:
             return 0
 
-    # Install it, score the region as it now really stands, and put it back if that was
-    # not an improvement.  Scoring in place rather than predicting: under the whole-move
-    # rule a cut that swallowed an anchor leaves a move spanning further than i..j, and
-    # rebuilding that arithmetic outside the list it applies to is how the two drift
-    # apart.  Only candidates that already passed both bounds get this far.
     old_points, old_factors = dense[i + 1:j], fac[i + 1:j]
     old_marks = list(marks)
     dense[i + 1:j] = points
     fac[i + 1:j] = factors
     shift = (i + 1 + len(points)) - j
     marks[:] = [m for m in marks if m <= i] + [m + shift for m in marks if m >= j]
-    if span_cost(lo, hi + shift) >= before - 1e-9:
+    # Under the whole-move rule, score the region as it now really stands and put it back
+    # if that was not an improvement.  Scoring in place rather than predicting: a cut that
+    # swallowed an anchor leaves a move spanning further than i..j, and rebuilding that
+    # arithmetic outside the list it applies to is how the two drift apart.  Per sub-step
+    # there is nothing to re-score -- the region is i..j, and its cost after the cut is
+    # `middle`, which the test above has already compared.
+    if whole and span_cost(lo, hi + shift) >= before - 1e-9:
         dense[i + 1:i + 1 + len(points)] = old_points
         fac[i + 1:i + 1 + len(points)] = old_factors
         marks[:] = old_marks
@@ -1844,7 +1859,7 @@ def _tcp_travel(cell: Cell, states: list[np.ndarray]) -> float:
     the caller keeps the two from being compared raw, which read a 1.8 m stretch as 1.8
     against a 250 mm threshold and so failed every length test there was.
     """
-    points = [cell.fk(q)[:3, 3] for q in states]
+    points = [cell.tcp_at(q) for q in states]
     raw = float(sum(np.linalg.norm(b - a) for a, b in zip(points, points[1:])))
     return raw / cell.man.scale
 
