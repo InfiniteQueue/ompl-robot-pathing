@@ -162,11 +162,14 @@ class MotionModel:
         T[:3, 3] /= self.cell.man.scale
         return T
 
-    def linear_chain(self, a: np.ndarray, b: np.ndarray) -> list[np.ndarray] | None:
+    def linear_chain(self, a: np.ndarray, b: np.ndarray, factors: bool = False):
         """The states the tool passes through running straight from ``a`` to ``b``.
 
-        ``None`` when it cannot get there: no inverse kinematics somewhere along the line,
-        or a collision in the joint gaps between the samples.
+        Returns ``(chain, factors)``, or ``(None, None)`` when it cannot get there: no
+        inverse kinematics somewhere along the line, or a collision in the joint gaps
+        between the samples.  ``factors`` asks for the penalty factor at each state of the
+        chain, taken off the walk that proves the gaps clear rather than measured
+        afterwards; unset, they come back as 1.0 and nothing is queried.
 
         Under a linear profile the controller drives the tool along the straight line and
         solves inverse kinematics as it goes, so that line -- not the joint chord between
@@ -182,16 +185,20 @@ class MotionModel:
             chain = plan_linear(self.cell, self._pose_mm(a), self._pose_mm(b), a,
                                 step_mm=self.tool_step)
         except PlanningError:
-            return None                     # no inverse kinematics somewhere along it
+            return None, None               # no inverse kinematics somewhere along it
         # Inverse kinematics returns the solution nearest its seed rather than the state
         # asked for, so pin the ends back before checking the gaps between the samples.
         chain[0] = np.asarray(a, dtype=float)
         chain[-1] = np.asarray(b, dtype=float)
-        return None if _chain_collides(self.cell, chain, self.max_step) else chain
+        hit, facs = _chain_scan(self.cell, chain, self.max_step,
+                                factors=factors and self.penalised)
+        if hit:
+            return None, None
+        return chain, (facs if facs is not None else [1.0] * len(chain))
 
     def linear_ok(self, a: np.ndarray, b: np.ndarray) -> bool:
         """Can the tool run straight from ``a`` to ``b``?"""
-        return self.linear_chain(a, b) is not None
+        return self.linear_chain(a, b)[0] is not None
 
     def clear_path(self, a: np.ndarray, b: np.ndarray, factors: bool = False):
         """The interior points of this move, or ``None`` if the move is unusable.
@@ -211,11 +218,13 @@ class MotionModel:
         to be measured -- unset, they come back as 1.0 and nothing is queried, which is
         what a caller with the penalty switched off wants.
 
-        For a joint move they come off the same walk that proved the move clear:
-        ``_resample`` returns exactly the interior of the grid ``segment_scan`` steps
-        along, so the states line up one for one and the caller pays nothing for them.  A
-        linear move has to measure its own, since its states come from inverse kinematics
-        along the tool's line rather than from that grid.
+        Either way they come off the same walk that proved the move clear, though by
+        different routes to it.  For a joint move ``_resample`` returns exactly the
+        interior of the grid ``segment_scan`` steps along, so the states line up one for
+        one.  A linear move's states come from inverse kinematics along the tool's line
+        rather than from that grid, but the gaps between them are walked to prove them
+        clear, and each such walk starts on a chain state -- so the factors are read there
+        instead.  Neither pays a state load for them.
         """
         if self.motion(a, b) == PTP:
             blocked, facs = self.cell.segment_scan(a, b, max_step=self.max_step,
@@ -225,13 +234,10 @@ class MotionModel:
             points = _resample(self.cell, a, b, self.max_step)
             return points, (list(facs[1:-1]) if facs is not None
                             else [1.0] * len(points))
-        chain = self.linear_chain(a, b)
+        chain, facs = self.linear_chain(a, b, factors=factors)
         if chain is None:
             return None, None
-        points = [np.asarray(q, dtype=float) for q in chain[1:-1]]
-        if not factors:
-            return points, [1.0] * len(points)
-        return points, [self.penalty_factor(p) for p in points]
+        return [np.asarray(q, dtype=float) for q in chain[1:-1]], list(facs[1:-1])
 
     # -- what it costs ------------------------------------------------------
     def _crosses(self, a: np.ndarray, b: np.ndarray) -> bool:
@@ -1864,10 +1870,42 @@ def _tcp_travel(cell: Cell, states: list[np.ndarray]) -> float:
     return raw / cell.man.scale
 
 
+def _chain_scan(cell: Cell, chain: list[np.ndarray], check_step: float,
+                factors: bool = False) -> tuple[bool, list[float] | None]:
+    """:func:`_chain_collides`, optionally reading the clearance off the same walk.
+
+    The linear counterpart of :meth:`weldpath.cell.Cell.segment_scan`, and it exists for
+    the same reason: a caller that installs this chain wants a factor at every point of
+    it, and asking for them afterwards loads every state a second time to measure a
+    clearance the contact test had the transforms for.  The gaps are walked here either
+    way, so the second question is answered where the first one already is.
+
+    The factors returned are those of the **chain points**, one per point, and not of the
+    grid inside each gap.  The chain is what gets installed -- its points become path
+    points and are what the cost is summed over -- while the grid inside a gap exists to
+    prove the gap clear and is thrown away.  Returning the finer sampling would price a
+    move by states that are nowhere in it.
+
+    Each gap's scan reports both its ends, so the shared point between two gaps is read
+    from the first of them and the last point from the final gap; taking both would be
+    the same figure from the same cache, but the pairing would no longer be one for one
+    with ``chain``, which is what the caller indexes by.
+    """
+    out: list[float] | None = [] if factors else None
+    for a, b in zip(chain, chain[1:]):
+        hit, facs = cell.segment_scan(a, b, max_step=check_step, factors=factors)
+        if hit:
+            return True, None
+        if factors:
+            out.append(facs[0])
+    if factors:
+        out.append(facs[-1] if len(chain) > 1 else cell.penalty_factor(chain[0]))
+    return False, out
+
+
 def _chain_collides(cell: Cell, chain: list[np.ndarray], check_step: float) -> bool:
     """``plan_linear`` clears the points it places; this clears the gaps between them."""
-    return any(cell.segment_collides(a, b, max_step=check_step)
-               for a, b in zip(chain, chain[1:]))
+    return _chain_scan(cell, chain, check_step)[0]
 
 
 def _linear_allowed(cell: Cell, dense: list[np.ndarray], zone: "LinearZone",
