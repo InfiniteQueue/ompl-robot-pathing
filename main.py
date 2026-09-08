@@ -347,9 +347,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "--robot-cell-mm is 0, since nothing on the arm is refined at all "
                         "(default: 0, i.e. one hull)")
     #CELL SIZE: GUN
-    p.add_argument("--gun-cell-mm", type=float, default=40, metavar="MM",
+    p.add_argument("--gun-cell-mm", type=float, default=60, metavar="MM",
                    help="--hull-cell-mm for the gun body and moving tip. Reduces "
-                        "webbing around the electrodes at lower values (default: 40)")
+                        "webbing around the electrodes at lower values (default: 60)")
     #FAR CELL SIZE: GUN
     p.add_argument("--gun-far-cell-mm", type=float, default=360, metavar="MM",
                    help="--far-cell-mm for the gun body and moving tip, i.e. the part of "
@@ -400,7 +400,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="--merge-cell-mm for the arm's own links. The arm never comes "
                         "close to anything, so it tolerates the coarsest merge in the "
                         "cell (default: unset)")
-    p.add_argument("--gun-merge-mm", type=float, default=None, metavar="MM",
+    p.add_argument("--gun-merge-mm", type=float, default=120, metavar="MM",
                    help="--merge-cell-mm for the gun body and moving tip. This is the "
                         "geometry it was written for: 99%% of the gun's components sit "
                         "beyond --shell-split-tcp-prox, and merging the far ones at "
@@ -486,7 +486,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "decides anything. Allow for the approach as well as the weld "
                         "itself. 0 refines everywhere (default: 60)")
     #TCP PROXIMITY FOR SHELL SPLIT
-    p.add_argument("--shell-split-tcp-prox", type=float, default=50.0, metavar="MM",
+    p.add_argument("--shell-split-tcp-prox", type=float, default=175.0, metavar="MM",
                    help="only refine the gun body and moving tip within this many mm of "
                         "the tool centre point. The gun and the TCP are rigid with respect "
                         "to each other, so unlike a weld this stays meaningful wherever the "
@@ -569,18 +569,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "turns all penalties off. Takes true/false (yes/no, on/off, 1/0); "
                         "passing the flag with no value means true (default: True)")
     #STRENGTH AT TOUCHING
-    p.add_argument("--stepped-penalty-multiplier", type=float, default=8.0, metavar="N",
+    p.add_argument("--stepped-penalty-multiplier", type=float, default=14.0, metavar="N", #was 8
                    help="penalty at zero clearance: a second spent touching costs as much "
-                        "as N seconds in open space (default: 8)")
+                        "as N seconds in open space (default: 14)")
     #WHERE THE PENALTY IS SPENT
-    p.add_argument("--stepped-penalty-zero-mm", type=float, default=100.0, metavar="MM",
+    p.add_argument("--stepped-penalty-zero-mm", type=float, default=50.0, metavar="MM", #was 100
                    help="clearance at which the penalty reaches 1x and stops mattering. "
                         "Also how far the proximity query has to see, so lowering it "
-                        "speeds planning up (default: 100)")
+                        "speeds planning up (default: 50)")
     #STEP LENGTH
-    p.add_argument("--stepped-penalty-step-mm", type=float, default=25.0, metavar="MM",
+    p.add_argument("--stepped-penalty-step-mm", type=float, default=3.0, metavar="MM", #was 25
                    help="how much extra clearance counts as one step of falloff "
-                        "(default: 25)")
+                        "(default: 3)")
     #STEP FACTOR
     p.add_argument("--stepped-penalty-step-factor", type=float, default=0.7, metavar="F",
                    help="what one step multiplies the penalty by: 0.7 means each "
