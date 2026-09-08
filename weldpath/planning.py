@@ -125,6 +125,31 @@ class MotionModel:
             return self.cell.segment_collides(a, b, max_step=self.max_step)
         return not self.linear_ok(a, b)
 
+    def check_and_cost(self, a: np.ndarray, b: np.ndarray, *, fa: float | None = None,
+                       fb: float | None = None, stops: bool = False) -> float | None:
+        """:meth:`blocked` and :meth:`cost` off one walk.  ``None`` when it is blocked.
+
+        Every caller that costs a move has already had to ask whether it is usable, and
+        asked separately the two questions load the same joint states twice over -- once
+        to test contact, once to measure clearance.  Here the walk that answers the first
+        keeps what the second needs.
+
+        Only the joint profile can share the walk.  A linear move is checked along the
+        tool's line, whose states come from inverse kinematics rather than from the joint
+        grid the cost is sampled on, so there is nothing to hand over and it falls back to
+        measuring its own.
+        """
+        if self.motion(a, b) == PTP:
+            hit, facs = self.cell.segment_scan(a, b, max_step=self.max_step,
+                                               factors=self.penalised)
+            if hit:
+                return None
+        elif not self.linear_ok(a, b):
+            return None
+        else:
+            facs = None
+        return self.cost(a, b, fa=fa, fb=fb, stops=stops, facs=facs)
+
     def _pose_mm(self, q: np.ndarray) -> np.ndarray:
         """TCP pose in manifest units.
 
@@ -168,7 +193,7 @@ class MotionModel:
         """Can the tool run straight from ``a`` to ``b``?"""
         return self.linear_chain(a, b) is not None
 
-    def clear_path(self, a: np.ndarray, b: np.ndarray) -> list[np.ndarray] | None:
+    def clear_path(self, a: np.ndarray, b: np.ndarray, factors: bool = False):
         """The interior points of this move, or ``None`` if the move is unusable.
 
         :meth:`blocked` with the route kept instead of thrown away, for the one caller that
@@ -180,15 +205,33 @@ class MotionModel:
 
         Not used by :meth:`blocked` itself, which is asked tens of thousands of times a
         pass and wants a verdict without building a point list to reach it.
+
+        Returns ``(points, factors)``, the factors being those of the interior points and
+        no others; ``(None, None)`` when the move is unusable.  ``factors`` asks for them
+        to be measured -- unset, they come back as 1.0 and nothing is queried, which is
+        what a caller with the penalty switched off wants.
+
+        For a joint move they come off the same walk that proved the move clear:
+        ``_resample`` returns exactly the interior of the grid ``segment_scan`` steps
+        along, so the states line up one for one and the caller pays nothing for them.  A
+        linear move has to measure its own, since its states come from inverse kinematics
+        along the tool's line rather than from that grid.
         """
         if self.motion(a, b) == PTP:
-            if self.cell.segment_collides(a, b, max_step=self.max_step):
-                return None
-            return _resample(self.cell, a, b, self.max_step)
+            blocked, facs = self.cell.segment_scan(a, b, max_step=self.max_step,
+                                                   factors=factors)
+            if blocked:
+                return None, None
+            points = _resample(self.cell, a, b, self.max_step)
+            return points, (list(facs[1:-1]) if facs is not None
+                            else [1.0] * len(points))
         chain = self.linear_chain(a, b)
         if chain is None:
-            return None
-        return [np.asarray(q, dtype=float) for q in chain[1:-1]]
+            return None, None
+        points = [np.asarray(q, dtype=float) for q in chain[1:-1]]
+        if not factors:
+            return points, [1.0] * len(points)
+        return points, [self.penalty_factor(p) for p in points]
 
     # -- what it costs ------------------------------------------------------
     def _crosses(self, a: np.ndarray, b: np.ndarray) -> bool:
@@ -304,7 +347,8 @@ class MotionModel:
         return max(base, _tcp_travel(self.cell, [a, b]) / self.zone.linear_speed_mm_s)
 
     def cost(self, a: np.ndarray, b: np.ndarray, *, fa: float | None = None,
-             fb: float | None = None, stops: bool = False) -> float:
+             fb: float | None = None, stops: bool = False,
+             facs: list[float] | None = None) -> float:
         """Penalised time, with the tool speed cap folded in.
 
         The cap raises the base time; the clearance penalty on top of it is unchanged, so
@@ -317,7 +361,7 @@ class MotionModel:
         times the route enters the band, not time spent anywhere.
         """
         penalised = self.cell.segment_cost(a, b, max_step=self.max_step,
-                                           fa=fa, fb=fb, stops=stops)
+                                           fa=fa, fb=fb, stops=stops, facs=facs)
         floor = self._time_floor(a, b)
         if floor > 0.0:
             raw = self.cell.move_time(a, b) if stops else self.cell.cruise_time(a, b)
@@ -385,11 +429,11 @@ def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
             if model.demotes(path[i], path[j], path[i + 1:j]):
                 j -= 1
                 continue
-            if model.blocked(path[i], path[j]):
+            chord = model.check_and_cost(path[i], path[j],
+                                         fa=factor(i), fb=factor(j), stops=True)
+            if chord is None:
                 j -= 1
                 continue
-            chord = model.cost(path[i], path[j],
-                               fa=factor(i), fb=factor(j), stops=True)
             if chord > polyline_cost(i, j) + 1e-9:
                 j -= 1
                 continue
@@ -509,10 +553,11 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
             if model.demotes(pts[k - 1], pts[k + 1], [pts[k]]):
                 k += 1
                 continue
-            if model.blocked(pts[k - 1], pts[k + 1]):
+            direct = model.check_and_cost(pts[k - 1], pts[k + 1], fa=fac[k - 1],
+                                          fb=fac[k + 1], stops=True)
+            if direct is None:
                 k += 1
                 continue
-            direct = _hop(model, pts[k - 1], pts[k + 1], fac[k - 1], fac[k + 1])
             if direct >= costs[k - 1] + costs[k] - 1e-9:
                 k += 1
                 continue
@@ -550,13 +595,15 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
         if (model.demotes(pts[k - 1], candidate, [pts[k]])
                 or model.demotes(candidate, pts[k + 1], [pts[k]])):
             continue
-        if model.blocked(pts[k - 1], candidate):
-            continue
-        if model.blocked(candidate, pts[k + 1]):
-            continue
         f = model.penalty_factor(candidate)
-        first = _hop(model, pts[k - 1], candidate, fac[k - 1], f)
-        second = _hop(model, candidate, pts[k + 1], f, fac[k + 1])
+        first = model.check_and_cost(pts[k - 1], candidate, fa=fac[k - 1], fb=f,
+                                     stops=True)
+        if first is None:
+            continue
+        second = model.check_and_cost(candidate, pts[k + 1], fa=f, fb=fac[k + 1],
+                                      stops=True)
+        if second is None:
+            continue
         if first + second >= budget - 1e-9:
             continue
         pts[k], fac[k] = candidate, f
@@ -795,11 +842,10 @@ def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
     # profile the check above runs along the Cartesian line, and joint-space points would
     # not lie on it: the pass would verify one curve and install another, leaving moves
     # that claim to be straight lines nobody ever checked.
-    points = model.clear_path(dense[i], dense[j])
+    points, factors = model.clear_path(dense[i], dense[j], factors=penalised)
     if points is None:
         return 0
     if penalised:
-        factors = [model.penalty_factor(p) for p in points]
         chain = [dense[i]] + points + [dense[j]]
         chain_f = [fac[i]] + factors + [fac[j]]
         secs = [model.cruise_time(x, y) for x, y in zip(chain, chain[1:])]
@@ -811,8 +857,6 @@ def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
                          in zip(secs, chain_f, chain_f[1:])) + cross
         if outer + middle >= before - 1e-9:
             return 0
-    else:
-        factors = [1.0] * len(points)
 
     # Install it, score the region as it now really stands, and put it back if that was
     # not an improvement.  Scoring in place rather than predicting: under the whole-move
@@ -1620,9 +1664,15 @@ def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> Non
     d = {k: v - before.get(k, 0) for k, v in counters.items()}
     asked = d["clearance"] + d["clearance_hits"]
     served = 100.0 * d["clearance_hits"] / asked if asked else 0.0
+    fused = d.get("clearance_fused", 0)
+    # What the shared walk saved, in the currency it saved it in: a fused query rode on a
+    # state load the collision check had already paid for, so without it the loads would
+    # have been this much higher.
+    share = f", {fused} of them off a walk already made" if fused else ""
     log(f"      work: {d['clearance']} clearance queries ({served:.0f}% of {asked} served "
-        f"from cache), {d['collision_tests']} collision tests, {d['state_loads']} state "
-        f"loads, {d['fk']} forward kinematics, in {elapsed:.1f}s")
+        f"from cache{share}), {d['collision_tests']} collision tests, "
+        f"{d['state_loads']} state loads, {d['fk']} forward kinematics, "
+        f"in {elapsed:.1f}s")
 
 
 def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
