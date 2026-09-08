@@ -53,7 +53,7 @@ MAX_TOOL_SUBDIVISION = 6
 # environment, a clearance query adds a contact test over every convex piece within the
 # probe, and a collision test adds one at the planning margins.
 COUNTER_NAMES = ("state_loads", "clearance", "clearance_hits", "clearance_fused",
-                 "collision_tests", "fk")
+                 "collision_tests", "fk", "tcp_hits")
 
 # States a cell remembers a clearance for before starting again.  Large enough that the
 # waypoints of a run stay resident, small enough that a long polish cannot exhaust memory
@@ -85,6 +85,9 @@ class Cell:
         # ask it of the same states repeatedly.  Keyed by the gun opening as well as the
         # joint vector, since where the moving tip sits changes the answer.
         self._clearance_cache: dict[tuple[float, bytes], float] = {}
+        # The same trick for the tool's position, which the cost arithmetic asks for far
+        # more often than anything asks for a whole transform.
+        self._tcp_cache: dict[tuple[float, bytes], np.ndarray] = {}
         self.counters = dict.fromkeys(COUNTER_NAMES, 0)
         self._state = None                      # keeps the SWIG state object alive
         self._revolute = [j.type == "revolute" for j in man.robot.joints
@@ -616,6 +619,36 @@ class Cell:
         self.env.setState(self._state_names, self._state_values(q))
         self._state = self.env.getState()
         return np.array(self.env.getLinkTransform(link).matrix(), dtype=float)
+
+    def tcp_at(self, q: np.ndarray) -> np.ndarray:
+        """Where the tool is for a joint state, in environment units, remembered.
+
+        Forward kinematics here is not a matrix multiply: it pushes the joints into the
+        environment and rebuilds every link transform, the same load a collision test
+        pays.  The optimisation passes ask this of the same handful of states over and
+        over -- costing a linear move needs the tool's travel, and a route is rescored
+        every time a candidate is drawn against it -- so on a leg that runs entirely under
+        the linear profile it dominated the cost arithmetic.  Measured on one transit:
+        33993 forward kinematics, against 947 on a leg that was mostly joint motion.
+
+        Keyed by the gun opening as well as the joint vector, since the tip's position
+        moves with it, and bounded like the clearance cache for the same reason.
+
+        Deliberately narrower than :meth:`fk`.  That method's side effect -- leaving the
+        state loaded for whoever asks next -- is part of its contract in places, and a
+        cache hit would quietly skip it.  This returns a position and promises nothing
+        about the environment, so there is nothing to skip.
+        """
+        key = (self.gun_value, np.asarray(q, dtype=float).tobytes())
+        hit = self._tcp_cache.get(key)
+        if hit is not None:
+            self.counters["tcp_hits"] += 1
+            return hit
+        got = np.array(self.fk(q)[:3, 3], dtype=float)
+        if len(self._tcp_cache) >= CLEARANCE_CACHE_MAX:
+            self._tcp_cache.clear()
+        self._tcp_cache[key] = got
+        return got
 
     def ik(self, pose_world_mm: np.ndarray, seed: np.ndarray) -> list[np.ndarray]:
         """Inverse kinematics for a world TCP pose given in manifest units."""
