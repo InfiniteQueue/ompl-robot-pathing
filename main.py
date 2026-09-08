@@ -88,7 +88,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "whichever profile is in force. 0 turns this off, which drops "
                         "both back to --check-step-deg alone (default: 7)")
     #COLLISION CHECK RESOLUTION
-    p.add_argument("--segment-length-rad", type=float, default=0.02,
+    p.add_argument("--segment-length-rad", type=float, default=0.02, #was 0.02
                    help="collision checking resolution for the sampling planner "
                         "(default: 0.02)")
 #endregion
@@ -529,6 +529,20 @@ def build_parser() -> argparse.ArgumentParser:
                    action="store_false",
                    help="do not penalise routes that run close to the panels and "
                         "tooling; only hard collisions are avoided")
+    #HOW THE PENALTY IS SPREAD OVER A MOVE
+    p.add_argument("--whole-move-penalty", type=boolean, nargs="?", const=True,
+                   default=False, metavar="BOOL",
+                   help="true charges every move at the penalty of its worst state -- the "
+                        "smallest clearance anywhere along it -- instead of charging each "
+                        "sub-step at the worse of its own two ends. A move that dips "
+                        "towards a panel once is then priced as though it ran that close "
+                        "throughout, so the passes cannot buy a fast route with a brief "
+                        "graze. Applies to whichever penalty curve is in force. Note this "
+                        "makes the cost depend on where the waypoints are, since a move is "
+                        "what gets charged: splitting one move at the edge of a tight "
+                        "region lets the clear half escape the tight half's factor. Takes "
+                        "true/false (yes/no, on/off, 1/0); passing the flag with no value "
+                        "means true (default: False)")
     #PENALTY CURVE START
     p.add_argument("--clearance-penalty-max-mm", type=float, default=100.0, metavar="MM",
                    help="clearance at and above which there is no penalty; the curve "
@@ -698,7 +712,8 @@ def main(argv: list[str] | None = None) -> int:
                 zero_mm=args.stepped_penalty_zero_mm,
                 step_mm=args.stepped_penalty_step_mm,
                 step_factor=args.stepped_penalty_step_factor,
-                enabled=args.clearance_penalty)
+                enabled=args.clearance_penalty,
+                whole_move=args.whole_move_penalty)
         else:
             penalty = ClearancePenalty(
                 max_mm=args.clearance_penalty_max_mm,
@@ -706,7 +721,8 @@ def main(argv: list[str] | None = None) -> int:
                 multiplier=args.clearance_penalty_multiplier,
                 cutoff_mm=args.clearance_penalty_cutoff_mm,
                 exponent=args.clearance_penalty_exponent,
-                enabled=args.clearance_penalty)
+                enabled=args.clearance_penalty,
+                whole_move=args.whole_move_penalty)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

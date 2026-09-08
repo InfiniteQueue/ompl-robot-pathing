@@ -578,7 +578,7 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
 
 def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: float,
             polish_seconds: float, relocate: "Relocation | None" = None,
-            log=print) -> list[np.ndarray]:
+            anchors: list[int] | None = None, log=print) -> list[np.ndarray]:
     """The whole post-processing chain, in the order the three passes need to run.
 
     Shortcutting reshapes the route while it is still dense, reduction picks which of those
@@ -597,7 +597,8 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     else:
         log(f"      refining {len(path)} points: up to {shortcut_seconds:g}s shortcutting "
             f"then {polish_seconds:g}s polishing, both spent in full")
-    improved = shortcut(model, path, time_budget=shortcut_seconds, log=log)
+    improved = shortcut(model, path, time_budget=shortcut_seconds, anchors=anchors,
+                        log=log)
     reduced = simplify(model, improved)
     return polish(model, reduced, time_budget=polish_seconds, relocate=relocate,
                   log=log)
@@ -617,17 +618,33 @@ def _densify(cell: Cell, path: list[np.ndarray], step: float) -> list[np.ndarray
     ``--check-step-deg`` the checking uses, so consecutive points differ by less than the
     resolution anything here can resolve.
     """
+    return _densify_marked(cell, path, step)[0]
+
+
+def _densify_marked(cell: Cell, path: list[np.ndarray],
+                    step: float) -> tuple[list[np.ndarray], list[int]]:
+    """:func:`_densify`, plus where the points it was given ended up.
+
+    The second return is the index in the dense list of each point of ``path``, in order.
+    Those are the route's real waypoints; everything between them is fill.  Nothing
+    downstream can tell the two apart from the geometry -- a filled point sits on the
+    straight line between its neighbours, and so does a waypoint on a straight stretch --
+    so a pass that needs to know has to be told here or not at all.
+    """
     out: list[np.ndarray] = [np.asarray(path[0], dtype=float)]
+    marks = [0]
     for a, b in zip(path, path[1:]):
         a = np.asarray(a, dtype=float)
         b = np.asarray(b, dtype=float)
         out.extend(_resample(cell, a, b, step))
         out.append(b)
-    return out
+        marks.append(len(out) - 1)
+    return out, marks
 
 
 def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float = 2.0,
              rng: np.random.Generator | None = None,
+             anchors: list[int] | None = None,
              log=None) -> list[np.ndarray]:
     """Reshape a path to take less time, penalised for running close to the parts.
 
@@ -665,6 +682,13 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
     it went.  Cruise time is unchanged by subdivision, so this pass judges the route's
     shape and ``simplify`` judges how many stops it needs.
 
+    ``anchors`` says which entries of ``path`` are real waypoints rather than fill, for
+    the caller that densified before calling.  It matters only under the penalty's
+    ``whole_move`` rule, where the unit being charged is a move between waypoints and not
+    a sub-step, so the pass has to know where one move ends and the next begins.  Left
+    unset, the points handed in are taken to be the waypoints, which is what they are when
+    nobody has densified yet.
+
     Work is bounded by ``time_budget`` seconds; the result is always collision free, since
     every replacement is checked before it is kept.
     """
@@ -673,20 +697,44 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
 
     cell = model.cell
     max_step = model.max_step
-    dense = _densify(cell, path, max_step)
+    if anchors is None:
+        dense, marks = _densify_marked(cell, path, max_step)
+    else:
+        # Already dense: densifying again would be a no-op that invalidated the indices.
+        dense = [np.asarray(p, dtype=float) for p in path]
+        marks = sorted({0, len(dense) - 1, *(int(m) for m in anchors)})
 
     # One clearance query per waypoint, cached: the geometry query dominates, so scoring a
     # candidate has to be arithmetic over remembered factors rather than fresh queries.
     penalised = model.penalised
     fac = [model.penalty_factor(p) if penalised else 1.0 for p in dense]
 
+    # Which unit the penalty is charged over.  Per sub-step the anchors are irrelevant and
+    # the cost is a plain sum; per move they decide where one charge ends and the next
+    # begins, and the pass has to respect the same division the emitted route will have.
+    whole = penalised and bool(getattr(cell.penalty, "whole_move", False))
+
     def step_cost(x: np.ndarray, y: np.ndarray, fx: float, fy: float) -> float:
         # Outside the factor, on the same footing as everywhere else it is charged.
         return model.cruise_time(x, y) * max(fx, fy) + model.crossing_penalty(x, y)
 
+    def move_cost(i: int, j: int) -> float:
+        """dense[i..j] as one move: its worst state prices the whole of it."""
+        cross = sum(model.crossing_penalty(dense[k], dense[k + 1]) for k in range(i, j))
+        secs = sum(model.cruise_time(dense[k], dense[k + 1]) for k in range(i, j))
+        return secs * max(fac[i:j + 1]) + cross
+
     def span_cost(i: int, j: int) -> float:
-        return sum(step_cost(dense[k], dense[k + 1], fac[k], fac[k + 1])
-                   for k in range(i, j))
+        """Cost of dense[i..j], divided into moves the way the anchors divide it.
+
+        ``i`` and ``j`` are boundaries whether or not they are anchors, which is what lets
+        a caller ask for the cost of a region it is about to cut at.
+        """
+        if not whole:
+            return sum(step_cost(dense[k], dense[k + 1], fac[k], fac[k + 1])
+                       for k in range(i, j))
+        bounds = [i] + [m for m in marks if i < m < j] + [j]
+        return sum(move_cost(u, v) for u, v in zip(bounds, bounds[1:]))
 
     rng = rng or np.random.default_rng(0)
     before = span_cost(0, len(dense) - 1)
@@ -695,7 +743,7 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
 
     while time.time() < deadline and len(dense) > 2:
         tried += 1
-        cuts += _try_cut(model, dense, fac, rng, penalised, span_cost)
+        cuts += _try_cut(model, dense, fac, marks, rng, penalised, whole, span_cost)
 
     if log:
         after = span_cost(0, len(dense) - 1)
@@ -706,17 +754,40 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
     return dense
 
 
-def _try_cut(model: "MotionModel", dense, fac, rng, penalised, span_cost) -> int:
-    """Replace dense[i..j] with the straight move between the ends, if that is cheaper."""
+def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
+             span_cost) -> int:
+    """Replace dense[i..j] with the straight move between the ends, if that is cheaper.
+
+    The comparison is made over the whole region between the anchors either side of the
+    cut, not over ``i..j`` alone.  Under the per-sub-step rule those outer stretches are
+    identical on both sides and cancel, leaving exactly the ``i..j`` comparison this pass
+    has always made.  Under the whole-move rule they do not: a cut that swallows an anchor
+    merges two moves into one, and the merged move is charged at the worst state of both,
+    which is a cost the middle alone does not show.
+
+    **A cut does not create anchors.**  It is tempting to make its two ends waypoints,
+    since it installs a real straight move between them, but under the whole-move rule
+    that turns the pass into a waypoint generator: adding a boundary can only ever lower
+    the cost, because a maximum over part of a move is never above the maximum over all of
+    it.  Measured on a straight stub route where no cut changes the geometry at all, the
+    pass took 6 of them and reported the route 50% cheaper -- entirely by re-dividing it.
+    Where the waypoints go is ``simplify``'s decision, made on stop-to-stop time where an
+    extra stop costs a pair of ramps; this pass may only reshape the route between them.
+    """
     i, j = sorted(rng.integers(0, len(dense), size=2))
     if j - i < 2:
         return 0
-    span = span_cost(i, j)
-    # Every factor is at least 1 and cruise time is additive, so the unpenalised cruise
-    # time of the direct move is a valid lower bound on what the replacement can cost.
-    # Rejecting on that first keeps the expensive checks off the many candidates that
-    # were never going to win.
-    if model.cell.cruise_time(dense[i], dense[j]) >= span - 1e-9:
+    lo = max([m for m in marks if m <= i], default=0)
+    hi = min([m for m in marks if m >= j], default=len(dense) - 1)
+    before = span_cost(lo, hi)
+    # A lower bound on what the region can cost once cut, used to reject cheaply.  Two
+    # things make it a bound rather than the answer: every factor is at least 1, so the
+    # unpenalised cruise time of the direct move is a floor under its middle; and cutting
+    # the region at i and j can only lower it, since a maximum over part of a move never
+    # exceeds the maximum over the whole.  The real figure is taken below, after the
+    # replacement exists.
+    outer = span_cost(lo, i) + span_cost(j, hi)
+    if outer + model.cell.cruise_time(dense[i], dense[j]) >= before - 1e-9:
         return 0
     if model.demotes(dense[i], dense[j], dense[i + 1:j]):
         return 0
@@ -731,15 +802,34 @@ def _try_cut(model: "MotionModel", dense, fac, rng, penalised, span_cost) -> int
         factors = [model.penalty_factor(p) for p in points]
         chain = [dense[i]] + points + [dense[j]]
         chain_f = [fac[i]] + factors + [fac[j]]
-        direct = sum(model.cruise_time(x, y) * max(fx, fy)
-                     + model.crossing_penalty(x, y)
-                     for x, y, fx, fy in zip(chain, chain[1:], chain_f, chain_f[1:]))
-        if direct >= span - 1e-9:
+        secs = [model.cruise_time(x, y) for x, y in zip(chain, chain[1:])]
+        cross = sum(model.crossing_penalty(x, y) for x, y in zip(chain, chain[1:]))
+        if whole:
+            middle = sum(secs) * max(chain_f) + cross
+        else:
+            middle = sum(s * max(fx, fy) for s, fx, fy
+                         in zip(secs, chain_f, chain_f[1:])) + cross
+        if outer + middle >= before - 1e-9:
             return 0
     else:
         factors = [1.0] * len(points)
+
+    # Install it, score the region as it now really stands, and put it back if that was
+    # not an improvement.  Scoring in place rather than predicting: under the whole-move
+    # rule a cut that swallowed an anchor leaves a move spanning further than i..j, and
+    # rebuilding that arithmetic outside the list it applies to is how the two drift
+    # apart.  Only candidates that already passed both bounds get this far.
+    old_points, old_factors = dense[i + 1:j], fac[i + 1:j]
+    old_marks = list(marks)
     dense[i + 1:j] = points
     fac[i + 1:j] = factors
+    shift = (i + 1 + len(points)) - j
+    marks[:] = [m for m in marks if m <= i] + [m + shift for m in marks if m >= j]
+    if span_cost(lo, hi + shift) >= before - 1e-9:
+        dense[i + 1:i + 1 + len(points)] = old_points
+        fac[i + 1:i + 1 + len(points)] = old_factors
+        marks[:] = old_marks
+        return 0
     return 1
 
 
@@ -1556,11 +1646,12 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     """
     before, t0 = getattr(cell, "counters", None), time.time()
     before = dict(before) if before is not None else None
-    dense = _densify(cell, path, check_step)
+    dense, anchors = _densify_marked(cell, path, check_step)
     allowed = zone is not None and _linear_allowed(cell, dense, zone, log=log)
     model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
     refined = _refine(model, dense, shortcut_seconds=shortcut_seconds,
-                      polish_seconds=polish_seconds, relocate=relocate, log=log)
+                      polish_seconds=polish_seconds, relocate=relocate,
+                      anchors=anchors, log=log)
     runs = _split_runs(model, refined)
     _verify_runs(model, runs, "planned route", log=log)
     _report_work(cell, before, time.time() - t0, log)

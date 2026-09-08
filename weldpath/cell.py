@@ -485,6 +485,11 @@ class Cell:
         multiplier, which is what the penalty was specified in: a second at the minimum
         clearance costs as much as N seconds in open space.
 
+        How that multiplier is spread over the move is the penalty's ``whole_move`` flag:
+        per sub-step by default, or the worst state's factor over the whole move when it
+        is set.  Either way the interior is sampled, because either way the answer depends
+        on states between the ends.
+
         ``stops`` picks which time this is.  False measures cruise only, for a move that is
         one step of a densified path the robot will not really stop along; True measures
         the full move, ramps included, for a move between two waypoints that will be
@@ -510,6 +515,12 @@ class Cell:
                 factors.append(fb)
             else:
                 factors.append(self.penalty_factor(a + t * (b - a)))
+        if getattr(self.penalty, "whole_move", False):
+            # The move is the unit being priced, so its worst state prices all of it: a
+            # dip cannot be made cheap by being brief.  Every interior sample is still
+            # taken -- the worst state is usually not an endpoint, and reading only the
+            # ends would let a move duck under a fixture between them for nothing.
+            return raw * max(factors)
         # Each sub-step is charged at the worse of the states it runs between, so a dip
         # towards the panel is never averaged away by the clear air on either side.  The
         # move's time is spread evenly over the sub-steps rather than following the ramps,
