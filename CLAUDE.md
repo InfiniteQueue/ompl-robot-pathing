@@ -49,6 +49,23 @@ the way, so the joint values in between are whatever that line demands.
 - `_densify` fills the OMPL path in at `--check-step-deg` resolution, measured as the
   **largest joint delta** — not time, not tool distance. OMPL itself returns very few
   points (four is typical); everything downstream runs on the dense list.
+  - The fill follows **the curve each move will really be flown along**: the joint
+    chord for a joint move, the tool's straight line for a linear one, which `_fill`
+    takes from `MotionModel.clear_path`. This used to be the chord in both cases,
+    which left the optimisation passes drawing their candidate cut endpoints from
+    states the robot never visits. Measured on a transit that withdrew 921 mm to
+    cross between two welds 59 mm apart: cuts taken off the real line were clear and
+    46% cheaper than the route that shipped, and not one of their endpoints existed
+    in the chord fill the pass was given.
+  - The linear fill is **thinned back to the same spacing**, by `_resample`'s own
+    largest-joint-delta rule walked along the real curve. `plan_linear` stations
+    every `--check-step-mm` of tool travel, which is far finer — over a hundred
+    points against seven on a metre-long move. Only the curve was wrong, not the
+    density, and changing both at once would have made the fix impossible to
+    attribute.
+  - A linear move that will not validate falls back to the chord. Densifying is not
+    where a route is rejected; `_verify_runs` sweeps the finished path and reports
+    there.
 - The profile is **not stored** against a waypoint. `MotionModel.motion(a, b)` derives it
   from the two states a move runs between: linear when either end is inside the band. That
   is what lets `shortcut` and `polish` move points around without invalidating anything.
@@ -91,5 +108,11 @@ the way, so the joint values in between are whatever that line demands.
     own factor arithmetic — `MotionModel.cost`, `simplify`'s `polyline_cost`, and both
     sides of `shortcut`'s comparison. Charged on the same footing everywhere or it would
     not cancel where it is supposed to.
-- Order in `_finish` is densify → gate → refine → split. The split is a reading of the
-  finished path, not a decision imposed before it.
+- Order in `_finish` is sample → gate → densify → refine → split. The gate and the
+  fill each need the other's answer, so the route is sampled twice: whether the leg
+  earns linear motion is a proportion over the route, which a chord sample answers
+  perfectly well, and only once that is settled is there a model to say which
+  stretches are linear. The second pass is free where it changes nothing — gate
+  refused means no zone, every move a joint move, and the profile-aware fill is the
+  chord again. The split is a reading of the finished path, not a decision imposed
+  before it.

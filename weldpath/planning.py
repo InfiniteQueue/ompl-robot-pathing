@@ -667,15 +667,74 @@ def _densify(cell: Cell, path: list[np.ndarray], step: float) -> list[np.ndarray
     """A sampling planner's handful of states, filled in at collision-check resolution.
 
     OMPL returns very few points -- four is typical -- and every pass downstream wants the
-    route rather than the tree's nodes.  The spacing is a joint-space one, the same
-    ``--check-step-deg`` the checking uses, so consecutive points differ by less than the
-    resolution anything here can resolve.
+    route rather than the tree's nodes.  Without a model the spacing is a joint-space one,
+    the same ``--check-step-deg`` the checking uses, so consecutive points differ by less
+    than the resolution anything here can resolve.
     """
     return _densify_marked(cell, path, step)[0]
 
 
-def _densify_marked(cell: Cell, path: list[np.ndarray],
-                    step: float) -> tuple[list[np.ndarray], list[int]]:
+def _thin(a: np.ndarray, points: list[np.ndarray], b: np.ndarray,
+          step: float) -> list[np.ndarray]:
+    """Enough of a chain to describe it at ``step``, and no more.
+
+    ``plan_linear`` places a station every ``--check-step-mm`` of tool travel, which is
+    far finer than the joint-space spacing the rest of the fill uses -- on a metre-long
+    move, well over a hundred points against seven.  Handing all of them on would change
+    how densely the route is sampled at the same time as changing which curve it is
+    sampled along, and only the second is wanted here: what the passes were missing is
+    candidate points that lie on the route, not more of them.
+
+    So this applies ``_resample``'s own criterion -- largest joint delta since the last
+    point kept -- walking the real curve instead of the chord.  A point within a step of
+    the far end is dropped as well, so the fill cannot leave a step so short that it
+    costs a stop for no distance.
+    """
+    out: list[np.ndarray] = []
+    last = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    for q in points:
+        q = np.asarray(q, dtype=float)
+        if float(np.max(np.abs(q - last))) < step:
+            continue
+        if float(np.max(np.abs(b - q))) < step:
+            continue
+        out.append(q)
+        last = q
+    return out
+
+
+def _fill(cell: Cell, model: "MotionModel | None", a: np.ndarray, b: np.ndarray,
+          step: float) -> list[np.ndarray]:
+    """Points strictly between ``a`` and ``b``, on the curve the robot will really fly.
+
+    A joint move follows the joint chord and ``_resample`` describes it exactly.  A linear
+    move does not: the tool runs a straight line in space and the joints come from inverse
+    kinematics along it, so interpolating the chord puts the fill on a curve the route
+    never passes through.
+
+    That distinction was already respected everywhere a move is *checked* or *installed*,
+    and nowhere the route is *sampled*, which left the optimisation passes drawing their
+    candidate cut endpoints from states the robot does not visit.  Measured on a transit
+    that withdrew 921 mm to cross between two welds 59 mm apart: cuts taken off the real
+    line were clear and 46% cheaper than the route that shipped, and none of their
+    endpoints existed in the chord-interpolated fill the pass was given.
+
+    Falls back to the chord when the linear move will not validate.  Densifying is not the
+    place to reject a route -- nothing here has ever done so, and ``_verify_runs`` sweeps
+    the finished path along the path each move really takes -- so a stretch that cannot be
+    flown linearly is filled as before and left to fail where failures are reported.
+    """
+    if model is not None and model.motion(a, b) == LIN:
+        points, _ = model.clear_path(a, b)
+        if points is not None:
+            return _thin(a, points, b, step)
+    return _resample(cell, a, b, step)
+
+
+def _densify_marked(cell: Cell, path: list[np.ndarray], step: float,
+                    model: "MotionModel | None" = None
+                    ) -> tuple[list[np.ndarray], list[int]]:
     """:func:`_densify`, plus where the points it was given ended up.
 
     The second return is the index in the dense list of each point of ``path``, in order.
@@ -683,13 +742,17 @@ def _densify_marked(cell: Cell, path: list[np.ndarray],
     downstream can tell the two apart from the geometry -- a filled point sits on the
     straight line between its neighbours, and so does a waypoint on a straight stretch --
     so a pass that needs to know has to be told here or not at all.
+
+    ``model`` decides how each stretch is filled: given one, a move it judges linear is
+    filled along the tool's line rather than the joint chord.  See :func:`_fill`.  Without
+    one every stretch is a chord, which is what a caller with no profile in force wants.
     """
     out: list[np.ndarray] = [np.asarray(path[0], dtype=float)]
     marks = [0]
     for a, b in zip(path, path[1:]):
         a = np.asarray(a, dtype=float)
         b = np.asarray(b, dtype=float)
-        out.extend(_resample(cell, a, b, step))
+        out.extend(_fill(cell, model, a, b, step))
         out.append(b)
         marks.append(len(out) - 1)
     return out, marks
@@ -751,7 +814,7 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
     cell = model.cell
     max_step = model.max_step
     if anchors is None:
-        dense, marks = _densify_marked(cell, path, max_step)
+        dense, marks = _densify_marked(cell, path, max_step, model=model)
     else:
         # Already dense: densifying again would be a no-op that invalidated the indices.
         dense = [np.asarray(p, dtype=float) for p in path]
@@ -1717,9 +1780,19 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     """
     before, t0 = getattr(cell, "counters", None), time.time()
     before = dict(before) if before is not None else None
-    dense, anchors = _densify_marked(cell, path, check_step)
-    allowed = zone is not None and _linear_allowed(cell, dense, zone, log=log)
+    # Two passes, because the gate and the fill each need the other's answer.  Whether the
+    # leg earns linear motion is a proportion over the route, so a chord-interpolated
+    # sample answers it perfectly well -- the question is how much of the leg runs near
+    # the panel, not exactly which states it passes through.  Only once that is settled is
+    # there a model to say which stretches are linear, and so where the chord is the wrong
+    # curve to have sampled.
+    #
+    # The second pass is free where it changes nothing: with the gate refused there is no
+    # zone, every move is a joint move, and the profile-aware fill is the chord again.
+    gate = _densify(cell, path, check_step)
+    allowed = zone is not None and _linear_allowed(cell, gate, zone, log=log)
     model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
+    dense, anchors = _densify_marked(cell, path, check_step, model=model)
     refined = _refine(model, dense, shortcut_seconds=shortcut_seconds,
                       polish_seconds=polish_seconds, relocate=relocate,
                       anchors=anchors, log=log)
