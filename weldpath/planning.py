@@ -27,6 +27,12 @@ from tesseract_robotics.tesseract_motion_planners_ompl import (
 
 from .cell import Cell
 
+try:                                        # not in every build of the bindings
+    from tesseract_robotics.tesseract_collision import (
+        CollisionEvaluatorType_LVS_CONTINUOUS as _LVS_CONTINUOUS)
+except ImportError:                         # pragma: no cover - binding dependent
+    _LVS_CONTINUOUS = None
+
 OMPL_NAMESPACE = "OMPLMotionPlanner"
 
 
@@ -1029,6 +1035,7 @@ DEFAULT_PLANNING_TIME = 5.0
 # The rest of OMPLSolverConfig's documented defaults, used to recognise the struct.
 _SOLVER_SIGNATURE = (10, 0, 1)          # max_solutions, simplify, optimize
 _planning_time_warned = False
+_continuous_warned = False
 
 
 @dataclass
@@ -1121,10 +1128,48 @@ def _set_planning_time(profile: OMPLRealVectorMoveProfile, seconds: float) -> bo
 
 def _ompl_profile(segment_length: float,
                   planning_time: float = DEFAULT_PLANNING_TIME,
+                  continuous_check: bool = False,
                   log=None) -> OMPLRealVectorMoveProfile:
-    global _planning_time_warned
+    """The profile one OMPL run is made under.
+
+    ``continuous_check`` swaps the collision evaluator from ``DISCRETE`` to
+    ``LVS_CONTINUOUS``.  The default samples states along each edge and tests each one,
+    which is what lets a move step over a fixture: the resolution is
+    ``longest_valid_segment_length``, a single distance in **joint** space, and how far
+    that carries the tool depends entirely on which joint moved.  At 0.02 rad it is some
+    71 mm at j1 against 16 mm at j6 on this robot, so one figure is either wasteful at the
+    wrist or blind at the shoulder.  It is blind at the shoulder, and that is the
+    ``move 0 -> 1`` rejection: our own check bisects wherever the tool travels more than
+    ``--check-step-mm``, sees what the sampler stepped over, and refuses the route.
+
+    OMPL cannot be asked to measure the tool instead.  It plans over an abstract state
+    space and has no forward kinematics, so Cartesian displacement is not a quantity it
+    can compute; the places one would inject it -- a custom ``MotionValidator``, or an
+    override of ``StateSpace::validSegmentCount`` -- are not in these bindings, which
+    export the planner, the configurators and this profile and nothing else of OMPL's.
+
+    The continuous evaluator sidesteps the question rather than answering it: it sweeps
+    each sub-step instead of sampling it, so there are no gaps to step over whatever the
+    lever arm.  ``LVS_CONTINUOUS`` rather than ``CONTINUOUS`` because the sweep is a
+    linear interpolation of link transforms while a joint move carries the link along an
+    arc -- keeping the joint-space subdivision holds that approximation to a short step.
+
+    Off by default.  It is dearer per test than sampling, and OMPL's budget is already
+    what limits this cell, so it can buy fewer solutions found in exchange for fewer
+    rejected -- which of those wins is a question about a cell and not one to guess at.
+    """
+    global _planning_time_warned, _continuous_warned
     profile = OMPLRealVectorMoveProfile()
     profile.collision_check_config.longest_valid_segment_length = segment_length
+    if continuous_check:
+        if _LVS_CONTINUOUS is None:
+            if not _continuous_warned:
+                _continuous_warned = True
+                (log or print)(
+                    "      ! this build of the bindings does not expose "
+                    "CollisionEvaluatorType_LVS_CONTINUOUS; checks stay discrete")
+        else:
+            profile.collision_check_config.type = _LVS_CONTINUOUS
     if abs(planning_time - DEFAULT_PLANNING_TIME) > 1e-12:
         if not _set_planning_time(profile, planning_time) and not _planning_time_warned:
             _planning_time_warned = True
@@ -1203,6 +1248,7 @@ def _endpoint_block(cell: Cell, qa: np.ndarray, qb: np.ndarray) -> str | None:
 
 def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget,
                      segment_length: float, check_step: float,
+                     continuous_check: bool = False,
                      via: np.ndarray | None,
                      shortcut_seconds: float, polish_seconds: float,
                      zone: LinearZone | None = None,
@@ -1231,6 +1277,7 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
     if via is None:
         return _plan_direct(cell, qa, qb, ompl=ompl,
                             segment_length=segment_length, check_step=check_step,
+                            continuous_check=continuous_check,
                             shortcut_seconds=shortcut_seconds,
                             polish_seconds=polish_seconds,
                             zone=zone, cartesian=cartesian,
@@ -1247,10 +1294,12 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
     # fallback pose whether the geometry called for one or not.
     first = _plan_direct(cell, qa, via, ompl=ompl,
                          segment_length=segment_length, check_step=check_step,
+                         continuous_check=continuous_check,
                          shortcut_seconds=0.0, polish_seconds=0.0,
                          log=log, record=halves)
     second = _plan_direct(cell, via, qb, ompl=ompl,
                           segment_length=segment_length, check_step=check_step,
+                          continuous_check=continuous_check,
                           shortcut_seconds=0.0, polish_seconds=0.0,
                           log=log, record=halves)
     if len(halves) == 2:
@@ -1265,7 +1314,7 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
 
 def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    ompl: OmplBudget | None = None, segment_length: float = 0.02,
-                   check_step: float = 0.05,
+                   check_step: float = 0.05, continuous_check: bool = False,
                    fallback_via=None,
                    fallback_runs: int = 0,
                    shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
@@ -1310,6 +1359,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
         with cell.gun_opening(opening):
             return _plan_at_opening(cell, a, b, ompl=effort or ompl,
                                     segment_length=segment_length,
+                                    continuous_check=continuous_check,
                                     check_step=check_step, via=via,
                                     shortcut_seconds=budget,
                                     polish_seconds=polish_seconds if budget else 0.0,
@@ -1536,7 +1586,8 @@ def _route_fault(cell: Cell, path: list[np.ndarray], check_step: float) -> str |
 
 
 def _ompl_run(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, segment_length: float,
-              planning_time: float, check_step: float, label: str, log
+              planning_time: float, check_step: float, label: str, log,
+              continuous_check: bool = False
               ) -> tuple[float, float, list[np.ndarray]] | None:
     """One sampling-planner solve, scored and reported.  ``None`` when it did not solve.
 
@@ -1546,7 +1597,7 @@ def _ompl_run(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, segment_length: flo
     """
     profiles = ProfileDictionary()
     profiles.addProfile(OMPL_NAMESPACE, "DEFAULT",
-                        _ompl_profile(segment_length, planning_time, log))
+                        _ompl_profile(segment_length, planning_time, continuous_check, log))
     request = PlannerRequest()
     request.env = cell.env
     request.instructions = _make_program(cell, qa, qb)
@@ -1576,6 +1627,7 @@ _ompl_run.message = ""
 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget,
                  segment_length: float, check_step: float,
+                 continuous_check: bool = False,
                  shortcut_seconds: float, polish_seconds: float,
                  zone: LinearZone | None = None,
                  cartesian: "CartesianBudget | None" = None,
@@ -1619,6 +1671,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     def run(planning_time: float, label: str) -> bool:
         nonlocal last
         found = _ompl_run(cell, qa, qb, segment_length=segment_length,
+                          continuous_check=continuous_check,
                           planning_time=planning_time, check_step=check_step,
                           label=label, log=log)
         if found is None:

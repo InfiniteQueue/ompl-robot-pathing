@@ -88,6 +88,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "whichever profile is in force. 0 turns this off, which drops "
                         "both back to --check-step-deg alone (default: 7)")
     #COLLISION CHECK RESOLUTION
+    p.add_argument("--ompl-continuous-check", type=boolean, nargs="?", const=True,
+                   default=False, metavar="BOOL",
+                   help="sweep each OMPL sub-step instead of sampling it "
+                        "(LVS_CONTINUOUS rather than DISCRETE). The sampled check "
+                        "is spaced by --segment-length-rad, a joint-space figure, "
+                        "so how far it carries the tool depends on which joint "
+                        "moved -- about 71 mm at j1 against 16 mm at j6 -- and a "
+                        "move that steps over a fixture at the shoulder is then "
+                        "refused by this planner's own finer check. A sweep leaves "
+                        "no gap to step over, at a higher cost per test. Off by "
+                        "default: OMPL's budget is what limits a hard cell, so "
+                        "this can buy fewer solutions found for fewer rejected "
+                        "(default: off)")
     p.add_argument("--segment-length-rad", type=float, default=0.02, #was 0.02
                    help="collision checking resolution for the sampling planner "
                         "(default: 0.02)")
@@ -794,6 +807,7 @@ def main(argv: list[str] | None = None) -> int:
                             min_mm=args.relocate_min_mm, max_mm=args.relocate_max_mm,
                             exponent=args.relocate_exponent),
         segment_length=args.segment_length_rad,
+        continuous_check=args.ompl_continuous_check,
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,
         polish_seconds=args.polish_seconds if args.shortcut else 0.0,
