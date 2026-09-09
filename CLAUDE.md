@@ -66,6 +66,16 @@ the way, so the joint values in between are whatever that line demands.
   - A linear move that will not validate falls back to the chord. Densifying is not
     where a route is rejected; `_verify_runs` sweeps the finished path and reports
     there.
+  - A stretch already inside the spacing is handed straight through, before the model
+    is consulted at all. That is the whole of a cartesian-tree route — its stations
+    arrive one `--check-step-mm` of tool travel apart, far inside one joint step, and
+    are the states it validated. Asking for a chain there would re-derive them, which
+    is exactly what that planner keeps its own edge states to avoid, and would build
+    hundreds of chains only to be told there is nothing to insert.
+  - Which profile applies is asked of the model, not taken from where the path came
+    from. Every solver's edges do have a known type, but that is how the edge was
+    *planned*; `_split_runs` decides how it will be *flown*, and an OMPL edge with
+    both ends in the band ships linear.
 - The profile is **not stored** against a waypoint. `MotionModel.motion(a, b)` derives it
   from the two states a move runs between: linear when either end is inside the band. That
   is what lets `shortcut` and `polish` move points around without invalidating anything.

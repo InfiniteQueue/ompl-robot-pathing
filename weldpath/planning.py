@@ -724,7 +724,25 @@ def _fill(cell: Cell, model: "MotionModel | None", a: np.ndarray, b: np.ndarray,
     place to reject a route -- nothing here has ever done so, and ``_verify_runs`` sweeps
     the finished path along the path each move really takes -- so a stretch that cannot be
     flown linearly is filled as before and left to fail where failures are reported.
+
+    The profile is asked of the model rather than taken from where the path came from,
+    and the difference is the point.  Every solver's edges do have a known type -- OMPL
+    only makes joint-space straight lines, and cannot make anything else -- but that is
+    how the edge was *planned*, and ``_split_runs`` decides how it will be *flown* from
+    where its ends sit.  An OMPL edge with both ends in the band ships linear.  On Path 1
+    that is the whole route, and the edge in question has a blocked joint chord and a
+    clear cartesian line: filling it on its provenance would sample a curve nothing can
+    fly.
     """
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    if float(np.max(np.abs(b - a))) <= step:
+        # Nothing to fill in, so do not pay a chain to be told so.  This is the whole of a
+        # cartesian-tree route, which arrives already dense -- its stations are one
+        # ``--check-step-mm`` of tool travel apart, far inside one joint step -- and whose
+        # states are the ones it validated.  Re-deriving them is what that planner keeps
+        # its own edge states to avoid.
+        return []
     if model is not None and model.motion(a, b) == LIN:
         points, _ = model.clear_path(a, b)
         if points is not None:
