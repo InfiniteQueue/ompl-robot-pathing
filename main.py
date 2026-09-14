@@ -101,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "default: OMPL's budget is what limits a hard cell, so "
                         "this can buy fewer solutions found for fewer rejected "
                         "(default: off)")
-    p.add_argument("--segment-length-rad", type=float, default=0.02, #was 0.02
+    p.add_argument("--segment-length-rad", type=float, default=0.01, #was 0.05
                    help="collision checking resolution for the sampling planner "
                         "(default: 0.02)")
 #endregion
@@ -520,7 +520,7 @@ def build_parser() -> argparse.ArgumentParser:
     #endregion
     #region ###CLEARANCE FROM THE PARTS###
     #CLEARANCE EVERYWHERE
-    p.add_argument("--obstacle-clearance-mm", type=float, default=0.0, metavar="MM",
+    p.add_argument("--obstacle-clearance-mm", type=float, default=5.0, metavar="MM",
                    help="how close the robot and gun may come to the panels and tooling "
                         "before it counts as a collision. Positive keeps that much clear "
                         "air, 0 means touching collides, negative tolerates that much "
