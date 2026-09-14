@@ -88,7 +88,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "whichever profile is in force. 0 turns this off, which drops "
                         "both back to --check-step-deg alone (default: 7)")
     #COLLISION CHECK RESOLUTION
-    p.add_argument("--segment-length-rad", type=float, default=0.02,
+    p.add_argument("--ompl-continuous-check", type=boolean, nargs="?", const=True,
+                   default=False, metavar="BOOL",
+                   help="sweep each OMPL sub-step instead of sampling it "
+                        "(LVS_CONTINUOUS rather than DISCRETE). The sampled check "
+                        "is spaced by --segment-length-rad, a joint-space figure, "
+                        "so how far it carries the tool depends on which joint "
+                        "moved -- about 71 mm at j1 against 16 mm at j6 -- and a "
+                        "move that steps over a fixture at the shoulder is then "
+                        "refused by this planner's own finer check. A sweep leaves "
+                        "no gap to step over, at a higher cost per test. Off by "
+                        "default: OMPL's budget is what limits a hard cell, so "
+                        "this can buy fewer solutions found for fewer rejected "
+                        "(default: off)")
+    p.add_argument("--segment-length-rad", type=float, default=0.01, #was 0.05
                    help="collision checking resolution for the sampling planner "
                         "(default: 0.02)")
 #endregion
@@ -507,7 +520,7 @@ def build_parser() -> argparse.ArgumentParser:
     #endregion
     #region ###CLEARANCE FROM THE PARTS###
     #CLEARANCE EVERYWHERE
-    p.add_argument("--obstacle-clearance-mm", type=float, default=0.0, metavar="MM",
+    p.add_argument("--obstacle-clearance-mm", type=float, default=5.0, metavar="MM",
                    help="how close the robot and gun may come to the panels and tooling "
                         "before it counts as a collision. Positive keeps that much clear "
                         "air, 0 means touching collides, negative tolerates that much "
@@ -529,6 +542,20 @@ def build_parser() -> argparse.ArgumentParser:
                    action="store_false",
                    help="do not penalise routes that run close to the panels and "
                         "tooling; only hard collisions are avoided")
+    #HOW THE PENALTY IS SPREAD OVER A MOVE
+    p.add_argument("--whole-move-penalty", type=boolean, nargs="?", const=True,
+                   default=False, metavar="BOOL",
+                   help="true charges every move at the penalty of its worst state -- the "
+                        "smallest clearance anywhere along it -- instead of charging each "
+                        "sub-step at the worse of its own two ends. A move that dips "
+                        "towards a panel once is then priced as though it ran that close "
+                        "throughout, so the passes cannot buy a fast route with a brief "
+                        "graze. Applies to whichever penalty curve is in force. Note this "
+                        "makes the cost depend on where the waypoints are, since a move is "
+                        "what gets charged: splitting one move at the edge of a tight "
+                        "region lets the clear half escape the tight half's factor. Takes "
+                        "true/false (yes/no, on/off, 1/0); passing the flag with no value "
+                        "means true (default: False)")
     #PENALTY CURVE START
     p.add_argument("--clearance-penalty-max-mm", type=float, default=100.0, metavar="MM",
                    help="clearance at and above which there is no penalty; the curve "
@@ -698,7 +725,8 @@ def main(argv: list[str] | None = None) -> int:
                 zero_mm=args.stepped_penalty_zero_mm,
                 step_mm=args.stepped_penalty_step_mm,
                 step_factor=args.stepped_penalty_step_factor,
-                enabled=args.clearance_penalty)
+                enabled=args.clearance_penalty,
+                whole_move=args.whole_move_penalty)
         else:
             penalty = ClearancePenalty(
                 max_mm=args.clearance_penalty_max_mm,
@@ -706,7 +734,8 @@ def main(argv: list[str] | None = None) -> int:
                 multiplier=args.clearance_penalty_multiplier,
                 cutoff_mm=args.clearance_penalty_cutoff_mm,
                 exponent=args.clearance_penalty_exponent,
-                enabled=args.clearance_penalty)
+                enabled=args.clearance_penalty,
+                whole_move=args.whole_move_penalty)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
@@ -778,6 +807,7 @@ def main(argv: list[str] | None = None) -> int:
                             min_mm=args.relocate_min_mm, max_mm=args.relocate_max_mm,
                             exponent=args.relocate_exponent),
         segment_length=args.segment_length_rad,
+        continuous_check=args.ompl_continuous_check,
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,
         polish_seconds=args.polish_seconds if args.shortcut else 0.0,

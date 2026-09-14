@@ -71,6 +71,7 @@ class ToolpathPlanner:
                  extra_openings: int = 0, opening_round_mm: float = 5.0,
                  fallback_mm: float = 100.0, fallback_step_mm: float = 40.0,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
+                 continuous_check: bool = False,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                  near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
                  near_panel_min_pct: float = 0.0, linear_speed_mm_s: float = 0.0,
@@ -95,6 +96,7 @@ class ToolpathPlanner:
         # relocating one, and how the distance is drawn between those bounds.
         self.relocate = relocate or Relocation()
         self.segment_length = segment_length
+        self.continuous_check = bool(continuous_check)
         self.check_step = np.deg2rad(check_step_deg)
         self.shortcut_seconds = shortcut_seconds
         self.polish_seconds = polish_seconds
@@ -374,6 +376,7 @@ class ToolpathPlanner:
             self.cell, transit_start, transit_end,
             ompl=self.ompl, cartesian=self.cartesian,
             segment_length=self.segment_length,
+            continuous_check=self.continuous_check,
             check_step=self.check_step,
             fallback_via=self._fallback_for(a, b, transit_start, transit_end),
             fallback_runs=self.fallback_runs, relocate=self.relocate,

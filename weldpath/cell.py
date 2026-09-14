@@ -52,7 +52,8 @@ MAX_TOOL_SUBDIVISION = 6
 # the primitives everything else is built from: a state load pushes joints into the
 # environment, a clearance query adds a contact test over every convex piece within the
 # probe, and a collision test adds one at the planning margins.
-COUNTER_NAMES = ("state_loads", "clearance", "clearance_hits", "collision_tests", "fk")
+COUNTER_NAMES = ("state_loads", "clearance", "clearance_hits", "clearance_fused",
+                 "collision_tests", "fk", "tcp_hits")
 
 # States a cell remembers a clearance for before starting again.  Large enough that the
 # waypoints of a run stay resident, small enough that a long polish cannot exhaust memory
@@ -84,6 +85,9 @@ class Cell:
         # ask it of the same states repeatedly.  Keyed by the gun opening as well as the
         # joint vector, since where the moving tip sits changes the answer.
         self._clearance_cache: dict[tuple[float, bytes], float] = {}
+        # The same trick for the tool's position, which the cost arithmetic asks for far
+        # more often than anything asks for a whole transform.
+        self._tcp_cache: dict[tuple[float, bytes], np.ndarray] = {}
         self.counters = dict.fromkeys(COUNTER_NAMES, 0)
         self._state = None                      # keeps the SWIG state object alive
         self._revolute = [j.type == "revolute" for j in man.robot.joints
@@ -347,6 +351,33 @@ class Cell:
         self._clearance_cache[key] = got
         return got
 
+    def _clearance_here(self, q: np.ndarray) -> float:
+        """:meth:`clearance_mm` for a state that is already loaded.
+
+        The state load is the expensive half -- pushing joints into the environment and
+        rebuilding the link transforms -- and a caller that has just collision checked a
+        state has already paid it.  Asking through :meth:`clearance_mm` would load the
+        same joints a second time to answer a question about transforms that are already
+        in place.
+
+        Caches and counts exactly as :meth:`clearance_mm` does, so a state measured this
+        way is not measured again later, and the run summary still adds up.
+        """
+        if self._pm is None:
+            return float("inf")
+        key = (self.gun_value, np.asarray(q, dtype=float).tobytes())
+        hit = self._clearance_cache.get(key)
+        if hit is not None:
+            self.counters["clearance_hits"] += 1
+            return hit
+        self.counters["clearance"] += 1
+        self.counters["clearance_fused"] += 1
+        got = self._clearance_now()
+        if len(self._clearance_cache) >= CLEARANCE_CACHE_MAX:
+            self._clearance_cache.clear()
+        self._clearance_cache[key] = got
+        return got
+
     def _clearance_now(self) -> float:
         """Clearance at the state already loaded.  Assumes ``set_state`` has just run."""
         self._pm.setCollisionObjectsTransform(self._state.link_transforms)
@@ -439,25 +470,58 @@ class Cell:
         The tool position is free: :meth:`in_collision` has already loaded the state, so
         reading the transform off it costs no kinematics.
         """
+        return self.segment_scan(a, b, max_step)[0]
+
+    def segment_scan(self, a: np.ndarray, b: np.ndarray, max_step: float = 0.05,
+                     factors: bool = False) -> tuple[bool, list[float] | None]:
+        """:meth:`segment_collides`, optionally reading the clearance off the same walk.
+
+        The two questions a pass asks about a move -- is it clear, and what does it cost --
+        are answered over the *same* states, and answering them apart loads every one of
+        them twice.  The counters said so outright: a run's state loads came to its
+        collision tests plus its clearance queries, exactly.
+
+        With ``factors`` set, the second return is the penalty factor at each point of the
+        grid, in order, which is the same grid :meth:`segment_cost` samples and the same
+        one :func:`weldpath.planning._resample` fills a move with.  Nothing is measured
+        that would not have been measured anyway; the saving is one state load per sample.
+
+        The tool-space subdivision is not included.  Those midpoints exist to catch a
+        collision the joint grid steps over, and they are extra *checks* rather than extra
+        samples of the route -- charging the penalty at them as well would make a move's
+        cost depend on how hard it was to prove clear.  A blocked move returns no factors
+        at all, since nothing is going to cost it.
+        """
         a = np.asarray(a, dtype=float)
         b = np.asarray(b, dtype=float)
         delta = b - a
         span = float(np.max(np.abs(delta)))
         n = max(2, int(np.ceil(span / max_step)) + 1)
         grid = np.linspace(0.0, 1.0, n)
+        # A penalty that is present but switched off still returns 1.0 from every factor,
+        # and asking it would pay for a clearance query to learn that.
+        want = (factors and self._pm is not None
+                and self.penalty is not None and self.penalty.enabled)
+        facs: list[float] | None = [] if want else None
 
         if self.tcp_check_mm <= 0.0:
             for t in grid:
-                if self.in_collision(a + t * delta):
-                    return True
-            return False
+                q = a + t * delta
+                if self.in_collision(q):
+                    return True, None
+                if want:
+                    facs.append(self.penalty.factor(self._clearance_here(q)))
+            return False, ([1.0] * n if factors and not want else facs)
 
         tool_step = self.tcp_check_mm * self.man.scale
         tools = []
         for t in grid:
-            if self.in_collision(a + t * delta):
-                return True
+            q = a + t * delta
+            if self.in_collision(q):
+                return True, None
             tools.append(self._tcp_now())
+            if want:
+                facs.append(self.penalty.factor(self._clearance_here(q)))
 
         # Right to left, so the halves of a split are popped in the order they are flown.
         stack = [(grid[k], grid[k + 1], tools[k], tools[k + 1], 0)
@@ -470,20 +534,25 @@ class Cell:
                 continue
             tm = 0.5 * (t0 + t1)
             if self.in_collision(a + tm * delta):
-                return True
+                return True, None
             pm = self._tcp_now()
             stack.append((tm, t1, pm, p1, depth + 1))
             stack.append((t0, tm, p0, pm, depth + 1))
-        return False
+        return False, ([1.0] * n if factors and not want else facs)
 
     def segment_cost(self, a: np.ndarray, b: np.ndarray, max_step: float = 0.05,
                      fa: float | None = None, fb: float | None = None,
-                     stops: bool = False) -> float:
+                     stops: bool = False, facs: list[float] | None = None) -> float:
         """Penalised time for the segment a->b, assuming it is already known clear.
 
         Time near a panel is charged at :class:`~weldpath.penalty.ClearancePenalty`'s
         multiplier, which is what the penalty was specified in: a second at the minimum
         clearance costs as much as N seconds in open space.
+
+        How that multiplier is spread over the move is the penalty's ``whole_move`` flag:
+        per sub-step by default, or the worst state's factor over the whole move when it
+        is set.  Either way the interior is sampled, because either way the answer depends
+        on states between the ends.
 
         ``stops`` picks which time this is.  False measures cruise only, for a move that is
         one step of a densified path the robot will not really stop along; True measures
@@ -502,14 +571,26 @@ class Cell:
         if self._pm is None or raw <= 0.0:
             return raw
         n = max(2, int(np.ceil(np.max(np.abs(b - a)) / max_step)) + 1)
-        factors = []
-        for k, t in enumerate(np.linspace(0.0, 1.0, n)):
-            if k == 0 and fa is not None:
-                factors.append(fa)
-            elif k == n - 1 and fb is not None:
-                factors.append(fb)
-            else:
-                factors.append(self.penalty_factor(a + t * (b - a)))
+        if facs is not None and len(facs) == n:
+            # Handed over by segment_scan, which sampled this very grid while proving the
+            # move clear.  Length checked rather than trusted: the two derive n by the
+            # same formula, and if that ever drifts apart the states would not line up.
+            factors = list(facs)
+        else:
+            factors = []
+            for k, t in enumerate(np.linspace(0.0, 1.0, n)):
+                if k == 0 and fa is not None:
+                    factors.append(fa)
+                elif k == n - 1 and fb is not None:
+                    factors.append(fb)
+                else:
+                    factors.append(self.penalty_factor(a + t * (b - a)))
+        if getattr(self.penalty, "whole_move", False):
+            # The move is the unit being priced, so its worst state prices all of it: a
+            # dip cannot be made cheap by being brief.  Every interior sample is still
+            # taken -- the worst state is usually not an endpoint, and reading only the
+            # ends would let a move duck under a fixture between them for nothing.
+            return raw * max(factors)
         # Each sub-step is charged at the worse of the states it runs between, so a dip
         # towards the panel is never averaged away by the clear air on either side.  The
         # move's time is spread evenly over the sub-steps rather than following the ramps,
@@ -538,6 +619,36 @@ class Cell:
         self.env.setState(self._state_names, self._state_values(q))
         self._state = self.env.getState()
         return np.array(self.env.getLinkTransform(link).matrix(), dtype=float)
+
+    def tcp_at(self, q: np.ndarray) -> np.ndarray:
+        """Where the tool is for a joint state, in environment units, remembered.
+
+        Forward kinematics here is not a matrix multiply: it pushes the joints into the
+        environment and rebuilds every link transform, the same load a collision test
+        pays.  The optimisation passes ask this of the same handful of states over and
+        over -- costing a linear move needs the tool's travel, and a route is rescored
+        every time a candidate is drawn against it -- so on a leg that runs entirely under
+        the linear profile it dominated the cost arithmetic.  Measured on one transit:
+        33993 forward kinematics, against 947 on a leg that was mostly joint motion.
+
+        Keyed by the gun opening as well as the joint vector, since the tip's position
+        moves with it, and bounded like the clearance cache for the same reason.
+
+        Deliberately narrower than :meth:`fk`.  That method's side effect -- leaving the
+        state loaded for whoever asks next -- is part of its contract in places, and a
+        cache hit would quietly skip it.  This returns a position and promises nothing
+        about the environment, so there is nothing to skip.
+        """
+        key = (self.gun_value, np.asarray(q, dtype=float).tobytes())
+        hit = self._tcp_cache.get(key)
+        if hit is not None:
+            self.counters["tcp_hits"] += 1
+            return hit
+        got = np.array(self.fk(q)[:3, 3], dtype=float)
+        if len(self._tcp_cache) >= CLEARANCE_CACHE_MAX:
+            self._tcp_cache.clear()
+        self._tcp_cache[key] = got
+        return got
 
     def ik(self, pose_world_mm: np.ndarray, seed: np.ndarray) -> list[np.ndarray]:
         """Inverse kinematics for a world TCP pose given in manifest units."""

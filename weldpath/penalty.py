@@ -29,6 +29,26 @@ is pushed away from the part early and then hardly cares how close it finally co
 climb matters: without it, the pass would spend its whole budget fighting over the last
 millimetre of a clearance that is already as bad as it is allowed to get.
 
+``whole_move`` picks **how the factor is spread over a move**, which is a separate
+question from the shape of the curve and is why it lives on both penalty classes rather
+than on either curve's parameters.
+
+* False, the default, charges each sub-step of a move at the worse of the two states it
+  runs between.  A move that dips towards a panel for a tenth of its length pays the peak
+  factor over that tenth and 1x over the rest, so the cost is the integral of the curve
+  along the path.
+* True charges the **whole** move at the factor of its worst state -- the smallest
+  clearance anywhere along it.  A move that touches 5 mm once is priced as though it ran
+  at 5 mm throughout.
+
+The difference is not a matter of degree.  Under the integral a brief dip is cheap
+because it is brief, so the passes will happily buy a fast route that grazes a panel
+once; under the whole-move rule that same dip condemns the entire move, and the only way
+to make it cheap again is to stop dipping.  It also changes what a *waypoint* means to
+the cost, because a move is the thing being charged: splitting one move into two at the
+edge of a tight region lets the clear half escape the tight half's factor.  Whether that
+is a modelling artefact or the point depends on what the waypoints are for.
+
 This is a *soft* preference and is deliberately not a safety mechanism -- what the robot
 is actually forbidden to do is set by the collision margins in :mod:`weldpath.cell`.
 """
@@ -37,12 +57,20 @@ from __future__ import annotations
 import math
 
 
+def _spread(whole_move: bool) -> str:
+    """The tail both curves append, since the rule is the same whichever is in force."""
+    if not whole_move:
+        return "; charged per sub-step, at the worse end of each"
+    return "; the whole move charged at its worst state"
+
+
 class ClearancePenalty:
     """Maps a clearance in millimetres to a cost multiplier."""
 
     def __init__(self, max_mm: float = 50.0, min_mm: float = 3.0,
                  multiplier: float = 50.0, cutoff_mm: float = 0.0,
-                 exponent: float = 2.0, enabled: bool = True):
+                 exponent: float = 2.0, enabled: bool = True,
+                 whole_move: bool = False):
         if max_mm <= min_mm:
             raise ValueError(
                 f"clearance penalty needs max ({max_mm:g} mm) above min ({min_mm:g} mm)")
@@ -64,6 +92,7 @@ class ClearancePenalty:
         self.cutoff_mm = (float(cutoff_mm) if 0.0 < cutoff_mm < self.max_mm
                           else self.max_mm)
         self.enabled = bool(enabled) and self.multiplier > 1.0
+        self.whole_move = bool(whole_move)
 
     @property
     def probe_mm(self) -> float:
@@ -87,7 +116,7 @@ class ClearancePenalty:
         if self.cutoff_mm < self.max_mm:
             out += (f"; ignored beyond {self.cutoff_mm:g} mm, so the factor steps "
                     f"straight to {self.factor(self.cutoff_mm - 1e-9):.1f}x there")
-        return out
+        return out + _spread(self.whole_move)
 
 class SteppedPenalty:
     """Maps a clearance to a cost multiplier along a decaying exponential.
@@ -130,7 +159,7 @@ class SteppedPenalty:
 
     def __init__(self, multiplier: float = 8.0, zero_mm: float = 200.0,
                  step_mm: float = 25.0, step_factor: float = 0.7,
-                 enabled: bool = True):
+                 enabled: bool = True, whole_move: bool = False):
         if multiplier < 1.0:
             raise ValueError(
                 f"stepped penalty multiplier must be at least 1, got {multiplier:g}")
@@ -151,6 +180,7 @@ class SteppedPenalty:
         self.step_mm = float(step_mm)
         self.step_factor = float(step_factor)
         self.enabled = bool(enabled) and self.multiplier > 1.0
+        self.whole_move = bool(whole_move)
 
         self._decay = math.log(self.step_factor) / self.step_mm       # < 0
         spent = math.exp(self._decay * self.zero_mm)                  # factor at zero_mm
@@ -191,4 +221,4 @@ class SteppedPenalty:
         return (f"clearance penalty (stepped): {self.multiplier:g}x at touching, falling "
                 f"by {self.step_factor:g} every {self.step_mm:g} mm to 1x at "
                 f"{self.zero_mm:g} mm -- {walk}; below 0 mm it continues as a straight "
-                f"line at {-self.slope:.3f}x per mm")
+                f"line at {-self.slope:.3f}x per mm") + _spread(self.whole_move)
