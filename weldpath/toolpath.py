@@ -71,7 +71,8 @@ class ToolpathPlanner:
                  extra_openings: int = 0, opening_round_mm: float = 5.0,
                  fallback_mm: float = 100.0, fallback_step_mm: float = 40.0,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
-                 continuous_check: bool = False,
+                 continuous_check: bool = False, repair_routes: bool = False,
+                 solver_clearance_mm: float = 0.0,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                  near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
                  near_panel_min_pct: float = 0.0, linear_speed_mm_s: float = 0.0,
@@ -97,6 +98,7 @@ class ToolpathPlanner:
         self.relocate = relocate or Relocation()
         self.segment_length = segment_length
         self.continuous_check = bool(continuous_check)
+        self.repair_routes = bool(repair_routes)
         self.check_step = np.deg2rad(check_step_deg)
         self.shortcut_seconds = shortcut_seconds
         self.polish_seconds = polish_seconds
@@ -111,8 +113,13 @@ class ToolpathPlanner:
         # placed or not, so the query has to see past the larger threshold with room to
         # spare.  A probe that stops at the threshold can only ever answer "at least the
         # requirement", which is the half of the question already known.
+        #
+        # The solver clearance counts here too: capping it at a transit's ends needs every
+        # pair inside it measured, which the query cannot do beyond its probe.
+        cell.solver_clearance = max(0.0, float(solver_clearance_mm)) * man.scale
         report_probe = max(cell.obstacle_clearance / man.scale,
-                           weld_clearance_mm or 0.0) + CLEARANCE_REPORT_HEADROOM_MM
+                           weld_clearance_mm or 0.0,
+                           solver_clearance_mm) + CLEARANCE_REPORT_HEADROOM_MM
         wanted = max(near_panel_mm if self.zone.enabled else 0.0, report_probe)
         if wanted > 0.0:
             cell.require_proximity(wanted, log=log)
@@ -377,6 +384,7 @@ class ToolpathPlanner:
             ompl=self.ompl, cartesian=self.cartesian,
             segment_length=self.segment_length,
             continuous_check=self.continuous_check,
+            repair_routes=self.repair_routes,
             check_step=self.check_step,
             fallback_via=self._fallback_for(a, b, transit_start, transit_end),
             fallback_runs=self.fallback_runs, relocate=self.relocate,

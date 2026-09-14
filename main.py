@@ -101,7 +101,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "default: OMPL's budget is what limits a hard cell, so "
                         "this can buy fewer solutions found for fewer rejected "
                         "(default: off)")
-    p.add_argument("--segment-length-rad", type=float, default=0.05, #was 0.05
+    p.add_argument("--repair-routes", type=boolean, nargs="?", const=True,
+                   default=False, metavar="BOOL",
+                   help="when a sampling-planner route is blocked under this planner's "
+                        "own check, densify it and try straight cuts around each blocked "
+                        "stretch -- first between the planner's own waypoints, then "
+                        "between densified points -- before refusing the solve. Off "
+                        "restores refusing it outright (default: on)")
+    p.add_argument("--segment-length-rad", type=float, default=0.1, #was 0.05
                    help="collision checking resolution for the sampling planner "
                         "(default: 0.02)")
 #endregion
@@ -520,16 +527,31 @@ def build_parser() -> argparse.ArgumentParser:
     #endregion
     #region ###CLEARANCE FROM THE PARTS###
     #CLEARANCE EVERYWHERE
-    p.add_argument("--obstacle-clearance-mm", type=float, default=5.0, metavar="MM",
+    p.add_argument("--obstacle-clearance-mm", type=float, default=0.0, metavar="MM", #was 5.0
                    help="how close the robot and gun may come to the panels and tooling "
                         "before it counts as a collision. Positive keeps that much clear "
                         "air, 0 means touching collides, negative tolerates that much "
-                        "overlap (default: 0)")
+                        "overlap. This is what the post-solve collision checks hold a "
+                        "route to; the sampling planner uses it too unless "
+                        "--solver-clearance-mm is larger (default: 0)")
     #CLEARANCE ON A MOVE TO OR FROM A WELD
     p.add_argument("--weld-clearance-mm", type=float, default=0.0, metavar="MM",
                    help="obstacle clearance used instead of --obstacle-clearance-mm on "
                         "any move starting or ending at a weld locator, where the gun "
-                        "has to reach the panel (default: 0)")
+                        "has to reach the panel. Post-solve checks only, like "
+                        "--obstacle-clearance-mm (default: 0)")
+    #CLEARANCE THE SAMPLING PLANNER PLANS AGAINST
+    p.add_argument("--solver-clearance-mm", type=float, default=5.0, metavar="MM",
+                   help="clearance from the panels and tooling that the sampling planner "
+                        "(OMPL) plans against, separate from the clearance the post-solve "
+                        "collision checks hold a route to (--obstacle-clearance-mm, or "
+                        "--weld-clearance-mm on a move to or from a weld). Set above those, "
+                        "OMPL keeps a wider berth, so the finer post-solve check has less "
+                        "to refuse. Never lower than the check clearance in force, and held "
+                        "down per pair to what the transit's own two ends have, since OMPL "
+                        "cannot start from a state it reads as colliding. The cartesian "
+                        "tree checks the same way the post-solve checks do and ignores "
+                        "this. 0 plans at the check clearance (default: 5)")
     #BACK THE WELD OFF THE PANEL SURFACE
     p.add_argument("--weld-shift-mm", type=float, default=-5.0, metavar="MM",
                    help="move every weld locator this far along its own z axis before "
@@ -808,6 +830,7 @@ def main(argv: list[str] | None = None) -> int:
                             exponent=args.relocate_exponent),
         segment_length=args.segment_length_rad,
         continuous_check=args.ompl_continuous_check,
+        repair_routes=args.repair_routes,
         check_step_deg=args.check_step_deg,
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,
         polish_seconds=args.polish_seconds if args.shortcut else 0.0,
@@ -817,6 +840,7 @@ def main(argv: list[str] | None = None) -> int:
         linear_speed_mm_s=args.linear_speed_mm_s,
         linear_crossing_penalty_s=args.linear_crossing_penalty_s,
         weld_clearance_mm=args.weld_clearance_mm,
+        solver_clearance_mm=args.solver_clearance_mm,
         export_dir=directory if args.export_collision_geometry else None,
         keep_unrefined=args.unrefined_output,
         log=log)
