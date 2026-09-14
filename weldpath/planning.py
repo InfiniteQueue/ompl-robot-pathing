@@ -12,7 +12,6 @@ planner usable here; it stays well inside the manifest's contact tolerance.
 """
 from __future__ import annotations
 
-import bisect
 import ctypes
 import struct
 import time
@@ -1249,7 +1248,7 @@ def _endpoint_block(cell: Cell, qa: np.ndarray, qb: np.ndarray) -> str | None:
 
 def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget,
                      segment_length: float, check_step: float,
-                     continuous_check: bool = False, repair_routes: bool = False,
+                     continuous_check: bool = False,
                      via: np.ndarray | None,
                      shortcut_seconds: float, polish_seconds: float,
                      zone: LinearZone | None = None,
@@ -1279,7 +1278,6 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
         return _plan_direct(cell, qa, qb, ompl=ompl,
                             segment_length=segment_length, check_step=check_step,
                             continuous_check=continuous_check,
-                            repair_routes=repair_routes,
                             shortcut_seconds=shortcut_seconds,
                             polish_seconds=polish_seconds,
                             zone=zone, cartesian=cartesian,
@@ -1296,12 +1294,12 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
     # fallback pose whether the geometry called for one or not.
     first = _plan_direct(cell, qa, via, ompl=ompl,
                          segment_length=segment_length, check_step=check_step,
-                         continuous_check=continuous_check, repair_routes=repair_routes,
+                         continuous_check=continuous_check,
                          shortcut_seconds=0.0, polish_seconds=0.0,
                          log=log, record=halves)
     second = _plan_direct(cell, via, qb, ompl=ompl,
                           segment_length=segment_length, check_step=check_step,
-                          continuous_check=continuous_check, repair_routes=repair_routes,
+                          continuous_check=continuous_check,
                           shortcut_seconds=0.0, polish_seconds=0.0,
                           log=log, record=halves)
     if len(halves) == 2:
@@ -1317,7 +1315,6 @@ def _plan_at_opening(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBu
 def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    ompl: OmplBudget | None = None, segment_length: float = 0.02,
                    check_step: float = 0.05, continuous_check: bool = False,
-                   repair_routes: bool = False,
                    fallback_via=None,
                    fallback_runs: int = 0,
                    shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
@@ -1363,7 +1360,6 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
             return _plan_at_opening(cell, a, b, ompl=effort or ompl,
                                     segment_length=segment_length,
                                     continuous_check=continuous_check,
-                                    repair_routes=repair_routes,
                                     check_step=check_step, via=via,
                                     shortcut_seconds=budget,
                                     polish_seconds=polish_seconds if budget else 0.0,
@@ -1589,179 +1585,9 @@ def _route_fault(cell: Cell, path: list[np.ndarray], check_step: float) -> str |
     return None
 
 
-REPAIR_MAX_BRIDGES = 60
-"""Most cuts between densified points tried per blocked stretch, once every cut between
-the planner's own waypoints has failed.  Each is a full ``segment_collides`` sweep of a
-chord that is usually long, so this is what bounds the repair's cost on a route that
-cannot be saved."""
-
-
-def _repair_route(cell: Cell, path: list[np.ndarray], check_step: float, *,
-                  label: str = "", log=None) -> list[np.ndarray] | None:
-    """A raw planner route with its blocked moves cut around, or ``None`` if they cannot be.
-
-    ``_route_fault`` refuses a whole solve over one blocked move, and most of those moves
-    are blocked over a sliver: a band a hundredth of a radian or two wide that OMPL's
-    spacing stepped over.  The rest of the route is sound, and discarding it throws away
-    a solve that took seconds to find.
-
-    The route is densified at ``--check-step-deg`` along the joint chords the planner
-    produced, which is what locates each blocked stretch to within one sub-step and
-    supplies the points a cut can land on.  Densifying *alone* cannot clear anything:
-    ``_resample`` places its points exactly on the grid ``segment_collides`` lays over
-    the whole move, and bisects the same intervals, so the sub-steps are the same test
-    as the move.  That is checked here rather than assumed -- a blocked route whose
-    sub-steps all come back clear is reported and refused.
-
-    Each blocked stretch is then cut around, by a straight joint move between two points
-    either side of it:
-
-    * first between the planner's own **pre-densification waypoints**, shortest first --
-      the cut that drops the fewest of the planner's states;
-    * then between **densified points** at doubling distances out from the stretch,
-      shortest first, up to ``REPAIR_MAX_BRIDGES``.
-
-    A cut must have at least one waypoint strictly between its ends.  Two points on the
-    same planner move lie on the same joint-space line as the blocked stretch, so a cut
-    between them is that line again, sampled on a different grid -- and a band thinner
-    than a step can fall between the new samples and read as clear when nothing about
-    the route has changed.  Only a cut across a corner follows a different curve.
-
-    The cut ends become waypoints of the returned route, and the waypoints they skip are
-    dropped.  The result is sparse again -- planner waypoints plus cut ends -- so the
-    caller carries on exactly as for a route that arrived clear, and ``_finish`` does
-    its own densifying along whichever profile each move will be flown.  The finished
-    route is re-checked with ``_route_fault`` before it is handed back.
-
-    Joint moves only, like ``_route_fault``: nothing here knows which moves ``_finish``
-    will turn linear, and ``_verify_runs`` still sweeps those along the tool's line.
-    """
-    t0 = time.time()
-
-    def say(text: str) -> None:
-        if log:
-            log(f"        {label} repair: {text}")
-
-    dense, marks = _densify_marked(cell, path, check_step)
-    blocked = [cell.segment_collides(x, y, max_step=check_step)
-               for x, y in zip(dense, dense[1:])]
-    moves = len(path) - 1
-    faulted = sorted({bisect.bisect_right(marks, k) - 1
-                      for k, hit in enumerate(blocked) if hit})
-    say(f"densified {len(path)} planner waypoints to {len(dense)} points at "
-        f"{np.degrees(check_step):g} deg; {sum(blocked)} of {len(blocked)} sub-steps "
-        f"blocked, on move{'' if len(faulted) == 1 else 's'} "
-        f"{', '.join(str(m) for m in faulted) or 'none'} of {moves}")
-    if not faulted:
-        say("no sub-step is blocked although the route as a whole is -- the two checks "
-            "disagree, which they should not; refusing the route")
-        return None
-
-    clear_cache: dict[bytes, bool] = {}
-
-    def clear_at(q: np.ndarray) -> bool:
-        key = q.tobytes()
-        if key not in clear_cache:
-            clear_cache[key] = not cell.in_collision(q)
-        return clear_cache[key]
-
-    def where(k: int, anchors: list[int]) -> str:
-        """Dense index ``k`` as a position on the route it was read from."""
-        e = bisect.bisect_right(anchors, k) - 1
-        if anchors[e] == k:
-            return f"waypoint {e}"
-        span = anchors[e + 1] - anchors[e]
-        return f"{100.0 * (k - anchors[e]) / span:.0f}% along move {e}"
-
-    k = 0
-    stretches = 0
-    while k < len(blocked):
-        if not blocked[k]:
-            k += 1
-            continue
-        u = v = k
-        while v + 1 < len(blocked) and blocked[v + 1]:
-            v += 1
-        stretches += 1
-        # Positions are quoted against the route as it stands when this stretch is cut,
-        # which after an earlier cut is no longer the planner's numbering.
-        anchors = list(marks)
-        inside = sum(1 for q in dense[u + 1:v + 1] if not clear_at(q))
-        head = (f"stretch {stretches}: {v - u + 1} blocked sub-step"
-                f"{'' if v == u else 's'} from {where(u, anchors)}, "
-                f"{inside} fill point{'' if inside == 1 else 's'} inside geometry")
-
-        # Cut ends: every waypoint, plus densified points at doubling distances out from
-        # the stretch.  Every densified point would be thousands of candidates, and taken
-        # shortest first they are near-copies of the blocked line: a cut leaving just
-        # before the band and landing just past the corner has barely moved off the chord
-        # where the band is.  Doubling reaches the cuts that swing wide in a few dozen.
-        is_anchor = set(anchors)
-        last = len(dense) - 1
-        reach = [2 ** i for i in range(last.bit_length() + 1)]
-        starts = ({m for m in anchors if m <= u} | {u}
-                  | {u - d for d in reach if u - d >= 0})
-        ends = ({m for m in anchors if m >= v + 1} | {v + 1}
-                | {v + 1 + d for d in reach if v + 1 + d <= last})
-        tiers: tuple[list, list] = ([], [])
-        for p in starts:
-            nxt = bisect.bisect_right(anchors, p)        # first waypoint after p
-            for q in ends:
-                if nxt >= len(anchors) or anchors[nxt] >= q:
-                    continue                             # same move: the same line
-                tier = 0 if (p in is_anchor and q in is_anchor) else 1
-                tiers[tier].append((q - p, p, q))
-
-        found = None
-        tried = [0, 0]
-        for tier in (0, 1):
-            for _, p, q in sorted(tiers[tier]):
-                if tier == 1 and tried[1] >= REPAIR_MAX_BRIDGES:
-                    break
-                if not (clear_at(dense[p]) and clear_at(dense[q])):
-                    continue
-                tried[tier] += 1
-                if not cell.segment_collides(dense[p], dense[q], max_step=check_step):
-                    found = (tier, p, q)
-                    break
-            if found is not None:
-                break
-
-        if found is None:
-            say(f"{head}; no clear cut in {tried[0]} tries between planner waypoints "
-                f"({len(tiers[0])} candidates) and {tried[1]} between densified points "
-                f"({len(tiers[1])} candidates); giving up after {time.time() - t0:.1f}s")
-            return None
-
-        tier, p, q = found
-        dropped = sum(1 for m in anchors if p < m < q)
-        span_deg = np.degrees(float(np.max(np.abs(dense[q] - dense[p]))))
-        kind = "between planner waypoints" if tier == 0 else "between densified points"
-        say(f"{head}; cut {kind} from {where(p, anchors)} to {where(q, anchors)} "
-            f"({span_deg:.1f} deg, dropping {dropped} waypoint"
-            f"{'' if dropped == 1 else 's'}) after {tried[0]} + {tried[1]} tries")
-
-        interior = _resample(cell, dense[p], dense[q], check_step)
-        shift = (p + 1 + len(interior)) - q
-        dense[p + 1:q] = interior
-        blocked[p:q] = [False] * (len(interior) + 1)
-        marks = sorted({m for m in marks if m <= p} | {p, q + shift}
-                       | {m + shift for m in marks if m > q})
-        k = q + shift
-
-    repaired = [dense[m] for m in marks]
-    fault = _route_fault(cell, repaired, check_step)
-    if fault is not None:
-        say(f"the cut route still faults ({fault}); refusing it")
-        return None
-    say(f"clear: {len(path)} -> {len(repaired)} waypoints, {stretches} stretch"
-        f"{'' if stretches == 1 else 'es'} cut in {time.time() - t0:.1f}s")
-    return repaired
-
-
 def _ompl_run(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, segment_length: float,
               planning_time: float, check_step: float, label: str, log,
-              continuous_check: bool = False, repair: bool = False
+              continuous_check: bool = False
               ) -> tuple[float, float, list[np.ndarray]] | None:
     """One sampling-planner solve, scored and reported.  ``None`` when it did not solve.
 
@@ -1785,23 +1611,13 @@ def _ompl_run(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, segment_length: flo
         return None
     raw = _extract(response.results)
     fault = _route_fault(cell, raw, check_step)
-    repaired = False
-    if fault is not None and repair:
-        # See _repair_route: a solve blocked over a sliver is cut around rather than
-        # thrown away, and refused as before only if no cut is clear.
-        log(f"      {label}: planner route is not clear under this cell's own check "
-            f"({fault}, {dt:.1f}s); trying to cut around it")
-        fixed = _repair_route(cell, raw, check_step, label=label, log=log)
-        if fixed is not None:
-            raw, fault, repaired = fixed, None, True
     if fault is not None:
         _ompl_run.message = (f"returned a route that is not clear under this cell's own "
                              f"check ({fault})")
         log(f"      {label}: {_ompl_run.message} ({dt:.1f}s)")
         return None
     cost, plain = _path_cost(cell, raw, check_step)
-    log(f"      {label}: solved in {dt:.1f}s ({len(raw)} raw points"
-        f"{', repaired' if repaired else ''}, "
+    log(f"      {label}: solved in {dt:.1f}s ({len(raw)} raw points, "
         f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
     return cost, plain, raw
 
@@ -1811,7 +1627,7 @@ _ompl_run.message = ""
 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget,
                  segment_length: float, check_step: float,
-                 continuous_check: bool = False, repair_routes: bool = False,
+                 continuous_check: bool = False,
                  shortcut_seconds: float, polish_seconds: float,
                  zone: LinearZone | None = None,
                  cartesian: "CartesianBudget | None" = None,
@@ -1855,7 +1671,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     def run(planning_time: float, label: str) -> bool:
         nonlocal last
         found = _ompl_run(cell, qa, qb, segment_length=segment_length,
-                          continuous_check=continuous_check, repair=repair_routes,
+                          continuous_check=continuous_check,
                           planning_time=planning_time, check_step=check_step,
                           label=label, log=log)
         if found is None:
@@ -1864,55 +1680,51 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         candidates.append(found)
         return True
 
-    # Both phases plan against the solver clearance, which only the sampling planner
-    # reads; see Cell.solver_margins.  The cartesian tree between them checks through the
-    # cell like everything else, so it is unaffected by being inside.
-    with cell.solver_margins((qa, qb), log=log):
-        if ompl.phase_one_runs > 0:
-            log(f"      phase 1: {ompl.phase_one_runs} runs of "
-                f"{ompl.phase_one_seconds:g}s each, keeping the cheapest that solves")
-            for attempt in range(1, ompl.phase_one_runs + 1):
-                run(ompl.phase_one_seconds, f"phase 1 run {attempt}")
+    if ompl.phase_one_runs > 0:
+        log(f"      phase 1: {ompl.phase_one_runs} runs of "
+            f"{ompl.phase_one_seconds:g}s each, keeping the cheapest that solves")
+        for attempt in range(1, ompl.phase_one_runs + 1):
+            run(ompl.phase_one_seconds, f"phase 1 run {attempt}")
 
-        if not candidates and cartesian is not None and cartesian.enabled \
-                and zone is not None and zone.enabled:
-            # Between the two phases rather than in place of either.  Every route this finds
-            # is also a joint-space route -- a path of straight tool moves is still a path
-            # through joint space -- so as a fallback it searches a strict *subset* of what
-            # phase two searches and cannot stand in for it.  What it has instead is guidance:
-            # steering along the tool's own line, with orientations drawn near the endpoints',
-            # concentrates the search into the corridor beside the panel, which is exactly
-            # where uniform joint sampling spends its whole budget and finds nothing.
-            #
-            # It goes before phase two because phase two is the expensive half of the worst
-            # case, so a transit this solves is one whose failure never has to be paid for.
-            # It is gated on the zone because a route made of straight moves only earns its
-            # cost where linear motion was wanted in the first place; with no band in force
-            # there is nothing here that phase two would not do better.
-            from .cartesian import plan_cartesian    # deferred: cartesian.py reads this module
-            log(f"      cartesian tree: up to {cartesian.seconds:g}s searching linear space "
-                f"for a solution")
-            t0 = time.time()
-            try:
-                route = plan_cartesian(cell, qa, qb, max_step=check_step,
-                                       budget=cartesian, log=log)
-            except PlanningError as exc:
-                log(f"      {exc} ({time.time() - t0:.1f}s)")
-            else:
-                cost, plain = _path_cost(cell, route, check_step)
-                log(f"      cartesian tree: solved in {time.time() - t0:.1f}s "
-                    f"({len(route)} points, cost {cost:.2f} s against {plain:.2f} s "
-                    f"unpenalised)")
-                candidates.append((cost, plain, route))
+    if not candidates and cartesian is not None and cartesian.enabled \
+            and zone is not None and zone.enabled:
+        # Between the two phases rather than in place of either.  Every route this finds
+        # is also a joint-space route -- a path of straight tool moves is still a path
+        # through joint space -- so as a fallback it searches a strict *subset* of what
+        # phase two searches and cannot stand in for it.  What it has instead is guidance:
+        # steering along the tool's own line, with orientations drawn near the endpoints',
+        # concentrates the search into the corridor beside the panel, which is exactly
+        # where uniform joint sampling spends its whole budget and finds nothing.
+        #
+        # It goes before phase two because phase two is the expensive half of the worst
+        # case, so a transit this solves is one whose failure never has to be paid for.
+        # It is gated on the zone because a route made of straight moves only earns its
+        # cost where linear motion was wanted in the first place; with no band in force
+        # there is nothing here that phase two would not do better.
+        from .cartesian import plan_cartesian    # deferred: cartesian.py reads this module
+        log(f"      cartesian tree: up to {cartesian.seconds:g}s searching linear space "
+            f"for a solution")
+        t0 = time.time()
+        try:
+            route = plan_cartesian(cell, qa, qb, max_step=check_step,
+                                   budget=cartesian, log=log)
+        except PlanningError as exc:
+            log(f"      {exc} ({time.time() - t0:.1f}s)")
+        else:
+            cost, plain = _path_cost(cell, route, check_step)
+            log(f"      cartesian tree: solved in {time.time() - t0:.1f}s "
+                f"({len(route)} points, cost {cost:.2f} s against {plain:.2f} s "
+                f"unpenalised)")
+            candidates.append((cost, plain, route))
 
-        if not candidates and ompl.phase_two_max_runs > 0:
-            # Nothing to choose between at this point, so the goal changes from a good route to
-            # any route, and the first one that arrives ends the phase.
-            log(f"      phase 2: up to {ompl.phase_two_max_runs} runs of "
-                f"{ompl.phase_two_seconds:g}s each, stopping at the first solution")
-            for attempt in range(1, ompl.phase_two_max_runs + 1):
-                if run(ompl.phase_two_seconds, f"phase 2 run {attempt}"):
-                    break
+    if not candidates and ompl.phase_two_max_runs > 0:
+        # Nothing to choose between at this point, so the goal changes from a good route to
+        # any route, and the first one that arrives ends the phase.
+        log(f"      phase 2: up to {ompl.phase_two_max_runs} runs of "
+            f"{ompl.phase_two_seconds:g}s each, stopping at the first solution")
+        for attempt in range(1, ompl.phase_two_max_runs + 1):
+            if run(ompl.phase_two_seconds, f"phase 2 run {attempt}"):
+                break
 
     if not candidates:
         raise PlanningError(

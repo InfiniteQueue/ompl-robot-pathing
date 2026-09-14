@@ -60,11 +60,6 @@ COUNTER_NAMES = ("state_loads", "clearance", "clearance_hits", "clearance_fused"
 # on candidates it drew once and threw away.
 CLEARANCE_CACHE_MAX = 250_000
 
-# How far inside a pair's measured distance at a transit's end the solver margin is held,
-# in mm, when that end is closer than the solver clearance.  Just enough that the end state
-# reads as clear to the planner; the check it has to pass is a strict "less than".
-SOLVER_CAP_SLACK_MM = 0.1
-
 
 class Cell:
     """A loaded scene plus the collision and kinematics helpers the planner needs."""
@@ -78,7 +73,6 @@ class Cell:
         self.margin_overrides: dict[tuple[str, str], float] = {}
         self.margin = 0.0                       # default (self-collision) margin
         self.obstacle_clearance = 0.0           # margin against the static objects
-        self.solver_clearance = 0.0             # what OMPL plans against; see solver_margins
         self.joint_names = man.robot_joint_names
         self.kin = env.getKinematicGroup(GROUP)
         self.manip_info = ManipulatorInfo(GROUP, man.robot.base_link, TCP_LINK)
@@ -236,99 +230,6 @@ class Cell:
             yield
         finally:
             self._set_obstacle_clearance(previous)
-
-    def pair_distances(self, q: np.ndarray) -> dict[tuple[str, str], float]:
-        """Distance per robot-to-part pair inside the clearance probe, environment units.
-
-        :meth:`clearance_mm` reduced to one number; this keeps the pairs apart.  Only the
-        pairs the proximity manager widens are reported -- every robot or gun link against
-        every static object -- and only those within its probe, so a pair missing from the
-        result is at least :attr:`probe_mm` clear.
-        """
-        if self._pm is None:
-            return {}
-        self._load_state(q)
-        self._pm.setCollisionObjectsTransform(self._state.link_transforms)
-        res = ContactResultMap()
-        self._pm.contactTest(res, ContactRequest(ContactTestType_ALL))
-        vec = ContactResultVector()
-        res.flattenCopyResults(vec)
-        out: dict[tuple[str, str], float] = {}
-        for c in vec:
-            key = tuple(sorted((c.link_names[0], c.link_names[1])))
-            d = float(c.distance)
-            if key not in out or d < out[key]:
-                out[key] = d
-        return out
-
-    @contextlib.contextmanager
-    def solver_margins(self, ends, log=None):
-        """Hold the sampling planner to :attr:`solver_clearance` for the duration.
-
-        OMPL is handed ``self.env`` and builds its validity checker from the environment's
-        margins when it solves.  Every check this module makes goes through ``self._cm``
-        instead, which is a *clone* taken when the margins were last set and does not
-        follow later changes to the environment -- which is why
-        :meth:`_set_obstacle_clearance` has to fetch a fresh one.  So raising the
-        environment's robot-to-part margins here widens what OMPL treats as a collision
-        and leaves the post-solve checks exactly where they were.
-
-        The point of the difference is OMPL's coarser checking.  It samples each edge at
-        ``--segment-length-rad`` and can step over a sliver of geometry the post-solve
-        check then finds, refusing the whole route.  Planning against obstacles grown by a
-        few millimetres makes a sliver that thin far harder to step over unseen.
-
-        Each pair's margin is held down to just inside its distance at the transit's own
-        ``ends``, where that is closer.  A weld pose sits millimetres off the panel, and
-        OMPL will not start from a state it reads as colliding -- a blanket margin would
-        make every weld transit fail before it began.  A pair's margin is never set below
-        the one the checks use for it, so the solver is only ever stricter.
-
-        A no-op unless the solver clearance exceeds the check clearance in force.
-        """
-        want = float(self.solver_clearance)
-        if want <= self.obstacle_clearance:
-            yield
-            return
-        slack = SOLVER_CAP_SLACK_MM * self.man.scale
-        near: dict[tuple[str, str], float] = {}
-        for q in ends:
-            for key, d in self.pair_distances(q).items():
-                near[key] = min(d, near.get(key, d))
-        data = CollisionMarginPairData()
-        held: dict[tuple[str, str], float] = {}
-        for a, b in _obstacle_margins(self.man):
-            key = tuple(sorted((a, b)))
-            base = self.margin_overrides.get(
-                (a, b), self.margin_overrides.get((b, a), self.obstacle_clearance))
-            margin = want
-            d = near.get(key)
-            if d is not None and d - slack < margin:
-                margin = d - slack
-            margin = max(margin, base)
-            if margin < want:
-                held[key] = margin
-            data.setCollisionMargin(a, b, margin)
-        self.env.applyCommand(ChangeCollisionMarginsCommand(
-            data, CollisionMarginPairOverrideType_MODIFY))
-        if log:
-            scale = self.man.scale
-            note = (f"      OMPL plans {want / scale:.1f} mm clear of the parts, against "
-                    f"{self.obstacle_clearance / scale:+.1f} mm for the checks")
-            if held:
-                worst = sorted(held.items(), key=lambda kv: kv[1])
-                named = ", ".join(f"{a} <-> {b} {m / scale:.1f} mm"
-                                  for (a, b), m in worst[:3])
-                more = f" (+{len(worst) - 3} more)" if len(worst) > 3 else ""
-                note += (f"; held lower for {len(held)} pair"
-                         f"{'' if len(held) == 1 else 's'} already that close at an end "
-                         f"of the transit: {named}{more}")
-            log(note)
-        try:
-            yield
-        finally:
-            _apply_margins(self.env, self.man, self.margin, self.margin_overrides,
-                           obstacle_clearance=self.obstacle_clearance)
 
     # -- gun opening ---------------------------------------------------------
     def set_gun_opening(self, opening_mm: float) -> None:
