@@ -71,11 +71,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     #region ###COLLISIONS###
     #COLLISION JOINT STEP RESOLUTION
-    p.add_argument("--check-step-deg", type=float, default=3.0,
+    p.add_argument("--check-step-deg", type=float, default=3.0, #was 3.0
                    help="joint-space resolution used when checking a move for collision; "
                         "smaller is safer and slower (default: 3)")
     #COLLISION STEP RESOLUTION AT THE TOOL
-    p.add_argument("--check-step-mm", type=float, default=7.0, metavar="MM",
+    p.add_argument("--check-step-mm", type=float, default=7.0, metavar="MM", #was 7.0
                    help="tool-space companion to --check-step-deg, applied as well as it "
                         "rather than instead of it. A joint step means different distances "
                         "at different poses -- a few degrees is millimetres at the wrist "
@@ -101,7 +101,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "default: OMPL's budget is what limits a hard cell, so "
                         "this can buy fewer solutions found for fewer rejected "
                         "(default: off)")
-    p.add_argument("--segment-length-rad", type=float, default=0.01, #was 0.05
+    p.add_argument("--segment-length-rad", type=float, default=0.05, #was 0.05
                    help="collision checking resolution for the sampling planner "
                         "(default: 0.02)")
 #endregion
