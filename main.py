@@ -596,11 +596,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "turns all penalties off. Takes true/false (yes/no, on/off, 1/0); "
                         "passing the flag with no value means true (default: True)")
     #STRENGTH AT TOUCHING
-    p.add_argument("--stepped-penalty-multiplier", type=float, default=14.0, metavar="N", #was 8
+    p.add_argument("--stepped-penalty-multiplier", type=float, default=7.0, metavar="N", #was 7
                    help="penalty at zero clearance: a second spent touching costs as much "
                         "as N seconds in open space (default: 14)")
     #WHERE THE PENALTY IS SPENT
-    p.add_argument("--stepped-penalty-zero-mm", type=float, default=50.0, metavar="MM", #was 100
+    p.add_argument("--stepped-penalty-zero-mm", type=float, default=35.0, metavar="MM", #was 100
                    help="clearance at which the penalty reaches 1x and stops mattering. "
                         "Also how far the proximity query has to see, so lowering it "
                         "speeds planning up (default: 50)")
