@@ -25,7 +25,7 @@ from tesseract_robotics.tesseract_motion_planners import PlannerRequest
 from tesseract_robotics.tesseract_motion_planners_ompl import (
     OMPLMotionPlanner, OMPLRealVectorMoveProfile)
 
-from .cell import Cell
+from .cell import STOP_BAND_JOINT, Cell
 
 try:                                        # not in every build of the bindings
     from tesseract_robotics.tesseract_collision import (
@@ -435,9 +435,16 @@ def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
 
     out = [path[0]]
     i = 0
+    last = len(path) - 1
     while i < len(path) - 1:
-        j = len(path) - 1
+        j = last
         while j > i + 1:
+            # Not a stop the robot may make.  Only reached past, not forced: the adjacent
+            # point is still taken unchecked when nothing further works, and
+            # ``clear_stop_band`` deals with it afterwards.
+            if j < last and model.cell.in_stop_band(path[j]):
+                j -= 1
+                continue
             if model.demotes(path[i], path[j], path[i + 1:j]):
                 j -= 1
                 continue
@@ -593,7 +600,7 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
         step = low + span * (x if flat else x ** exponent)
         candidate = np.clip(pts[k] + direction * (step / reach),
                             cell.lower, cell.upper)
-        if not cell.within_limits(candidate):
+        if not cell.within_limits(candidate) or cell.in_stop_band(candidate):
             continue
         # Unpenalised time is a lower bound on penalised time, so this rejects most
         # candidates before paying for a collision check or a clearance query.  It has to
@@ -635,6 +642,96 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
     return pts
 
 
+# How far past the edge of the stop band ``clear_stop_band`` tries putting joint 5, in
+# degrees, nearest first.  The first clears the edge by enough not to read as inside it
+# after rounding; the others are there for when the move off the edge is blocked.
+STOP_BAND_NUDGES_DEG = (0.5, 5.0, 15.0)
+
+
+def clear_stop_band(model: "MotionModel", path: list[np.ndarray],
+                    log=None) -> list[np.ndarray]:
+    """Take every interior waypoint out of the joint 5 stop band, or refuse the route.
+
+    The band constrains where the robot may **stop**, not where it may travel, so the
+    searches and the dense fill never hear of it and this runs on the reduced path, where
+    every point is a stop.  ``simplify`` and ``polish`` already avoid choosing one inside
+    the band; this is for the ones they could not avoid.  The ends belong to the locators
+    either side and are left alone.
+
+    Each offender gets two repairs, and the cheaper of those that work is kept:
+
+    * **remove** -- go straight past it, if the move is clear and ``demotes`` allows it.
+      Unlike ``polish``'s removal this is kept even when it costs time.
+    * **nudge** -- set joint 5 just outside the band, on the side it is already on first,
+      and keep its other joints.  Both moves through it are checked and costed along the
+      path their profile gives them, and a nudge ``demotes`` refuses is not offered.
+
+    Neither working is a ``PlanningError``, which the caller treats like any other failed
+    route: the next gun opening, the next fallback pose.
+    """
+    cell = model.cell
+    if cell.stop_band_rad <= 0.0 or len(path) < 3:
+        return path
+    pts = [np.asarray(p, dtype=float).copy() for p in path]
+    removed = nudged = 0
+    k = 1
+    while k < len(pts) - 1:
+        q = pts[k]
+        if not cell.in_stop_band(q):
+            k += 1
+            continue
+        a, b = pts[k - 1], pts[k + 1]
+        fa, fb = model.penalty_factor(a), model.penalty_factor(b)
+        options = []                            # (cost, replacement or None to remove)
+        if not model.demotes(a, b, [q]):
+            direct = model.check_and_cost(a, b, fa=fa, fb=fb, stops=True)
+            if direct is not None:
+                options.append((direct, None))
+        side = 1.0 if float(q[STOP_BAND_JOINT]) >= 0.0 else -1.0
+        for sign in (side, -side):
+            found = None
+            for extra in STOP_BAND_NUDGES_DEG:
+                candidate = q.copy()
+                candidate[STOP_BAND_JOINT] = sign * (cell.stop_band_rad
+                                                     + np.deg2rad(extra))
+                if not cell.within_limits(candidate):
+                    break                       # further out on this side is no better
+                if (model.demotes(a, candidate, [q])
+                        or model.demotes(candidate, b, [q])):
+                    continue
+                f = model.penalty_factor(candidate)
+                first = model.check_and_cost(a, candidate, fa=fa, fb=f, stops=True)
+                if first is None:
+                    continue
+                second = model.check_and_cost(candidate, b, fa=f, fb=fb, stops=True)
+                if second is None:
+                    continue
+                found = (first + second, candidate)
+                break
+            if found is not None:
+                options.append(found)
+                break                           # the nearer side worked
+        if not options:
+            raise PlanningError(
+                f"waypoint {k} of {len(pts)} stops with joint 5 at "
+                f"{np.rad2deg(float(q[STOP_BAND_JOINT])):.1f} deg, inside the "
+                f"+/-{np.rad2deg(cell.stop_band_rad):g} deg stop band, and can neither "
+                f"be removed nor moved out of it")
+        _, replacement = min(options, key=lambda o: o[0])
+        if replacement is None:
+            del pts[k]
+            removed += 1                        # the point now at k is tested next
+        else:
+            pts[k] = replacement
+            nudged += 1
+            k += 1
+    if log and (removed or nudged):
+        log(f"      stop band: removed {removed} and moved {nudged} waypoints holding "
+            f"joint 5 within {np.rad2deg(cell.stop_band_rad):g} deg of zero, "
+            f"{len(pts)} points")
+    return pts
+
+
 def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: float,
             polish_seconds: float, relocate: "Relocation | None" = None,
             anchors: list[int] | None = None, log=print) -> list[np.ndarray]:
@@ -659,8 +756,10 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     improved = shortcut(model, path, time_budget=shortcut_seconds, anchors=anchors,
                         log=log)
     reduced = simplify(model, improved)
-    return polish(model, reduced, time_budget=polish_seconds, relocate=relocate,
-                  log=log)
+    polished = polish(model, reduced, time_budget=polish_seconds, relocate=relocate,
+                      log=log)
+    # Outside the budgets on purpose: a route refined with none still ships its stops.
+    return clear_stop_band(model, polished, log=log)
 
 
 def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.ndarray]:
@@ -1427,6 +1526,12 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     # No single opening reaches: split the move and change the gun partway, at a pose the
     # robot is already passing through and stationary at.
     for i, mid in enumerate(vias()):
+        if cell.in_stop_band(mid):
+            # The robot stands still here while the gun changes, and nothing downstream
+            # moves an endpoint.
+            log(f"      fallback pose {i + 1}/{len(vias())} holds joint 5 inside the "
+                f"stop band; not changing the gun there")
+            continue
         for first_open in candidates:
             with cell.gun_opening(first_open):
                 if cell.in_collision(mid):

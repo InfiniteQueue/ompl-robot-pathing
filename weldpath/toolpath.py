@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .cell import Cell
+from .cell import STOP_BAND_JOINT, Cell
 from .manifest import Locator, Manifest
 from .cartesian import CartesianBudget
 from .fallback import FallbackFinder
@@ -282,7 +282,8 @@ class ToolpathPlanner:
         problems = []
         for opening in self._locator_openings(loc):
             with self._clearance_for(loc), self.cell.gun_opening(opening):
-                q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q])
+                q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q],
+                                         avoid_stop_band=True)
                 searched = ""
                 if q is None and self.stand_off_search and loc.pose_world_import is not None:
                     q, searched = self._search_stand_off(loc, seed)
@@ -295,6 +296,12 @@ class ToolpathPlanner:
                 else:
                     self._report_clearance(loc, q, opening, placed=True)
             if q is not None:
+                if self.cell.in_stop_band(q):
+                    # Every solution found was inside it.  A locator is an endpoint the
+                    # passes never move, so this one stands.
+                    self.log(f"    ! '{loc.name}' has no solution outside the joint 5 "
+                             f"stop band; placed at "
+                             f"{np.rad2deg(q[STOP_BAND_JOINT]):.1f} deg")
                 if opening:
                     self.log(f"    '{loc.name}' needs the gun at {opening:g} mm to be "
                              f"reachable")
@@ -356,7 +363,8 @@ class ToolpathPlanner:
         def sample(d: float) -> float:
             d = round(min(max(d, 0.0), span), 9)
             if d not in samples:
-                q = self.cell.solve_pose(pose_at(d), [seed, self.start_q])
+                q = self.cell.solve_pose(pose_at(d), [seed, self.start_q],
+                                         avoid_stop_band=True)
                 samples[d] = (q, -np.inf if q is None else self.cell.clearance_mm(q))
             return d
 
@@ -600,7 +608,8 @@ class ToolpathPlanner:
         if not loc.is_weld or loc.pose_world_import is None:
             return None
         q = self.cell.solve_pose(loc.export_pose, [seed],
-                                 require_collision_free=False, branch_seeds=0)
+                                 require_collision_free=False, branch_seeds=0,
+                                 avoid_stop_band=True)
         if q is None:
             self.log(f"    ! cannot reach the imported pose of '{loc.name}'; "
                      f"leaving it at the shifted pose")

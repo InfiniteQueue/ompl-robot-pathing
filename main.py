@@ -312,6 +312,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "across the cell, which suits a route already near its answer; "
                         "below 1 crowds it towards the maximum (default: 2)")
     #endregion
+    #region ###WAYPOINT CONSTRAINTS###
+    #ENABLE THE JOINT 5 STOP BAND
+    p.add_argument("--j5-stop-band", type=boolean, nargs="?", const=True, default=True,
+                   metavar="BOOL",
+                   help="forbid waypoints from stopping with joint 5 within "
+                        "--j5-stop-band-deg of zero; moves may still pass through that band "
+                        "between waypoints. false lets waypoints stop with joint 5 anywhere "
+                        "in its range (default: true)")
+    #HOW CLOSE TO ZERO JOINT 5 MAY STOP
+    p.add_argument("--j5-stop-band-deg", type=float, default=15.0, metavar="DEG",
+                   help="smallest magnitude joint 5 may hold at a waypoint. Enforced "
+                        "after refinement, by removing an offending waypoint or moving its "
+                        "joint 5 just outside the band, whichever is quicker; a route "
+                        "where neither is collision free is refused like any other failed "
+                        "route. Locator poses prefer an IK solution outside the band and "
+                        "are warned about when none exists (default: 15)")
+    #endregion
     #region ###LINEAR MOTION NEAR THE PARTS###
     #DISABLE LINEAR MOTION NEAR THE PARTS
     p.add_argument("--no-near-panel-linear", dest="near_panel_linear",
@@ -885,6 +902,10 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
+    if args.j5_stop_band and args.j5_stop_band_deg > 0.0:
+        import math
+        cell.stop_band_rad = math.radians(args.j5_stop_band_deg)
+
     if args.probe_point:
         # Instead of planning: this is asked when a specific pose is already known to be
         # blocked, and the answer does not depend on the toolpath.  The export, if one was
@@ -936,6 +957,8 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     document = output_mod.build_document(cell, man, segments, timing)
 
     for problem in output_mod.check_endpoints(document, man):
+        print(f"warning: {problem}", file=sys.stderr)
+    for problem in output_mod.check_stop_band(document, cell):
         print(f"warning: {problem}", file=sys.stderr)
 
     if args.unrefined_output:

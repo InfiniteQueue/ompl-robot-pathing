@@ -48,6 +48,10 @@ from .scene import GROUP, TCP_LINK, SceneBuilder
 # until it ran out of floating point.
 MAX_TOOL_SUBDIVISION = 6
 
+# The joint the stop band applies to, as an index into the robot's joint vector: joint 5,
+# the wrist pitch.  See ``Cell.stop_band_rad``.
+STOP_BAND_JOINT = 4
+
 # What the planner is asked to do, counted so a slow run can say where it went.  These are
 # the primitives everything else is built from: a state load pushes joints into the
 # environment, a clearance query adds a contact test over every convex piece within the
@@ -113,6 +117,10 @@ class Cell:
         self._probe_mm = 0.0                    # how far that manager can actually see
         self._extra_probe_mm = 0.0              # asked for by something other than the penalty
         self.tcp_check_mm = 0.0                 # tool-space check resolution; 0 disables
+        # No waypoint the robot stops at may hold joint 5 closer to zero than this, in
+        # radians; 0 disables.  It constrains stops only -- a move may sweep through the
+        # band on its way somewhere else, so nothing that samples or checks a move reads it.
+        self.stop_band_rad = 0.0
         self.dynamics = None                    # set by attach_dynamics
         self.weights = self._joint_weights()
 
@@ -603,6 +611,11 @@ class Cell:
     def within_limits(self, q: np.ndarray) -> bool:
         return bool(np.all(q >= self.lower - 1e-9) and np.all(q <= self.upper + 1e-9))
 
+    def in_stop_band(self, q: np.ndarray) -> bool:
+        """Whether the robot may not stop at ``q``: joint 5 inside ``stop_band_rad`` of zero."""
+        return (self.stop_band_rad > 0.0 and len(q) > STOP_BAND_JOINT
+                and abs(float(q[STOP_BAND_JOINT])) < self.stop_band_rad)
+
     # -- kinematics ----------------------------------------------------------
     def _tcp_now(self) -> np.ndarray:
         """Where the tool is for the state already loaded, in environment units.
@@ -675,7 +688,8 @@ class Cell:
 
     def solve_pose(self, pose_world_mm: np.ndarray, seeds: list[np.ndarray],
                    require_collision_free: bool = True, branch_seeds: int = 8,
-                   rng: np.random.Generator | None = None) -> np.ndarray | None:
+                   rng: np.random.Generator | None = None,
+                   avoid_stop_band: bool = False) -> np.ndarray | None:
         """Best joint solution for a pose: in limits, collision free, nearest the seed.
 
         KDL's solver is a local method returning one solution per seed, so the branch it
@@ -683,6 +697,11 @@ class Cell:
         other arm configurations, every candidate is then wrapped onto its nearest
         equivalent turn, and the winner is chosen by weighted distance so a solution is
         only preferred if it genuinely moves the tool less.
+
+        ``avoid_stop_band`` is for states the robot will stop at.  A solution outside the
+        stop band then beats every solution inside it, however much nearer the seed those
+        are, and one inside is returned only when nothing else was found.  Left off where a
+        solve tracks a line, whose stations have to stay on the branch they started on.
         """
         reference = np.asarray(seeds[0], dtype=float)
         rng = rng or np.random.default_rng(0)
@@ -694,18 +713,23 @@ class Cell:
                                          self.lower, self.upper))
 
         best, best_cost = None, np.inf
+        banded, banded_cost = None, np.inf      # the best of those inside the stop band
         for seed in all_seeds:
             for q in self.ik(pose_world_mm, seed):
                 q = self.wrap_towards(q, reference)
                 if not self.within_limits(q):
                     continue
+                inside = avoid_stop_band and self.in_stop_band(q)
                 cost = self.distance(reference, q)
-                if cost >= best_cost:
+                if cost >= (banded_cost if inside else best_cost):
                     continue                    # cheaper test before the collision check
                 if require_collision_free and self.in_collision(q):
                     continue
-                best, best_cost = q, cost
-        return best
+                if inside:
+                    banded, banded_cost = q, cost
+                else:
+                    best, best_cost = q, cost
+        return best if best is not None else banded
 
 
 def hull_categories(man: Manifest) -> dict[str, str]:

@@ -33,7 +33,7 @@ import os
 
 import numpy as np
 
-from .cell import Cell
+from .cell import STOP_BAND_JOINT, Cell
 from .manifest import Manifest
 from .profile import JointDynamics, commanded
 from .toolpath import LIN, Segment
@@ -195,6 +195,39 @@ def check_endpoints(document: dict, man: Manifest, tol_mm: float = 1.0) -> list[
             if error > tol_mm:
                 problems.append(f"{seg['from']} -> {seg['to']} {verb} {error:.2f} mm "
                                 f"from locator '{locator}'")
+    return problems
+
+
+def check_stop_band(document: dict, cell: Cell) -> list[str]:
+    """Every written waypoint that stops with joint 5 inside the stop band.
+
+    The planner repairs the transits' own waypoints, so what this normally finds is a
+    locator with no solution outside the band -- a weld pose, which nothing moves.  Read
+    off the document rather than the phases so that it checks what was actually written.
+    """
+    if cell.stop_band_rad <= 0.0 or len(cell.joint_names) <= STOP_BAND_JOINT:
+        return []
+    name = cell.joint_names[STOP_BAND_JOINT]
+    band = float(np.rad2deg(cell.stop_band_rad))
+    problems = []
+    for seg in document["segments"]:
+        if seg.get("error"):
+            continue
+        found, previous = [], None
+        for p, phase in enumerate(seg["phases"]):
+            for w, waypoint in enumerate(phase["waypoints"]):
+                value = float(waypoint["joints"][name])
+                # Consecutive phases share their boundary waypoint; count it once.
+                if previous is not None and waypoint["joints"] == previous:
+                    continue
+                previous = waypoint["joints"]
+                if abs(value) < cell.stop_band_rad:
+                    weld = " (weld)" if waypoint.get("is_weld") else ""
+                    found.append(f"phase {p} waypoint {w}{weld} at "
+                                 f"{np.rad2deg(value):.1f} deg")
+        if found:
+            problems.append(f"{seg['from']} -> {seg['to']}: {len(found)} waypoint(s) stop "
+                            f"with joint 5 inside +/-{band:g} deg: " + "; ".join(found))
     return problems
 
 
