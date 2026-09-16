@@ -874,7 +874,8 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
                               enclosed_probe_mm: float = 0.0,
                               enclosed_voxel_mm: float = 0.0,
                               enclosed_keep_mm: float = 0.0,
-                              enclosed_dump: bool = False) -> dict[str, str]:
+                              enclosed_dump: bool = False,
+                              panel_bend_mm: float = 0.0) -> dict[str, str]:
     from . import meshprep
 
     overlap = meshprep.DEFAULT_OVERLAP if hull_overlap is None else float(hull_overlap)
@@ -932,6 +933,11 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
             + f", screened on a {enclosed_voxel_mm:g} mm voxel"
             + (f", never above {enclosed_keep_mm:g} mm across" if enclosed_keep_mm > 0
                else ", with no size backstop"))
+    bends = ({name: float(panel_bend_mm) for name, category in hull_categories(man).items()
+              if category == "panel"} if panel_bend_mm > 0.0 else {})
+    if bends:
+        log(f"  panel pieces split again wherever they bend more than {panel_bend_mm:g} mm "
+            f"out of flat")
     return meshprep.prepare(man.directory, rel, man.scale, log=log,
                             min_extent=min_extent, max_shells=max_shells,
                             hull_cell=hull_cell, fill=hull_fill,
@@ -942,7 +948,8 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
                             merge_cell=merge_cell_mm, enclosed_probes=probes,
                             enclosed_voxel=enclosed_voxel_mm,
                             enclosed_keep=enclosed_keep_mm,
-                            enclosed_dump=enclosed_dump)
+                            enclosed_dump=enclosed_dump,
+                            bends=bends)
 
 
 # Probe distance for the exact re-measurement.  Generous on purpose: a pair the hulls
@@ -1203,6 +1210,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
           enclosed_per_category=None, enclosed_probe_mm: float = 0.0,
           enclosed_voxel_mm: float = 0.0,
           enclosed_keep_mm: float = 0.0, enclosed_dump: bool = False,
+          panel_bend_mm: float = 0.0,
           obstacle_clearance_mm: float = 0.0, tcp_check_mm: float = 0.0,
           export_dir: str | None = None,
           penalty=None, dynamics=None) -> Cell:
@@ -1214,7 +1222,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
                                           merge_per_category, enclosed_per_category,
                                           enclosed_probe_mm,
                                           enclosed_voxel_mm, enclosed_keep_mm,
-                                          enclosed_dump)
+                                          enclosed_dump, panel_bend_mm=panel_bend_mm)
     velocity = {}
     if dynamics is not None:
         velocity = {n: float(v) for n, v in zip(man.robot_joint_names, dynamics.velocity)}

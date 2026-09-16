@@ -372,6 +372,104 @@ def split_near_focus(V: np.ndarray, tris: np.ndarray, cell: float,
     return V, pieces, near_pieces
 
 
+# How many times one piece may be halved at its bends, so a pathological piece costs at most
+# 2**depth hulls; and the dot product past which two normal clusters face the same way, so
+# the halving has to be done across the piece rather than between its faces.
+BEND_MAX_DEPTH = 5
+BEND_PARALLEL = 0.97
+BEND_ITERATIONS = 6
+
+
+def _slab(V: np.ndarray, tris: np.ndarray) -> tuple[np.ndarray, float, np.ndarray]:
+    """The axis a piece mostly faces, how thick it is along that axis, and its normals.
+
+    The axis is the principal eigenvector of the normal tensor, the sum of ``n n^T`` over the
+    unnormalised face normals.  Being quadratic in the normal, it does not care which way a
+    normal points, so the two faces of a sheet agree on it, and each face counts by the
+    square of its area.  The thickness is the spread of the piece's vertices along it: a
+    hull of the piece lies inside that slab, so it can stand off the surface by no more.
+    """
+    a, b, c = V[tris[:, 0]], V[tris[:, 1]], V[tris[:, 2]]
+    normals = np.cross(b - a, c - a)
+    axis = np.linalg.eigh(normals.T @ normals)[1][:, -1]
+    along = V[np.unique(tris)] @ axis
+    return axis, float(along.max() - along.min()), normals
+
+
+def split_bends(V: np.ndarray, tris: np.ndarray, tolerance: float,
+                depth: int = 0) -> list[np.ndarray]:
+    """Halve a grid piece along its bends until every part is flat to ``tolerance``.
+
+    A grid cell bounds how far a hull can bridge, not whether it does: a cell that happens
+    to hold a flat stack and the slope rising out of it hulls to a wedge filling the corner
+    between them, which is where the electrode goes.  Measured on one ST240 panel, a 20 mm
+    cell produced exactly that over a weld -- the gun 2 mm into the hull and 5.3 mm clear
+    of the real surface.  A panel is a sheet, so a piece that is not a thin slab is a piece
+    that bends, and the hull fills the inside of the bend whichever side that is.  Both
+    sides matter to a spot welder, whose electrodes close on the sheet from either face.
+
+    A piece thicker than ``tolerance`` (see :func:`_slab`) is divided in two by which way
+    its faces point: two-means over normal axes, seeded with the dominant axis and the face
+    least aligned with it, so the flat stack and the slope separate and the cut falls on the
+    corner, a fillet included.  Where both halves would face the same way -- the two walls of
+    a channel, or two flanges at different heights -- the piece is cut across its axis at
+    the widest gap between its triangles instead.  Each half is then measured again.
+
+    Triangles stay whole, so every triangle is in exactly one part and inside that part's
+    hull, as with the grid.  Recursion stops at ``BEND_MAX_DEPTH``; a part still too thick
+    there is kept as it is, which is no worse than the piece it came from.  The fragments
+    are then rejoined greedily, smallest first, wherever the union is still flat to
+    ``tolerance``, since a bend cut in a fillet leaves slivers nothing gained by keeping
+    apart.  On that panel this took the 20 mm pieces up about 60% rather than 120%.
+
+    What it does not catch is bridging within the plane: a hole or a notch in a flat piece
+    is still covered by that piece's hull.  ``tolerance`` must also sit above the thickest
+    stack of sheet the panel carries, or every flat piece measures as bent; 2t stacks read
+    1.5-1.9 mm.
+    """
+    axis, thick, normals = _slab(V, tris)
+    if thick <= tolerance or len(tris) < 2 or depth >= BEND_MAX_DEPTH:
+        return [tris]
+    unit = normals / (np.linalg.norm(normals, axis=1, keepdims=True) + 1e-12)
+    first, second = axis, unit[np.argmin(np.abs(unit @ axis))]
+    side = np.abs(unit @ first) >= np.abs(unit @ second)
+    for _ in range(BEND_ITERATIONS):
+        if side.all() or not side.any():
+            break
+        first = np.linalg.eigh(normals[side].T @ normals[side])[1][:, -1]
+        second = np.linalg.eigh(normals[~side].T @ normals[~side])[1][:, -1]
+        side = np.abs(unit @ first) >= np.abs(unit @ second)
+    if side.all() or not side.any() or abs(float(first @ second)) > BEND_PARALLEL:
+        along = V[tris].mean(axis=1) @ axis
+        order = np.sort(along)
+        side = along <= order[int(np.argmax(np.diff(order)))]
+        if side.all() or not side.any():
+            return [tris]
+    parts = (split_bends(V, tris[side], tolerance, depth + 1)
+             + split_bends(V, tris[~side], tolerance, depth + 1))
+    return parts if depth else _rejoin_flat(V, parts, tolerance)
+
+
+def _rejoin_flat(V: np.ndarray, parts: list[np.ndarray],
+                 tolerance: float) -> list[np.ndarray]:
+    """Merge parts pairwise, smallest first, into whichever partner stays flattest."""
+    parts = sorted(parts, key=len)
+    i = 0
+    while i < len(parts) and len(parts) > 1:
+        best, best_thick = None, tolerance
+        for j, other in enumerate(parts):
+            if j != i:
+                thick = _slab(V, np.concatenate([parts[i], other]))[1]
+                if thick <= best_thick:
+                    best, best_thick = j, thick
+        if best is None:
+            i += 1
+            continue
+        parts[best] = np.concatenate([parts[i], parts[best]])
+        del parts[i]
+    return parts
+
+
 def merge_far(V: np.ndarray, groups: list[tuple[np.ndarray, np.ndarray]],
               points: np.ndarray | None, radius: float, near_cell: float,
               merge_cell: float, overlap: float = DEFAULT_OVERLAP
@@ -453,7 +551,8 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
                      overlap: float = DEFAULT_OVERLAP, merge_cell: float = 0.0,
                      enclosed_probe: float = 0.0, enclosed_voxel: float = 0.0,
                      enclosed_keep: float = 0.0,
-                     enclosed_dump: str | None = None) -> dict:
+                     enclosed_dump: str | None = None,
+                     bend_tolerance: float = 0.0) -> dict:
     """Split ``src`` into connected shells and write them as ``o`` groups into ``dst``.
 
     Every shell becomes a convex hull, and each hull is a collision pair to test, so the
@@ -468,6 +567,11 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
     can reach from outside the link are dropped, which on assembled CAD is most of what the
     file contains.  See :mod:`weldpath.enclosed` -- in particular for why this one can lose
     a real collision where the other two cannot, and what ``enclosed_keep`` does about it.
+
+    ``bend_tolerance`` above 0 re-splits the grid pieces with :func:`split_bends` wherever a
+    piece is thicker than that, so no hull bridges a bend in the sheet.  Only the pieces
+    inside the focus radius when a focus is given, since that is where the hulls are paid
+    for; every piece when none is.
     """
     t0 = time.time()
     V, F = load_obj(src)
@@ -532,7 +636,7 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
     # the same way, so "near" and "far" are not two things and reporting a share of them
     # would invent a distinction the run never made.
     focused = (focus_points is not None and len(focus_points) and focus_radius > 0.0)
-    near_hulls = far_hulls = 0
+    near_hulls = far_hulls = bend_hulls = 0
     if hull_cell > 0:
         refined: list[tuple[np.ndarray, np.ndarray]] = []
         for vids, tris in groups:
@@ -543,6 +647,16 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
                 continue
             V, pieces, near = split_near_focus(V, tris, hull_cell, focus_points,
                                                focus_radius, far_cell, overlap)
+            if bend_tolerance > 0.0:
+                # The near pieces lead the list, which is what keeps ``near`` meaningful
+                # once their count changes.
+                count = near if focused else len(pieces)
+                bent = [part for piece in pieces[:count]
+                        for part in split_bends(V, piece, bend_tolerance)]
+                bend_hulls += len(bent) - count
+                pieces = bent + pieces[count:]
+                if focused:
+                    near = len(bent)
             if len(pieces) < 2:
                 refined.append((vids, tris))
                 continue
@@ -578,6 +692,9 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
         # given, so a cache entry can tell "did not merge" from "merged nothing".
         **({"merged_from": int(pooled),
             "merged_to": int(len(groups) - (before - pooled))} if pooled else {}),
+        # Hulls the bend splitting added over the grid's own, absent when it was off.
+        **({"bend_tolerance": float(bend_tolerance), "bend_hulls": int(bend_hulls)}
+           if bend_tolerance > 0.0 else {}),
         # Absent entirely when no probe was given, so a cache entry can be told apart from
         # one where the filter ran and found nothing to drop.
         **({"enclosed": enc_stats} if enc_stats else {}),
@@ -656,6 +773,14 @@ def _merge_share(stats: dict) -> str:
     return f", {got} of them merged into {int(stats.get('merged_to', 0))}"
 
 
+def _bend_share(stats: dict) -> str:
+    """What splitting at bends added on one link, as a phrase; empty when it was off."""
+    if "bend_hulls" not in stats:
+        return ""
+    return (f", {int(stats['bend_hulls'])} more from splitting pieces bent past "
+            f"{float(stats['bend_tolerance']):g} mm")
+
+
 def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             log=print, min_extent: float = 40.0, max_shells: int = 80,
             hull_cell: float = 0.0, fill: float = DEFAULT_FILL,
@@ -666,7 +791,8 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             merge_cells: dict[str, float] | None = None, merge_cell: float = 0.0,
             enclosed_probes: dict[str, float] | None = None,
             enclosed_voxel: float = 0.0, enclosed_keep: float = 0.0,
-            enclosed_dump: bool = False) -> dict[str, str]:
+            enclosed_dump: bool = False,
+            bends: dict[str, float] | None = None) -> dict[str, str]:
     """Convex-decompose every mesh that needs it, reusing cached results.
 
     ``mesh_rel_paths`` maps link name -> mesh path relative to ``directory``.
@@ -692,6 +818,10 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
     one hull covers everything in a cell whatever solid it came from.  It is the only step
     that reduces a hull count set by how the CAD was assembled rather than by how the part
     is shaped -- see :func:`merge_far`.
+
+    ``bends`` maps a link to the thickness past which a grid piece counts as bent and is
+    split again along the bend -- see :func:`split_bends`.  Only meaningful on a link with a
+    cell, since it re-splits what the grid produced.
     """
     focus = {k: (np.asarray(pts, dtype=float).reshape(-1, 3), float(r))
              for k, (pts, r) in (focus or {}).items() if pts is not None and len(pts)}
@@ -712,6 +842,7 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
         far = float((far_cells or {}).get(link, far_cell))
         probe = float((enclosed_probes or {}).get(link, 0.0))
         merge = float((merge_cells or {}).get(link, merge_cell))
+        bend = float((bends or {}).get(link, 0.0)) if cell > 0.0 else 0.0
         threshold = float(fill)
         points, radius = focus.get(link, (None, 0.0))
         settings = [round(float(min_extent), 4), int(max_shells), round(float(scale), 9),
@@ -744,6 +875,10 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             # The near cell and the radius are already in the key above, and they decide
             # which groups are pooled, so they need no second mention here.
             settings += ["merge", round(merge, 4)]
+        if bend > 0.0:
+            # Appended only where bend splitting is on, so switching it off reuses caches
+            # built before it existed.
+            settings += ["bend", round(bend, 4)]
         if probe > 0.0:
             # Appended only where the filter is on, so every cache built before it existed
             # stays valid.  The voxel is in the key as well as the probe: it is a screening
@@ -766,7 +901,8 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
             log(f"  = {link:<22} cached ({cached['stats']['shells_kept']} shells"
                 f"{_focus_share(cached['stats'])}"
                 f"{_enclosed_share(cached['stats'])}"
-                f"{_merge_share(cached['stats'])})")
+                f"{_merge_share(cached['stats'])}"
+                f"{_bend_share(cached['stats'])})")
             out[link] = dst
             continue
         log(f"  . {link:<22} decomposing {os.path.getsize(src) / 1e6:.1f} MB of "
@@ -780,16 +916,17 @@ def prepare(directory: str, mesh_rel_paths: dict[str, str], scale: float,
                                  enclosed_voxel=enclosed_voxel,
                                  enclosed_keep=enclosed_keep,
                                  enclosed_dump=(dump if enclosed_dump and probe > 0.0
-                                                else None))
+                                                else None),
+                                 bend_tolerance=bend)
         near = ((f" within {radius:g} mm of a focus point, "
                  + (f"{far:g} mm beyond it" if far > 0.0 else "one hull beyond it"))
                 if radius > 0.0 else "")
         refined = (f", {stats['shells_refined']} split at {cell:g} mm below "
                    f"{threshold:g} fill{near}" if stats["shells_refined"] else "")
-        log("  + %-22s %d tris, %d shells -> %d kept%s%s%s%s (%.1fs)"
+        log("  + %-22s %d tris, %d shells -> %d kept%s%s%s%s%s (%.1fs)"
             % (link, stats["triangles"], stats["shells"], stats["shells_kept"],
                _enclosed_share(stats), refined, _focus_share(stats),
-               _merge_share(stats), stats["seconds"]))
+               _merge_share(stats), _bend_share(stats), stats["seconds"]))
         index[link] = {"sig": sig, "settings": settings, "stats": stats}
         out[link] = dst
 

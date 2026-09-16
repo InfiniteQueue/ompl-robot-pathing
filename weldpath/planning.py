@@ -97,7 +97,7 @@ class MotionModel:
         key = np.asarray(q, dtype=float).tobytes()
         hit = self._near.get(key)
         if hit is None:
-            hit = bool(self.cell.clearance_mm(q) <= self.zone.near_mm)
+            hit = _reads_near(self.cell, q, self.zone.near_mm)
             self._near[key] = hit
         return hit
 
@@ -1624,6 +1624,97 @@ def _ompl_run(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, segment_length: flo
 
 _ompl_run.message = ""
 
+# A scored solution: penalised cost, plain time, and the raw route itself.
+_Solution = tuple[float, float, list[np.ndarray]]
+
+
+def _cheapest(candidates: list[_Solution], log) -> _Solution:
+    """The lowest-cost solution of a set, with the spread reported where there was one.
+
+    Worth printing rather than just taking: it is the one number that says whether phase
+    one's runs are buying anything.  A set whose best and worst are the same cost is a set
+    that found the same route every time, and the budget spent sampling for a choice could
+    have gone to the phases that search for one at all.
+    """
+    best = min(candidates, key=lambda c: c[0])
+    if log and len(candidates) > 1:
+        worst = max(c[0] for c in candidates)
+        log(f"      keeping the best of {len(candidates)} solutions: cost {best[0]:.2f} s "
+            f"against {worst:.2f} s for the worst")
+    return best
+
+
+@dataclass
+class _Sampler:
+    """The two sampling-planner phases, asked of whichever pair of endpoints is wanted.
+
+    ``_plan_direct`` asks them of the whole transit; ``_recut_outside_band`` asks them
+    again of the stretches of a Cartesian route that lie outside the band.  Both want the
+    same thing -- every phase-one run spent and the cheapest kept, then phase two only if
+    nothing solved at all -- under the same budgets, the same profile settings and the
+    same reporting.  Holding that here is what lets the recut use *the* phase one and
+    phase two rather than a second copy of them that drifts as this one is tuned.
+
+    ``message`` is the planner's own words for the last failure.  It is left on the object
+    rather than returned because only the last one is ever quoted, and threading it back
+    out of every call to say the same thing is noise.
+    """
+    cell: Cell
+    ompl: OmplBudget
+    segment_length: float
+    check_step: float
+    continuous_check: bool = False
+    log: object = print
+    message: str = ""
+
+    def phase_one(self, qa: np.ndarray, qb: np.ndarray,
+                  label: str = "phase 1") -> list[_Solution]:
+        """Every run, spent whether or not earlier ones solved.  See ``OmplBudget``."""
+        if self.ompl.phase_one_runs <= 0:
+            return []
+        self.log(f"      {label}: {self.ompl.phase_one_runs} runs of "
+                 f"{self.ompl.phase_one_seconds:g}s each, keeping the cheapest that "
+                 f"solves")
+        found = [self._run(qa, qb, self.ompl.phase_one_seconds, f"{label} run {attempt}")
+                 for attempt in range(1, self.ompl.phase_one_runs + 1)]
+        return [c for c in found if c is not None]
+
+    def phase_two(self, qa: np.ndarray, qb: np.ndarray,
+                  label: str = "phase 2") -> list[_Solution]:
+        """Runs until one solves, there being nothing to choose between."""
+        if self.ompl.phase_two_max_runs <= 0:
+            return []
+        self.log(f"      {label}: up to {self.ompl.phase_two_max_runs} runs of "
+                 f"{self.ompl.phase_two_seconds:g}s each, stopping at the first solution")
+        for attempt in range(1, self.ompl.phase_two_max_runs + 1):
+            found = self._run(qa, qb, self.ompl.phase_two_seconds,
+                              f"{label} run {attempt}")
+            if found is not None:
+                return [found]
+        return []
+
+    def solve(self, qa: np.ndarray, qb: np.ndarray, *,
+              label: str = "") -> _Solution | None:
+        """Both phases in order, cheapest solution or ``None``.
+
+        For a caller that has nothing to insert between them.  ``_plan_direct`` does --
+        the Cartesian tree goes there -- so it drives the two phases itself.
+        """
+        prefix = f"{label} " if label else ""
+        candidates = (self.phase_one(qa, qb, f"{prefix}phase 1")
+                      or self.phase_two(qa, qb, f"{prefix}phase 2"))
+        return _cheapest(candidates, self.log) if candidates else None
+
+    def _run(self, qa: np.ndarray, qb: np.ndarray, planning_time: float,
+             label: str) -> _Solution | None:
+        found = _ompl_run(self.cell, qa, qb, segment_length=self.segment_length,
+                          continuous_check=self.continuous_check,
+                          planning_time=planning_time, check_step=self.check_step,
+                          label=label, log=self.log)
+        if found is None:
+            self.message = _ompl_run.message
+        return found
+
 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget,
                  segment_length: float, check_step: float,
@@ -1665,26 +1756,8 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     # it to the other side of an obstacle, so whichever class arrives here is the one that
     # ships.  Sampling several solutions and keeping the best-scoring one is therefore the
     # only stage that can make that choice at all.
-    candidates: list[tuple[float, float, list[np.ndarray]]] = []
-    last = ""
-
-    def run(planning_time: float, label: str) -> bool:
-        nonlocal last
-        found = _ompl_run(cell, qa, qb, segment_length=segment_length,
-                          continuous_check=continuous_check,
-                          planning_time=planning_time, check_step=check_step,
-                          label=label, log=log)
-        if found is None:
-            last = _ompl_run.message
-            return False
-        candidates.append(found)
-        return True
-
-    if ompl.phase_one_runs > 0:
-        log(f"      phase 1: {ompl.phase_one_runs} runs of "
-            f"{ompl.phase_one_seconds:g}s each, keeping the cheapest that solves")
-        for attempt in range(1, ompl.phase_one_runs + 1):
-            run(ompl.phase_one_seconds, f"phase 1 run {attempt}")
+    sampler = _Sampler(cell, ompl, segment_length, check_step, continuous_check, log)
+    candidates = sampler.phase_one(qa, qb)
 
     if not candidates and cartesian is not None and cartesian.enabled \
             and zone is not None and zone.enabled:
@@ -1715,33 +1788,159 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
             log(f"      cartesian tree: solved in {time.time() - t0:.1f}s "
                 f"({len(route)} points, cost {cost:.2f} s against {plain:.2f} s "
                 f"unpenalised)")
+            if cartesian.recut:
+                recut = _recut_outside_band(cell, route, zone=zone, sampler=sampler,
+                                            check_step=check_step, log=log)
+                if recut is not route:
+                    route = recut
+                    cost, plain = _path_cost(cell, route, check_step)
+                    log(f"      cartesian tree after the recut: {len(route)} points, "
+                        f"cost {cost:.2f} s against {plain:.2f} s unpenalised")
             candidates.append((cost, plain, route))
 
-    if not candidates and ompl.phase_two_max_runs > 0:
+    if not candidates:
         # Nothing to choose between at this point, so the goal changes from a good route to
         # any route, and the first one that arrives ends the phase.
-        log(f"      phase 2: up to {ompl.phase_two_max_runs} runs of "
-            f"{ompl.phase_two_seconds:g}s each, stopping at the first solution")
-        for attempt in range(1, ompl.phase_two_max_runs + 1):
-            if run(ompl.phase_two_seconds, f"phase 2 run {attempt}"):
-                break
+        candidates = sampler.phase_two(qa, qb)
 
     if not candidates:
         raise PlanningError(
-            f"freespace transit failed after {ompl.worst_case_runs} attempts: {last}")
+            f"freespace transit failed after {ompl.worst_case_runs} attempts: "
+            f"{sampler.message}")
 
-    cost, plain, raw = min(candidates, key=lambda c: c[0])
+    cost, plain, raw = _cheapest(candidates, log)
     _capture(record, raw)
-    if len(candidates) > 1:
-        worst = max(c[0] for c in candidates)
-        log(f"      keeping the best of {len(candidates)} solutions: cost {cost:.2f} s "
-            f"against {worst:.2f} s for the worst")
     # Shortcut before reducing: the dense path gives the cuts somewhere to land.
     out = _finish(cell, raw, zone=zone, relocate=relocate,
                   shortcut_seconds=shortcut_seconds,
                   polish_seconds=polish_seconds, check_step=check_step, log=log)
     log(f"      reduced to {sum(len(r.states) for r in out)} points in "
         f"{len(out)} run{'' if len(out) == 1 else 's'}")
+    return out
+
+
+def _far_stretches(near: list[bool]) -> list[tuple[int, int]]:
+    """Index pairs bounding each stretch of the route that reads outside the band.
+
+    The bounds are the first and last state of the stretch itself, not the near states
+    either side of it, which is what puts the cut *just outside* the band: the near
+    stretches keep every state the tree validated for them, and what is given up is only
+    what was already out of range.
+
+    A stretch with nothing between its bounds is left out.  There is no route to replan
+    there -- the two cuts are adjacent, the move between them is already the only move --
+    and it is the shape the apex of a retract makes as it clips out of the band for an
+    instant, so it would otherwise buy a full sampling search for no change at all.
+    """
+    out: list[tuple[int, int]] = []
+    i = 0
+    while i < len(near):
+        if near[i]:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(near) and not near[j + 1]:
+            j += 1
+        if j - i >= 2:
+            out.append((i, j))
+        i = j + 1
+    return out
+
+
+def _recut_outside_band(cell: Cell, route: list[np.ndarray], *, zone: LinearZone,
+                        sampler: _Sampler, check_step: float, log=print
+                        ) -> list[np.ndarray]:
+    """Cut a Cartesian-tree route at the band boundary and re-plan what lies outside it.
+
+    The tree searches linear space over the whole transit, band or no band, because a
+    straight tool move is the only edge it has and it still has to reach the far endpoint.
+    Only the near-panel half of what comes back was ever the point.  Outside the band a
+    route made of straight tool moves is a route drawn from a strict subset of what the
+    arm can do, and nothing recommends it there: the long withdrawal a transit makes
+    between two welds a few millimetres apart is exactly the shape a joint move crosses
+    directly, and the tree cannot produce that move because the tool would not travel in a
+    straight line while it was made.
+
+    So each stretch that reads far is handed back to the sampling planner, under the same
+    phase one and phase two the transit itself gets.  The two ends of the stretch become
+    waypoints of the finished route; every state between them is dropped, whatever profile
+    it would have flown under, because a linear move outside the band is precisely what
+    this is here to be rid of.
+
+    Two things it declines to search rather than search badly:
+
+    * **A stretch whose chord is already clear** is answered by that chord, with no run
+      spent.  The straight joint move between two states is the quickest route there can
+      be between them, so a planner asked to improve on it can only return it again --
+      the same reasoning ``_plan_direct`` opens with.
+    * **A route with no near states at all** is left alone entirely.  There would be
+      nothing to keep, so the "stretch" is the whole transit, and that is the query phase
+      one has just failed on. Asking it again with the same budget is the one thing here
+      guaranteed to be a waste.
+
+    A stretch the planner cannot join keeps its Cartesian states.  That is a route which
+    is known to work, and a worse shape than a joint move is not a reason to have no route
+    at all.
+    """
+    if len(route) < 3 or not zone.enabled:
+        return route
+    if log and len(route) > 200:
+        log(f"      recut: reading clearance at {len(route)} points to find where the "
+            f"route leaves the {zone.near_mm:g} mm band")
+    near = [_reads_near(cell, q, zone.near_mm) for q in route]
+    if not any(near):
+        log("      recut: no state of the route reads near the panel, so there is nothing "
+            "to keep and nothing phase one has not already tried; leaving it as it is")
+        return route
+
+    cuts = _far_stretches(near)
+    if not cuts:
+        log("      recut: the route holds no stretch outside the band worth replanning")
+        return route
+    one = len(cuts) == 1
+    log(f"      recut: the route leaves the band in {len(cuts)} "
+        f"stretch{'' if one else 'es'}, {'which is' if one else 'each'} replanned as "
+        f"joint motion")
+
+    plans: list[tuple[int, int, list[np.ndarray]]] = []
+    for n, (i, j) in enumerate(cuts, 1):
+        dropped = route[i:j + 1]
+        head = (f"      recut {n} of {len(cuts)}: points {i} to {j} of {len(route)}, "
+                f"{_tcp_travel(cell, dropped):.0f} mm of tool travel")
+        if not cell.segment_collides(route[i], route[j], max_step=check_step):
+            log(f"{head}; the joint move between the cuts is clear, so it is the answer")
+            plans.append((i, j, [route[i], route[j]]))
+            continue
+        log(f"{head}; searching for a joining route")
+        found = sampler.solve(route[i], route[j], label=f"recut {n}")
+        if found is None:
+            log(f"      recut {n}: no joining route, so this stretch keeps the Cartesian "
+                f"one ({sampler.message})")
+            continue
+        cost, _plain, bridge = found
+        # The splice assumes the joining route begins and ends at the states it was asked
+        # for.  It does -- the program is built from them -- but a route that did not
+        # would leave two moves in the finished path that nothing has ever checked, and
+        # that is worth a line of arithmetic rather than a trust.
+        if not (np.allclose(bridge[0], route[i]) and np.allclose(bridge[-1], route[j])):
+            log(f"      recut {n}: the joining route does not start and end at the cuts, "
+                f"so it cannot be spliced in; keeping the Cartesian stretch")
+            continue
+        was, _ = _path_cost(cell, dropped, check_step)
+        log(f"      recut {n}: joined with {len(bridge)} points at cost {cost:.2f} s, "
+            f"against {was:.2f} s for the {len(dropped)} Cartesian points it replaces")
+        plans.append((i, j, bridge))
+
+    if not plans:
+        return route
+    # Spliced back to front so that the indices of the stretches still to come are the
+    # ones they were found at.  Each bridge already begins and ends on the cut states, so
+    # the slice it replaces includes them.
+    out = list(route)
+    for i, j, bridge in reversed(plans):
+        out[i:j + 1] = bridge
+    log(f"      recut: {len(plans)} of {len(cuts)} "
+        f"stretch{'' if one else 'es'} replanned, {len(route)} points now {len(out)}")
     return out
 
 
@@ -2052,6 +2251,23 @@ def _chain_collides(cell: Cell, chain: list[np.ndarray], check_step: float) -> b
     return _chain_scan(cell, chain, check_step)[0]
 
 
+def _reads_near(cell: Cell, q: np.ndarray, near_mm: float) -> bool:
+    """Whether ``q`` is within ``near_mm`` of the parts, as far as the clearance query knows.
+
+    ``clearance_mm`` returns the probe distance itself when nothing lies within the probe,
+    so a reading at the probe is "nothing seen", not a distance, and it has to be kept out
+    of an at-or-under test.  Compared as a distance it passed whenever the probe was no
+    wider than the band: ``ToolpathPlanner`` sized the two equal, every state of every leg
+    read as near, and nearly every move shipped linear.
+
+    The caller has to have sized the probe past ``near_mm`` -- ``ToolpathPlanner`` does --
+    or states clear by more than the probe and less than the band are missed.  The probe
+    only ever grows, so once it is past the band this answer no longer depends on it.
+    """
+    reading = cell.clearance_mm(q)
+    return reading < cell.probe_mm and reading <= near_mm
+
+
 def _linear_allowed(cell: Cell, dense: list[np.ndarray], zone: "LinearZone",
                     log=None) -> bool:
     """Whether this leg earns linear motion at all, and the report explaining the verdict.
@@ -2077,7 +2293,7 @@ def _linear_allowed(cell: Cell, dense: list[np.ndarray], zone: "LinearZone",
     if log and len(dense) > 200:
         log(f"      measuring clearance at {len(dense)} points along the route to find "
             f"its near-panel stretches")
-    near = [cell.clearance_mm(q) <= zone.near_mm for q in dense]
+    near = [_reads_near(cell, q, zone.near_mm) for q in dense]
     in_range = 100.0 * sum(near) / len(near) if near else 0.0
     by_share = zone.min_run_pct > 0.0 and in_range >= zone.min_run_pct
 
@@ -2158,13 +2374,34 @@ def validate(cell: Cell, path: list[np.ndarray], max_step: float = 0.05, *,
 # ---------------------------------------------------------------------------
 # linear (Cartesian) motion
 # ---------------------------------------------------------------------------
+def rotation_angle(Ra: np.ndarray, Rb: np.ndarray) -> float:
+    """Shortest rotation angle, in radians, taking ``Ra`` onto ``Rb``.
+
+    Taken as ``atan2(2 sin(theta), 2 cos(theta))`` from the relative rotation's skew part
+    and trace, not as ``arccos`` of the trace alone.  ``arccos`` is flat at 1, so it cannot
+    resolve a small angle: a rotation compared with itself, whose trace is 3 give or take
+    rounding, came back as anything up to 5.6e-8 rad -- above 1e-9 for 480 of 2000 random
+    rotations.  The Cartesian tree decides its two halves have met on a turn under 1e-9,
+    so a quarter of the time the test could not pass at all: the connect sat on the goal
+    pose adding zero-length steps until the budget ran out, 3982 nodes from one sample on
+    a 300 mm straight retract that joins in 6 once the angle reads true.
+
+    The skew part is itself a difference of near-equal entries, but one that cancels to
+    rounding error, so the angle it gives near zero is of that order rather than its
+    square root.
+    """
+    R = Ra.T @ Rb
+    s = np.linalg.norm([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    return float(np.arctan2(s, np.trace(R) - 1.0))
+
+
 def interpolate_pose(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
     """Linear in position, shortest-arc slerp in orientation."""
     out = np.eye(4)
     out[:3, 3] = a[:3, 3] + t * (b[:3, 3] - a[:3, 3])
     Ra, Rb = a[:3, :3], b[:3, :3]
     R = Ra.T @ Rb
-    angle = float(np.arccos(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)))
+    angle = rotation_angle(Ra, Rb)
     if angle < 1e-9:
         out[:3, :3] = Ra
         return out

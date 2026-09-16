@@ -161,20 +161,21 @@ def check_endpoints(document: dict, man: Manifest, tol_mm: float = 1.0) -> list[
     required to begin at the first locator rather than at the robot's start pose, so both
     ends are worth asserting rather than assuming.
 
-    Checked against the pose the segment was *planned* to reach, which for a shifted weld
-    is ``pose_world`` and not ``export_pose``.  ``shift_weld_locators`` backs a weld off
-    along its own approach axis so the pose is reachable without the gun entering the
-    sheet, and it moves the planner, the collision checks and the emitted ``tcp_world_mm``
-    together -- so an endpoint landing exactly on target sits ``--weld-shift-mm`` away from
-    the imported pose by construction.  Comparing against the imported one therefore
-    reported the shift itself, on every weld-to-weld segment of every solve, and reported
-    it as a failure to arrive.
+    A shifted weld has two poses, and each end is checked against the one it is meant to
+    stand on.  ``shift_weld_locators`` backs a weld off along its own approach axis, so a
+    transit arrives at ``pose_world``, the stand-off -- ``--weld-shift-mm`` from the imported
+    pose, or the shorter distance ``ToolpathPlanner._search_stand_off`` settled on.  The ``weld`` phase is then put back on ``export_pose`` by
+    ``_restore_weld_poses``, and that phase is the first waypoint of every segment leaving a
+    weld (and the last of a tour ending on one).  Reading one pose for both reports the
+    shift itself on every weld end of every solve: the imported pose flagged the arrivals,
+    and the planned pose, which replaced it, flagged the departures instead.
 
-    The imported pose is still the one the exported program names; it is simply not what
-    this is asking about.  The question here is whether the segment runs between the two
-    locators it claims to, and that is answered against where those locators were planned.
+    The waypoint's own ``is_weld`` mark says which it is.  A weld phase whose imported pose
+    could not be reached keeps the stand-off, and is reported here: the program then names
+    the weld somewhere other than where the study put it.
     """
-    poses = {loc.name: np.array(loc.pose_world, dtype=float) for loc in man.locators}
+    planned = {loc.name: np.array(loc.pose_world, dtype=float) for loc in man.locators}
+    imported = {loc.name: np.array(loc.export_pose, dtype=float) for loc in man.locators}
     problems = []
 
     def position(waypoint) -> np.ndarray:
@@ -186,8 +187,11 @@ def check_endpoints(document: dict, man: Manifest, tol_mm: float = 1.0) -> list[
             continue
         ends = (("starts", seg["from"], position(seg["phases"][0]["waypoints"][0])),
                 ("ends", seg["to"], position(seg["phases"][-1]["waypoints"][-1])))
-        for verb, locator, got in ends:
-            error = float(np.linalg.norm(got - poses[locator][:3, 3]))
+        weld = (seg["phases"][0]["waypoints"][0].get("is_weld", False),
+                seg["phases"][-1]["waypoints"][-1].get("is_weld", False))
+        for (verb, locator, got), at_weld in zip(ends, weld):
+            target = (imported if at_weld else planned)[locator]
+            error = float(np.linalg.norm(got - target[:3, 3]))
             if error > tol_mm:
                 problems.append(f"{seg['from']} -> {seg['to']} {verb} {error:.2f} mm "
                                 f"from locator '{locator}'")
