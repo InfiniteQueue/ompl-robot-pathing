@@ -25,6 +25,7 @@ from tesseract_robotics.tesseract_motion_planners import PlannerRequest
 from tesseract_robotics.tesseract_motion_planners_ompl import (
     OMPLMotionPlanner, OMPLRealVectorMoveProfile)
 
+from . import stagetrace
 from .cell import STOP_BAND_JOINT, Cell
 
 try:                                        # not in every build of the bindings
@@ -755,11 +756,16 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
             f"then {polish_seconds:g}s polishing, both spent in full")
     improved = shortcut(model, path, time_budget=shortcut_seconds, anchors=anchors,
                         log=log)
+    stagetrace.stage("shortcut", model, improved)
     reduced = simplify(model, improved)
+    stagetrace.stage("simplify", model, reduced)
     polished = polish(model, reduced, time_budget=polish_seconds, relocate=relocate,
                       log=log)
+    stagetrace.stage("polish", model, polished)
     # Outside the budgets on purpose: a route refined with none still ships its stops.
-    return clear_stop_band(model, polished, log=log)
+    cleared = clear_stop_band(model, polished, log=log)
+    stagetrace.stage("stop band", model, cleared)
+    return cleared
 
 
 def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.ndarray]:
@@ -2103,10 +2109,13 @@ def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
         return runs
     allowed = zone is not None and _linear_allowed(cell, pts, zone, log=log)
     model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
+    stagetrace.route("refining a leg planned earlier without a budget")
+    stagetrace.note(_trace_gate(zone, allowed))
+    stagetrace.stage("input", model, pts)
     refined = _refine(model, pts, shortcut_seconds=shortcut_seconds,
                       polish_seconds=polish_seconds, relocate=relocate, log=log)
     runs = _split_runs(model, refined)
-    _verify_runs(model, runs, "refined leg", log=log)
+    _traced_verify(model, runs, "refined leg", log=log)
     return runs
 
 
@@ -2168,11 +2177,18 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     allowed = zone is not None and _linear_allowed(cell, gate, zone, log=log)
     model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
     dense, anchors = _densify_marked(cell, path, check_step, model=model)
+    stagetrace.route(f"planned route, refinement budgets shortcut {shortcut_seconds:g} s, "
+                     f"polish {polish_seconds:g} s"
+                     + ("" if shortcut_seconds > 0 or polish_seconds > 0 else
+                        " (unrefined for now: may be refined again later or discarded)"))
+    stagetrace.note(_trace_gate(zone, allowed))
+    stagetrace.stage("solver", model, path, sources=range(len(path)))
+    stagetrace.stage("densify", model, dense, sources=anchors)
     refined = _refine(model, dense, shortcut_seconds=shortcut_seconds,
                       polish_seconds=polish_seconds, relocate=relocate,
                       anchors=anchors, log=log)
     runs = _split_runs(model, refined)
-    _verify_runs(model, runs, "planned route", log=log)
+    _traced_verify(model, runs, "planned route", log=log)
     _report_work(cell, before, time.time() - t0, log)
     if log:
         lin = sum(1 for r in runs if r.motion == LIN)
@@ -2181,6 +2197,25 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
             log(f"      {lin} linear runs over {moves} moves, "
                 f"{len(runs) - lin} joint runs, {len(refined)} waypoints")
     return runs
+
+
+def _trace_gate(zone: "LinearZone | None", allowed: bool) -> str:
+    """The linear gate's answer, as the stage trace reports it."""
+    if zone is None or not zone.enabled:
+        return "linear band: off, every move is PTP"
+    return (f"linear gate: {'admitted' if allowed else 'refused, every move is PTP'} "
+            f"(band {zone.near_mm:g})")
+
+
+def _traced_verify(model: "MotionModel", runs: list[Run], where: str, log=None) -> None:
+    """:func:`_verify_runs`, with its verdict and the shipped split in the stage trace."""
+    try:
+        _verify_runs(model, runs, where, log=log)
+    except PlanningError as exc:
+        stagetrace.note(f"verify: FAILED, route discarded: {exc}")
+        raise
+    stagetrace.note("verify: passed; ships as " + ", ".join(
+        f"{r.motion} x{len(r.states) - 1}" for r in runs))
 
 
 def _verify_runs(model: "MotionModel", runs: list[Run], where: str, log=None) -> None:

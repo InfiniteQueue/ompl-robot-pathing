@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import stagetrace
 from .cell import STOP_BAND_JOINT, Cell
 from .manifest import Locator, Manifest
 from .cartesian import CartesianBudget
@@ -455,7 +456,8 @@ class ToolpathPlanner:
         pairs = list(zip(locators, locators[1:]))
         for index, (a, b) in enumerate(pairs):
             seg = Segment(a.name, b.name)
-            self.log(f"  segment {a.name} -> {b.name}")
+            self.log(f"  segment {a.name} -> {b.name} [{index + 1}/{len(pairs)}]")
+            stagetrace.section(f"segment {a.name} -> {b.name} [{index + 1}/{len(pairs)}]")
             try:
                 if a.name not in anchors:
                     raise PlanningError(f"no reachable joint solution for '{a.name}'")

@@ -44,6 +44,8 @@ _line_buffer_output()
 
 # Written into the study directory beside waypoints.json unless --write-log false.
 LOG_NAME = "weldpath-log.txt"
+# Written beside it: every route's waypoints at each refinement stage, for debugging them.
+STAGES_NAME = "weldpath-stages.txt"
 
 
 class _Tee:
@@ -760,7 +762,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--write-log", type=boolean, nargs="?", const=True, default=True,
                    metavar="BOOL",
                    help=f"also write everything printed to <directory>/{LOG_NAME}, "
-                        f"replacing the previous run's; false prints to the console only "
+                        f"and each planned route's waypoints before refinement and after "
+                        f"each refinement stage to <directory>/{STAGES_NAME}, replacing "
+                        f"the previous run's; false prints to the console only "
                         f"(default: true)")
     return p
     #endregion
@@ -776,9 +780,12 @@ def main(argv: list[str] | None = None) -> int:
 
     # Line buffered so a run that is killed partway, as an hours-long one may be, leaves
     # everything up to that point on disk.
-    with open(os.path.join(directory, LOG_NAME), "w", encoding="utf-8", buffering=1) as fh:
+    from weldpath import stagetrace     # plain Python: needs no Tesseract bindings
+    with open(os.path.join(directory, LOG_NAME), "w", encoding="utf-8", buffering=1) as fh, \
+            open(os.path.join(directory, STAGES_NAME), "w", encoding="utf-8") as stages:
         stdout, stderr = sys.stdout, sys.stderr
         sys.stdout, sys.stderr = _Tee(stdout, fh), _Tee(stderr, fh)
+        stagetrace.start(stages)
         try:
             return _run(args, directory)
         except BaseException:
@@ -787,6 +794,7 @@ def main(argv: list[str] | None = None) -> int:
             fh.write(traceback.format_exc())
             raise
         finally:
+            stagetrace.stop()
             sys.stdout, sys.stderr = stdout, stderr
 
 
