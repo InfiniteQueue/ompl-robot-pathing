@@ -1382,6 +1382,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         _apply_margins(env, man, margin, overrides, obstacle_clearance=clearance)
         cell = Cell(man, builder, env, pairs)
         cell.margin, cell.obstacle_clearance = margin, clearance
+        cell.tcp_check_mm = max(0.0, float(tcp_check_mm))
         cell.margin_overrides = overrides
         cell.attach_penalty(penalty, log=log)
         cell.attach_dynamics(dynamics)
