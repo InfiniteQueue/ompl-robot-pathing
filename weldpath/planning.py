@@ -141,20 +141,19 @@ class MotionModel:
         to test contact, once to measure clearance.  Here the walk that answers the first
         keeps what the second needs.
 
-        Only the joint profile can share the walk.  A linear move is checked along the
-        tool's line, whose states come from inverse kinematics rather than from the joint
-        grid the cost is sampled on, so there is nothing to hand over and it falls back to
-        measuring its own.
+        Both profiles share it.  A joint move hands over the factors on its joint grid; a
+        linear move hands over the factors at the stations along the tool's line, which is
+        the walk that proved it clear and the only curve it may be priced on.
         """
         if self.motion(a, b) == PTP:
             hit, facs = self.cell.segment_scan(a, b, max_step=self.max_step,
                                                factors=self.penalised)
             if hit:
                 return None
-        elif not self.linear_ok(a, b):
-            return None
         else:
-            facs = None
+            chain, facs = self.linear_chain(a, b, factors=self.penalised)
+            if chain is None:
+                return None
         return self.cost(a, b, fa=fa, fb=fb, stops=stops, facs=facs)
 
     def _pose_mm(self, q: np.ndarray) -> np.ndarray:
@@ -372,9 +371,32 @@ class MotionModel:
         The crossing penalty is added afterwards rather than folded into the floor, so it
         is not multiplied by the clearance factor: it is a fixed preference about how many
         times the route enters the band, not time spent anywhere.
+
+        The clearance penalty is read along the path the move really takes.  For a joint
+        move that is the joint grid, and ``facs`` are its factors.  For a linear move it is
+        the tool's straight line, and ``facs`` are the factors at the stations along it,
+        one per station, as :meth:`linear_chain` returns them; left unset they are measured
+        here.  This used to sample the joint chord for both, so a long linear move was
+        charged for a curve it never flies -- one that nothing collision checks and that
+        can pass through the parts.  Measured on a 707 mm move whose line stood 3.6 mm
+        clear at worst, the chord reached 64.5 mm inside the panel and priced the move at
+        54.4 s where its line gave 3.6 s, and simplify and polish kept a 918 mm detour
+        rather than take it.  A linear move with no reachable line has no price and
+        costs infinity; every caller that installs a move has proved it clear first.
         """
-        penalised = self.cell.segment_cost(a, b, max_step=self.max_step,
-                                           fa=fa, fb=fb, stops=stops, facs=facs)
+        if self.motion(a, b) == LIN:
+            raw = self.cell.move_time(a, b) if stops else self.cell.cruise_time(a, b)
+            if not self.penalised or self.cell._pm is None:
+                penalised = raw
+            else:
+                if facs is None:
+                    chain, facs = self.linear_chain(a, b, factors=True)
+                    if chain is None:
+                        return float("inf")
+                penalised = self.cell.price(raw, facs)
+        else:
+            penalised = self.cell.segment_cost(a, b, max_step=self.max_step,
+                                               fa=fa, fb=fb, stops=stops, facs=facs)
         floor = self._time_floor(a, b)
         if floor > 0.0:
             raw = self.cell.move_time(a, b) if stops else self.cell.cruise_time(a, b)

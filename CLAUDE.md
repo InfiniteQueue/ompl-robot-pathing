@@ -98,6 +98,17 @@ the way, so the joint values in between are whatever that line demands.
 - `shortcut`, `simplify` and `polish` all go through `MotionModel`, so a move destined for
   a linear profile is costed under the tool speed cap and collision checked along the
   straight line the tool will take.
+  - Its clearance penalty is read along that line too: `MotionModel.cost` prices a linear
+    move off the factors at the stations `linear_chain` places, through `Cell.price`.
+    Until this was fixed it sampled the **joint chord** for both profiles, which nothing
+    collision checks and which can pass through the parts. Measured on Path 1's
+    73075-05 -> 73075-03 transit: a 707 mm linear move clear by 3.6 mm at worst was priced
+    at 54.4 s off a chord reaching 64.5 mm into the panel, against 3.6 s off its line, so
+    simplify and polish kept a joint detour up and over rather than take it. Shortcut's
+    cuts were never affected; they priced the chain they installed.
+  - Still read off the joint chord, before any profile is known: `_path_cost` ranking raw
+    solver routes, and `_plan_direct`'s check of whether a clear direct move runs close
+    enough to the parts to be worth refining.
 - `MotionModel.demotes` is why the linear stretches survive those passes. Deleting a
   waypoint is nearly always quicker — every retained hop pays its own ramps — so left
   alone the passes collapse a near-panel polyline into one chord whose ends sit outside

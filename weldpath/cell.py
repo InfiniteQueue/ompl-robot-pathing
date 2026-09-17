@@ -593,6 +593,20 @@ class Cell:
                     factors.append(fb)
                 else:
                     factors.append(self.penalty_factor(a + t * (b - a)))
+        return self.price(raw, factors)
+
+    def price(self, raw: float, factors: list[float]) -> float:
+        """Spread ``raw`` seconds evenly over the samples of a move and charge the penalty.
+
+        ``factors`` are the penalty factors at samples of the path the move really takes,
+        in order, ends included: the joint grid for a joint move (what
+        :meth:`segment_cost` walks), the stations along the tool's line for a linear one.
+        Pricing a linear move off the joint grid instead would charge it for a curve the
+        robot never flies and nothing collision checks, which on a long move can run
+        straight through the parts the line itself stands clear of.
+        """
+        if raw <= 0.0 or len(factors) < 2:
+            return raw * (max(factors) if factors else 1.0)
         if getattr(self.penalty, "whole_move", False):
             # The move is the unit being priced, so its worst state prices all of it: a
             # dip cannot be made cheap by being brief.  Every interior sample is still
@@ -605,7 +619,7 @@ class Cell:
         # which slightly under-charges the ends of a move; where the route is close to the
         # parts it is close for a stretch, not at a single instant, so the shape of the
         # penalty across a move matters much less than its total.
-        step = raw / (n - 1)
+        step = raw / (len(factors) - 1)
         return sum(step * max(x, y) for x, y in zip(factors, factors[1:]))
 
     def within_limits(self, q: np.ndarray) -> bool:
