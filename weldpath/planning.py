@@ -1869,25 +1869,31 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         # "sensible" part company when the line grazes a panel, so when the penalty says
         # this one does, the same pass that stands other routes off is given a chance to
         # bow it away -- there is nothing for OMPL to do here, but plenty for relocation.
-        def straight() -> list[Run]:
-            return _finish(cell, _capture(record, [qa, qb]), zone=zone, relocate=relocate,
-                           shortcut_seconds=0.0, polish_seconds=0.0,
+        stand_off = False
+        if cell.penalty is not None and cell.penalty.enabled and shortcut_seconds > 0:
+            raw = cell.move_time(qa, qb)
+            cost = cell.segment_cost(qa, qb, max_step=check_step, stops=True)
+            stand_off = cost > raw * 1.05
+            if stand_off:
+                log(f"      direct move is clear but runs close to the parts "
+                    f"(cost {cost:.2f} s against {raw:.2f} s unpenalised); standing it off")
+        try:
+            # _finish fills the interior in, which a two-point path needs before
+            # relocation has anything to move.
+            runs = _finish(cell, [qa, qb], zone=zone, relocate=relocate,
+                           shortcut_seconds=shortcut_seconds if stand_off else 0.0,
+                           polish_seconds=polish_seconds if stand_off else 0.0,
                            check_step=check_step, log=log)
-
-        raw = cell.move_time(qa, qb)
-        if not (cell.penalty is not None and cell.penalty.enabled) or shortcut_seconds <= 0:
-            return straight()
-        cost = cell.segment_cost(qa, qb, max_step=check_step, stops=True)
-        if cost <= raw * 1.05:
-            return straight()
-        log(f"      direct move is clear but runs close to the parts "
-            f"(cost {cost:.2f} s against {raw:.2f} s unpenalised); standing it off")
-        # The unrefined route stays the bare straight line; _finish fills the interior in,
-        # which a two-point path needs before relocation has anything to move.
-        _capture(record, [qa, qb])
-        return _finish(cell, [qa, qb], zone=zone, relocate=relocate,
-                       shortcut_seconds=shortcut_seconds,
-                       polish_seconds=polish_seconds, check_step=check_step, log=log)
+        except PlanningError as exc:
+            # Clear as a joint chord is not the same as flyable: with both ends in the
+            # band the move ships linear, and _finish verifies it along the tool's line.
+            # This used to raise straight out and write the whole gun opening off without
+            # a single sampling run, where a route round the obstacle may well exist.
+            log(f"      the direct move is clear as a joint move but not as planned "
+                f"({exc}); searching for a route instead")
+        else:
+            _capture(record, [qa, qb])
+            return runs
 
     # RRTConnect returns the first path it finds, and which homotopy class that lands in
     # is luck -- one run goes over the fixture, the next threads behind it.  The
