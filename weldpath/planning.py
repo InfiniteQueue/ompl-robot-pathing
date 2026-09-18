@@ -1081,18 +1081,22 @@ def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
     points, factors = model.clear_path(dense[i], dense[j], factors=penalised)
     if points is None:
         return 0
-    if penalised:
-        chain = [dense[i]] + points + [dense[j]]
-        chain_f = [fac[i]] + factors + [fac[j]]
-        secs = [model.cruise_time(x, y) for x, y in zip(chain, chain[1:])]
-        cross = sum(model.crossing_penalty(x, y) for x, y in zip(chain, chain[1:]))
-        if whole:
-            middle = sum(secs) * max(chain_f) + cross
-        else:
-            middle = sum(s * max(fx, fy) for s, fx, fy
-                         in zip(secs, chain_f, chain_f[1:])) + cross
-        if outer + middle >= before - 1e-9:
-            return 0
+    # Scored in full with or without the penalty.  The bound above is joint cruise time
+    # alone, and without a penalty this used to be the whole test -- so a cut that turned
+    # joint hops into a linear move held to the tool speed cap, or that added a crossing
+    # of the band, was kept whenever the joints alone got there sooner.  The factors are
+    # all 1.0 when the penalty is off, which reduces this to exactly that comparison.
+    chain = [dense[i]] + points + [dense[j]]
+    chain_f = [fac[i]] + factors + [fac[j]]
+    secs = [model.cruise_time(x, y) for x, y in zip(chain, chain[1:])]
+    cross = sum(model.crossing_penalty(x, y) for x, y in zip(chain, chain[1:]))
+    if whole:
+        middle = sum(secs) * max(chain_f) + cross
+    else:
+        middle = sum(s * max(fx, fy) for s, fx, fy
+                     in zip(secs, chain_f, chain_f[1:])) + cross
+    if outer + middle >= before - 1e-9:
+        return 0
 
     old_points, old_factors = dense[i + 1:j], fac[i + 1:j]
     old_marks = list(marks)
