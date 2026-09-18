@@ -19,6 +19,7 @@ import numpy as np
 
 from . import meshprep
 from .hullexport import _outward, _link_hulls
+from .scene import SceneBuilder
 
 # How many triangles of a link are measured exactly.  The box bound below is cheap and
 # runs over every triangle; only the closest handful can win, and measuring those properly
@@ -158,6 +159,12 @@ def report(env, man, spec: str, log=print) -> None:
 
     meshes = {s.name: man.mesh_path(s.mesh) for s in man.static_objects if s.mesh}
     placed: dict[str, np.ndarray] = {}
+    # A source mesh is stored in world coordinates at the captured pose, and the URDF puts
+    # it in its link's frame by subtracting that frame's origin (see weldpath.scene).  The
+    # link transform alone therefore places it that origin away from where it belongs.  Study
+    # coordinates sit far from the world origin, so on Path 1 that was 96 m for the gun tip
+    # and 173 m for link 3, and every moving link reported material nowhere near the point.
+    origins = SceneBuilder(man, {}).frame_origin
     for link in man.all_links():
         if not link.mesh:
             continue
@@ -165,6 +172,7 @@ def report(env, man, spec: str, log=print) -> None:
         try:                                    # a moving link is compared where it is now
             matrix = np.array(transforms[link.name].matrix(), dtype=float)
             matrix[:3, 3] *= unit
+            matrix[:3, 3] -= matrix[:3, :3] @ origins.get(link.name, np.zeros(3))
             placed[link.name] = matrix
         except Exception:
             pass
