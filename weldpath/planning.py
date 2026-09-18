@@ -189,9 +189,11 @@ class MotionModel:
         """
         try:
             chain = plan_linear(self.cell, self._pose_mm(a), self._pose_mm(b), a,
-                                step_mm=self.tool_step)
+                                step_mm=self.tool_step, step_rad=self.max_step)
         except PlanningError:
             return None, None               # no inverse kinematics somewhere along it
+        if _line_end_fault(chain, a, b) is not None:
+            return None, None               # the line does not arrive at ``b``
         # Inverse kinematics returns the solution nearest its seed rather than the state
         # asked for, so pin the ends back before checking the gaps between the samples.
         chain[0] = np.asarray(a, dtype=float)
@@ -2349,9 +2351,12 @@ def _linear_fault(model: "MotionModel", a: np.ndarray, b: np.ndarray) -> str:
     head = (f"{travel:.0f} mm of tool travel against a {step:g} mm linear step, "
             f"joint chord {chord}")
     try:
-        chain = plan_linear(cell, pa, pb, a, step_mm=step)
+        chain = plan_linear(cell, pa, pb, a, step_mm=step, step_rad=model.max_step)
     except PlanningError as exc:
         return f"{head}; {exc}"
+    ends = _line_end_fault(chain, a, b)
+    if ends is not None:
+        return f"{head}; {ends}"
     chain[0] = np.asarray(a, dtype=float)
     chain[-1] = np.asarray(b, dtype=float)
     gap = next((j for j, (x, y) in enumerate(zip(chain, chain[1:]))
@@ -2584,16 +2589,64 @@ def interpolate_pose(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
     return out
 
 
-def plan_linear(cell: Cell, pose_a: np.ndarray, pose_b: np.ndarray, seed: np.ndarray, *,
-                step_mm: float = 50.0, allow_collision: bool = False
-                ) -> list[np.ndarray]:
-    """Joint states following the straight Cartesian line from ``pose_a`` to ``pose_b``.
+# Most a joint may move between two stations of one straight tool move, and furthest a
+# tracked line may end from the state it was asked to reach.  Measured on Path 1's linear
+# moves the stations moved 0.031 rad at most and the ends landed within 1.1e-4 rad, so
+# both leave wide headroom; what they catch is a branch flip or a whole extra turn, which
+# the controller cannot make inside one straight move.
+LINE_JUMP_RAD = 0.5
+LINE_END_TOL_RAD = 1e-2
 
-    Poses are world 4x4 in manifest units.  Points are spaced by ``step_mm`` -- a FANUC
-    L move only needs enough points to pin the line, not a dense sampling.
+
+def line_stations(pose_a: np.ndarray, pose_b: np.ndarray, step_mm: float,
+                  step_rad: float = 0.0) -> int:
+    """How many equal steps a straight tool move is divided into.
+
+    Enough that no step carries the tool further than ``step_mm`` or turns it further than
+    ``step_rad``.  Travel alone used to decide it, so a move that mostly turned the tool --
+    a wrist reorientation on the spot -- got its two ends and nothing between them, and was
+    checked only along the joint chord joining those.  An infinite ``step_mm`` is
+    ``--check-step-mm 0``, which collapses the stations onto the ends; the turn is not
+    allowed to bring them back, since that setting asks for the joint grid alone.
     """
     dist = float(np.linalg.norm(pose_b[:3, 3] - pose_a[:3, 3]))
-    n = max(1, int(np.ceil(dist / max(step_mm, 1e-6))))
+    n = int(np.ceil(dist / max(step_mm, 1e-6)))
+    if np.isfinite(step_mm) and step_rad > 0.0:
+        turn = rotation_angle(pose_a[:3, :3], pose_b[:3, :3])
+        n = max(n, int(np.ceil(turn / step_rad)))
+    return max(1, n)
+
+
+def _line_end_fault(chain: list[np.ndarray], a: np.ndarray, b: np.ndarray) -> str | None:
+    """Why a tracked line is not the move from ``a`` to ``b``, or ``None`` if it is.
+
+    ``plan_linear`` solves every station afresh, the two ends included, and callers pin
+    the ends back onto ``a`` and ``b`` before checking the gaps.  Pinning without looking
+    hid the case where tracking the line from ``a`` lands on another arm configuration, or
+    on the same one a whole turn round, than ``b``: the last gap then held a wrist flip,
+    checked as a joint chord and passed, in a move the controller drives as a line.
+    """
+    for label, got, want in (("starts", chain[0], a), ("ends", chain[-1], b)):
+        off = np.abs(np.asarray(got, dtype=float) - np.asarray(want, dtype=float))
+        if float(off.max()) > LINE_END_TOL_RAD:
+            j = int(np.argmax(off))
+            return (f"the line {label} on a different arm configuration, joint {j + 1} "
+                    f"{np.degrees(off[j]):.1f} deg away")
+    return None
+
+
+def plan_linear(cell: Cell, pose_a: np.ndarray, pose_b: np.ndarray, seed: np.ndarray, *,
+                step_mm: float = 50.0, step_rad: float = 0.0,
+                allow_collision: bool = False) -> list[np.ndarray]:
+    """Joint states following the straight Cartesian line from ``pose_a`` to ``pose_b``.
+
+    Poses are world 4x4 in manifest units.  Stations are placed by :func:`line_stations`.
+    A station further than ``LINE_JUMP_RAD`` from the one before it on any joint is a
+    branch flip the controller cannot make mid-line, and is refused like a station with no
+    solution -- the rule ``cartesian._steer`` already held its edges to.
+    """
+    n = line_stations(pose_a, pose_b, step_mm, step_rad)
+    dist = float(np.linalg.norm(pose_b[:3, 3] - pose_a[:3, 3]))
     out: list[np.ndarray] = []
     current = np.asarray(seed, dtype=float)
     for k in range(n + 1):
@@ -2603,6 +2656,10 @@ def plan_linear(cell: Cell, pose_a: np.ndarray, pose_b: np.ndarray, seed: np.nda
             raise PlanningError(
                 f"no collision-free IK at {100.0 * k / n:.0f}% along a {dist:.0f} mm "
                 f"linear move")
+        if k and float(np.max(np.abs(q - current))) > LINE_JUMP_RAD:
+            raise PlanningError(
+                f"the arm changes configuration at {100.0 * k / n:.0f}% along a "
+                f"{dist:.0f} mm linear move")
         out.append(q)
         current = q
     return out

@@ -42,7 +42,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .cell import Cell
-from .planning import PlanningError, interpolate_pose, rotation_angle
+from .planning import PlanningError, interpolate_pose, line_stations, rotation_angle
 
 __all__ = ["CartesianBudget", "plan_cartesian"]
 
@@ -212,8 +212,7 @@ def _steer(cell: Cell, step_mm: float, max_step: float, budget: CartesianBudget,
     if t <= 1e-9:
         return None
 
-    span = dist * t
-    n = max(1, int(np.ceil(span / max(step_mm, 1e-6))))
+    n = line_stations(pa, interpolate_pose(pa, pb, t), step_mm, max_step)
 
     chain = [np.asarray(q_from, dtype=float)]
     current = chain[0]

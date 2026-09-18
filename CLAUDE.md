@@ -48,6 +48,16 @@ the way, so the joint values in between are whatever that line demands.
   seeding from the previous solution, and takes whatever comes back nearest. It is greedy
   and never backtracks, so it can report "no collision-free IK at 45%" for a line that is
   perfectly reachable from a different starting configuration.
+  - Stations come from `line_stations`: no step travels further than `--check-step-mm`
+    **or turns the tool further than `--check-step-deg`**. Travel alone used to decide,
+    so a move that mostly reoriented the tool was checked at its two ends only.
+  - A station more than `LINE_JUMP_RAD` from the previous one is a branch flip and fails
+    the line, as `cartesian._steer` already required of its edges.
+  - `linear_chain` pins the chain's ends onto `a` and `b`, but only after
+    `_line_end_fault` confirms the tracked line actually arrives there. Pinning blind
+    let a line that ends a whole joint 6 turn away, or on another wrist branch, pass
+    with the flip hidden in its last joint gap. Measured on Path 1, real lines end
+    within 1.1e-4 rad of their target and step at most 0.031 rad per station.
 - `_densify` fills the OMPL path in at `--check-step-deg` resolution, measured as the
   **largest joint delta** — not time, not tool distance. OMPL itself returns very few
   points (four is typical); everything downstream runs on the dense list.
