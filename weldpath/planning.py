@@ -2567,8 +2567,17 @@ def interpolate_pose(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
     if angle < 1e-9:
         out[:3, :3] = Ra
         return out
-    axis = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
-    axis = axis / (2.0 * np.sin(angle))
+    skew = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    norm = float(np.linalg.norm(skew))
+    if norm > 1e-6:
+        axis = skew / norm                  # |skew| = 2 sin(angle)
+    else:
+        # A half turn: the skew part vanishes and carries no axis.  R = 2 a a^T - I there,
+        # so the axis is the largest column of (R + I), whichever sign it comes out with --
+        # a half turn about a and about -a are the same rotation.
+        M = R + np.eye(3)
+        axis = M[:, int(np.argmax(np.linalg.norm(M, axis=0)))]
+        axis = axis / np.linalg.norm(axis)
     th = angle * t
     K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
     out[:3, :3] = Ra @ (np.eye(3) + np.sin(th) * K + (1 - np.cos(th)) * (K @ K))
