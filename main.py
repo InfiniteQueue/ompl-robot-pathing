@@ -137,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: off)")
     p.add_argument("--segment-length-rad", type=float, default=0.01, #was 0.05
                    help="collision checking resolution for the sampling planner "
-                        "(default: 0.02)")
+                        "(default: %(default)g)")
 #endregion
     #region ###PATHFINDING###
     #PHASE ONE: CHOOSE BETWEEN ROUTES
@@ -293,13 +293,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "the clock in sole charge (default: 20)")
     #HOW FAR A RELOCATION MOVES A WAYPOINT
     p.add_argument("--relocate-min-mm", type=float, default=5.0, metavar="MM",
-                   help="shortest displacement the shortcut and polish passes try when "
+                   help="shortest displacement the polish pass tries when "
                         "relocating a waypoint, as approximate tool travel rather than "
                         "joint angle. Below the resolution at which a move changes "
                         "anything, an attempt is a collision check spent to learn "
                         "nothing (default: 5)")
     p.add_argument("--relocate-max-mm", type=float, default=75.0, metavar="MM",
-                   help="longest displacement those passes try. This is what lets a "
+                   help="longest displacement that pass tries. This is what lets a "
                         "waypoint leave the neighbourhood it was sampled in, so it has "
                         "to cover the distance from a route to the one beside it; too "
                         "small and polish can only ever tidy the route it was given "
@@ -500,7 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "120 mm takes the body from about 2000 hulls to about 110. Weigh "
                         "it against transit -- the far body is what sweeps past the "
                         "tooling, and a merged hull claims the space between the solids "
-                        "it covers (default: unset)")
+                        "it covers (default: %(default)g)")
     p.add_argument("--tooling-merge-mm", type=float, default=None, metavar="MM",
                    help="--merge-cell-mm for static objects the manifest calls tooling. "
                         "These are the largest meshes in the cell and set most of the "
@@ -586,7 +586,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "arm carries them. Allow for the electrode stroke as well as the "
                         "approach, since the tip travels relative to the body. Needs "
                         "--gun-cell-mm above 0 to do anything at all. 0 refines everywhere "
-                        "(default: 50)")
+                        "(default: %(default)g)")
     #HOW FAR A CELL REACHES PAST ITS OWN BOUNDS
     p.add_argument("--hull-cell-overlap", type=float, default=0.00, metavar="F",
                    help="how far past its own bounds a cell claims triangles, as a "
@@ -604,7 +604,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="how close the robot and gun may come to the panels and tooling "
                         "before it counts as a collision. Positive keeps that much clear "
                         "air, 0 means touching collides, negative tolerates that much "
-                        "overlap (default: 0)")
+                        "overlap (default: %(default)g)")
     #CLEARANCE ON A MOVE TO OR FROM A WELD
     p.add_argument("--weld-clearance-mm", type=float, default=0.0, metavar="MM",
                    help="obstacle clearance used instead of --obstacle-clearance-mm on "
@@ -691,12 +691,12 @@ def build_parser() -> argparse.ArgumentParser:
     #STRENGTH AT TOUCHING
     p.add_argument("--stepped-penalty-multiplier", type=float, default=7.0, metavar="N", #was 7
                    help="penalty at zero clearance: a second spent touching costs as much "
-                        "as N seconds in open space (default: 14)")
+                        "as N seconds in open space (default: %(default)g)")
     #WHERE THE PENALTY IS SPENT
     p.add_argument("--stepped-penalty-zero-mm", type=float, default=35.0, metavar="MM", #was 100
                    help="clearance at which the penalty reaches 1x and stops mattering. "
                         "Also how far the proximity query has to see, so lowering it "
-                        "speeds planning up (default: 50)")
+                        "speeds planning up (default: %(default)g)")
     #STEP LENGTH
     p.add_argument("--stepped-penalty-step-mm", type=float, default=3.0, metavar="MM", #was 25
                    help="how much extra clearance counts as one step of falloff "

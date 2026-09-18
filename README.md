@@ -69,8 +69,8 @@ make the difference between planning working and not working at all:
   the study's original `waypoints.json`. That tolerance exists to absorb error in
   approximating a link's *own* geometry, which is a self-collision concern, so it is
   applied only to link-against-link pairs. Against the panels and tooling the margin is
-  `--obstacle-clearance-mm` instead, which defaults to 0 — the robot either clears the
-  part or it hits it. Both figures are printed at load.
+  `--obstacle-clearance-mm` instead, which defaults to 5 mm of clear air; 0 would mean
+  the robot either clears the part or hits it. Both figures are printed at load.
 * **Raw meshes are far too slow.** Checking the CAD meshes as concave geometry costs
   ~708 ms per discrete collision check, so the sampling planner exhausts its time budget
   having explored almost nothing. Convex geometry costs 1–2 ms.
