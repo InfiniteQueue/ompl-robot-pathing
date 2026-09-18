@@ -127,9 +127,6 @@ class JointDynamics:
         t = self.joint_times(a, b)
         return float(np.max(t)) if t.size else 0.0
 
-    def slowest_joint(self, a: np.ndarray, b: np.ndarray) -> int:
-        return int(np.argmax(self.joint_times(a, b)))
-
     def describe(self, names: list[str] | None = None) -> str:
         names = names or [f"j{i + 1}" for i in range(len(self.velocity))]
         parts = ", ".join(

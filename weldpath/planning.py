@@ -25,7 +25,8 @@ from tesseract_robotics.tesseract_motion_planners import PlannerRequest
 from tesseract_robotics.tesseract_motion_planners_ompl import (
     OMPLMotionPlanner, OMPLRealVectorMoveProfile)
 
-from .cell import Cell
+from . import stagetrace
+from .cell import STOP_BAND_JOINT, Cell
 
 try:                                        # not in every build of the bindings
     from tesseract_robotics.tesseract_collision import (
@@ -97,7 +98,7 @@ class MotionModel:
         key = np.asarray(q, dtype=float).tobytes()
         hit = self._near.get(key)
         if hit is None:
-            hit = bool(self.cell.clearance_mm(q) <= self.zone.near_mm)
+            hit = _reads_near(self.cell, q, self.zone.near_mm)
             self._near[key] = hit
         return hit
 
@@ -140,33 +141,20 @@ class MotionModel:
         to test contact, once to measure clearance.  Here the walk that answers the first
         keeps what the second needs.
 
-        Only the joint profile can share the walk.  A linear move is checked along the
-        tool's line, whose states come from inverse kinematics rather than from the joint
-        grid the cost is sampled on, so there is nothing to hand over and it falls back to
-        measuring its own.
+        Both profiles share it.  A joint move hands over the factors on its joint grid; a
+        linear move hands over the factors at the stations along the tool's line, which is
+        the walk that proved it clear and the only curve it may be priced on.
         """
         if self.motion(a, b) == PTP:
             hit, facs = self.cell.segment_scan(a, b, max_step=self.max_step,
                                                factors=self.penalised)
             if hit:
                 return None
-        elif not self.linear_ok(a, b):
-            return None
         else:
-            facs = None
+            chain, facs = self.linear_chain(a, b, factors=self.penalised)
+            if chain is None:
+                return None
         return self.cost(a, b, fa=fa, fb=fb, stops=stops, facs=facs)
-
-    def _pose_mm(self, q: np.ndarray) -> np.ndarray:
-        """TCP pose in manifest units.
-
-        ``fk`` answers in environment units, which are metres, while ``plan_linear`` and
-        the inverse kinematics behind it take manifest units and apply the scale
-        themselves.  Handing the raw transform over asks for a pose a millimetre from the
-        base, which has no solution, so every linear move reads as unreachable.
-        """
-        T = self.cell.fk(q).copy()
-        T[:3, 3] /= self.cell.man.scale
-        return T
 
     def linear_chain(self, a: np.ndarray, b: np.ndarray, factors: bool = False):
         """The states the tool passes through running straight from ``a`` to ``b``.
@@ -188,10 +176,12 @@ class MotionModel:
         the joint chord instead would verify one path and commit another.
         """
         try:
-            chain = plan_linear(self.cell, self._pose_mm(a), self._pose_mm(b), a,
-                                step_mm=self.tool_step)
+            chain = plan_linear(self.cell, self.cell.pose_mm(a), self.cell.pose_mm(b), a,
+                                step_mm=self.tool_step, step_rad=self.max_step)
         except PlanningError:
             return None, None               # no inverse kinematics somewhere along it
+        if _line_end_fault(chain, a, b) is not None:
+            return None, None               # the line does not arrive at ``b``
         # Inverse kinematics returns the solution nearest its seed rather than the state
         # asked for, so pin the ends back before checking the gaps between the samples.
         chain[0] = np.asarray(a, dtype=float)
@@ -371,9 +361,32 @@ class MotionModel:
         The crossing penalty is added afterwards rather than folded into the floor, so it
         is not multiplied by the clearance factor: it is a fixed preference about how many
         times the route enters the band, not time spent anywhere.
+
+        The clearance penalty is read along the path the move really takes.  For a joint
+        move that is the joint grid, and ``facs`` are its factors.  For a linear move it is
+        the tool's straight line, and ``facs`` are the factors at the stations along it,
+        one per station, as :meth:`linear_chain` returns them; left unset they are measured
+        here.  This used to sample the joint chord for both, so a long linear move was
+        charged for a curve it never flies -- one that nothing collision checks and that
+        can pass through the parts.  Measured on a 707 mm move whose line stood 3.6 mm
+        clear at worst, the chord reached 64.5 mm inside the panel and priced the move at
+        54.4 s where its line gave 3.6 s, and simplify and polish kept a 918 mm detour
+        rather than take it.  A linear move with no reachable line has no price and
+        costs infinity; every caller that installs a move has proved it clear first.
         """
-        penalised = self.cell.segment_cost(a, b, max_step=self.max_step,
-                                           fa=fa, fb=fb, stops=stops, facs=facs)
+        if self.motion(a, b) == LIN:
+            raw = self.cell.move_time(a, b) if stops else self.cell.cruise_time(a, b)
+            if not self.penalised or self.cell._pm is None:
+                penalised = raw
+            else:
+                if facs is None:
+                    chain, facs = self.linear_chain(a, b, factors=True)
+                    if chain is None:
+                        return float("inf")
+                penalised = self.cell.price(raw, facs)
+        else:
+            penalised = self.cell.segment_cost(a, b, max_step=self.max_step,
+                                               fa=fa, fb=fb, stops=stops, facs=facs)
         floor = self._time_floor(a, b)
         if floor > 0.0:
             raw = self.cell.move_time(a, b) if stops else self.cell.cruise_time(a, b)
@@ -435,9 +448,16 @@ def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
 
     out = [path[0]]
     i = 0
+    last = len(path) - 1
     while i < len(path) - 1:
-        j = len(path) - 1
+        j = last
         while j > i + 1:
+            # Not a stop the robot may make.  Only reached past, not forced: the adjacent
+            # point is still taken unchecked when nothing further works, and
+            # ``clear_stop_band`` deals with it afterwards.
+            if j < last and model.cell.in_stop_band(path[j]):
+                j -= 1
+                continue
             if model.demotes(path[i], path[j], path[i + 1:j]):
                 j -= 1
                 continue
@@ -453,12 +473,6 @@ def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
         out.append(path[j])
         i = j
     return out
-
-
-def _hop(model: "MotionModel", a: np.ndarray, b: np.ndarray,
-         fa: float, fb: float) -> float:
-    """Penalised time of one emitted move: full bang-bang, ramps included."""
-    return model.cost(a, b, fa=fa, fb=fb, stops=True)
 
 
 @dataclass
@@ -546,7 +560,8 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
     flat = abs(exponent - 1.0) < 1e-9
     pts = [np.asarray(p, dtype=float).copy() for p in path]
     fac = [model.penalty_factor(p) for p in pts]
-    costs = [_hop(model, pts[i], pts[i + 1], fac[i], fac[i + 1])
+    # Stop-to-stop, ramps included: every point here is one the robot really stops at.
+    costs = [model.cost(pts[i], pts[i + 1], fa=fac[i], fb=fac[i + 1], stops=True)
              for i in range(len(pts) - 1)]
     before = sum(costs)
     deadline = time.time() + time_budget
@@ -593,7 +608,7 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
         step = low + span * (x if flat else x ** exponent)
         candidate = np.clip(pts[k] + direction * (step / reach),
                             cell.lower, cell.upper)
-        if not cell.within_limits(candidate):
+        if not cell.within_limits(candidate) or cell.in_stop_band(candidate):
             continue
         # Unpenalised time is a lower bound on penalised time, so this rejects most
         # candidates before paying for a collision check or a clearance query.  It has to
@@ -635,6 +650,96 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
     return pts
 
 
+# How far past the edge of the stop band ``clear_stop_band`` tries putting joint 5, in
+# degrees, nearest first.  The first clears the edge by enough not to read as inside it
+# after rounding; the others are there for when the move off the edge is blocked.
+STOP_BAND_NUDGES_DEG = (0.5, 5.0, 15.0)
+
+
+def clear_stop_band(model: "MotionModel", path: list[np.ndarray],
+                    log=None) -> list[np.ndarray]:
+    """Take every interior waypoint out of the joint 5 stop band, or refuse the route.
+
+    The band constrains where the robot may **stop**, not where it may travel, so the
+    searches and the dense fill never hear of it and this runs on the reduced path, where
+    every point is a stop.  ``simplify`` and ``polish`` already avoid choosing one inside
+    the band; this is for the ones they could not avoid.  The ends belong to the locators
+    either side and are left alone.
+
+    Each offender gets two repairs, and the cheaper of those that work is kept:
+
+    * **remove** -- go straight past it, if the move is clear and ``demotes`` allows it.
+      Unlike ``polish``'s removal this is kept even when it costs time.
+    * **nudge** -- set joint 5 just outside the band, on the side it is already on first,
+      and keep its other joints.  Both moves through it are checked and costed along the
+      path their profile gives them, and a nudge ``demotes`` refuses is not offered.
+
+    Neither working is a ``PlanningError``, which the caller treats like any other failed
+    route: the next gun opening, the next fallback pose.
+    """
+    cell = model.cell
+    if cell.stop_band_rad <= 0.0 or len(path) < 3:
+        return path
+    pts = [np.asarray(p, dtype=float).copy() for p in path]
+    removed = nudged = 0
+    k = 1
+    while k < len(pts) - 1:
+        q = pts[k]
+        if not cell.in_stop_band(q):
+            k += 1
+            continue
+        a, b = pts[k - 1], pts[k + 1]
+        fa, fb = model.penalty_factor(a), model.penalty_factor(b)
+        options = []                            # (cost, replacement or None to remove)
+        if not model.demotes(a, b, [q]):
+            direct = model.check_and_cost(a, b, fa=fa, fb=fb, stops=True)
+            if direct is not None:
+                options.append((direct, None))
+        side = 1.0 if float(q[STOP_BAND_JOINT]) >= 0.0 else -1.0
+        for sign in (side, -side):
+            found = None
+            for extra in STOP_BAND_NUDGES_DEG:
+                candidate = q.copy()
+                candidate[STOP_BAND_JOINT] = sign * (cell.stop_band_rad
+                                                     + np.deg2rad(extra))
+                if not cell.within_limits(candidate):
+                    break                       # further out on this side is no better
+                if (model.demotes(a, candidate, [q])
+                        or model.demotes(candidate, b, [q])):
+                    continue
+                f = model.penalty_factor(candidate)
+                first = model.check_and_cost(a, candidate, fa=fa, fb=f, stops=True)
+                if first is None:
+                    continue
+                second = model.check_and_cost(candidate, b, fa=f, fb=fb, stops=True)
+                if second is None:
+                    continue
+                found = (first + second, candidate)
+                break
+            if found is not None:
+                options.append(found)
+                break                           # the nearer side worked
+        if not options:
+            raise PlanningError(
+                f"waypoint {k} of {len(pts)} stops with joint 5 at "
+                f"{np.rad2deg(float(q[STOP_BAND_JOINT])):.1f} deg, inside the "
+                f"+/-{np.rad2deg(cell.stop_band_rad):g} deg stop band, and can neither "
+                f"be removed nor moved out of it")
+        _, replacement = min(options, key=lambda o: o[0])
+        if replacement is None:
+            del pts[k]
+            removed += 1                        # the point now at k is tested next
+        else:
+            pts[k] = replacement
+            nudged += 1
+            k += 1
+    if log and (removed or nudged):
+        log(f"      stop band: removed {removed} and moved {nudged} waypoints holding "
+            f"joint 5 within {np.rad2deg(cell.stop_band_rad):g} deg of zero, "
+            f"{len(pts)} points")
+    return pts
+
+
 def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: float,
             polish_seconds: float, relocate: "Relocation | None" = None,
             anchors: list[int] | None = None, log=print) -> list[np.ndarray]:
@@ -658,9 +763,16 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
             f"then {polish_seconds:g}s polishing, both spent in full")
     improved = shortcut(model, path, time_budget=shortcut_seconds, anchors=anchors,
                         log=log)
+    stagetrace.stage("shortcut", model, improved)
     reduced = simplify(model, improved)
-    return polish(model, reduced, time_budget=polish_seconds, relocate=relocate,
-                  log=log)
+    stagetrace.stage("simplify", model, reduced)
+    polished = polish(model, reduced, time_budget=polish_seconds, relocate=relocate,
+                      log=log)
+    stagetrace.stage("polish", model, polished)
+    # Outside the budgets on purpose: a route refined with none still ships its stops.
+    cleared = clear_stop_band(model, polished, log=log)
+    stagetrace.stage("stop band", model, cleared)
+    return cleared
 
 
 def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.ndarray]:
@@ -952,18 +1064,22 @@ def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
     points, factors = model.clear_path(dense[i], dense[j], factors=penalised)
     if points is None:
         return 0
-    if penalised:
-        chain = [dense[i]] + points + [dense[j]]
-        chain_f = [fac[i]] + factors + [fac[j]]
-        secs = [model.cruise_time(x, y) for x, y in zip(chain, chain[1:])]
-        cross = sum(model.crossing_penalty(x, y) for x, y in zip(chain, chain[1:]))
-        if whole:
-            middle = sum(secs) * max(chain_f) + cross
-        else:
-            middle = sum(s * max(fx, fy) for s, fx, fy
-                         in zip(secs, chain_f, chain_f[1:])) + cross
-        if outer + middle >= before - 1e-9:
-            return 0
+    # Scored in full with or without the penalty.  The bound above is joint cruise time
+    # alone, and without a penalty this used to be the whole test -- so a cut that turned
+    # joint hops into a linear move held to the tool speed cap, or that added a crossing
+    # of the band, was kept whenever the joints alone got there sooner.  The factors are
+    # all 1.0 when the penalty is off, which reduces this to exactly that comparison.
+    chain = [dense[i]] + points + [dense[j]]
+    chain_f = [fac[i]] + factors + [fac[j]]
+    secs = [model.cruise_time(x, y) for x, y in zip(chain, chain[1:])]
+    cross = sum(model.crossing_penalty(x, y) for x, y in zip(chain, chain[1:]))
+    if whole:
+        middle = sum(secs) * max(chain_f) + cross
+    else:
+        middle = sum(s * max(fx, fy) for s, fx, fy
+                     in zip(secs, chain_f, chain_f[1:])) + cross
+    if outer + middle >= before - 1e-9:
+        return 0
 
     old_points, old_factors = dense[i + 1:j], fac[i + 1:j]
     old_marks = list(marks)
@@ -1427,6 +1543,12 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     # No single opening reaches: split the move and change the gun partway, at a pose the
     # robot is already passing through and stationary at.
     for i, mid in enumerate(vias()):
+        if cell.in_stop_band(mid):
+            # The robot stands still here while the gun changes, and nothing downstream
+            # moves an endpoint.
+            log(f"      fallback pose {i + 1}/{len(vias())} holds joint 5 inside the "
+                f"stop band; not changing the gun there")
+            continue
         for first_open in candidates:
             with cell.gun_opening(first_open):
                 if cell.in_collision(mid):
@@ -1585,44 +1707,116 @@ def _route_fault(cell: Cell, path: list[np.ndarray], check_step: float) -> str |
     return None
 
 
-def _ompl_run(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, segment_length: float,
-              planning_time: float, check_step: float, label: str, log,
-              continuous_check: bool = False
-              ) -> tuple[float, float, list[np.ndarray]] | None:
-    """One sampling-planner solve, scored and reported.  ``None`` when it did not solve.
+# A scored solution: penalised cost, plain time, and the raw route itself.
+_Solution = tuple[float, float, list[np.ndarray]]
 
-    The planner's own message for a failure is left on ``_ompl_run.message`` rather than
-    returned: only the last one is ever quoted, and threading it back through every caller
-    to say the same thing is noise.
+
+def _cheapest(candidates: list[_Solution], log) -> _Solution:
+    """The lowest-cost solution of a set, with the spread reported where there was one.
+
+    Worth printing rather than just taking: it is the one number that says whether phase
+    one's runs are buying anything.  A set whose best and worst are the same cost is a set
+    that found the same route every time, and the budget spent sampling for a choice could
+    have gone to the phases that search for one at all.
     """
-    profiles = ProfileDictionary()
-    profiles.addProfile(OMPL_NAMESPACE, "DEFAULT",
-                        _ompl_profile(segment_length, planning_time, continuous_check, log))
-    request = PlannerRequest()
-    request.env = cell.env
-    request.instructions = _make_program(cell, qa, qb)
-    request.profiles = profiles
-    t0 = time.time()
-    response = OMPLMotionPlanner(OMPL_NAMESPACE).solve(request)
-    dt = time.time() - t0
-    if not response.successful:
-        _ompl_run.message = str(response.message)
-        log(f"      {label}: {_ompl_run.message} ({dt:.1f}s)")
-        return None
-    raw = _extract(response.results)
-    fault = _route_fault(cell, raw, check_step)
-    if fault is not None:
-        _ompl_run.message = (f"returned a route that is not clear under this cell's own "
-                             f"check ({fault})")
-        log(f"      {label}: {_ompl_run.message} ({dt:.1f}s)")
-        return None
-    cost, plain = _path_cost(cell, raw, check_step)
-    log(f"      {label}: solved in {dt:.1f}s ({len(raw)} raw points, "
-        f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
-    return cost, plain, raw
+    best = min(candidates, key=lambda c: c[0])
+    if log and len(candidates) > 1:
+        worst = max(c[0] for c in candidates)
+        log(f"      keeping the best of {len(candidates)} solutions: cost {best[0]:.2f} s "
+            f"against {worst:.2f} s for the worst")
+    return best
 
 
-_ompl_run.message = ""
+@dataclass
+class _Sampler:
+    """The two sampling-planner phases, asked of whichever pair of endpoints is wanted.
+
+    ``_plan_direct`` asks them of the whole transit; ``_recut_outside_band`` asks them
+    again of the stretches of a Cartesian route that lie outside the band.  Both want the
+    same thing -- every phase-one run spent and the cheapest kept, then phase two only if
+    nothing solved at all -- under the same budgets, the same profile settings and the
+    same reporting.  Holding that here is what lets the recut use *the* phase one and
+    phase two rather than a second copy of them that drifts as this one is tuned.
+
+    ``message`` is the planner's own words for the last failure.  It is left on the object
+    rather than returned because only the last one is ever quoted, and threading it back
+    out of every call to say the same thing is noise.
+    """
+    cell: Cell
+    ompl: OmplBudget
+    segment_length: float
+    check_step: float
+    continuous_check: bool = False
+    log: object = print
+    message: str = ""
+
+    def phase_one(self, qa: np.ndarray, qb: np.ndarray,
+                  label: str = "phase 1") -> list[_Solution]:
+        """Every run, spent whether or not earlier ones solved.  See ``OmplBudget``."""
+        if self.ompl.phase_one_runs <= 0:
+            return []
+        self.log(f"      {label}: {self.ompl.phase_one_runs} runs of "
+                 f"{self.ompl.phase_one_seconds:g}s each, keeping the cheapest that "
+                 f"solves")
+        found = [self._run(qa, qb, self.ompl.phase_one_seconds, f"{label} run {attempt}")
+                 for attempt in range(1, self.ompl.phase_one_runs + 1)]
+        return [c for c in found if c is not None]
+
+    def phase_two(self, qa: np.ndarray, qb: np.ndarray,
+                  label: str = "phase 2") -> list[_Solution]:
+        """Runs until one solves, there being nothing to choose between."""
+        if self.ompl.phase_two_max_runs <= 0:
+            return []
+        self.log(f"      {label}: up to {self.ompl.phase_two_max_runs} runs of "
+                 f"{self.ompl.phase_two_seconds:g}s each, stopping at the first solution")
+        for attempt in range(1, self.ompl.phase_two_max_runs + 1):
+            found = self._run(qa, qb, self.ompl.phase_two_seconds,
+                              f"{label} run {attempt}")
+            if found is not None:
+                return [found]
+        return []
+
+    def solve(self, qa: np.ndarray, qb: np.ndarray, *,
+              label: str = "") -> _Solution | None:
+        """Both phases in order, cheapest solution or ``None``.
+
+        For a caller that has nothing to insert between them.  ``_plan_direct`` does --
+        the Cartesian tree goes there -- so it drives the two phases itself.
+        """
+        prefix = f"{label} " if label else ""
+        candidates = (self.phase_one(qa, qb, f"{prefix}phase 1")
+                      or self.phase_two(qa, qb, f"{prefix}phase 2"))
+        return _cheapest(candidates, self.log) if candidates else None
+
+    def _run(self, qa: np.ndarray, qb: np.ndarray, planning_time: float,
+             label: str) -> _Solution | None:
+        """One sampling-planner solve, scored and reported.  ``None`` when it did not solve."""
+        profiles = ProfileDictionary()
+        profiles.addProfile(OMPL_NAMESPACE, "DEFAULT",
+                            _ompl_profile(self.segment_length, planning_time,
+                                          self.continuous_check, self.log))
+        request = PlannerRequest()
+        request.env = self.cell.env
+        request.instructions = _make_program(self.cell, qa, qb)
+        request.profiles = profiles
+        t0 = time.time()
+        response = OMPLMotionPlanner(OMPL_NAMESPACE).solve(request)
+        dt = time.time() - t0
+        if not response.successful:
+            self.message = str(response.message)
+            self.log(f"      {label}: {self.message} ({dt:.1f}s)")
+            return None
+        raw = _extract(response.results)
+        fault = _route_fault(self.cell, raw, self.check_step)
+        if fault is not None:
+            self.message = (f"returned a route that is not clear under this cell's own "
+                            f"check ({fault})")
+            self.log(f"      {label}: {self.message} ({dt:.1f}s)")
+            return None
+        cost, plain = _path_cost(self.cell, raw, self.check_step)
+        self.log(f"      {label}: solved in {dt:.1f}s ({len(raw)} raw points, "
+                 f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
+        return cost, plain, raw
 
 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget,
@@ -1639,25 +1833,31 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         # "sensible" part company when the line grazes a panel, so when the penalty says
         # this one does, the same pass that stands other routes off is given a chance to
         # bow it away -- there is nothing for OMPL to do here, but plenty for relocation.
-        def straight() -> list[Run]:
-            return _finish(cell, _capture(record, [qa, qb]), zone=zone, relocate=relocate,
-                           shortcut_seconds=0.0, polish_seconds=0.0,
+        stand_off = False
+        if cell.penalty is not None and cell.penalty.enabled and shortcut_seconds > 0:
+            raw = cell.move_time(qa, qb)
+            cost = cell.segment_cost(qa, qb, max_step=check_step, stops=True)
+            stand_off = cost > raw * 1.05
+            if stand_off:
+                log(f"      direct move is clear but runs close to the parts "
+                    f"(cost {cost:.2f} s against {raw:.2f} s unpenalised); standing it off")
+        try:
+            # _finish fills the interior in, which a two-point path needs before
+            # relocation has anything to move.
+            runs = _finish(cell, [qa, qb], zone=zone, relocate=relocate,
+                           shortcut_seconds=shortcut_seconds if stand_off else 0.0,
+                           polish_seconds=polish_seconds if stand_off else 0.0,
                            check_step=check_step, log=log)
-
-        raw = cell.move_time(qa, qb)
-        if not (cell.penalty is not None and cell.penalty.enabled) or shortcut_seconds <= 0:
-            return straight()
-        cost = cell.segment_cost(qa, qb, max_step=check_step, stops=True)
-        if cost <= raw * 1.05:
-            return straight()
-        log(f"      direct move is clear but runs close to the parts "
-            f"(cost {cost:.2f} s against {raw:.2f} s unpenalised); standing it off")
-        # The unrefined route stays the bare straight line; _finish fills the interior in,
-        # which a two-point path needs before relocation has anything to move.
-        _capture(record, [qa, qb])
-        return _finish(cell, [qa, qb], zone=zone, relocate=relocate,
-                       shortcut_seconds=shortcut_seconds,
-                       polish_seconds=polish_seconds, check_step=check_step, log=log)
+        except PlanningError as exc:
+            # Clear as a joint chord is not the same as flyable: with both ends in the
+            # band the move ships linear, and _finish verifies it along the tool's line.
+            # This used to raise straight out and write the whole gun opening off without
+            # a single sampling run, where a route round the obstacle may well exist.
+            log(f"      the direct move is clear as a joint move but not as planned "
+                f"({exc}); searching for a route instead")
+        else:
+            _capture(record, [qa, qb])
+            return runs
 
     # RRTConnect returns the first path it finds, and which homotopy class that lands in
     # is luck -- one run goes over the fixture, the next threads behind it.  The
@@ -1665,26 +1865,8 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     # it to the other side of an obstacle, so whichever class arrives here is the one that
     # ships.  Sampling several solutions and keeping the best-scoring one is therefore the
     # only stage that can make that choice at all.
-    candidates: list[tuple[float, float, list[np.ndarray]]] = []
-    last = ""
-
-    def run(planning_time: float, label: str) -> bool:
-        nonlocal last
-        found = _ompl_run(cell, qa, qb, segment_length=segment_length,
-                          continuous_check=continuous_check,
-                          planning_time=planning_time, check_step=check_step,
-                          label=label, log=log)
-        if found is None:
-            last = _ompl_run.message
-            return False
-        candidates.append(found)
-        return True
-
-    if ompl.phase_one_runs > 0:
-        log(f"      phase 1: {ompl.phase_one_runs} runs of "
-            f"{ompl.phase_one_seconds:g}s each, keeping the cheapest that solves")
-        for attempt in range(1, ompl.phase_one_runs + 1):
-            run(ompl.phase_one_seconds, f"phase 1 run {attempt}")
+    sampler = _Sampler(cell, ompl, segment_length, check_step, continuous_check, log)
+    candidates = sampler.phase_one(qa, qb)
 
     if not candidates and cartesian is not None and cartesian.enabled \
             and zone is not None and zone.enabled:
@@ -1715,33 +1897,163 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
             log(f"      cartesian tree: solved in {time.time() - t0:.1f}s "
                 f"({len(route)} points, cost {cost:.2f} s against {plain:.2f} s "
                 f"unpenalised)")
+            if cartesian.recut:
+                recut = _recut_outside_band(cell, route, zone=zone, sampler=sampler,
+                                            check_step=check_step, log=log)
+                if recut is not route:
+                    route = recut
+                    cost, plain = _path_cost(cell, route, check_step)
+                    log(f"      cartesian tree after the recut: {len(route)} points, "
+                        f"cost {cost:.2f} s against {plain:.2f} s unpenalised")
             candidates.append((cost, plain, route))
 
-    if not candidates and ompl.phase_two_max_runs > 0:
+    if not candidates:
         # Nothing to choose between at this point, so the goal changes from a good route to
         # any route, and the first one that arrives ends the phase.
-        log(f"      phase 2: up to {ompl.phase_two_max_runs} runs of "
-            f"{ompl.phase_two_seconds:g}s each, stopping at the first solution")
-        for attempt in range(1, ompl.phase_two_max_runs + 1):
-            if run(ompl.phase_two_seconds, f"phase 2 run {attempt}"):
-                break
+        candidates = sampler.phase_two(qa, qb)
 
     if not candidates:
         raise PlanningError(
-            f"freespace transit failed after {ompl.worst_case_runs} attempts: {last}")
+            f"freespace transit failed after {ompl.worst_case_runs} attempts: "
+            f"{sampler.message}")
 
-    cost, plain, raw = min(candidates, key=lambda c: c[0])
+    cost, plain, raw = _cheapest(candidates, log)
     _capture(record, raw)
-    if len(candidates) > 1:
-        worst = max(c[0] for c in candidates)
-        log(f"      keeping the best of {len(candidates)} solutions: cost {cost:.2f} s "
-            f"against {worst:.2f} s for the worst")
     # Shortcut before reducing: the dense path gives the cuts somewhere to land.
     out = _finish(cell, raw, zone=zone, relocate=relocate,
                   shortcut_seconds=shortcut_seconds,
                   polish_seconds=polish_seconds, check_step=check_step, log=log)
     log(f"      reduced to {sum(len(r.states) for r in out)} points in "
         f"{len(out)} run{'' if len(out) == 1 else 's'}")
+    return out
+
+
+def _far_stretches(near: list[bool]) -> list[tuple[int, int]]:
+    """Index pairs bounding each stretch of the route that reads outside the band.
+
+    The bounds are the first and last state of the stretch itself, not the near states
+    either side of it, which is what puts the cut *just outside* the band: the near
+    stretches keep every state the tree validated for them, and what is given up is only
+    what was already out of range.
+
+    A stretch with nothing between its bounds is left out.  There is no route to replan
+    there -- the two cuts are adjacent, the move between them is already the only move --
+    and it is the shape the apex of a retract makes as it clips out of the band for an
+    instant, so it would otherwise buy a full sampling search for no change at all.
+    """
+    return [(i, j) for i, j in _runs_of(near, False) if j - i >= 2]
+
+
+def _runs_of(flags: list[bool], value: bool) -> list[tuple[int, int]]:
+    """``(first, last)`` index of every maximal run of ``value`` in ``flags``."""
+    out: list[tuple[int, int]] = []
+    i = 0
+    while i < len(flags):
+        if flags[i] != value:
+            i += 1
+            continue
+        j = i
+        while j + 1 < len(flags) and flags[j + 1] == value:
+            j += 1
+        out.append((i, j))
+        i = j + 1
+    return out
+
+
+def _recut_outside_band(cell: Cell, route: list[np.ndarray], *, zone: LinearZone,
+                        sampler: _Sampler, check_step: float, log=print
+                        ) -> list[np.ndarray]:
+    """Cut a Cartesian-tree route at the band boundary and re-plan what lies outside it.
+
+    The tree searches linear space over the whole transit, band or no band, because a
+    straight tool move is the only edge it has and it still has to reach the far endpoint.
+    Only the near-panel half of what comes back was ever the point.  Outside the band a
+    route made of straight tool moves is a route drawn from a strict subset of what the
+    arm can do, and nothing recommends it there: the long withdrawal a transit makes
+    between two welds a few millimetres apart is exactly the shape a joint move crosses
+    directly, and the tree cannot produce that move because the tool would not travel in a
+    straight line while it was made.
+
+    So each stretch that reads far is handed back to the sampling planner, under the same
+    phase one and phase two the transit itself gets.  The two ends of the stretch become
+    waypoints of the finished route; every state between them is dropped, whatever profile
+    it would have flown under, because a linear move outside the band is precisely what
+    this is here to be rid of.
+
+    Two things it declines to search rather than search badly:
+
+    * **A stretch whose chord is already clear** is answered by that chord, with no run
+      spent.  The straight joint move between two states is the quickest route there can
+      be between them, so a planner asked to improve on it can only return it again --
+      the same reasoning ``_plan_direct`` opens with.
+    * **A route with no near states at all** is left alone entirely.  There would be
+      nothing to keep, so the "stretch" is the whole transit, and that is the query phase
+      one has just failed on. Asking it again with the same budget is the one thing here
+      guaranteed to be a waste.
+
+    A stretch the planner cannot join keeps its Cartesian states.  That is a route which
+    is known to work, and a worse shape than a joint move is not a reason to have no route
+    at all.
+    """
+    if len(route) < 3 or not zone.enabled:
+        return route
+    if log and len(route) > 200:
+        log(f"      recut: reading clearance at {len(route)} points to find where the "
+            f"route leaves the {zone.near_mm:g} mm band")
+    near = [_reads_near(cell, q, zone.near_mm) for q in route]
+    if not any(near):
+        log("      recut: no state of the route reads near the panel, so there is nothing "
+            "to keep and nothing phase one has not already tried; leaving it as it is")
+        return route
+
+    cuts = _far_stretches(near)
+    if not cuts:
+        log("      recut: the route holds no stretch outside the band worth replanning")
+        return route
+    one = len(cuts) == 1
+    log(f"      recut: the route leaves the band in {len(cuts)} "
+        f"stretch{'' if one else 'es'}, {'which is' if one else 'each'} replanned as "
+        f"joint motion")
+
+    plans: list[tuple[int, int, list[np.ndarray]]] = []
+    for n, (i, j) in enumerate(cuts, 1):
+        dropped = route[i:j + 1]
+        head = (f"      recut {n} of {len(cuts)}: points {i} to {j} of {len(route)}, "
+                f"{_tcp_travel(cell, dropped):.0f} mm of tool travel")
+        if not cell.segment_collides(route[i], route[j], max_step=check_step):
+            log(f"{head}; the joint move between the cuts is clear, so it is the answer")
+            plans.append((i, j, [route[i], route[j]]))
+            continue
+        log(f"{head}; searching for a joining route")
+        found = sampler.solve(route[i], route[j], label=f"recut {n}")
+        if found is None:
+            log(f"      recut {n}: no joining route, so this stretch keeps the Cartesian "
+                f"one ({sampler.message})")
+            continue
+        cost, _plain, bridge = found
+        # The splice assumes the joining route begins and ends at the states it was asked
+        # for.  It does -- the program is built from them -- but a route that did not
+        # would leave two moves in the finished path that nothing has ever checked, and
+        # that is worth a line of arithmetic rather than a trust.
+        if not (np.allclose(bridge[0], route[i]) and np.allclose(bridge[-1], route[j])):
+            log(f"      recut {n}: the joining route does not start and end at the cuts, "
+                f"so it cannot be spliced in; keeping the Cartesian stretch")
+            continue
+        was, _ = _path_cost(cell, dropped, check_step)
+        log(f"      recut {n}: joined with {len(bridge)} points at cost {cost:.2f} s, "
+            f"against {was:.2f} s for the {len(dropped)} Cartesian points it replaces")
+        plans.append((i, j, bridge))
+
+    if not plans:
+        return route
+    # Spliced back to front so that the indices of the stretches still to come are the
+    # ones they were found at.  Each bridge already begins and ends on the cut states, so
+    # the slice it replaces includes them.
+    out = list(route)
+    for i, j, bridge in reversed(plans):
+        out[i:j + 1] = bridge
+    log(f"      recut: {len(plans)} of {len(cuts)} "
+        f"stretch{'' if one else 'es'} replanned, {len(route)} points now {len(out)}")
     return out
 
 
@@ -1797,12 +2109,19 @@ def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
     pts = _flatten(runs)
     if len(pts) < 2:
         return runs
-    allowed = zone is not None and _linear_allowed(cell, pts, zone, log=log)
+    # Gated on the route filled in, as _finish gates it.  These runs have already been
+    # reduced to their waypoints, and a share "of the leg in range" counted over a handful
+    # of stops says nothing about how much of the leg runs near the panel.
+    allowed = zone is not None and _linear_allowed(cell, _densify(cell, pts, check_step),
+                                                   zone, log=log)
     model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
+    stagetrace.route("refining a leg planned earlier without a budget")
+    stagetrace.note(_trace_gate(zone, allowed))
+    stagetrace.stage("input", model, pts)
     refined = _refine(model, pts, shortcut_seconds=shortcut_seconds,
                       polish_seconds=polish_seconds, relocate=relocate, log=log)
     runs = _split_runs(model, refined)
-    _verify_runs(model, runs, "refined leg", log=log)
+    _traced_verify(model, runs, "refined leg", log=log)
     return runs
 
 
@@ -1864,11 +2183,18 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     allowed = zone is not None and _linear_allowed(cell, gate, zone, log=log)
     model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
     dense, anchors = _densify_marked(cell, path, check_step, model=model)
+    stagetrace.route(f"planned route, refinement budgets shortcut {shortcut_seconds:g} s, "
+                     f"polish {polish_seconds:g} s"
+                     + ("" if shortcut_seconds > 0 or polish_seconds > 0 else
+                        " (unrefined for now: may be refined again later or discarded)"))
+    stagetrace.note(_trace_gate(zone, allowed))
+    stagetrace.stage("solver", model, path, sources=range(len(path)))
+    stagetrace.stage("densify", model, dense, sources=anchors)
     refined = _refine(model, dense, shortcut_seconds=shortcut_seconds,
                       polish_seconds=polish_seconds, relocate=relocate,
                       anchors=anchors, log=log)
     runs = _split_runs(model, refined)
-    _verify_runs(model, runs, "planned route", log=log)
+    _traced_verify(model, runs, "planned route", log=log)
     _report_work(cell, before, time.time() - t0, log)
     if log:
         lin = sum(1 for r in runs if r.motion == LIN)
@@ -1877,6 +2203,25 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
             log(f"      {lin} linear runs over {moves} moves, "
                 f"{len(runs) - lin} joint runs, {len(refined)} waypoints")
     return runs
+
+
+def _trace_gate(zone: "LinearZone | None", allowed: bool) -> str:
+    """The linear gate's answer, as the stage trace reports it."""
+    if zone is None or not zone.enabled:
+        return "linear band: off, every move is PTP"
+    return (f"linear gate: {'admitted' if allowed else 'refused, every move is PTP'} "
+            f"(band {zone.near_mm:g})")
+
+
+def _traced_verify(model: "MotionModel", runs: list[Run], where: str, log=None) -> None:
+    """:func:`_verify_runs`, with its verdict and the shipped split in the stage trace."""
+    try:
+        _verify_runs(model, runs, where, log=log)
+    except PlanningError as exc:
+        stagetrace.note(f"verify: FAILED, route discarded: {exc}")
+        raise
+    stagetrace.note("verify: passed; ships as " + ", ".join(
+        f"{r.motion} x{len(r.states) - 1}" for r in runs))
 
 
 def _verify_runs(model: "MotionModel", runs: list[Run], where: str, log=None) -> None:
@@ -1980,7 +2325,7 @@ def _linear_fault(model: "MotionModel", a: np.ndarray, b: np.ndarray) -> str:
     knowing a route failed and knowing why.
     """
     cell = model.cell
-    pa, pb = model._pose_mm(a), model._pose_mm(b)
+    pa, pb = cell.pose_mm(a), cell.pose_mm(b)
     travel = float(np.linalg.norm(pb[:3, 3] - pa[:3, 3]))
     step = model.tool_step
     chord = ("clear" if not cell.segment_collides(a, b, max_step=model.max_step)
@@ -1988,9 +2333,12 @@ def _linear_fault(model: "MotionModel", a: np.ndarray, b: np.ndarray) -> str:
     head = (f"{travel:.0f} mm of tool travel against a {step:g} mm linear step, "
             f"joint chord {chord}")
     try:
-        chain = plan_linear(cell, pa, pb, a, step_mm=step)
+        chain = plan_linear(cell, pa, pb, a, step_mm=step, step_rad=model.max_step)
     except PlanningError as exc:
         return f"{head}; {exc}"
+    ends = _line_end_fault(chain, a, b)
+    if ends is not None:
+        return f"{head}; {ends}"
     chain[0] = np.asarray(a, dtype=float)
     chain[-1] = np.asarray(b, dtype=float)
     gap = next((j for j, (x, y) in enumerate(zip(chain, chain[1:]))
@@ -2016,7 +2364,10 @@ def _tcp_travel(cell: Cell, states: list[np.ndarray]) -> float:
 
 def _chain_scan(cell: Cell, chain: list[np.ndarray], check_step: float,
                 factors: bool = False) -> tuple[bool, list[float] | None]:
-    """:func:`_chain_collides`, optionally reading the clearance off the same walk.
+    """Whether the joint gaps between a tracked line's stations are blocked, and the
+    penalty factors read off the same walk.
+
+    ``plan_linear`` clears the stations it places; this clears the gaps between them.
 
     The linear counterpart of :meth:`weldpath.cell.Cell.segment_scan`, and it exists for
     the same reason: a caller that installs this chain wants a factor at every point of
@@ -2047,9 +2398,21 @@ def _chain_scan(cell: Cell, chain: list[np.ndarray], check_step: float,
     return False, out
 
 
-def _chain_collides(cell: Cell, chain: list[np.ndarray], check_step: float) -> bool:
-    """``plan_linear`` clears the points it places; this clears the gaps between them."""
-    return _chain_scan(cell, chain, check_step)[0]
+def _reads_near(cell: Cell, q: np.ndarray, near_mm: float) -> bool:
+    """Whether ``q`` is within ``near_mm`` of the parts, as far as the clearance query knows.
+
+    ``clearance_mm`` returns the probe distance itself when nothing lies within the probe,
+    so a reading at the probe is "nothing seen", not a distance, and it has to be kept out
+    of an at-or-under test.  Compared as a distance it passed whenever the probe was no
+    wider than the band: ``ToolpathPlanner`` sized the two equal, every state of every leg
+    read as near, and nearly every move shipped linear.
+
+    The caller has to have sized the probe past ``near_mm`` -- ``ToolpathPlanner`` does --
+    or states clear by more than the probe and less than the band are missed.  The probe
+    only ever grows, so once it is past the band this answer no longer depends on it.
+    """
+    reading = cell.clearance_mm(q)
+    return reading < cell.probe_mm and reading <= near_mm
 
 
 def _linear_allowed(cell: Cell, dense: list[np.ndarray], zone: "LinearZone",
@@ -2077,22 +2440,12 @@ def _linear_allowed(cell: Cell, dense: list[np.ndarray], zone: "LinearZone",
     if log and len(dense) > 200:
         log(f"      measuring clearance at {len(dense)} points along the route to find "
             f"its near-panel stretches")
-    near = [cell.clearance_mm(q) <= zone.near_mm for q in dense]
+    near = [_reads_near(cell, q, zone.near_mm) for q in dense]
     in_range = 100.0 * sum(near) / len(near) if near else 0.0
     by_share = zone.min_run_pct > 0.0 and in_range >= zone.min_run_pct
 
-    stretches: list[float] = []
-    i = 0
-    while i < len(dense):
-        if not near[i]:
-            i += 1
-            continue
-        j = i
-        while j + 1 < len(dense) and near[j + 1]:
-            j += 1
-        if j > i:
-            stretches.append(_tcp_travel(cell, dense[i:j + 1]))
-        i = j + 1
+    stretches = [_tcp_travel(cell, dense[i:j + 1])
+                 for i, j in _runs_of(near, True) if j > i]
 
     by_length = any(t >= zone.min_run_mm for t in stretches)
     allowed = bool(by_length or by_share)
@@ -2158,34 +2511,112 @@ def validate(cell: Cell, path: list[np.ndarray], max_step: float = 0.05, *,
 # ---------------------------------------------------------------------------
 # linear (Cartesian) motion
 # ---------------------------------------------------------------------------
+def rotation_angle(Ra: np.ndarray, Rb: np.ndarray) -> float:
+    """Shortest rotation angle, in radians, taking ``Ra`` onto ``Rb``.
+
+    Taken as ``atan2(2 sin(theta), 2 cos(theta))`` from the relative rotation's skew part
+    and trace, not as ``arccos`` of the trace alone.  ``arccos`` is flat at 1, so it cannot
+    resolve a small angle: a rotation compared with itself, whose trace is 3 give or take
+    rounding, came back as anything up to 5.6e-8 rad -- above 1e-9 for 480 of 2000 random
+    rotations.  The Cartesian tree decides its two halves have met on a turn under 1e-9,
+    so a quarter of the time the test could not pass at all: the connect sat on the goal
+    pose adding zero-length steps until the budget ran out, 3982 nodes from one sample on
+    a 300 mm straight retract that joins in 6 once the angle reads true.
+
+    The skew part is itself a difference of near-equal entries, but one that cancels to
+    rounding error, so the angle it gives near zero is of that order rather than its
+    square root.
+    """
+    R = Ra.T @ Rb
+    s = np.linalg.norm([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    return float(np.arctan2(s, np.trace(R) - 1.0))
+
+
 def interpolate_pose(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
     """Linear in position, shortest-arc slerp in orientation."""
     out = np.eye(4)
     out[:3, 3] = a[:3, 3] + t * (b[:3, 3] - a[:3, 3])
     Ra, Rb = a[:3, :3], b[:3, :3]
     R = Ra.T @ Rb
-    angle = float(np.arccos(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)))
+    angle = rotation_angle(Ra, Rb)
     if angle < 1e-9:
         out[:3, :3] = Ra
         return out
-    axis = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
-    axis = axis / (2.0 * np.sin(angle))
+    skew = np.array([R[2, 1] - R[1, 2], R[0, 2] - R[2, 0], R[1, 0] - R[0, 1]])
+    norm = float(np.linalg.norm(skew))
+    if norm > 1e-6:
+        axis = skew / norm                  # |skew| = 2 sin(angle)
+    else:
+        # A half turn: the skew part vanishes and carries no axis.  R = 2 a a^T - I there,
+        # so the axis is the largest column of (R + I), whichever sign it comes out with --
+        # a half turn about a and about -a are the same rotation.
+        M = R + np.eye(3)
+        axis = M[:, int(np.argmax(np.linalg.norm(M, axis=0)))]
+        axis = axis / np.linalg.norm(axis)
     th = angle * t
     K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
     out[:3, :3] = Ra @ (np.eye(3) + np.sin(th) * K + (1 - np.cos(th)) * (K @ K))
     return out
 
 
-def plan_linear(cell: Cell, pose_a: np.ndarray, pose_b: np.ndarray, seed: np.ndarray, *,
-                step_mm: float = 50.0, allow_collision: bool = False
-                ) -> list[np.ndarray]:
-    """Joint states following the straight Cartesian line from ``pose_a`` to ``pose_b``.
+# Most a joint may move between two stations of one straight tool move, and furthest a
+# tracked line may end from the state it was asked to reach.  Measured on Path 1's linear
+# moves the stations moved 0.031 rad at most and the ends landed within 1.1e-4 rad, so
+# both leave wide headroom; what they catch is a branch flip or a whole extra turn, which
+# the controller cannot make inside one straight move.
+LINE_JUMP_RAD = 0.5
+LINE_END_TOL_RAD = 1e-2
 
-    Poses are world 4x4 in manifest units.  Points are spaced by ``step_mm`` -- a FANUC
-    L move only needs enough points to pin the line, not a dense sampling.
+
+def line_stations(pose_a: np.ndarray, pose_b: np.ndarray, step_mm: float,
+                  step_rad: float = 0.0) -> int:
+    """How many equal steps a straight tool move is divided into.
+
+    Enough that no step carries the tool further than ``step_mm`` or turns it further than
+    ``step_rad``.  Travel alone used to decide it, so a move that mostly turned the tool --
+    a wrist reorientation on the spot -- got its two ends and nothing between them, and was
+    checked only along the joint chord joining those.  An infinite ``step_mm`` is
+    ``--check-step-mm 0``, which collapses the stations onto the ends; the turn is not
+    allowed to bring them back, since that setting asks for the joint grid alone.
     """
     dist = float(np.linalg.norm(pose_b[:3, 3] - pose_a[:3, 3]))
-    n = max(1, int(np.ceil(dist / max(step_mm, 1e-6))))
+    n = int(np.ceil(dist / max(step_mm, 1e-6)))
+    if np.isfinite(step_mm) and step_rad > 0.0:
+        turn = rotation_angle(pose_a[:3, :3], pose_b[:3, :3])
+        n = max(n, int(np.ceil(turn / step_rad)))
+    return max(1, n)
+
+
+def _line_end_fault(chain: list[np.ndarray], a: np.ndarray, b: np.ndarray) -> str | None:
+    """Why a tracked line is not the move from ``a`` to ``b``, or ``None`` if it is.
+
+    ``plan_linear`` solves every station afresh, the two ends included, and callers pin
+    the ends back onto ``a`` and ``b`` before checking the gaps.  Pinning without looking
+    hid the case where tracking the line from ``a`` lands on another arm configuration, or
+    on the same one a whole turn round, than ``b``: the last gap then held a wrist flip,
+    checked as a joint chord and passed, in a move the controller drives as a line.
+    """
+    for label, got, want in (("starts", chain[0], a), ("ends", chain[-1], b)):
+        off = np.abs(np.asarray(got, dtype=float) - np.asarray(want, dtype=float))
+        if float(off.max()) > LINE_END_TOL_RAD:
+            j = int(np.argmax(off))
+            return (f"the line {label} on a different arm configuration, joint {j + 1} "
+                    f"{np.degrees(off[j]):.1f} deg away")
+    return None
+
+
+def plan_linear(cell: Cell, pose_a: np.ndarray, pose_b: np.ndarray, seed: np.ndarray, *,
+                step_mm: float = 50.0, step_rad: float = 0.0,
+                allow_collision: bool = False) -> list[np.ndarray]:
+    """Joint states following the straight Cartesian line from ``pose_a`` to ``pose_b``.
+
+    Poses are world 4x4 in manifest units.  Stations are placed by :func:`line_stations`.
+    A station further than ``LINE_JUMP_RAD`` from the one before it on any joint is a
+    branch flip the controller cannot make mid-line, and is refused like a station with no
+    solution -- the rule ``cartesian._steer`` already held its edges to.
+    """
+    n = line_stations(pose_a, pose_b, step_mm, step_rad)
+    dist = float(np.linalg.norm(pose_b[:3, 3] - pose_a[:3, 3]))
     out: list[np.ndarray] = []
     current = np.asarray(seed, dtype=float)
     for k in range(n + 1):
@@ -2195,6 +2626,10 @@ def plan_linear(cell: Cell, pose_a: np.ndarray, pose_b: np.ndarray, seed: np.nda
             raise PlanningError(
                 f"no collision-free IK at {100.0 * k / n:.0f}% along a {dist:.0f} mm "
                 f"linear move")
+        if k and float(np.max(np.abs(q - current))) > LINE_JUMP_RAD:
+            raise PlanningError(
+                f"the arm changes configuration at {100.0 * k / n:.0f}% along a "
+                f"{dist:.0f} mm linear move")
         out.append(q)
         current = q
     return out

@@ -7,8 +7,8 @@ lookup, and it is cheap -- each condition touches its own joint and nothing coup
 so the nearest point is found joint by joint with no search.
 
 Everything about the definition lives here, in ``CONDITIONS``.  Changing what neutral
-means is meant to be an edit to that list and nothing else: the projection, the validity
-test and the three search methods all read it rather than restating it.
+means is meant to be an edit to that list and nothing else: the projection and the search
+methods read it rather than restating it.
 
 Joint numbers are the robot's own, counting from 1, and are converted to indices at the
 point of use.  Angles are in degrees here because that is how the conditions were
@@ -118,26 +118,3 @@ def project(q: np.ndarray, lower: np.ndarray, upper: np.ndarray) -> np.ndarray:
                 out[i] = low if (out[i] - low) <= (high - out[i]) else high
     return np.clip(out, lower, upper)
 
-
-def satisfied(q: np.ndarray, tol_deg: float = 1e-6) -> bool:
-    """Whether ``q`` is a neutral pose.
-
-    Used to check the projection rather than to filter candidates -- nothing in the search
-    produces a configuration that ought to be neutral without having been projected.  It
-    is the one place the conditions are read forwards rather than backwards, so a
-    projection that quietly disagrees with its own definition shows up here.
-    """
-    tol = np.deg2rad(tol_deg)
-    for cond in CONDITIONS:
-        i = cond.number - 1
-        if i >= len(q):
-            continue
-        if isinstance(cond, Fixed):
-            if abs(float(q[i]) - _kinematic(cond.number, np.deg2rad(cond.degrees), q)) > tol:
-                return False
-        elif isinstance(cond, Outside):
-            low = _kinematic(cond.number, np.deg2rad(cond.low), q)
-            high = _kinematic(cond.number, np.deg2rad(cond.high), q)
-            if low + tol < float(q[i]) < high - tol:
-                return False
-    return True

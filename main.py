@@ -11,6 +11,7 @@ import argparse
 import os
 import sys
 import time
+import traceback
 
 
 def _line_buffer_output() -> None:
@@ -39,6 +40,39 @@ def _line_buffer_output() -> None:
 
 
 _line_buffer_output()
+
+
+# Written into the study directory beside waypoints.json unless --write-log false.
+LOG_NAME = "weldpath-log.txt"
+# Written beside it: every route's waypoints at each refinement stage, for debugging them.
+STAGES_NAME = "weldpath-stages.txt"
+
+
+class _Tee:
+    """A text stream that writes to the console stream it stands in for and to the run log.
+
+    Replacing ``sys.stdout`` and ``sys.stderr`` catches everything Python prints, the run
+    log, warnings and errors alike, without every call site having to know about the file.
+    Output that native code writes straight to the process's file descriptors bypasses these
+    objects and reaches the console only.
+    """
+
+    def __init__(self, stream, log):
+        self.stream, self.log = stream, log
+
+    def write(self, text: str) -> int:
+        if self.stream is not None:
+            self.stream.write(text)
+        self.log.write(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if self.stream is not None:
+            self.stream.flush()
+        self.log.flush()
+
+    def __getattr__(self, name):
+        return getattr(self.stream, name)
 
 
 TRUE_WORDS = ("true", "yes", "on", "1")
@@ -103,7 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: off)")
     p.add_argument("--segment-length-rad", type=float, default=0.01, #was 0.05
                    help="collision checking resolution for the sampling planner "
-                        "(default: 0.02)")
+                        "(default: %(default)g)")
 #endregion
     #region ###PATHFINDING###
     #PHASE ONE: CHOOSE BETWEEN ROUTES
@@ -169,6 +203,22 @@ def build_parser() -> argparse.ArgumentParser:
                         "to the panel at a weld is square to it most of the way in, and "
                         "sampling orientations freely would spend nearly the whole budget "
                         "on ones no route uses (default: 45)")
+    #GIVE THE OUT-OF-BAND PART OF A CARTESIAN ROUTE BACK TO OMPL
+    p.add_argument("--cartesian-recut", type=boolean, nargs="?", const=True, default=True,
+                   metavar="BOOL",
+                   help="cut a Cartesian-tree route where it leaves the --near-panel-mm "
+                        "band and re-plan what lies outside it with the sampling planner, "
+                        "under the regular phase one and phase two. The tree has to reach "
+                        "the far endpoint, so it returns straight tool moves over the "
+                        "whole transit, including the long withdrawal between two nearby "
+                        "welds -- which is where a joint move crosses directly and a "
+                        "straight-line route is only a detour the tree had no way to "
+                        "avoid. The cuts become waypoints just outside the band and every "
+                        "state between them is dropped, linear or not; the near-panel "
+                        "stretches keep the states the tree validated. A stretch whose "
+                        "straight joint move is already clear takes that move and spends "
+                        "no runs; one the planner cannot join keeps its Cartesian states, "
+                        "so this can only cost time, never a route (default: true)")
     p.add_argument("--extra-gun-openings", type=int, default=2, metavar="N",
                    help="further gun openings to try on a transit, beyond the departure "
                         "and arrival openings and the closed, widest and half-open ones "
@@ -243,13 +293,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "the clock in sole charge (default: 20)")
     #HOW FAR A RELOCATION MOVES A WAYPOINT
     p.add_argument("--relocate-min-mm", type=float, default=5.0, metavar="MM",
-                   help="shortest displacement the shortcut and polish passes try when "
+                   help="shortest displacement the polish pass tries when "
                         "relocating a waypoint, as approximate tool travel rather than "
                         "joint angle. Below the resolution at which a move changes "
                         "anything, an attempt is a collision check spent to learn "
                         "nothing (default: 5)")
     p.add_argument("--relocate-max-mm", type=float, default=75.0, metavar="MM",
-                   help="longest displacement those passes try. This is what lets a "
+                   help="longest displacement that pass tries. This is what lets a "
                         "waypoint leave the neighbourhood it was sampled in, so it has "
                         "to cover the distance from a route to the one beside it; too "
                         "small and polish can only ever tidy the route it was given "
@@ -263,6 +313,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "most attempts probing around a waypoint rather than throwing it "
                         "across the cell, which suits a route already near its answer; "
                         "below 1 crowds it towards the maximum (default: 2)")
+    #endregion
+    #region ###WAYPOINT CONSTRAINTS###
+    #ENABLE THE JOINT 5 STOP BAND
+    p.add_argument("--j5-stop-band", type=boolean, nargs="?", const=True, default=True,
+                   metavar="BOOL",
+                   help="forbid waypoints from stopping with joint 5 within "
+                        "--j5-stop-band-deg of zero; moves may still pass through that band "
+                        "between waypoints. false lets waypoints stop with joint 5 anywhere "
+                        "in its range (default: true)")
+    #HOW CLOSE TO ZERO JOINT 5 MAY STOP
+    p.add_argument("--j5-stop-band-deg", type=float, default=15.0, metavar="DEG",
+                   help="smallest magnitude joint 5 may hold at a waypoint. Enforced "
+                        "after refinement, by removing an offending waypoint or moving its "
+                        "joint 5 just outside the band, whichever is quicker; a route "
+                        "where neither is collision free is refused like any other failed "
+                        "route. Locator poses prefer an IK solution outside the band and "
+                        "are warned about when none exists (default: 15)")
     #endregion
     #region ###LINEAR MOTION NEAR THE PARTS###
     #DISABLE LINEAR MOTION NEAR THE PARTS
@@ -391,6 +458,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "part of a panel away from every weld still has to be traversed, "
                         "so it is worth keeping finer than the tooling around it "
                         "(default: 40)")
+    #BEND SPLITTING: PANELS
+    p.add_argument("--split-panel-bends", type=boolean, nargs="?", const=True, default=True,
+                   metavar="BOOL",
+                   help="split each panel cell near a weld again wherever the sheet in it "
+                        "bends, so a hull cannot fill the corner between a flat face and "
+                        "the slope rising out of it; a cell size only limits how far such "
+                        "a bridge reaches, not whether one forms (default: true)")
+    p.add_argument("--panel-bend-mm", type=float, default=3.0, metavar="MM",
+                   help="how far a panel cell may depart from flat before it counts as "
+                        "bent: its thickness along the direction it mostly faces, which is "
+                        "also the most its hull can then stand off the sheet. Keep it above "
+                        "the thickest stack of sheet, or flat cells read as bent "
+                        "(default: 3)")
     #region ###HULL MERGING###
     #MERGE CELL PER CATEGORY
     p.add_argument("--merge-cell-mm", type=float, default=0, metavar="MM",
@@ -420,7 +500,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "120 mm takes the body from about 2000 hulls to about 110. Weigh "
                         "it against transit -- the far body is what sweeps past the "
                         "tooling, and a merged hull claims the space between the solids "
-                        "it covers (default: unset)")
+                        "it covers (default: %(default)g)")
     p.add_argument("--tooling-merge-mm", type=float, default=None, metavar="MM",
                    help="--merge-cell-mm for static objects the manifest calls tooling. "
                         "These are the largest meshes in the cell and set most of the "
@@ -506,7 +586,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "arm carries them. Allow for the electrode stroke as well as the "
                         "approach, since the tip travels relative to the body. Needs "
                         "--gun-cell-mm above 0 to do anything at all. 0 refines everywhere "
-                        "(default: 50)")
+                        "(default: %(default)g)")
     #HOW FAR A CELL REACHES PAST ITS OWN BOUNDS
     p.add_argument("--hull-cell-overlap", type=float, default=0.00, metavar="F",
                    help="how far past its own bounds a cell claims triangles, as a "
@@ -524,7 +604,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="how close the robot and gun may come to the panels and tooling "
                         "before it counts as a collision. Positive keeps that much clear "
                         "air, 0 means touching collides, negative tolerates that much "
-                        "overlap (default: 0)")
+                        "overlap (default: %(default)g)")
     #CLEARANCE ON A MOVE TO OR FROM A WELD
     p.add_argument("--weld-clearance-mm", type=float, default=0.0, metavar="MM",
                    help="obstacle clearance used instead of --obstacle-clearance-mm on "
@@ -535,6 +615,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="move every weld locator this far along its own z axis before "
                         "planning, backing the tool off a pose authored on the panel "
                         "surface. Negative retreats along -z (default: -5)")
+    #WHEN THE SHIFTED WELD POSE IS BLOCKED
+    p.add_argument("--no-weld-shift-search", dest="weld_shift_search", action="store_false",
+                   help="fail a weld whose shifted pose is blocked, rather than searching "
+                        "the shorter stand-offs between it and the imported pose for the "
+                        "clear one with the most clearance")
+    p.add_argument("--weld-shift-scan-mm", type=float, default=0.5, metavar="MM",
+                   help="spacing of that search's first scan; gaps between two blocked "
+                        "stand-offs are then halved down to --weld-shift-resolution-mm "
+                        "(default: 0.5)")
+    p.add_argument("--weld-shift-resolution-mm", type=float, default=0.05, metavar="MM",
+                   help="finest spacing the search goes down to, both looking for a clear "
+                        "stand-off and refining one. A clear window narrower than the "
+                        "final spacing can be missed (default: 0.05)")
     #endregion
     #region ###CLEARANCE PENALTY###
     #DISABLE CLEARANCE PENALTY
@@ -598,12 +691,12 @@ def build_parser() -> argparse.ArgumentParser:
     #STRENGTH AT TOUCHING
     p.add_argument("--stepped-penalty-multiplier", type=float, default=7.0, metavar="N", #was 7
                    help="penalty at zero clearance: a second spent touching costs as much "
-                        "as N seconds in open space (default: 14)")
+                        "as N seconds in open space (default: %(default)g)")
     #WHERE THE PENALTY IS SPENT
     p.add_argument("--stepped-penalty-zero-mm", type=float, default=35.0, metavar="MM", #was 100
                    help="clearance at which the penalty reaches 1x and stops mattering. "
                         "Also how far the proximity query has to see, so lowering it "
-                        "speeds planning up (default: 50)")
+                        "speeds planning up (default: %(default)g)")
     #STEP LENGTH
     p.add_argument("--stepped-penalty-step-mm", type=float, default=3.0, metavar="MM", #was 25
                    help="how much extra clearance counts as one step of falloff "
@@ -665,6 +758,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: off)")
     #SUPPRESS THE RUN LOG
     p.add_argument("--quiet", action="store_true", help="only print the final summary")
+    #WRITE THE RUN LOG TO A FILE
+    p.add_argument("--write-log", type=boolean, nargs="?", const=True, default=True,
+                   metavar="BOOL",
+                   help=f"also write everything printed to <directory>/{LOG_NAME}, "
+                        f"and each planned route's waypoints before refinement and after "
+                        f"each refinement stage to <directory>/{STAGES_NAME}, replacing "
+                        f"the previous run's; false prints to the console only "
+                        f"(default: true)")
     return p
     #endregion
 
@@ -674,7 +775,30 @@ def main(argv: list[str] | None = None) -> int:
     if not os.path.isdir(directory):
         print(f"error: not a directory: {directory}", file=sys.stderr)
         return 2
+    if not args.write_log:
+        return _run(args, directory)
 
+    # Line buffered so a run that is killed partway, as an hours-long one may be, leaves
+    # everything up to that point on disk.
+    from weldpath import stagetrace     # plain Python: needs no Tesseract bindings
+    with open(os.path.join(directory, LOG_NAME), "w", encoding="utf-8", buffering=1) as fh, \
+            open(os.path.join(directory, STAGES_NAME), "w", encoding="utf-8") as stages:
+        stdout, stderr = sys.stdout, sys.stderr
+        sys.stdout, sys.stderr = _Tee(stdout, fh), _Tee(stderr, fh)
+        stagetrace.start(stages)
+        try:
+            return _run(args, directory)
+        except BaseException:
+            # The interpreter prints the traceback once main has let go of it, by which point
+            # the streams are restored and the file closed, so it is written here as well.
+            fh.write(traceback.format_exc())
+            raise
+        finally:
+            stagetrace.stop()
+            sys.stdout, sys.stderr = stdout, stderr
+
+
+def _run(args: argparse.Namespace, directory: str) -> int:
     log = (lambda *a, **k: None) if args.quiet else print
 
     # Imported here so that --help works without the Tesseract bindings present.
@@ -741,35 +865,36 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     log(penalty.describe())
 
-    far_per_category = {"robot": args.robot_far_cell_mm, "gun": args.gun_far_cell_mm,
-                        "tooling": args.tooling_far_cell_mm,
-                        "panel": args.panel_far_cell_mm}
-    per_category = {"robot": args.robot_cell_mm, "gun": args.gun_cell_mm,
-                    "tooling": args.tooling_cell_mm, "panel": args.panel_cell_mm}
-    merge_per_category = {"robot": args.robot_merge_mm, "gun": args.gun_merge_mm,
-                          "tooling": args.tooling_merge_mm, "panel": args.panel_merge_mm}
-    enclosed_per_category = {"robot": args.robot_enclosed_mm, "gun": args.gun_enclosed_mm,
-                             "tooling": args.tooling_enclosed_mm,
-                             "panel": args.panel_enclosed_mm}
+    def by_category(option: str) -> dict[str, float | None]:
+        """``--<category>-<option>`` for every hull category, e.g. ``--gun-cell-mm``."""
+        return {c: getattr(args, f"{c}_{option}")
+                for c in ("robot", "gun", "tooling", "panel")}
+
+    if args.split_panel_bends and args.panel_bend_mm <= 0:
+        print("error: --panel-bend-mm must be above 0; use --split-panel-bends false to "
+              "switch bend splitting off", file=sys.stderr)
+        return 2
 
     try:
         cell = cell_mod.build(man, log=log, min_shell_mm=args.min_shell_mm,
                               max_shells=args.max_shells,
                               hull_cell_mm=args.hull_cell_mm,
                               hull_fill=args.hull_fill,
-                              hull_per_category=per_category,
+                              hull_per_category=by_category("cell_mm"),
                               weld_proximity_mm=args.shell_split_weld_prox,
                               tcp_proximity_mm=args.shell_split_tcp_prox,
                               far_cell_mm=args.far_cell_mm,
-                              far_per_category=far_per_category,
+                              far_per_category=by_category("far_cell_mm"),
                               hull_overlap=args.hull_cell_overlap,
                               merge_cell_mm=args.merge_cell_mm,
-                              merge_per_category=merge_per_category,
-                              enclosed_per_category=enclosed_per_category,
+                              merge_per_category=by_category("merge_mm"),
+                              enclosed_per_category=by_category("enclosed_mm"),
                               enclosed_probe_mm=args.enclosed_probe_mm,
                               enclosed_voxel_mm=args.enclosed_voxel_mm,
                               enclosed_keep_mm=args.enclosed_keep_mm,
                               enclosed_dump=args.export_enclosed,
+                              panel_bend_mm=(args.panel_bend_mm if args.split_panel_bends
+                                             else 0.0),
                               obstacle_clearance_mm=args.obstacle_clearance_mm,
                               tcp_check_mm=args.check_step_mm,
                               export_dir=(directory if args.export_collision_geometry
@@ -778,6 +903,10 @@ def main(argv: list[str] | None = None) -> int:
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    if args.j5_stop_band and args.j5_stop_band_deg > 0.0:
+        import math
+        cell.stop_band_rad = math.radians(args.j5_stop_band_deg)
 
     if args.probe_point:
         # Instead of planning: this is asked when a specific pose is already known to be
@@ -797,7 +926,8 @@ def main(argv: list[str] | None = None) -> int:
         cartesian=CartesianBudget(seconds=args.cartesian_seconds,
                                   extend_mm=args.cartesian_extend_mm,
                                   margin_mm=args.cartesian_margin_mm,
-                                  tilt_deg=args.cartesian_tilt_deg),
+                                  tilt_deg=args.cartesian_tilt_deg,
+                                  recut=args.cartesian_recut),
         fallback_runs=args.fallback_runs,
         fallback_mm=args.fallback_distance_mm,
         fallback_step_mm=args.fallback_step_mm,
@@ -817,6 +947,9 @@ def main(argv: list[str] | None = None) -> int:
         linear_speed_mm_s=args.linear_speed_mm_s,
         linear_crossing_penalty_s=args.linear_crossing_penalty_s,
         weld_clearance_mm=args.weld_clearance_mm,
+        stand_off_search=args.weld_shift_search,
+        stand_off_scan_mm=args.weld_shift_scan_mm,
+        stand_off_resolution_mm=args.weld_shift_resolution_mm,
         export_dir=directory if args.export_collision_geometry else None,
         keep_unrefined=args.unrefined_output,
         log=log)
@@ -826,6 +959,8 @@ def main(argv: list[str] | None = None) -> int:
     document = output_mod.build_document(cell, man, segments, timing)
 
     for problem in output_mod.check_endpoints(document, man):
+        print(f"warning: {problem}", file=sys.stderr)
+    for problem in output_mod.check_stop_band(document, cell):
         print(f"warning: {problem}", file=sys.stderr)
 
     if args.unrefined_output:

@@ -15,8 +15,10 @@ shape falls out of the arm's configuration and is not visible anywhere in the ce
 - Timing comes from the joint limits in `weldpath.profile` — `Cell.move_time` /
   `Cell.cruise_time`.
 - Collision checking interpolates **in joint space**: `Cell.segment_collides` steps
-  `a + t*(b - a)` over the joint vector, which is exactly the path the robot takes.
-- This is what OMPL produces and what every unconverted stretch keeps.
+  `a + t*(b - a)` over the joint vector, bisecting further wherever the tool moves more
+  than `--check-step-mm` between samples, which is exactly the path the robot takes.
+- This is what OMPL produces, and what every move keeps that has neither end in the band
+  or sits on a leg the gate refused.
 
 ### Linear profile (`LIN`)
 
@@ -46,6 +48,16 @@ the way, so the joint values in between are whatever that line demands.
   seeding from the previous solution, and takes whatever comes back nearest. It is greedy
   and never backtracks, so it can report "no collision-free IK at 45%" for a line that is
   perfectly reachable from a different starting configuration.
+  - Stations come from `line_stations`: no step travels further than `--check-step-mm`
+    **or turns the tool further than `--check-step-deg`**. Travel alone used to decide,
+    so a move that mostly reoriented the tool was checked at its two ends only.
+  - A station more than `LINE_JUMP_RAD` from the previous one is a branch flip and fails
+    the line, as `cartesian._steer` already required of its edges.
+  - `linear_chain` pins the chain's ends onto `a` and `b`, but only after
+    `_line_end_fault` confirms the tracked line actually arrives there. Pinning blind
+    let a line that ends a whole joint 6 turn away, or on another wrist branch, pass
+    with the flip hidden in its last joint gap. Measured on Path 1, real lines end
+    within 1.1e-4 rad of their target and step at most 0.031 rad per station.
 - `_densify` fills the OMPL path in at `--check-step-deg` resolution, measured as the
   **largest joint delta** — not time, not tool distance. OMPL itself returns very few
   points (four is typical); everything downstream runs on the dense list.
@@ -79,9 +91,34 @@ the way, so the joint values in between are whatever that line demands.
 - The profile is **not stored** against a waypoint. `MotionModel.motion(a, b)` derives it
   from the two states a move runs between: linear when either end is inside the band. That
   is what lets `shortcut` and `polish` move points around without invalidating anything.
+  - Only on a leg `_linear_allowed` admits (`--near-panel-min-pct` of the samples near,
+    or one unbroken near stretch of `--near-panel-min-mm` tool travel). A refused leg gets
+    a model with no zone, and every move on it is joint motion however close it runs.
+  - "Near" is `_reads_near`: `clearance_mm(q) <= near_mm` **and** `< cell.probe_mm`.
+    `clearance_mm` returns the probe distance when nothing is in range, so a saturated
+    reading is "nothing seen", never a distance. `ToolpathPlanner` asks for a probe of
+    `near_mm + NEAR_PANEL_HEADROOM_MM` so the band is always measurable. Both halves are
+    needed. Before, the probe was `max(near_mm, obstacle clearance + 25)`, exactly
+    `near_mm` at the defaults, and the plain `<=` test put every state in range: logs
+    said 100% of every leg, and nearly every move shipped linear.
+    `fallback.validity.Validator` widening the shared probe mid-run used to change labels
+    too; with the probe already past the band it no longer can.
+  - A failed `_verify_runs` discards the route. Nothing re-plans or relabels a stretch
+    whose profile cannot be flown.
 - `shortcut`, `simplify` and `polish` all go through `MotionModel`, so a move destined for
   a linear profile is costed under the tool speed cap and collision checked along the
   straight line the tool will take.
+  - Its clearance penalty is read along that line too: `MotionModel.cost` prices a linear
+    move off the factors at the stations `linear_chain` places, through `Cell.price`.
+    Until this was fixed it sampled the **joint chord** for both profiles, which nothing
+    collision checks and which can pass through the parts. Measured on Path 1's
+    73075-05 -> 73075-03 transit: a 707 mm linear move clear by 3.6 mm at worst was priced
+    at 54.4 s off a chord reaching 64.5 mm into the panel, against 3.6 s off its line, so
+    simplify and polish kept a joint detour up and over rather than take it. Shortcut's
+    cuts were never affected; they priced the chain they installed.
+  - Still read off the joint chord, before any profile is known: `_path_cost` ranking raw
+    solver routes, and `_plan_direct`'s check of whether a clear direct move runs close
+    enough to the parts to be worth refining.
 - `MotionModel.demotes` is why the linear stretches survive those passes. Deleting a
   waypoint is nearly always quicker — every retained hop pays its own ramps — so left
   alone the passes collapse a near-panel polyline into one chord whose ends sit outside
@@ -118,7 +155,29 @@ the way, so the joint values in between are whatever that line demands.
     own factor arithmetic — `MotionModel.cost`, `simplify`'s `polyline_cost`, and both
     sides of `shortcut`'s comparison. Charged on the same footing everywhere or it would
     not cancel where it is supposed to.
-- Order in `_finish` is sample → gate → densify → refine → split. The gate and the
+- `plan_cartesian` is the only search that builds straight tool moves. `_plan_direct`
+  reaches it only when OMPL phase one returned nothing and the band is on, and never for
+  the halves of a fallback-pose route, which are planned with no zone.
+  - It returns every station it validated, about `--check-step-mm` of tool travel apart,
+    each gap swept as a joint chord — close enough that chord and line coincide — plus
+    one stationary joint move where the two trees meet at the same pose.
+  - With `--cartesian-recut` (default on), `_recut_outside_band` then cuts the route
+    where it leaves the band, before it becomes a candidate. The first and last state of
+    each far stretch stay as waypoints just outside the band; every state between them is
+    dropped, and the gap is re-planned by `_Sampler` -- the same phase one and phase two
+    the transit gets -- or taken as the joint chord when that is already clear. A gap
+    that cannot be joined keeps its tree states. A route with no near state is left
+    alone, since that query is the one phase one just failed.
+  - Afterwards it is treated exactly like an OMPL route. With the recut off, joint motion
+    enters it only through the endpoint rule, and the refinement passes then replace
+    out-of-band stretches with long joint chords. A leg the gate refuses ships with no
+    linear moves at all, even though it was found by searching linear space.
+  - `_fill` hands stations straight through only while consecutive ones are within
+    `--check-step-deg`. `jump_rad` allows 0.5 rad per station, and a linear gap wider
+    than the step is re-derived by `plan_linear`, which need not reproduce the chain the
+    tree validated.
+  - `--unrefined-output` writes every transit as one `PTP` phase regardless.
+- Order in `_finish` is sample → gate → densify → refine → split → verify. The gate and the
   fill each need the other's answer, so the route is sampled twice: whether the leg
   earns linear motion is a proportion over the route, which a chord sample answers
   perfectly well, and only once that is settled is there a model to say which

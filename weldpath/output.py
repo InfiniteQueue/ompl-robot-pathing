@@ -33,7 +33,7 @@ import os
 
 import numpy as np
 
-from .cell import Cell
+from .cell import STOP_BAND_JOINT, Cell
 from .manifest import Manifest
 from .profile import JointDynamics, commanded
 from .toolpath import LIN, Segment
@@ -93,9 +93,7 @@ def _joint_scales(cell: Cell, man: Manifest) -> np.ndarray:
 
 def _pose_rows(cell: Cell, q: np.ndarray) -> list[list[float]]:
     """World TCP pose as 4x4 row-major, translation in manifest units (mm)."""
-    T = cell.fk(q).copy()
-    T[:3, 3] /= cell.man.scale
-    return [[round(float(v), 6) for v in row] for row in T]
+    return [[round(float(v), 6) for v in row] for row in cell.pose_mm(q)]
 
 
 def build_document(cell: Cell, man: Manifest, segments: list[Segment],
@@ -161,20 +159,21 @@ def check_endpoints(document: dict, man: Manifest, tol_mm: float = 1.0) -> list[
     required to begin at the first locator rather than at the robot's start pose, so both
     ends are worth asserting rather than assuming.
 
-    Checked against the pose the segment was *planned* to reach, which for a shifted weld
-    is ``pose_world`` and not ``export_pose``.  ``shift_weld_locators`` backs a weld off
-    along its own approach axis so the pose is reachable without the gun entering the
-    sheet, and it moves the planner, the collision checks and the emitted ``tcp_world_mm``
-    together -- so an endpoint landing exactly on target sits ``--weld-shift-mm`` away from
-    the imported pose by construction.  Comparing against the imported one therefore
-    reported the shift itself, on every weld-to-weld segment of every solve, and reported
-    it as a failure to arrive.
+    A shifted weld has two poses, and each end is checked against the one it is meant to
+    stand on.  ``shift_weld_locators`` backs a weld off along its own approach axis, so a
+    transit arrives at ``pose_world``, the stand-off -- ``--weld-shift-mm`` from the imported
+    pose, or the shorter distance ``ToolpathPlanner._search_stand_off`` settled on.  The ``weld`` phase is then put back on ``export_pose`` by
+    ``_restore_weld_poses``, and that phase is the first waypoint of every segment leaving a
+    weld (and the last of a tour ending on one).  Reading one pose for both reports the
+    shift itself on every weld end of every solve: the imported pose flagged the arrivals,
+    and the planned pose, which replaced it, flagged the departures instead.
 
-    The imported pose is still the one the exported program names; it is simply not what
-    this is asking about.  The question here is whether the segment runs between the two
-    locators it claims to, and that is answered against where those locators were planned.
+    The waypoint's own ``is_weld`` mark says which it is.  A weld phase whose imported pose
+    could not be reached keeps the stand-off, and is reported here: the program then names
+    the weld somewhere other than where the study put it.
     """
-    poses = {loc.name: np.array(loc.pose_world, dtype=float) for loc in man.locators}
+    planned = {loc.name: np.array(loc.pose_world, dtype=float) for loc in man.locators}
+    imported = {loc.name: np.array(loc.export_pose, dtype=float) for loc in man.locators}
     problems = []
 
     def position(waypoint) -> np.ndarray:
@@ -186,11 +185,47 @@ def check_endpoints(document: dict, man: Manifest, tol_mm: float = 1.0) -> list[
             continue
         ends = (("starts", seg["from"], position(seg["phases"][0]["waypoints"][0])),
                 ("ends", seg["to"], position(seg["phases"][-1]["waypoints"][-1])))
-        for verb, locator, got in ends:
-            error = float(np.linalg.norm(got - poses[locator][:3, 3]))
+        weld = (seg["phases"][0]["waypoints"][0].get("is_weld", False),
+                seg["phases"][-1]["waypoints"][-1].get("is_weld", False))
+        for (verb, locator, got), at_weld in zip(ends, weld):
+            target = (imported if at_weld else planned)[locator]
+            error = float(np.linalg.norm(got - target[:3, 3]))
             if error > tol_mm:
                 problems.append(f"{seg['from']} -> {seg['to']} {verb} {error:.2f} mm "
                                 f"from locator '{locator}'")
+    return problems
+
+
+def check_stop_band(document: dict, cell: Cell) -> list[str]:
+    """Every written waypoint that stops with joint 5 inside the stop band.
+
+    The planner repairs the transits' own waypoints, so what this normally finds is a
+    locator with no solution outside the band -- a weld pose, which nothing moves.  Read
+    off the document rather than the phases so that it checks what was actually written.
+    """
+    if cell.stop_band_rad <= 0.0 or len(cell.joint_names) <= STOP_BAND_JOINT:
+        return []
+    name = cell.joint_names[STOP_BAND_JOINT]
+    band = float(np.rad2deg(cell.stop_band_rad))
+    problems = []
+    for seg in document["segments"]:
+        if seg.get("error"):
+            continue
+        found, previous = [], None
+        for p, phase in enumerate(seg["phases"]):
+            for w, waypoint in enumerate(phase["waypoints"]):
+                value = float(waypoint["joints"][name])
+                # Consecutive phases share their boundary waypoint; count it once.
+                if previous is not None and waypoint["joints"] == previous:
+                    continue
+                previous = waypoint["joints"]
+                if abs(value) < cell.stop_band_rad:
+                    weld = " (weld)" if waypoint.get("is_weld") else ""
+                    found.append(f"phase {p} waypoint {w}{weld} at "
+                                 f"{np.rad2deg(value):.1f} deg")
+        if found:
+            problems.append(f"{seg['from']} -> {seg['to']}: {len(found)} waypoint(s) stop "
+                            f"with joint 5 inside +/-{band:g} deg: " + "; ".join(found))
     return problems
 
 

@@ -217,10 +217,6 @@ class Manifest:
     def mesh_path(self, rel: str) -> str:
         return os.path.join(self.directory, rel).replace("\\", "/")
 
-    def obstacle_names(self) -> list[str]:
-        """Static objects that the robot must avoid."""
-        return [s.name for s in self.static_objects if s.mesh]
-
 
 def shift_weld_locators(man: Manifest, distance: float) -> int:
     """Move every weld locator along its own z axis by ``distance`` manifest units.

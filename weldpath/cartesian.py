@@ -42,7 +42,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from .cell import Cell
-from .planning import PlanningError, interpolate_pose
+from .planning import PlanningError, interpolate_pose, line_stations, rotation_angle
 
 __all__ = ["CartesianBudget", "plan_cartesian"]
 
@@ -57,6 +57,12 @@ class CartesianBudget:
     nearest-neighbour scan per millimetre of progress, while long ones cover ground but
     are refused whole the moment any station on them fails, wasting the inverse kinematics
     already spent on the stations before it.
+
+    ``recut`` is the one setting here that is not about the search.  The tree has to reach
+    the far endpoint, so it returns straight tool moves over the whole transit including
+    the part of it that runs nowhere near a panel, where a straight-line route was never
+    what anyone wanted.  With this on, ``planning._recut_outside_band`` cuts the route
+    where it leaves the band and gives what is outside back to the sampling planner.
     """
     seconds: float = 20.0           # wall clock for one solve
     max_iters: int = 4000           # sample budget, whichever runs out first
@@ -68,6 +74,7 @@ class CartesianBudget:
     jump_rad: float = 0.50          # largest per-joint step allowed between two stations
     orient_weight_mm_per_rad: float = 200.0     # a radian of turn as this much tool travel
     branch_seeds: int = 8           # scattered seeds tried when the continuing one fails
+    recut: bool = True              # re-plan the stretches outside the band with OMPL
     seed: int = 0
 
     @property
@@ -78,12 +85,6 @@ class CartesianBudget:
 # ---------------------------------------------------------------------------
 # pose helpers
 # ---------------------------------------------------------------------------
-def _rot_angle(Ra: np.ndarray, Rb: np.ndarray) -> float:
-    """Shortest rotation angle, in radians, taking ``Ra`` onto ``Rb``."""
-    R = Ra.T @ Rb
-    return float(np.arccos(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)))
-
-
 def _random_rotation(rng: np.random.Generator, max_angle: float) -> np.ndarray:
     """A rotation of at most ``max_angle`` about a uniformly random axis."""
     axis = rng.normal(size=3)
@@ -96,19 +97,6 @@ def _random_rotation(rng: np.random.Generator, max_angle: float) -> np.ndarray:
                   [axis[2], 0.0, -axis[0]],
                   [-axis[1], axis[0], 0.0]])
     return np.eye(3) + np.sin(th) * K + (1.0 - np.cos(th)) * (K @ K)
-
-
-def pose_mm(cell: Cell, q: np.ndarray) -> np.ndarray:
-    """TCP pose in manifest units.
-
-    ``Cell.fk`` answers in environment units -- metres -- while the inverse kinematics
-    behind ``solve_pose`` takes manifest units and applies the scale itself.  Handing the
-    raw transform over asks for a pose a millimetre from the base, which has no solution,
-    so every line would read as unreachable.  Same conversion as ``MotionModel._pose_mm``.
-    """
-    T = cell.fk(q).copy()
-    T[:3, 3] /= cell.man.scale
-    return T
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +118,7 @@ class _Tree:
     by the Frobenius distance between the rotation matrices rather than by the angle
     itself: the two are monotonically related -- ``|Ra - Rb|_F = 2 sqrt(2) sin(theta/2)``
     -- and the Frobenius form is one vectorised subtraction over the whole tree, where the
-    angle needs a trace and an arccos per node.  Nearest is a ranking, so a monotone
+    angle needs a trace and an atan2 per node.  Nearest is a ranking, so a monotone
     substitute for the metric ranks identically.
     """
 
@@ -200,7 +188,7 @@ def _steer(cell: Cell, step_mm: float, max_step: float, budget: CartesianBudget,
     pa = np.asarray(pose_from, dtype=float)
     pb = np.asarray(pose_to, dtype=float)
     dist = float(np.linalg.norm(pb[:3, 3] - pa[:3, 3]))
-    turn = _rot_angle(pa[:3, :3], pb[:3, :3])
+    turn = rotation_angle(pa[:3, :3], pb[:3, :3])
 
     # How much of the line this extend takes: whichever of travel and turn binds first.
     t = 1.0
@@ -211,8 +199,7 @@ def _steer(cell: Cell, step_mm: float, max_step: float, budget: CartesianBudget,
     if t <= 1e-9:
         return None
 
-    span = dist * t
-    n = max(1, int(np.ceil(span / max(step_mm, 1e-6))))
+    n = line_stations(pa, interpolate_pose(pa, pb, t), step_mm, max_step)
 
     chain = [np.asarray(q_from, dtype=float)]
     current = chain[0]
@@ -284,7 +271,7 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     deadline = time.perf_counter() + budget.seconds
     step_mm = float(getattr(cell, "tcp_check_mm", 0.0)) or float("inf")
 
-    pa, pb = pose_mm(cell, qa), pose_mm(cell, qb)
+    pa, pb = cell.pose_mm(qa), cell.pose_mm(qb)
     if cell.in_collision(qa) or cell.in_collision(qb):
         raise PlanningError("cartesian tree: an endpoint is already in collision")
 
@@ -322,7 +309,7 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
             cursor_index = a.add(link[-1], cursor_pose, cursor_index, link)
             cursor = link[-1]
             gap = float(np.linalg.norm(cursor_pose[:3, 3] - b.nodes[j].pose[:3, 3]))
-            turn = _rot_angle(cursor_pose[:3, :3], b.nodes[j].pose[:3, :3])
+            turn = rotation_angle(cursor_pose[:3, :3], b.nodes[j].pose[:3, :3])
             if gap > 1e-6 or turn > 1e-9:
                 continue
             # The two trees are at the same pose.  They are not yet at the same joint

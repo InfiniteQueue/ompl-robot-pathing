@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from .cell import Cell
+from . import stagetrace
+from .cell import STOP_BAND_JOINT, Cell
 from .manifest import Locator, Manifest
 from .cartesian import CartesianBudget
 from .fallback import FallbackFinder
@@ -62,6 +63,11 @@ class Segment:
 # threshold and every success reads the same.
 CLEARANCE_REPORT_HEADROOM_MM = 25.0
 
+# How far past --near-panel-mm the clearance query has to see.  A reading at the probe means
+# nothing was found within it, so a probe no wider than the band cannot tell a state inside
+# the band from one far outside it.
+NEAR_PANEL_HEADROOM_MM = 25.0
+
 
 class ToolpathPlanner:
     def __init__(self, cell: Cell, man: Manifest, *,
@@ -77,6 +83,8 @@ class ToolpathPlanner:
                  near_panel_min_pct: float = 0.0, linear_speed_mm_s: float = 0.0,
                  linear_crossing_penalty_s: float = 0.0,
                  weld_clearance_mm: float | None = None,
+                 stand_off_search: bool = True, stand_off_scan_mm: float = 0.5,
+                 stand_off_resolution_mm: float = 0.05,
                  export_dir: str | None = None,
                  keep_unrefined: bool = False, log=print):
         self.cell = cell
@@ -101,8 +109,9 @@ class ToolpathPlanner:
         self.shortcut_seconds = shortcut_seconds
         self.polish_seconds = polish_seconds
         # Stretches of a transit that run this close to a panel or to tooling come out as
-        # linear motion instead of joint motion.  The clearance query has to be able to
-        # see that far, which it will not do on the penalty's probe alone.
+        # linear motion instead of joint motion.  The clearance query has to see past the
+        # band, not just to it: a reading at the probe means nothing was found, so a probe
+        # equal to the band reads every state outside it as sitting on its edge.
         self.zone = LinearZone(near_mm=near_panel_mm, min_run_mm=near_panel_min_mm,
                                min_run_pct=near_panel_min_pct,
                                linear_speed_mm_s=linear_speed_mm_s,
@@ -113,7 +122,8 @@ class ToolpathPlanner:
         # requirement", which is the half of the question already known.
         report_probe = max(cell.obstacle_clearance / man.scale,
                            weld_clearance_mm or 0.0) + CLEARANCE_REPORT_HEADROOM_MM
-        wanted = max(near_panel_mm if self.zone.enabled else 0.0, report_probe)
+        wanted = max(near_panel_mm + NEAR_PANEL_HEADROOM_MM if self.zone.enabled else 0.0,
+                     report_probe)
         if wanted > 0.0:
             cell.require_proximity(wanted, log=log)
         # Set when --export-collision-geometry is on: a pose that cannot be placed then
@@ -123,6 +133,13 @@ class ToolpathPlanner:
         # None means "no separate weld rule", i.e. the cell's own clearance throughout.
         self.weld_clearance = (None if weld_clearance_mm is None
                                else weld_clearance_mm * man.scale)
+        # A weld blocked at its shifted pose searches the shorter stand-offs back towards the
+        # imported one; see _search_stand_off.
+        if stand_off_scan_mm <= 0.0 or stand_off_resolution_mm <= 0.0:
+            raise ValueError("the stand-off scan spacing and resolution must be positive")
+        self.stand_off_search = bool(stand_off_search)
+        self.stand_off_scan_mm = float(stand_off_scan_mm)
+        self.stand_off_resolution_mm = float(stand_off_resolution_mm)
         self.start_q = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
         # Gun opening each locator turned out to be reachable at, filled in by run().
         self.openings: dict[str, float] = {}
@@ -266,14 +283,26 @@ class ToolpathPlanner:
         problems = []
         for opening in self._locator_openings(loc):
             with self._clearance_for(loc), self.cell.gun_opening(opening):
-                q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q])
+                q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q],
+                                         avoid_stop_band=True)
+                searched = ""
+                if q is None and self.stand_off_search and loc.pose_world_import is not None:
+                    q, searched = self._search_stand_off(loc, seed)
                 if q is None:
+                    # Diagnosed at the full shift: the search only replaces pose_world when
+                    # it finds somewhere clear.
                     tag = f"{loc.name}_at_{opening:g}mm"
                     problems.append(f"at {opening:g} mm, "
-                                    f"{self._diagnose(loc, seed, tag, opening)}")
+                                    f"{self._diagnose(loc, seed, tag, opening)}{searched}")
                 else:
                     self._report_clearance(loc, q, opening, placed=True)
             if q is not None:
+                if self.cell.in_stop_band(q):
+                    # Every solution found was inside it.  A locator is an endpoint the
+                    # passes never move, so this one stands.
+                    self.log(f"    ! '{loc.name}' has no solution outside the joint 5 "
+                             f"stop band; placed at "
+                             f"{np.rad2deg(q[STOP_BAND_JOINT]):.1f} deg")
                 if opening:
                     self.log(f"    '{loc.name}' needs the gun at {opening:g} mm to be "
                              f"reachable")
@@ -284,6 +313,119 @@ class ToolpathPlanner:
                 "raw geometry before trusting it, and see --hull-cell-mm")
         raise PlanningError(f"cannot place the robot at locator '{loc.name}' -- "
                             f"{detail}{hint}")
+
+    def _search_stand_off(self, loc: Locator, seed: np.ndarray
+                          ) -> tuple[np.ndarray | None, str]:
+        """Find a shorter stand-off for a weld the full ``--weld-shift-mm`` could not place.
+
+        Candidates lie on the line the shift moved the weld along, from the imported pose (0)
+        to the full shift, orientation unchanged.  The one kept is the clear pose reading the
+        most clearance, ties going to the larger stand-off.  On success ``loc.pose_world`` is
+        replaced, so the transits, the fallback search and the endpoint check all read the
+        pose that was actually placed; the imported pose is left alone.
+
+        Not a bisection: clear is not monotonic in the distance.  Backing off frees the tip
+        from the panel but can put the throat into tooling behind it, so there may be several
+        clear windows, some narrower than any fixed scan.  So:
+
+        1. scan the range every ``stand_off_scan_mm``;
+        2. split every gap between two blocked samples in half, and again, until the spacing
+           is at or below ``stand_off_resolution_mm`` -- carrying on after something is
+           clear, since a better window may be narrower.  A window narrower than the final
+           spacing can still fall between samples and be missed;
+        3. in every clear window, climb from its best sample: try half the scan spacing
+           either side, keep whichever reads more clearance, halve, and stop once the step is
+           at or below the resolution.  This finds the best point near that sample, not
+           necessarily a narrower peak elsewhere in a wide window.
+
+        Returns the state, or None and a note for the failure message.  Call inside the
+        clearance and gun-opening context the locator is being solved in.
+        """
+        imported = np.asarray(loc.pose_world_import, dtype=float)
+        offset = np.asarray(loc.pose_world, dtype=float)[:3, 3] - imported[:3, 3]
+        span = float(np.linalg.norm(offset))
+        if span <= 0.0:
+            return None, ""
+        # Signed as --weld-shift-mm is, along the locator's own z.
+        sign = 1.0 if float(offset @ imported[:3, 2]) >= 0.0 else -1.0
+        cells = max(1, int(np.ceil(span / self.stand_off_scan_mm - 1e-9)))
+        step = span / cells
+
+        def pose_at(d: float) -> np.ndarray:
+            P = imported.copy()
+            P[:3, 3] += offset * (d / span)
+            return P
+
+        # Distance -> (state, clearance), a blocked pose reading -inf.  The full shift has
+        # just failed, so it bounds the search without being solved again.
+        samples: dict[float, tuple[np.ndarray | None, float]] = {
+            round(span, 9): (None, -np.inf)}
+
+        def sample(d: float) -> float:
+            d = round(min(max(d, 0.0), span), 9)
+            if d not in samples:
+                q = self.cell.solve_pose(pose_at(d), [seed, self.start_q],
+                                         avoid_stop_band=True)
+                samples[d] = (q, -np.inf if q is None else self.cell.clearance_mm(q))
+            return d
+
+        def clear(d: float) -> bool:
+            return samples[d][0] is not None
+
+        def rank(d: float) -> tuple[float, float]:
+            return samples[d][1], d
+
+        for k in range(cells):
+            sample(k * step)
+        coarse = step
+        # Split every gap between two blocked samples, whether or not something is already
+        # clear elsewhere: the first window found need not be the best one, and stopping there
+        # measured 1.2 mm of clearance with a 3.3 mm window sitting unsampled further out.
+        # A gap with a clear end is not split -- anything clear inside it runs on from that
+        # sample's window, which the climb below explores.  Blocked samples are cheap, being
+        # rejected before any clearance is measured.
+        while step > self.stand_off_resolution_mm + 1e-9:
+            grid = sorted(samples)
+            step /= 2.0
+            gaps = [(a + b) / 2.0 for a, b in zip(grid, grid[1:])
+                    if not clear(a) and not clear(b)]
+            if not gaps:
+                break
+            for d in gaps:
+                sample(d)
+
+        # A run of clear samples with no blocked one between them is a window.
+        windows: list[list[float]] = []
+        run: list[float] = []
+        for d in sorted(samples):
+            if clear(d):
+                run.append(d)
+            elif run:
+                windows.append(run)
+                run = []
+        if run:
+            windows.append(run)
+        if not windows:
+            return None, (f"; no shorter stand-off is clear either ({len(samples) - 1} tried "
+                          f"between 0 and {sign * span:+g} mm, {step:.3g} mm apart)")
+
+        for run in windows:
+            d = max(run, key=rank)
+            h = coarse / 2.0
+            while True:
+                d = max((d, sample(d - h), sample(d + h)), key=rank)
+                if h <= self.stand_off_resolution_mm + 1e-9:
+                    break
+                h /= 2.0
+
+        best = max((d for d in samples if clear(d)), key=rank)
+        shown = ", ".join(f"{sign * r[0]:+.2f}" if len(r) == 1 else
+                          f"{sign * r[0]:+.2f} to {sign * r[-1]:+.2f}" for r in windows)
+        self.log(f"    '{loc.name}' is blocked at the full {sign * span:+g} mm stand-off; "
+                 f"clear at {shown} mm ({len(samples) - 1} tried), standing off "
+                 f"{sign * best:+.2f} mm")
+        loc.pose_world = pose_at(best)
+        return samples[best][0], ""
 
     def _leave_opening(self, loc: Locator) -> float:
         """Gun opening in force as the robot leaves this locator."""
@@ -314,7 +456,8 @@ class ToolpathPlanner:
         pairs = list(zip(locators, locators[1:]))
         for index, (a, b) in enumerate(pairs):
             seg = Segment(a.name, b.name)
-            self.log(f"  segment {a.name} -> {b.name}")
+            self.log(f"  segment {a.name} -> {b.name} [{index + 1}/{len(pairs)}]")
+            stagetrace.section(f"segment {a.name} -> {b.name} [{index + 1}/{len(pairs)}]")
             try:
                 if a.name not in anchors:
                     raise PlanningError(f"no reachable joint solution for '{a.name}'")
@@ -467,7 +610,8 @@ class ToolpathPlanner:
         if not loc.is_weld or loc.pose_world_import is None:
             return None
         q = self.cell.solve_pose(loc.export_pose, [seed],
-                                 require_collision_free=False, branch_seeds=0)
+                                 require_collision_free=False, branch_seeds=0,
+                                 avoid_stop_band=True)
         if q is None:
             self.log(f"    ! cannot reach the imported pose of '{loc.name}'; "
                      f"leaving it at the shifted pose")

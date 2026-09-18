@@ -17,6 +17,7 @@ writes `<directory>/waypoints.json`. Filenames are fixed.
 | `<dir>/meshes/*.obj` | input: geometry referenced by the manifest |
 | `<dir>/waypoints.json` | **output** |
 | `<dir>/waypoints-unrefined.json` | output, only with `--unrefined-output`: the same motion before shortcutting and reduction |
+| `<dir>/weldpath-log.txt` | output, unless `--write-log false`: everything the run printed, replaced each run |
 | `<dir>/convex_cache/` | generated: shells for the convex decomposition, reused between runs |
 | `<dir>/generated/` | generated: the URDF/SRDF and plugin configs actually loaded |
 | `<dir>/collision_geometry/` | generated, only with `--export-collision-geometry`: the convex geometry actually collided against, plus a `blocked_*.obj` per unplaceable locator |
@@ -41,13 +42,18 @@ The generated directories are safe to delete; they are rebuilt on the next run.
    reported in the run log. Contact between the robot or gun and the panels or tooling is
    never waived this way -- a study that starts inside the parts is rejected with the
    offending pairs and their overlaps.
-4. **Planning** (`planning.py`, `toolpath.py`). A direct joint move is tried first;
-   otherwise OMPL, and failing that a two-leg route through the start pose. Each stretch of
-   motion is planned with the gun tip where that phase will hold it, and a transit that no
-   single opening gets through is split so the gun can change partway. The result is then
-   improved under a **time** metric — the same bang-bang joint dynamics the output is
-   scheduled with, penalised for running close to the parts — by cutting detours,
-   relocating waypoints and dropping the ones that are not worth stopping at.
+4. **Planning** (`planning.py`, `cartesian.py`, `toolpath.py`, `fallback/`). Each transit
+   is solved whole, by the first of these that works: a direct joint move; OMPL, keeping
+   the cheapest of several runs; a Cartesian-space tree whose edges are straight tool moves
+   (only while the near-panel band is on); longer OMPL runs; the same again through a
+   fallback pose searched for that transit; and finally two legs with the gun changing
+   between them. Every gun opening is tried directly before any fallback pose is. Each
+   attempt runs with the gun tip where that phase will hold it. The route is then improved
+   under a **time** metric — the same bang-bang joint dynamics the output is scheduled with,
+   penalised for running close to the parts — by cutting detours, dropping waypoints that
+   are not worth stopping at and relocating the rest. Whether each move is flown `LIN` or
+   `PTP` is read from where its two ends sit, not from which solver found it; see
+   [Linear motion near the parts](#linear-motion-near-the-parts).
 5. **Output** (`output.py`).
 
 ## Why the geometry is preprocessed
@@ -63,8 +69,8 @@ make the difference between planning working and not working at all:
   the study's original `waypoints.json`. That tolerance exists to absorb error in
   approximating a link's *own* geometry, which is a self-collision concern, so it is
   applied only to link-against-link pairs. Against the panels and tooling the margin is
-  `--obstacle-clearance-mm` instead, which defaults to 0 — the robot either clears the
-  part or it hits it. Both figures are printed at load.
+  `--obstacle-clearance-mm` instead, which defaults to 5 mm of clear air; 0 would mean
+  the robot either clears the part or hits it. Both figures are printed at load.
 * **Raw meshes are far too slow.** Checking the CAD meshes as concave geometry costs
   ~708 ms per discrete collision check, so the sampling planner exhausts its time budget
   having explored almost nothing. Convex geometry costs 1–2 ms.
@@ -192,11 +198,14 @@ Three details of the contract are easy to get wrong and are worth restating:
   them; `contact_allowed` is not repeated. On the first waypoint of a phase, `motion`
   describes the move that *leaves* it — there is no move into it.
 
-A segment may contain **more than one `PTP` phase**. That happens when no single gun opening
-gets the robot through the transit, so the move is split and the gun changes at the join —
-where the robot is stationary. The consumer has to drive the gun to each phase's
-`gun_opening_mm` before executing that phase, which was already implied by the schema
-carrying one opening per phase.
+A segment usually contains **several phases**. Consecutive moves under the same profile form
+one phase, so a transit that works along a panel and then swings clear alternates between
+`LIN` and `PTP` phases, and each phase's first waypoint repeats the last waypoint of the one
+before it. A segment can also change gun opening partway: when no single opening gets the
+robot through the transit, the move is split and the gun changes at the join, where the
+robot is stationary. The consumer has to drive the gun to each phase's `gun_opening_mm`
+before executing that phase, which was already implied by the schema carrying one opening
+per phase.
 
 `time` comes from the velocity profile described below, reset to zero at the start of each
 phase. It is a plausible schedule for the consumer to read, not a controller-verified one.
@@ -211,9 +220,10 @@ as a raw joint value put the start state hundreds of radians out and left the ti
 that landed. The opening it resolves to is printed at load, along with a note if the manifest
 asked for more than the gun has.
 
-`start_state` never contributes a waypoint. It is used to seed inverse kinematics and as a
-known-clear pose to route a difficult transit through, but getting the robot from wherever
-it is onto the first locator is left to the caller.
+`start_state` never contributes a waypoint. It is used to seed inverse kinematics, and
+getting the robot from wherever it is onto the first locator is left to the caller. It is
+not what a difficult transit detours through: those poses are searched for per transit, by
+`weldpath.fallback`.
 
 ## Choosing a joint solution for a locator
 
@@ -287,10 +297,12 @@ degrades to plain cruise time, so it still picks the quickest of the sampled sol
 ### Seeing what the refinement changed
 
 `--unrefined-output` writes a second file, `waypoints-unrefined.json`, holding each transit
-exactly as the sampling planner returned the solution that was chosen — before shortcutting
-and before waypoint reduction. It uses the same schema as `waypoints.json`, and the linear
-approach and depart phases are identical in both, since nothing optimises those. Only the
-route that was actually kept is recorded; solutions the run discarded leave nothing behind.
+exactly as the planner returned the solution that was chosen — before shortcutting and
+before waypoint reduction. It uses the same schema as `waypoints.json`, and the weld phases
+are identical in both, since nothing optimises those. Each transit is written there as a
+single `PTP` phase whatever profiles it ships with in `waypoints.json`, including a route
+the Cartesian tree built out of straight tool moves. Only the route that was actually kept
+is recorded; solutions the run discarded leave nothing behind.
 
 The two files line up waypoint-for-waypoint at their ends, so a segment can be replayed
 either way and compared. On a two-segment sample the point counts came out the same either
@@ -400,51 +412,90 @@ straight-line move is predictable, which is what you want where the margin for e
 small. Far from the parts none of that matters and joint motion is both quicker to execute
 and easier to plan.
 
-So the whole transit is planned as joint motion first, and then measured. Every point
-within `--near-panel-mm` of a panel or a piece of tooling is a candidate; maximal runs of
-those points are found, and each run is re-planned as a chain of straight Cartesian moves.
-Deciding it by measurement is the point — the entry and exit of a near-panel stretch are
-themselves the output of pathfinding, so there is no way to pick them in advance, and a
-fixed retract direction is exactly the assumption that fails on a panel with a complex
-shape.
+Nothing is *planned* as linear motion. Every solver hands back joint states, and the profile
+each move is flown under is read off the route afterwards: a move is `LIN` when either of
+its two ends is within `--near-panel-mm` of a panel or tooling, and `PTP` otherwise. Where a
+stretch came from plays no part. An OMPL edge with both ends in the band ships linear, and
+an edge of the Cartesian tree with both ends outside it ships as a joint move. Deciding by
+measurement is the point: where a near-panel stretch begins and ends is itself an output of
+pathfinding, so it cannot be picked in advance.
 
-Within a run, the straight chord end to end is tried first, since one long `L` is what a
-robot programmer would write. Where the part is in the way the span is halved and each
-half tried in turn, so the chain bends only where it has to. It converges: the guide's own
-steps are one collision-check resolution apart and so are very nearly straight already. A
-run that cannot be linearised at all keeps its joint motion, which makes the worst case the
-route that would have been emitted anyway.
+From start to finish:
 
-Two details are worth knowing about:
+1. **Band on or off, for the run.** `--near-panel-mm 0` or `--no-near-panel-linear` turns
+   it off: every transit move is `PTP`, and the Cartesian tree is never tried either.
+2. **Solve.** Whichever solver succeeds (see [How it works](#how-it-works)) returns an
+   unlabelled route.
+3. **Gate, per leg.** The route is sampled at `--check-step-deg` and each sample is marked
+   near or not. The leg earns linear motion if at least `--near-panel-min-pct` of the
+   samples are near, or if any unbroken near stretch covers `--near-panel-min-mm` of tool
+   travel. A leg that meets neither is `PTP` throughout, however close it runs.
+4. **Label, per move.** On a leg that passed, `LIN` if either end is near, else `PTP`. So a
+   waypoint is reached by a linear move when it is in the band or the waypoint before it
+   was.
+5. **Refine.** Shortcut, simplify and polish move and delete waypoints, and each move they
+   propose takes its profile from its new ends. A `LIN` candidate is checked along the
+   tool's straight line and costed under `--linear-speed-mm-s`; a `PTP` one is checked
+   along the joint chord. A replacement that would swallow near waypoints into a joint
+   move with both ends outside the band is refused, so the passes cannot dissolve a
+   near-panel stretch into one long joint arc. `--linear-crossing-penalty-s` adds a flat
+   cost each time a move enters the band from outside.
+6. **Split.** Consecutive moves under the same profile become one phase.
+7. **Verify.** Every move is swept along the path its profile implies. A failure discards
+   the whole route, and the planner moves on to its next gun opening or fallback pose;
+   nothing is relabelled or re-planned to rescue it.
 
-* **It runs before shortcutting and reduction, not after.** Those passes reshape a route to
-  save time, and cutting the corner that a linear move exists to hold is exactly how they
-  would save it. Deciding which stretches are linear afterwards would mean deciding it
-  about a route that had already been pulled out of shape. Once the split is made, the
-  passes are applied only to the joint-motion runs; a linear run is a decision about the
-  shape of the move, not a route to be improved.
-* **Brief contact with the band is ignored, but "brief" is measured two ways.** A sweeping
-  transit that clips the proximity band for a moment is not working near the panel, and
-  cutting it into three phases to say so would cost a stop at each end for nothing.
-  `--near-panel-min-mm` is the shortest stretch worth converting, measured as tool travel
-  rather than as a waypoint count. On its own, though, that test measures the wrong thing
-  on a short move: a 60 mm hop from one weld to the next is near the panel for its entire
-  length and is precisely the motion that should be straight, yet no absolute threshold
-  worth setting for transits will ever admit it. So a stretch also qualifies on
-  `--near-panel-min-pct`, its share of that move's own tool travel. Either test is
-  sufficient; the length test catches long work near the panel, the share test catches
-  short moves that never leave it.
+A route through a fallback pose is gated and labelled once, over the joined route. A transit
+split for a gun change is gated and labelled per leg, under that leg's own opening. The
+final per-phase validation checks each phase under its label, and `output.Timing` holds `LIN`
+moves to the tool speed cap.
 
-The endpoints of a linear run are snapped back onto the joint route's own states. IK
-returns whichever solution is nearest the seed rather than the exact state asked for, and a
-linear run that ends a hair off where the next run begins is a discontinuity the controller
-has no way to execute; the displacement allowed is one `--check-step-deg`, which is below
-what the collision checking can resolve anyway.
+**Brief contact with the band is ignored, but "brief" is measured two ways.** A sweeping
+transit that clips the band for a moment is not working near the panel, and cutting it into
+three phases to say so would cost a stop at each end for nothing, so `--near-panel-min-mm`
+asks for a stretch of real length. On its own that fails a short move: a 60 mm hop from one
+weld to the next is near the panel for its whole length, yet no threshold worth setting for
+transits would admit it. `--near-panel-min-pct` covers that case. It is measured over the
+whole leg rather than per stretch, so a retract whose apex leaves the band for an instant
+does not disqualify the leg either side of it.
 
-This is now the only source of linear motion in a transit. Welds used to get a fixed
-straight lead-in and lead-out along one named axis as well; that has been removed, because
-where a straight run near the panel is wanted it is better found by measuring the route
-than assumed at the weld. `--no-near-panel-linear` turns this off.
+**Routes from the Cartesian tree.** The tree is tried only when OMPL's first phase found
+nothing and the band is on, and never for the two halves of a route through a fallback pose.
+Its route is dense: states about `--check-step-mm` of tool travel apart, each gap a straight
+tool move, plus one stationary joint move where its two trees meet.
+
+With `--cartesian-recut` on (the default), the route is then cut wherever it leaves the
+band. Each stretch outside the band is bounded by its own first and last state, which
+become waypoints just outside the band, and every state between them is dropped, linear or
+not. The near-panel stretches keep the states the tree validated. The gap between each pair
+of cuts is replanned as joint motion: if the straight joint move between the cuts is clear,
+that move is used with no search; otherwise the gap gets the regular phase one and phase
+two. A gap they cannot join keeps its Cartesian states. Two cases are left alone: a stretch
+with nothing between its cuts, and a route with no state in the band at all, since
+replanning that would repeat the search phase one has just failed. Each gap that needs a
+search can cost up to the full phase-one and phase-two budget.
+
+The route then goes through exactly the same gate and labelling as an OMPL route. With
+`--cartesian-recut false`, nothing turns the out-of-band stretches into joint motion
+beforehand: those moves label `PTP` by the endpoint rule, and refinement turns them into
+long joint moves by cutting across them once both ends of a cut lie outside the band. If
+the gate refuses the leg, the whole route ships `PTP`.
+
+**How "near" is measured.** The clearance query only looks as far as its probe, and when it
+finds nothing within that it returns the probe distance itself. So a state counts as near
+only when its reading is at or under `--near-panel-mm` *and* short of the probe; a reading at
+the probe means nothing was found, not that something is exactly that far away. The probe
+is sized to `--near-panel-mm` plus 25 mm, so every state inside the band is measured
+properly. It can grow during a run — a fallback-pose search widens it to
+`--fallback-distance-mm` — but it never drops below the band, so that changes no label.
+
+Until this was fixed the probe was sized to exactly `--near-panel-mm`, and a saturated
+reading passed the "at or under" test. Every state read as near, legs reported 100% in
+range, and nearly every move came out `LIN`, except on legs planned after the first
+fallback search had widened the probe.
+
+Welds get no straight lead-in or lead-out of their own; linear motion near a weld comes from
+this rule like anywhere else.
 
 ## Velocity profile
 
@@ -517,13 +568,33 @@ comes out as a phase boundary:
 
 | Phase | motion | contact_allowed | gun_opening_mm |
 | --- | --- | --- | --- |
-| approach onto the joint | `LIN` | true | `gun_opening_arrive` |
 | the weld itself — one waypoint, robot stationary | `LIN` | true | `gun_opening_leave` |
-| depart along the same line | `LIN` | true | `gun_opening_leave` |
-| transit to the next locator | `PTP` | false | chosen; `gun_opening_leave` preferred |
+| transit to the next locator | `LIN` and `PTP` phases, per [Linear motion near the parts](#linear-motion-near-the-parts) | false | chosen; `gun_opening_leave` tried first |
 
-No motion is planned for the closing itself. The approach ends and the depart begins on
-the locator pose, so the single-waypoint weld phase is where the opening changes.
+No motion is planned for the closing itself. The weld phase has a single waypoint, so its
+`LIN` describes no move; it is where the opening changes. That waypoint is put back onto the
+weld's imported pose after validation, while the transits either side end on the pose
+shifted by `--weld-shift-mm`. A tour that ends on a weld gets one more single-waypoint weld
+phase at the end of its last segment.
+
+If the robot cannot stand collision free at the full shift, the shorter stand-offs between
+it and the imported pose are searched, along the same line, and the clear one with the most
+clearance is used instead (ties go to the larger stand-off). That pose then replaces the
+shifted one everywhere: the transits end on it and the endpoint check reads it. Clear is not
+assumed to be monotonic — backing off frees the tip but can put the throat into tooling — so
+this is not a bisection:
+
+1. scan the range every `--weld-shift-scan-mm` (0.5);
+2. split every gap between two blocked samples in half, and again, until the spacing is at or
+   below `--weld-shift-resolution-mm` (0.05). This carries on after something is clear,
+   because the first window found need not be the best. A clear window narrower than the
+   final spacing can still fall between samples and be missed;
+3. in each clear window, climb from its best sample towards more clearance, halving the step
+   until it is at or below the resolution. This finds the best point near that sample, not
+   necessarily a narrower peak elsewhere in a wide window.
+
+The log names every clear window and the stand-off chosen. If nothing is clear the weld fails
+as before, diagnosed at the full shift. `--no-weld-shift-search` turns it off.
 
 `contact_allowed` marks the phases where the gun is deliberately up against a panel. It
 records intent: no margin is relaxed for those phases, so a weld whose gun tip genuinely
@@ -558,19 +629,18 @@ Where the tip sits genuinely decides what the robot can do. Sampling 600 random 
 changed collision state with the gun — **in both directions**: some are blocked closed and
 clear wide open, others the reverse. So a destination can be unreachable at the opening the
 robot arrives with, and the transit planner searches openings for one that works: the
-opening at the *weld* end of the move first, then the one carried over from the other end,
-then closed, wide and half. Changing the gun is a real operation on the machine, so a
-single opening for the whole transit is always preferred; only when none works is the move
-split into two legs with the gun changing at the intermediate pose, where the robot is
-stationary anyway.
+opening the robot departs with first, then the one it has to arrive with, then closed,
+widest and half open, plus `--extra-gun-openings` more. Changing the gun is a real
+operation on the machine, so a single opening for the whole transit is always preferred;
+only when none works is the move split into two legs with the gun changing at the
+intermediate pose, where the robot is stationary anyway.
 
-**The weld end leads because it is the end that was actually checked.** A weld anchor and
-its linear approach are solved at the weld's own opening, and that is the only gun state
-they were ever proved reachable in. Preferring the other end's opening put the goal pose
-into the planner in a state nobody had validated, and on this cell that cost a full time
-budget per run to rediscover: `gun_moving_tip` 5.7 mm inside `Assy_ST200_RH`, past
-the -5 mm `--weld-clearance-mm` tolerance, reported as *Goal state is in collision*
-after 11 s of OMPL and again after 11 s more.
+**The departure opening leads because it is already in force.** Using it costs no gun
+change at the start of the move, and it is the state the robot was proved to stand at the
+departing locator in. The arrival opening is still tried second. The order used to put a
+weld's arrival opening first, on the grounds that the weld pose was only ever checked in
+it; that holds for the destination, but a transit has to leave its start as well as reach
+its end, and the same argument applies there.
 
 **Both endpoints are screened before the planner starts**, for the same reason. Endpoint
 validity at a given opening is two contact queries; letting OMPL find out costs a whole
@@ -624,7 +694,7 @@ to be clear along that one direction with no freedom to curve, which a weld set 
 panelling may simply have no room for — the symptom was a segment failing partway along a
 300 mm linear move. The transit now runs weld to weld and can curve away from the panel
 immediately; straight running near the panel is found by measuring the route, in
-[Near-panel linear motion](#near-panel-linear-motion).
+[Linear motion near the parts](#linear-motion-near-the-parts).
 
 Note that `--weld-shift-mm` still backs the tool off along the locator's **z**. If z is not
 the panel normal for these welds then the shift is sliding the tool along the surface rather
@@ -785,6 +855,36 @@ gun and arm:
 --hull-cell-mm 0 --panel-cell-mm 8 --tooling-cell-mm 60
 ```
 
+### Splitting panel cells at bends
+
+A cell limits how far a hull can bridge, not whether it does. A cell that happens to hold
+the flat stack around a weld and the slope rising out of it hulls to a wedge filling the
+corner between them — which is where the electrode goes. On one ST240 panel a 20 mm cell
+did exactly that: the gun sat 2 mm inside the hull and 5.3 mm clear of the real sheet.
+
+`--split-panel-bends` (on by default) re-splits the panel pieces inside the weld radius
+wherever they bend:
+
+1. A piece's **thickness** is the spread of its vertices along the direction it mostly
+   faces (the principal axis of its face normals, sign ignored, so both faces of a sheet
+   agree). A hull stands off the sheet by no more than that. A flat 2t stack reads
+   1.5–1.9 mm.
+2. A piece thicker than `--panel-bend-mm` (3) is halved by which way its faces point, so
+   the flat part and the slope separate and the cut lands on the corner, fillets included.
+   Where both halves face the same way — a channel's two walls — it is cut across instead,
+   at the widest gap. Each half is measured again, at most five levels deep.
+3. The fragments are rejoined wherever the union is still flat to `--panel-bend-mm`.
+
+Both faces of the sheet count, because the electrodes close on it from either side. What it
+does not catch is bridging within the plane of a flat piece, such as over a hole. Keep
+`--panel-bend-mm` above the thickest stack of sheet, or every flat piece reads as bent.
+
+The extra hulls only appear where the sheet bends, so a coarser `--panel-cell-mm` with
+bend splitting can cost fewer hulls than a fine cell without it. On the whole ST240 panel,
+split on an even grid: 20 mm gave 546 hulls and overlapped the gun; with bend splitting it
+gave 892 and cleared it by 5.2 mm; 40 mm with bend splitting gave 505 and cleared it by
+3.0 mm.
+
 ### Refining only where the geometry gets close
 
 Cell size is a blunt control: it refines a whole link, and the far side of a fixture costs
@@ -864,40 +964,54 @@ correction is what keeps the false contact from disabling a real collision check
 
 ## Options
 
+A selection; `python main.py --help` lists every flag with its current default.
+
 | Flag | Default | Effect |
 | --- | --- | --- |
-| `--linear-step-mm` | 50 | point spacing on a linear run |
-| `--check-step-deg` | 3 | collision checking resolution along a move |
-| `--segment-length-rad` | 0.02 | collision resolution inside the sampling planner |
-| `--ompl-attempts` | 20 | most freespace attempts before the fallback route |
-| `--ompl-min-runs` | 7 | sample this many solutions and keep the cheapest |
-| `--ompl-seconds` | 7 | how long one sampling-planner run may search |
-| `--no-shortcut` | off | emit the sampling planner's own route, unshortened |
+| `--check-step-deg` | 3 | collision checking resolution along a move, in joint space |
+| `--check-step-mm` | 7 | tool-space companion to it; also the station spacing along a linear move |
+| `--segment-length-rad` | 0.01 | collision resolution inside the sampling planner |
+| `--phase-one-runs` | 25 | OMPL runs per transit, keeping the cheapest that solves |
+| `--phase-one-solve-seconds` | 25 | how long one of those runs may search |
+| `--cartesian-seconds` | 120 | Cartesian tree budget, tried when phase one finds nothing; 0 disables |
+| `--cartesian-recut` | true | cut a Cartesian-tree route where it leaves the band and replan the parts outside it with phases one and two |
+| `--phase-two-max-runs` | 8 | further OMPL runs, stopping at the first solution |
+| `--phase-two-solve-seconds` | 45 | how long one of those runs may search |
+| `--fallback-distance-mm` | 100 | room a fallback pose must leave around the robot and gun |
+| `--no-shortcut` | off | skip shortcutting and polishing |
 | `--shortcut-seconds` | 20 | time budget for shortcutting each transit |
-| `--polish-seconds` | 20 | time budget for the final pass over the emitted waypoints |
-| `--no-near-panel-linear` | off | plan every transit as joint motion, never converting to linear |
-| `--near-panel-mm` | 100 | clearance at or under which a stretch is re-planned as linear motion |
-| `--near-panel-min-mm` | 150 | shortest near-panel stretch worth converting, as tool travel |
-| `--near-panel-min-pct` | 50 | ...or this share of the move's own travel, however short |
-| `--min-shell-mm` | 5 | drop collision shells smaller than this |
+| `--polish-seconds` | 50 | time budget for the final pass over the emitted waypoints |
+| `--no-near-panel-linear` | off | every transit move `PTP`; also disables the Cartesian tree |
+| `--near-panel-mm` | 50 | clearance at or under which a waypoint is in the band |
+| `--near-panel-min-mm` | 100 | a leg earns `LIN` moves if an unbroken near stretch covers this much tool travel |
+| `--near-panel-min-pct` | 60 | ...or if this share of the leg is near |
+| `--linear-crossing-penalty-s` | 100 | costing-only surcharge on each move entering the band |
+| `--min-shell-mm` | 10 | drop collision shells smaller than this |
 | `--max-shells` | 1500 | cap convex shells per link |
-| `--hull-cell-mm` | 25 | refine badly-hulled shells into cells this size; 0 disables |
-| `--hull-fill` | 0.75 | bounding-box fill below which a shell is refined |
+| `--hull-cell-mm` | 50 | refine badly-hulled shells into cells this size; 0 disables |
+| `--hull-fill` | 0.85 | bounding-box fill below which a shell is refined |
 | `--robot-cell-mm` | 0 | cell size for the arm's own links |
-| `--gun-cell-mm` | 0 | cell size for the gun body and moving tip |
-| `--tooling-cell-mm` | 50 | cell size for static objects the manifest calls tooling |
-| `--panel-cell-mm` | 25 | cell size for static objects the manifest calls panel |
-| `--shell-split-weld-prox` | 0 | refine panels and tooling only this far from the gun at a weld; 0 refines everywhere |
-| `--shell-split-tcp-prox` | 0 | refine the gun only this far from the TCP; 0 refines everywhere |
-| `--far-cell-factor` | 4 | multiplier on the cell size beyond either radius; 0 means one hull |
-| `--obstacle-clearance-mm` | 0 | clear air to hold from panels and tooling; may be negative |
-| `--weld-clearance-mm` | −12 | clearance used instead on moves to or from a weld |
+| `--gun-cell-mm` | 60 | cell size for the gun body and moving tip |
+| `--tooling-cell-mm` | 30 | cell size for static objects the manifest calls tooling |
+| `--panel-cell-mm` | 20 | cell size for static objects the manifest calls panel |
+| `--split-panel-bends` | true | split panel cells near a weld again wherever the sheet bends; `false` keeps the grid pieces as they are |
+| `--panel-bend-mm` | 3 | thickness past which a panel cell counts as bent, and the most its hull can then stand off the sheet |
+| `--shell-split-weld-prox` | 60 | refine panels and tooling only this far from the gun at a weld; 0 refines everywhere |
+| `--shell-split-tcp-prox` | 175 | refine the gun only this far from the TCP; 0 refines everywhere |
+| `--obstacle-clearance-mm` | 5 | clear air to hold from panels and tooling; may be negative |
+| `--weld-clearance-mm` | 0 | clearance used instead on moves to or from a weld |
 | `--weld-shift-mm` | −5 | shift weld locators along their own z before planning |
+| `--no-weld-shift-search` | off | fail a blocked shifted weld rather than search shorter stand-offs |
+| `--weld-shift-scan-mm` | 0.5 | first scan spacing of that search; halved while nothing is clear |
+| `--weld-shift-resolution-mm` | 0.05 | finest spacing the search refines to |
 | `--no-clearance-penalty` | off | avoid only hard collisions, ignoring proximity |
-| `--clearance-penalty-max-mm` | 300 | clearance at and above which there is no penalty |
-| `--clearance-penalty-min-mm` | 10 | clearance at and below which the penalty peaks |
-| `--clearance-penalty-multiplier` | 5 | peak penalty factor |
+| `--clearance-penalty-max-mm` | 100 | clearance at and above which there is no penalty |
+| `--clearance-penalty-min-mm` | 0 | clearance at and below which the penalty peaks |
+| `--clearance-penalty-multiplier` | 8 | peak penalty factor |
 | `--clearance-penalty-cutoff-mm` | 0 | ignore clearances beyond this; 0 uses the maximum |
+| `--stepped-penalty` | on | use the stepped clearance penalty |
+| `--stepped-penalty-multiplier` | 7 | stepped penalty at zero clearance |
+| `--stepped-penalty-zero-mm` | 35 | clearance at which the stepped penalty reaches 1× |
 | `--joint-max-velocity` | 2π/3, J6 11π/9 | per-joint velocity limits, rad/s, comma separated |
 | `--joint-max-acceleration` | 2.5, J6 11 | per-joint acceleration limits, rad/s², comma separated |
 | `--linear-speed-mm-s` | 250 | tool speed cap on `LIN` moves |
@@ -905,14 +1019,15 @@ correction is what keeps the false contact from disabling a real collision check
 | `--probe-point` | off | name the collision hulls containing `LOCATOR:X,Y,Z` and how far the nearest real material is, then stop |
 | `--export-collision-geometry` | off | write the hulls actually collided against, and the blocking pair at each unplaceable locator, to `<dir>/collision_geometry/` |
 | `--quiet` | off | print only the summary |
+| `--write-log` | true | also write everything printed to `weldpath-log.txt` in the study directory |
 
 Exit code is 0 when every segment planned, 1 otherwise.
 
 ## Notes and limitations
 
 * Freespace planning is randomised, so a marginal segment can take a different number of
-  attempts between runs. The fallback route through the start pose makes this much less
-  likely, but a cell with tighter clearances may need `--ompl-attempts` raised.
+  attempts between runs. Fallback poses searched per transit make this much less likely,
+  but a cell with tighter clearances may need `--phase-two-max-runs` raised.
 * The Python OMPL bindings do not expose the planner's time budget, so difficulty is
   managed by making collision checks cheaper rather than by planning for longer.
 * Convex decomposition overstates penetration where a hull is a poor fit — on the sample
