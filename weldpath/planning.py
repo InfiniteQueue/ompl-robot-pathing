@@ -2141,7 +2141,11 @@ def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
     pts = _flatten(runs)
     if len(pts) < 2:
         return runs
-    allowed = zone is not None and _linear_allowed(cell, pts, zone, log=log)
+    # Gated on the route filled in, as _finish gates it.  These runs have already been
+    # reduced to their waypoints, and a share "of the leg in range" counted over a handful
+    # of stops says nothing about how much of the leg runs near the panel.
+    allowed = zone is not None and _linear_allowed(cell, _densify(cell, pts, check_step),
+                                                   zone, log=log)
     model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
     stagetrace.route("refining a leg planned earlier without a budget")
     stagetrace.note(_trace_gate(zone, allowed))
