@@ -1333,8 +1333,11 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         log(f"  {len(always)} pairs read as in contact; re-measuring each against the raw "
             f"concave meshes. Every pair loads full-resolution CAD into a scene of its "
             f"own, so expect seconds to minutes per pair")
-        exact = _exact_contacts(man, collision, out_dir, sorted(always), start,
-                                cell.joint_names, log)
+        # With the gun at the start opening, as the hulls were measured: a pair involving
+        # the moving tip reads differently at every opening, and the exact scene left to
+        # itself holds the gun joint at zero.
+        exact = _exact_contacts(man, collision, out_dir, sorted(always),
+                                cell._state_values(start), cell._state_names, log)
         disable: list[tuple[str, str]] = []
         fatal: list[tuple[str, str, float]] = []
         for (a, b), hull in sorted(always.items(), key=lambda kv: kv[1]):
