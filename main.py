@@ -865,16 +865,10 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         return 2
     log(penalty.describe())
 
-    far_per_category = {"robot": args.robot_far_cell_mm, "gun": args.gun_far_cell_mm,
-                        "tooling": args.tooling_far_cell_mm,
-                        "panel": args.panel_far_cell_mm}
-    per_category = {"robot": args.robot_cell_mm, "gun": args.gun_cell_mm,
-                    "tooling": args.tooling_cell_mm, "panel": args.panel_cell_mm}
-    merge_per_category = {"robot": args.robot_merge_mm, "gun": args.gun_merge_mm,
-                          "tooling": args.tooling_merge_mm, "panel": args.panel_merge_mm}
-    enclosed_per_category = {"robot": args.robot_enclosed_mm, "gun": args.gun_enclosed_mm,
-                             "tooling": args.tooling_enclosed_mm,
-                             "panel": args.panel_enclosed_mm}
+    def by_category(option: str) -> dict[str, float | None]:
+        """``--<category>-<option>`` for every hull category, e.g. ``--gun-cell-mm``."""
+        return {c: getattr(args, f"{c}_{option}")
+                for c in ("robot", "gun", "tooling", "panel")}
 
     if args.split_panel_bends and args.panel_bend_mm <= 0:
         print("error: --panel-bend-mm must be above 0; use --split-panel-bends false to "
@@ -886,15 +880,15 @@ def _run(args: argparse.Namespace, directory: str) -> int:
                               max_shells=args.max_shells,
                               hull_cell_mm=args.hull_cell_mm,
                               hull_fill=args.hull_fill,
-                              hull_per_category=per_category,
+                              hull_per_category=by_category("cell_mm"),
                               weld_proximity_mm=args.shell_split_weld_prox,
                               tcp_proximity_mm=args.shell_split_tcp_prox,
                               far_cell_mm=args.far_cell_mm,
-                              far_per_category=far_per_category,
+                              far_per_category=by_category("far_cell_mm"),
                               hull_overlap=args.hull_cell_overlap,
                               merge_cell_mm=args.merge_cell_mm,
-                              merge_per_category=merge_per_category,
-                              enclosed_per_category=enclosed_per_category,
+                              merge_per_category=by_category("merge_mm"),
+                              enclosed_per_category=by_category("enclosed_mm"),
                               enclosed_probe_mm=args.enclosed_probe_mm,
                               enclosed_voxel_mm=args.enclosed_voxel_mm,
                               enclosed_keep_mm=args.enclosed_keep_mm,

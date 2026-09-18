@@ -93,9 +93,7 @@ def _joint_scales(cell: Cell, man: Manifest) -> np.ndarray:
 
 def _pose_rows(cell: Cell, q: np.ndarray) -> list[list[float]]:
     """World TCP pose as 4x4 row-major, translation in manifest units (mm)."""
-    T = cell.fk(q).copy()
-    T[:3, 3] /= cell.man.scale
-    return [[round(float(v), 6) for v in row] for row in T]
+    return [[round(float(v), 6) for v in row] for row in cell.pose_mm(q)]
 
 
 def build_document(cell: Cell, man: Manifest, segments: list[Segment],

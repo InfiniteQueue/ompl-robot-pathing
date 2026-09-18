@@ -156,18 +156,6 @@ class MotionModel:
                 return None
         return self.cost(a, b, fa=fa, fb=fb, stops=stops, facs=facs)
 
-    def _pose_mm(self, q: np.ndarray) -> np.ndarray:
-        """TCP pose in manifest units.
-
-        ``fk`` answers in environment units, which are metres, while ``plan_linear`` and
-        the inverse kinematics behind it take manifest units and apply the scale
-        themselves.  Handing the raw transform over asks for a pose a millimetre from the
-        base, which has no solution, so every linear move reads as unreachable.
-        """
-        T = self.cell.fk(q).copy()
-        T[:3, 3] /= self.cell.man.scale
-        return T
-
     def linear_chain(self, a: np.ndarray, b: np.ndarray, factors: bool = False):
         """The states the tool passes through running straight from ``a`` to ``b``.
 
@@ -188,7 +176,7 @@ class MotionModel:
         the joint chord instead would verify one path and commit another.
         """
         try:
-            chain = plan_linear(self.cell, self._pose_mm(a), self._pose_mm(b), a,
+            chain = plan_linear(self.cell, self.cell.pose_mm(a), self.cell.pose_mm(b), a,
                                 step_mm=self.tool_step, step_rad=self.max_step)
         except PlanningError:
             return None, None               # no inverse kinematics somewhere along it
@@ -487,12 +475,6 @@ def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
     return out
 
 
-def _hop(model: "MotionModel", a: np.ndarray, b: np.ndarray,
-         fa: float, fb: float) -> float:
-    """Penalised time of one emitted move: full bang-bang, ramps included."""
-    return model.cost(a, b, fa=fa, fb=fb, stops=True)
-
-
 @dataclass
 class Relocation:
     """How ``polish`` draws a relocation: how far, shaped how, and how many at least.
@@ -578,7 +560,8 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
     flat = abs(exponent - 1.0) < 1e-9
     pts = [np.asarray(p, dtype=float).copy() for p in path]
     fac = [model.penalty_factor(p) for p in pts]
-    costs = [_hop(model, pts[i], pts[i + 1], fac[i], fac[i + 1])
+    # Stop-to-stop, ramps included: every point here is one the robot really stops at.
+    costs = [model.cost(pts[i], pts[i + 1], fa=fac[i], fb=fac[i + 1], stops=True)
              for i in range(len(pts) - 1)]
     before = sum(costs)
     deadline = time.time() + time_budget
@@ -1724,45 +1707,6 @@ def _route_fault(cell: Cell, path: list[np.ndarray], check_step: float) -> str |
     return None
 
 
-def _ompl_run(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, segment_length: float,
-              planning_time: float, check_step: float, label: str, log,
-              continuous_check: bool = False
-              ) -> tuple[float, float, list[np.ndarray]] | None:
-    """One sampling-planner solve, scored and reported.  ``None`` when it did not solve.
-
-    The planner's own message for a failure is left on ``_ompl_run.message`` rather than
-    returned: only the last one is ever quoted, and threading it back through every caller
-    to say the same thing is noise.
-    """
-    profiles = ProfileDictionary()
-    profiles.addProfile(OMPL_NAMESPACE, "DEFAULT",
-                        _ompl_profile(segment_length, planning_time, continuous_check, log))
-    request = PlannerRequest()
-    request.env = cell.env
-    request.instructions = _make_program(cell, qa, qb)
-    request.profiles = profiles
-    t0 = time.time()
-    response = OMPLMotionPlanner(OMPL_NAMESPACE).solve(request)
-    dt = time.time() - t0
-    if not response.successful:
-        _ompl_run.message = str(response.message)
-        log(f"      {label}: {_ompl_run.message} ({dt:.1f}s)")
-        return None
-    raw = _extract(response.results)
-    fault = _route_fault(cell, raw, check_step)
-    if fault is not None:
-        _ompl_run.message = (f"returned a route that is not clear under this cell's own "
-                             f"check ({fault})")
-        log(f"      {label}: {_ompl_run.message} ({dt:.1f}s)")
-        return None
-    cost, plain = _path_cost(cell, raw, check_step)
-    log(f"      {label}: solved in {dt:.1f}s ({len(raw)} raw points, "
-        f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
-    return cost, plain, raw
-
-
-_ompl_run.message = ""
-
 # A scored solution: penalised cost, plain time, and the raw route itself.
 _Solution = tuple[float, float, list[np.ndarray]]
 
@@ -1846,13 +1790,33 @@ class _Sampler:
 
     def _run(self, qa: np.ndarray, qb: np.ndarray, planning_time: float,
              label: str) -> _Solution | None:
-        found = _ompl_run(self.cell, qa, qb, segment_length=self.segment_length,
-                          continuous_check=self.continuous_check,
-                          planning_time=planning_time, check_step=self.check_step,
-                          label=label, log=self.log)
-        if found is None:
-            self.message = _ompl_run.message
-        return found
+        """One sampling-planner solve, scored and reported.  ``None`` when it did not solve."""
+        profiles = ProfileDictionary()
+        profiles.addProfile(OMPL_NAMESPACE, "DEFAULT",
+                            _ompl_profile(self.segment_length, planning_time,
+                                          self.continuous_check, self.log))
+        request = PlannerRequest()
+        request.env = self.cell.env
+        request.instructions = _make_program(self.cell, qa, qb)
+        request.profiles = profiles
+        t0 = time.time()
+        response = OMPLMotionPlanner(OMPL_NAMESPACE).solve(request)
+        dt = time.time() - t0
+        if not response.successful:
+            self.message = str(response.message)
+            self.log(f"      {label}: {self.message} ({dt:.1f}s)")
+            return None
+        raw = _extract(response.results)
+        fault = _route_fault(self.cell, raw, self.check_step)
+        if fault is not None:
+            self.message = (f"returned a route that is not clear under this cell's own "
+                            f"check ({fault})")
+            self.log(f"      {label}: {self.message} ({dt:.1f}s)")
+            return None
+        cost, plain = _path_cost(self.cell, raw, self.check_step)
+        self.log(f"      {label}: solved in {dt:.1f}s ({len(raw)} raw points, "
+                 f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
+        return cost, plain, raw
 
 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget,
@@ -1977,17 +1941,21 @@ def _far_stretches(near: list[bool]) -> list[tuple[int, int]]:
     and it is the shape the apex of a retract makes as it clips out of the band for an
     instant, so it would otherwise buy a full sampling search for no change at all.
     """
+    return [(i, j) for i, j in _runs_of(near, False) if j - i >= 2]
+
+
+def _runs_of(flags: list[bool], value: bool) -> list[tuple[int, int]]:
+    """``(first, last)`` index of every maximal run of ``value`` in ``flags``."""
     out: list[tuple[int, int]] = []
     i = 0
-    while i < len(near):
-        if near[i]:
+    while i < len(flags):
+        if flags[i] != value:
             i += 1
             continue
         j = i
-        while j + 1 < len(near) and not near[j + 1]:
+        while j + 1 < len(flags) and flags[j + 1] == value:
             j += 1
-        if j - i >= 2:
-            out.append((i, j))
+        out.append((i, j))
         i = j + 1
     return out
 
@@ -2357,7 +2325,7 @@ def _linear_fault(model: "MotionModel", a: np.ndarray, b: np.ndarray) -> str:
     knowing a route failed and knowing why.
     """
     cell = model.cell
-    pa, pb = model._pose_mm(a), model._pose_mm(b)
+    pa, pb = cell.pose_mm(a), cell.pose_mm(b)
     travel = float(np.linalg.norm(pb[:3, 3] - pa[:3, 3]))
     step = model.tool_step
     chord = ("clear" if not cell.segment_collides(a, b, max_step=model.max_step)
@@ -2396,7 +2364,10 @@ def _tcp_travel(cell: Cell, states: list[np.ndarray]) -> float:
 
 def _chain_scan(cell: Cell, chain: list[np.ndarray], check_step: float,
                 factors: bool = False) -> tuple[bool, list[float] | None]:
-    """:func:`_chain_collides`, optionally reading the clearance off the same walk.
+    """Whether the joint gaps between a tracked line's stations are blocked, and the
+    penalty factors read off the same walk.
+
+    ``plan_linear`` clears the stations it places; this clears the gaps between them.
 
     The linear counterpart of :meth:`weldpath.cell.Cell.segment_scan`, and it exists for
     the same reason: a caller that installs this chain wants a factor at every point of
@@ -2425,11 +2396,6 @@ def _chain_scan(cell: Cell, chain: list[np.ndarray], check_step: float,
     if factors:
         out.append(facs[-1] if len(chain) > 1 else cell.penalty_factor(chain[0]))
     return False, out
-
-
-def _chain_collides(cell: Cell, chain: list[np.ndarray], check_step: float) -> bool:
-    """``plan_linear`` clears the points it places; this clears the gaps between them."""
-    return _chain_scan(cell, chain, check_step)[0]
 
 
 def _reads_near(cell: Cell, q: np.ndarray, near_mm: float) -> bool:
@@ -2478,18 +2444,8 @@ def _linear_allowed(cell: Cell, dense: list[np.ndarray], zone: "LinearZone",
     in_range = 100.0 * sum(near) / len(near) if near else 0.0
     by_share = zone.min_run_pct > 0.0 and in_range >= zone.min_run_pct
 
-    stretches: list[float] = []
-    i = 0
-    while i < len(dense):
-        if not near[i]:
-            i += 1
-            continue
-        j = i
-        while j + 1 < len(dense) and near[j + 1]:
-            j += 1
-        if j > i:
-            stretches.append(_tcp_travel(cell, dense[i:j + 1]))
-        i = j + 1
+    stretches = [_tcp_travel(cell, dense[i:j + 1])
+                 for i, j in _runs_of(near, True) if j > i]
 
     by_length = any(t >= zone.min_run_mm for t in stretches)
     allowed = bool(by_length or by_share)

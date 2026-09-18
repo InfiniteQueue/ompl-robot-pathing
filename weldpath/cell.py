@@ -339,25 +339,7 @@ class Cell:
         Returns the probe distance when nothing is within it, which is all the penalty
         needs: beyond that the cost is flat, so the exact figure does not matter.
         """
-        if self._pm is None:
-            return float("inf")
-        key = (self.gun_value, np.asarray(q, dtype=float).tobytes())
-        hit = self._clearance_cache.get(key)
-        if hit is not None:
-            self.counters["clearance_hits"] += 1
-            return hit
-        self.counters["clearance"] += 1
-        # Deliberately not set_state: refreshing the planning manager's transforms costs as
-        # much as the query itself and nothing here is going to ask it anything.
-        self._load_state(q)
-        got = self._clearance_now()
-        if len(self._clearance_cache) >= CLEARANCE_CACHE_MAX:
-            # Relocation candidates are drawn at random and never revisited, so the cache
-            # grows with states that will never be asked for again.  Dropping the lot is
-            # fine: what matters is the waypoints, and they are re-measured on demand.
-            self._clearance_cache.clear()
-        self._clearance_cache[key] = got
-        return got
+        return self._clearance(q, loaded=False)
 
     def _clearance_here(self, q: np.ndarray) -> float:
         """:meth:`clearance_mm` for a state that is already loaded.
@@ -371,6 +353,10 @@ class Cell:
         Caches and counts exactly as :meth:`clearance_mm` does, so a state measured this
         way is not measured again later, and the run summary still adds up.
         """
+        return self._clearance(q, loaded=True)
+
+    def _clearance(self, q: np.ndarray, loaded: bool) -> float:
+        """The cache both clearance entry points share; ``loaded`` skips the state load."""
         if self._pm is None:
             return float("inf")
         key = (self.gun_value, np.asarray(q, dtype=float).tobytes())
@@ -379,26 +365,26 @@ class Cell:
             self.counters["clearance_hits"] += 1
             return hit
         self.counters["clearance"] += 1
-        self.counters["clearance_fused"] += 1
+        if loaded:
+            self.counters["clearance_fused"] += 1
+        else:
+            # Deliberately not set_state: refreshing the planning manager's transforms
+            # costs as much as the query itself and nothing here will ask it anything.
+            self._load_state(q)
         got = self._clearance_now()
         if len(self._clearance_cache) >= CLEARANCE_CACHE_MAX:
+            # Relocation candidates are drawn at random and never revisited, so the cache
+            # grows with states that will never be asked for again.  Dropping the lot is
+            # fine: what matters is the waypoints, and they are re-measured on demand.
             self._clearance_cache.clear()
         self._clearance_cache[key] = got
         return got
 
     def _clearance_now(self) -> float:
-        """Clearance at the state already loaded.  Assumes ``set_state`` has just run."""
+        """Clearance at the state already loaded.  Assumes ``_load_state`` has just run."""
         self._pm.setCollisionObjectsTransform(self._state.link_transforms)
-        res = ContactResultMap()
-        self._pm.contactTest(res, ContactRequest(ContactTestType_ALL))
-        if res.size() == 0:
-            return self._probe_mm
-        vec = ContactResultVector()
-        res.flattenCopyResults(vec)
-        worst = min((float(c.distance) for c in vec), default=None)
-        if worst is None:
-            return self._probe_mm
-        return worst / self.man.scale
+        worst = min((float(c.distance) for c in _contact_test(self._pm)), default=None)
+        return self._probe_mm if worst is None else worst / self.man.scale
 
     def penalty_factor(self, q: np.ndarray) -> float:
         """Cost multiplier for standing where ``q`` puts the robot."""
@@ -436,12 +422,8 @@ class Cell:
         It answers "where on the gun is this happening", which the distance alone does not.
         """
         self.set_state(q)
-        res = ContactResultMap()
-        self._cm.contactTest(res, ContactRequest(ContactTestType_ALL))
-        vec = ContactResultVector()
-        res.flattenCopyResults(vec)
         worst: dict[tuple[str, str], tuple[float, np.ndarray]] = {}
-        for c in vec:
+        for c in _contact_test(self._cm):
             key = tuple(sorted((c.link_names[0], c.link_names[1])))
             d = float(c.distance)
             if key not in worst or d < worst[key][0]:
@@ -511,26 +493,21 @@ class Cell:
         want = (factors and self._pm is not None
                 and self.penalty is not None and self.penalty.enabled)
         facs: list[float] | None = [] if want else None
+        measure_tool = self.tcp_check_mm > 0.0
 
-        if self.tcp_check_mm <= 0.0:
-            for t in grid:
-                q = a + t * delta
-                if self.in_collision(q):
-                    return True, None
-                if want:
-                    facs.append(self.penalty.factor(self._clearance_here(q)))
-            return False, ([1.0] * n if factors and not want else facs)
-
-        tool_step = self.tcp_check_mm * self.man.scale
         tools = []
         for t in grid:
             q = a + t * delta
             if self.in_collision(q):
                 return True, None
-            tools.append(self._tcp_now())
+            if measure_tool:
+                tools.append(self._tcp_now())
             if want:
                 facs.append(self.penalty.factor(self._clearance_here(q)))
+        if not measure_tool:
+            return False, ([1.0] * n if factors and not want else facs)
 
+        tool_step = self.tcp_check_mm * self.man.scale
         # Right to left, so the halves of a split are popped in the order they are flown.
         stack = [(grid[k], grid[k + 1], tools[k], tools[k + 1], 0)
                  for k in range(n - 2, -1, -1)]
@@ -646,6 +623,18 @@ class Cell:
         self.env.setState(self._state_names, self._state_values(q))
         self._state = self.env.getState()
         return np.array(self.env.getLinkTransform(link).matrix(), dtype=float)
+
+    def pose_mm(self, q: np.ndarray) -> np.ndarray:
+        """TCP pose at ``q`` as a 4x4 with its translation in manifest units.
+
+        ``fk`` answers in environment units, which are metres, while the inverse kinematics
+        behind ``ik`` and ``solve_pose`` takes manifest units and applies the scale itself.
+        Handing it the raw transform asks for a pose a millimetre from the base, which has
+        no solution, so every linear move reads as unreachable.
+        """
+        T = self.fk(q).copy()
+        T[:3, 3] /= self.man.scale
+        return T
 
     def tcp_at(self, q: np.ndarray) -> np.ndarray:
         """Where the tool is for a joint state, in environment units, remembered.
@@ -927,12 +916,13 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
             rel[s.name] = s.mesh
     log("preparing collision geometry (convex decomposition):")
     focus = refinement_focus(man, weld_proximity, tcp_proximity, log=log)
-    # Only the categories that actually have geometry, so the line names what is there.
-    present = set(hull_categories(man).values())
-    far_resolved = {c: float((far_per_category or {}).get(c) if
-                             (far_per_category or {}).get(c) is not None
-                             else far_cell_mm)
-                    for c in present}
+    categories = hull_categories(man)
+
+    def per_category(values: dict[str, float]) -> list[tuple[str, float]]:
+        """A link -> value map said once per category, as the log lines quote it."""
+        return sorted({categories[name]: value for name, value in values.items()}.items())
+
+    far_cells = hull_cells(man, far_cell_mm, far_per_category)
     if focus:
         if weld_proximity > 0.0:
             log(f"  panels and tooling refined within {weld_proximity:g} mm of the gun "
@@ -941,7 +931,7 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
             log(f"  the gun refined within {tcp_proximity:g} mm of the tool centre point")
         log("  elsewhere: " + ", ".join(
             f"{category} {size:g} mm" if size > 0 else f"{category} one hull"
-            for category, size in sorted(far_resolved.items())))
+            for category, size in per_category(far_cells)))
     if hull_cell > 0.0:
         log(f"  cells claim triangles {overlap:g} of a cell past their own bounds, so a "
             f"cell's hull spans about {1.0 + 2.0 * overlap:.2f}x the cell")
@@ -952,26 +942,19 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
     merges = {k: v for k, v in
               hull_cells(man, merge_cell_mm, merge_per_category).items() if v > 0}
     if merges:
-        by_cat: dict[str, float] = {}
-        for name, value in merges.items():
-            by_cat[hull_categories(man)[name]] = value
         log("  beyond the focus, one hull per cell across whatever solids fall in it: "
-            + ", ".join(f"{c} {v:g} mm" for c, v in sorted(by_cat.items()))
+            + ", ".join(f"{c} {v:g} mm" for c, v in per_category(merges))
             + " -- the only step that can bring two shells together, and the only one "
               "that claims space rather than giving it up")
     probes = {k: v for k, v in
               hull_cells(man, enclosed_probe_mm, enclosed_per_category).items() if v > 0}
     if probes:
-        by_category: dict[str, float] = {}
-        categories = hull_categories(man)
-        for name, value in probes.items():
-            by_category[categories[name]] = value
         log("  dropping shells no probe can reach from outside the link: "
-            + ", ".join(f"{c} {v:g} mm" for c, v in sorted(by_category.items()))
+            + ", ".join(f"{c} {v:g} mm" for c, v in per_category(probes))
             + f", screened on a {enclosed_voxel_mm:g} mm voxel"
             + (f", never above {enclosed_keep_mm:g} mm across" if enclosed_keep_mm > 0
                else ", with no size backstop"))
-    bends = ({name: float(panel_bend_mm) for name, category in hull_categories(man).items()
+    bends = ({name: float(panel_bend_mm) for name, category in categories.items()
               if category == "panel"} if panel_bend_mm > 0.0 else {})
     if bends:
         log(f"  panel pieces split again wherever they bend more than {panel_bend_mm:g} mm "
@@ -981,7 +964,7 @@ def _resolve_collision_meshes(man: Manifest, log, min_extent: float, max_shells:
                             hull_cell=hull_cell, fill=hull_fill,
                             cells=hull_cells(man, hull_cell, hull_per_category),
                             focus=focus, far_cell=far_cell_mm,
-                            far_cells=hull_cells(man, far_cell_mm, far_per_category),
+                            far_cells=far_cells,
                             overlap=overlap, merge_cells=merges,
                             merge_cell=merge_cell_mm, enclosed_probes=probes,
                             enclosed_voxel=enclosed_voxel_mm,
@@ -1086,24 +1069,8 @@ def _exact_pair(man: Manifest, collision: dict[str, str], out_dir: str,
     links = sorted({a, b})
     builder = SceneBuilder(man, collision, exact_links=set(links))
     ex_dir = os.path.join(out_dir, "exact_check")
-    os.makedirs(ex_dir, exist_ok=True)
-
-    paths = {}
-    for stem, text in (("cell.urdf", builder.urdf()),
-                       ("kinematics_plugins.yaml", builder.kinematics_plugins_yaml()),
-                       ("contact_managers_plugins.yaml", builder.contact_managers_yaml())):
-        paths[stem] = os.path.join(ex_dir, stem).replace("\\", "/")
-        with open(paths[stem], "w", encoding="utf-8") as fh:
-            fh.write(text)
-    paths["cell.srdf"] = os.path.join(ex_dir, "cell.srdf").replace("\\", "/")
-    with open(paths["cell.srdf"], "w", encoding="utf-8") as fh:
-        fh.write(builder.srdf(builder.adjacent_pairs(), paths["kinematics_plugins.yaml"],
-                              paths["contact_managers_plugins.yaml"]))
-
-    env = Environment()
-    if not env.init(FilesystemPath(paths["cell.urdf"]), FilesystemPath(paths["cell.srdf"]),
-                    GeneralResourceLocator()):
-        raise RuntimeError(f"failed to load the exact-geometry scene in {ex_dir}")
+    env = _load_scene(*_write_scene(builder, ex_dir, builder.adjacent_pairs()),
+                      f"failed to load the exact-geometry scene in {ex_dir}")
     env.applyCommand(ChangeCollisionMarginsCommand(probe))
 
     raw = {l.name: l.mesh for l in man.all_links() if l.mesh}
@@ -1121,11 +1088,41 @@ def _exact_pair(man: Manifest, collision: dict[str, str], out_dir: str,
     env.setState(joint_names, np.asarray(q, dtype=float))
     state = env.getState()          # must outlive the transform call, see Cell.set_state
     cm.setCollisionObjectsTransform(state.link_transforms)
+    return min((float(c.distance) for c in _contact_test(cm)), default=None)
+
+
+def _write_scene(builder: SceneBuilder, directory: str,
+                 pairs: list[tuple[str, str, str]]) -> tuple[str, str]:
+    """Write a scene's URDF, SRDF and plugin configs; returns the URDF and SRDF paths."""
+    os.makedirs(directory, exist_ok=True)
+
+    def path(name: str) -> str:
+        return os.path.join(directory, name).replace("\\", "/")
+
+    urdf, srdf = path("cell.urdf"), path("cell.srdf")
+    kin, contact = path("kinematics_plugins.yaml"), path("contact_managers_plugins.yaml")
+    for target, text in ((urdf, builder.urdf()), (kin, builder.kinematics_plugins_yaml()),
+                         (contact, builder.contact_managers_yaml()),
+                         (srdf, builder.srdf(pairs, kin, contact))):
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write(text)
+    return urdf, srdf
+
+
+def _load_scene(urdf: str, srdf: str, failure: str) -> Environment:
+    env = Environment()
+    if not env.init(FilesystemPath(urdf), FilesystemPath(srdf), GeneralResourceLocator()):
+        raise RuntimeError(failure)
+    return env
+
+
+def _contact_test(manager) -> ContactResultVector:
+    """Every contact ``manager`` reports at the transforms it already holds."""
     res = ContactResultMap()
-    cm.contactTest(res, ContactRequest(ContactTestType_ALL))
+    manager.contactTest(res, ContactRequest(ContactTestType_ALL))
     vec = ContactResultVector()
     res.flattenCopyResults(vec)
-    return min((float(c.distance) for c in vec), default=None)
+    return vec
 
 
 def _contact_point(c) -> np.ndarray:
@@ -1267,43 +1264,35 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
     builder = SceneBuilder(man, collision, joint_velocity=velocity)
 
     out_dir = out_dir or os.path.join(man.directory, "generated")
-    os.makedirs(out_dir, exist_ok=True)
-    urdf_path = os.path.join(out_dir, "cell.urdf").replace("\\", "/")
-    srdf_path = os.path.join(out_dir, "cell.srdf").replace("\\", "/")
-    kin_path = os.path.join(out_dir, "kinematics_plugins.yaml").replace("\\", "/")
-    contact_path = os.path.join(out_dir, "contact_managers_plugins.yaml").replace("\\", "/")
-    with open(urdf_path, "w", encoding="utf-8") as fh:
-        fh.write(builder.urdf())
-    with open(kin_path, "w", encoding="utf-8") as fh:
-        fh.write(builder.kinematics_plugins_yaml())
-    with open(contact_path, "w", encoding="utf-8") as fh:
-        fh.write(builder.contact_managers_yaml())
+    margin = -man.contact_ok_distance_mm * man.scale
+    clearance = obstacle_clearance_mm * man.scale
 
-    def write_srdf(pairs):
-        with open(srdf_path, "w", encoding="utf-8") as fh:
-            fh.write(builder.srdf(pairs, kin_path, contact_path))
+    def load(pairs, overrides, limits_log, failure) -> Cell:
+        """The scene written, loaded and configured, in one place for both loads.
 
-    pairs = builder.adjacent_pairs()
-    write_srdf(pairs)
+        The scene is loaded a second time once the start-pose contacts are settled, and
+        every setting has to reach both.  Written out twice, the reload once lost
+        ``tcp_check_mm`` and ran with the tool-space check switched off.
+        """
+        env = _load_scene(*_write_scene(builder, out_dir, pairs), failure)
+        _apply_joint_limits(env, man.robot_joint_names, dynamics, limits_log)
+        _apply_margins(env, man, margin, overrides, obstacle_clearance=clearance)
+        cell = Cell(man, builder, env, pairs)
+        cell.margin, cell.obstacle_clearance = margin, clearance
+        cell.margin_overrides = overrides
+        cell.tcp_check_mm = max(0.0, float(tcp_check_mm))
+        return cell
 
     os.environ.setdefault("TESSERACT_RESOURCE_PATH", man.directory)
     log("loading the scene into Tesseract; builds a collision broadphase over every "
         "shell above")
-    env = Environment()
-    if not env.init(FilesystemPath(urdf_path), FilesystemPath(srdf_path),
-                    GeneralResourceLocator()):
-        raise RuntimeError(f"Tesseract failed to load the generated scene in {out_dir}")
-    _apply_joint_limits(env, man.robot_joint_names, dynamics, log)
-    margin = -man.contact_ok_distance_mm * man.scale
-    clearance = obstacle_clearance_mm * man.scale
-    _apply_margins(env, man, margin, obstacle_clearance=clearance)
+    pairs = builder.adjacent_pairs()
+    overrides: dict[tuple[str, str], float] = {}     # filled once the contacts are measured
+    cell = load(pairs, {}, log,
+                f"Tesseract failed to load the generated scene in {out_dir}")
     log(f"scene loaded; collision margin {margin * 1000:.1f} mm between the robot's own "
         f"links (contact_ok_distance_mm={man.contact_ok_distance_mm:g}), "
         f"{clearance * 1000:+.1f} mm against panels and tooling")
-
-    cell = Cell(man, builder, env, pairs)
-    cell.margin, cell.obstacle_clearance = margin, clearance
-    cell.tcp_check_mm = max(0.0, float(tcp_check_mm))
     if cell.tcp_check_mm > 0.0:
         log(f"collision checks also measure the tool: an interval that carries the gun "
             f"more than {cell.tcp_check_mm:g} mm is split and rechecked, up to "
@@ -1318,14 +1307,13 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         # pair, and the hulls it is complaining about are exactly what a reader wants open
         # in front of them while it does.  Nothing after this point changes them.
         from . import hullexport
-        hullexport.export(env, man, export_dir, log=log)
+        hullexport.export(cell.env, man, export_dir, log=log)
 
     # -- pairs in contact at the start pose: re-measure, then loosen or disable ---------
     start = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
     log("testing the start pose against every collision pair; this is the first full test "
         "of the scene and the slowest one")
     always = cell.contact_pairs(start)
-    overrides: dict[tuple[str, str], float] = {}
     obstacle = {tuple(sorted(p)) for p in _obstacle_margins(man)}
     if always:
         if export_dir:
@@ -1388,19 +1376,10 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
                 "fix the start pose or the part placement in the study and re-import.")
 
         pairs = pairs + [(a, b, "InContactAtStart") for (a, b) in disable]
-        write_srdf(pairs)
         log("  reloading the scene with the generated collision matrix; the broadphase is "
             "built a second time")
-        env = Environment()
-        if not env.init(FilesystemPath(urdf_path), FilesystemPath(srdf_path),
-                        GeneralResourceLocator()):
-            raise RuntimeError("failed to reload scene with generated collision matrix")
-        _apply_joint_limits(env, man.robot_joint_names, dynamics, lambda *a: None)
-        _apply_margins(env, man, margin, overrides, obstacle_clearance=clearance)
-        cell = Cell(man, builder, env, pairs)
-        cell.margin, cell.obstacle_clearance = margin, clearance
-        cell.tcp_check_mm = max(0.0, float(tcp_check_mm))
-        cell.margin_overrides = overrides
+        cell = load(pairs, overrides, lambda *a: None,
+                    "failed to reload scene with generated collision matrix")
         cell.attach_penalty(penalty, log=log)
         cell.attach_dynamics(dynamics)
 

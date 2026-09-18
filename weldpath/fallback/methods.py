@@ -39,12 +39,6 @@ class Context:
     pose_b: np.ndarray              # end locator pose, 4x4, manifest units
     step_mm: float
 
-    def tcp_pose_mm(self, q: np.ndarray) -> np.ndarray:
-        """The tool pose at ``q`` as a 4x4 in manifest units."""
-        T = np.array(self.cell.fk(q), dtype=float)
-        T[:3, 3] /= self.man.scale
-        return T
-
 
 def _walk_axis(ctx: Context, pose: np.ndarray, q_at: np.ndarray) -> Iterator[np.ndarray]:
     """Candidates stepping away from ``pose`` along its retreat axis."""
@@ -100,7 +94,7 @@ def midpoint_towards_neutral(ctx: Context) -> Iterator[np.ndarray]:
     """
     mid = interpolate_pose(np.asarray(ctx.pose_a, dtype=float),
                            np.asarray(ctx.pose_b, dtype=float), 0.5)
-    target = ctx.tcp_pose_mm(nearest_neutral(ctx))[:3, 3]
+    target = ctx.cell.pose_mm(nearest_neutral(ctx))[:3, 3]
     span = target - mid[:3, 3]
     dist = float(np.linalg.norm(span))
     if dist < 1e-9:

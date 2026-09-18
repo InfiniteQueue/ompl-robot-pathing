@@ -99,19 +99,6 @@ def _random_rotation(rng: np.random.Generator, max_angle: float) -> np.ndarray:
     return np.eye(3) + np.sin(th) * K + (1.0 - np.cos(th)) * (K @ K)
 
 
-def pose_mm(cell: Cell, q: np.ndarray) -> np.ndarray:
-    """TCP pose in manifest units.
-
-    ``Cell.fk`` answers in environment units -- metres -- while the inverse kinematics
-    behind ``solve_pose`` takes manifest units and applies the scale itself.  Handing the
-    raw transform over asks for a pose a millimetre from the base, which has no solution,
-    so every line would read as unreachable.  Same conversion as ``MotionModel._pose_mm``.
-    """
-    T = cell.fk(q).copy()
-    T[:3, 3] /= cell.man.scale
-    return T
-
-
 # ---------------------------------------------------------------------------
 # the tree
 # ---------------------------------------------------------------------------
@@ -284,7 +271,7 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     deadline = time.perf_counter() + budget.seconds
     step_mm = float(getattr(cell, "tcp_check_mm", 0.0)) or float("inf")
 
-    pa, pb = pose_mm(cell, qa), pose_mm(cell, qb)
+    pa, pb = cell.pose_mm(qa), cell.pose_mm(qb)
     if cell.in_collision(qa) or cell.in_collision(qb):
         raise PlanningError("cartesian tree: an endpoint is already in collision")
 
