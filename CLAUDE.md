@@ -158,6 +158,10 @@ the way, so the joint values in between are whatever that line demands.
 - `plan_cartesian` is the only search that builds straight tool moves. `_plan_direct`
   reaches it only when OMPL phase one returned nothing and the band is on, and never for
   the halves of a fallback-pose route, which are planned with no zone.
+  - `_cartesian_solutions` runs it from successive seeds: until one solves or
+    `--cartesian-solve-seconds` passes, then on until `--cartesian-min-seconds` has, both
+    timed from the first run. Routes are ranked by `_path_cost`, as phase one's are, and
+    only the cheapest is recut, since the recut runs the sampling phases per stretch.
   - It returns every station it validated, about `--check-step-mm` of tool travel apart,
     each gap swept as a joint chord — close enough that chord and line coincide — plus
     one stationary joint move where the two trees meet at the same pose.

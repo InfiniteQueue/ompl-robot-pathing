@@ -1883,20 +1883,12 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         # It is gated on the zone because a route made of straight moves only earns its
         # cost where linear motion was wanted in the first place; with no band in force
         # there is nothing here that phase two would not do better.
-        from .cartesian import plan_cartesian    # deferred: cartesian.py reads this module
-        log(f"      cartesian tree: up to {cartesian.seconds:g}s searching linear space "
-            f"for a solution")
-        t0 = time.time()
-        try:
-            route = plan_cartesian(cell, qa, qb, max_step=check_step,
-                                   budget=cartesian, log=log)
-        except PlanningError as exc:
-            log(f"      {exc} ({time.time() - t0:.1f}s)")
-        else:
-            cost, plain = _path_cost(cell, route, check_step)
-            log(f"      cartesian tree: solved in {time.time() - t0:.1f}s "
-                f"({len(route)} points, cost {cost:.2f} s against {plain:.2f} s "
-                f"unpenalised)")
+        found = _cartesian_solutions(cell, qa, qb, cartesian, check_step, log)
+        if found:
+            # The best of the set is the only one recut: the recut runs the sampling
+            # phases on every stretch outside the band, far too dear to spend on routes
+            # that are then thrown away.
+            cost, plain, route = _cheapest(found, log)
             if cartesian.recut:
                 recut = _recut_outside_band(cell, route, zone=zone, sampler=sampler,
                                             check_step=check_step, log=log)
@@ -1926,6 +1918,47 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     log(f"      reduced to {sum(len(r.states) for r in out)} points in "
         f"{len(out)} run{'' if len(out) == 1 else 's'}")
     return out
+
+
+def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
+                         budget: "CartesianBudget", check_step: float,
+                         log) -> list[_Solution]:
+    """Cartesian-tree routes for one transit, each scored as phase one scores its own.
+
+    Searches run from successive seeds until one solves or ``budget.seconds`` has passed,
+    then carry on until ``budget.min_seconds`` has passed, both counted from the start of
+    the first.  A tree search, like RRTConnect, settles for whichever route its seed leads
+    it to first, so more of them is the only way to have a choice.  Each search is given
+    only the time left, so neither figure is overrun by more than the search in hand takes
+    to notice.
+    """
+    from .cartesian import plan_cartesian    # deferred: cartesian.py reads this module
+    if cell.in_collision(qa) or cell.in_collision(qb):
+        # The one failure no other seed can change; retried, it would spin out the clock.
+        log("      cartesian tree: an endpoint is already in collision")
+        return []
+    log(f"      cartesian tree: up to {budget.seconds:g}s searching linear space for a "
+        f"solution, then until {budget.min_seconds:g}s for better ones")
+    start = time.time()
+    found: list[_Solution] = []
+    run = 0
+    while True:
+        left = start + (budget.min_seconds if found else budget.seconds) - time.time()
+        if left <= 0.0:
+            return found
+        run += 1
+        t0 = time.time()
+        try:
+            route = plan_cartesian(cell, qa, qb, max_step=check_step, log=log,
+                                   budget=replace(budget, seconds=left,
+                                                  seed=budget.seed + run - 1))
+        except PlanningError as exc:
+            log(f"      {exc} (run {run}, {time.time() - t0:.1f}s)")
+            continue
+        cost, plain = _path_cost(cell, route, check_step)
+        log(f"      cartesian tree run {run}: solved in {time.time() - t0:.1f}s "
+            f"({len(route)} points, cost {cost:.2f} s against {plain:.2f} s unpenalised)")
+        found.append((cost, plain, route))
 
 
 def _far_stretches(near: list[bool]) -> list[tuple[int, int]]:
