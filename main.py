@@ -702,7 +702,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "turns all penalties off. Takes true/false (yes/no, on/off, 1/0); "
                         "passing the flag with no value means true (default: %(default)s)")
     #STRENGTH AT TOUCHING
-    p.add_argument("--stepped-penalty-multiplier", type=float, default=7.0, metavar="N", #was 7
+    p.add_argument("--stepped-penalty-multiplier", type=float, default=14.0, metavar="N", #was 7
                    help="penalty at zero clearance: a second spent touching costs as much "
                         "as N seconds in open space (default: %(default)g)")
     #WHERE THE PENALTY IS SPENT
@@ -711,7 +711,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "Also how far the proximity query has to see, so lowering it "
                         "speeds planning up (default: %(default)g)")
     #STEP LENGTH
-    p.add_argument("--stepped-penalty-step-mm", type=float, default=3.0, metavar="MM", #was 25
+    p.add_argument("--stepped-penalty-step-mm", type=float, default=1.5, metavar="MM", #was 25
                    help="how much extra clearance counts as one step of falloff "
                         "(default: %(default)g)")
     #STEP FACTOR
@@ -740,7 +740,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="commanded tool speed cap on linear moves; the joint limits still "
                         "govern whenever they are slower (default: %(default)g)")
     #HOW MUCH A STOP COSTS THE OPTIMISER
-    p.add_argument("--stop-time-weight", type=float, default=1.0, metavar="W",
+    p.add_argument("--stop-time-weight", type=float, default=0.5, metavar="W",
                    help="how heavily a stop is charged in the time the planner scores "
                         "routes by, and nowhere else: the exported timing is the real "
                         "one. Every waypoint is a full stop, so deleting one nearly "

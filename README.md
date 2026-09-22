@@ -1045,7 +1045,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--joint-max-velocity` | 2π/3, J6 11π/9 | per-joint velocity limits, rad/s, comma separated |
 | `--joint-max-acceleration` | 2.5, J6 11 | per-joint acceleration limits, rad/s², comma separated |
 | `--linear-speed-mm-s` | 250 | tool speed cap on `LIN` moves |
-| `--stop-time-weight` | 1 | how heavily route scoring charges a stop, 0 to 2; splitting a short move into n scores sqrt(n)**W the whole; below 1 removes fewer waypoints for time |
+| `--stop-time-weight` | 0.5 | how heavily route scoring charges a stop, 0 to 2; splitting a short move into n scores sqrt(n)**W the whole; below 1 removes fewer waypoints for time |
 | `--unrefined-output` | off | also write `waypoints-unrefined.json`, pre-optimisation |
 | `--probe-point` | off | name the collision hulls containing `LOCATOR:X,Y,Z` and how far the nearest real material is, then stop |
 | `--export-collision-geometry` | off | write the hulls actually collided against, and the blocking pair at each unplaceable locator, to `<dir>/collision_geometry/` |
