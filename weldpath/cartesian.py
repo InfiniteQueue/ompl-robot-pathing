@@ -64,7 +64,8 @@ class CartesianBudget:
     what anyone wanted.  With this on, ``planning._recut_outside_band`` cuts the route
     where it leaves the band and gives what is outside back to the sampling planner.
     """
-    seconds: float = 20.0           # wall clock for one solve
+    seconds: float = 20.0           # wall clock to find a first route
+    min_seconds: float = 20.0       # wall clock spent re-solving for a better one
     max_iters: int = 4000           # sample budget, whichever runs out first
     extend_mm: float = 120.0        # furthest one extend drives the tool
     extend_deg: float = 25.0        # ...and furthest it turns the tool, whichever binds

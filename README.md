@@ -462,7 +462,10 @@ does not disqualify the leg either side of it.
 **Routes from the Cartesian tree.** The tree is tried only when OMPL's first phase found
 nothing and the band is on, and never for the two halves of a route through a fallback pose.
 Its route is dense: states about `--check-step-mm` of tool travel apart, each gap a straight
-tool move, plus one stationary joint move where its two trees meet.
+tool move, plus one stationary joint move where its two trees meet. Like phase one, it
+searches more than once: new seeds until one solves within `--cartesian-solve-seconds`,
+then more until `--cartesian-min-seconds` has passed, and only the cheapest route of
+the set goes on.
 
 With `--cartesian-recut` on (the default), the route is then cut wherever it leaves the
 band. Each stretch outside the band is bounded by its own first and last state, which
@@ -973,7 +976,8 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--segment-length-rad` | 0.01 | collision resolution inside the sampling planner |
 | `--phase-one-runs` | 25 | OMPL runs per transit, keeping the cheapest that solves |
 | `--phase-one-solve-seconds` | 25 | how long one of those runs may search |
-| `--cartesian-seconds` | 120 | Cartesian tree budget, tried when phase one finds nothing; 0 disables |
+| `--cartesian-solve-seconds` | 120 | Cartesian tree time to find a first route, tried when phase one finds nothing; 0 disables. `--cartesian-seconds` still works |
+| `--cartesian-min-seconds` | 120 | least time the tree spends once solved, re-solving from new seeds and keeping the cheapest route |
 | `--cartesian-recut` | true | cut a Cartesian-tree route where it leaves the band and replan the parts outside it with phases one and two |
 | `--phase-two-max-runs` | 8 | further OMPL runs, stopping at the first solution |
 | `--phase-two-solve-seconds` | 45 | how long one of those runs may search |

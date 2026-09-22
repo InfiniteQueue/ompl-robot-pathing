@@ -171,9 +171,12 @@ def build_parser() -> argparse.ArgumentParser:
                         "longer single search helps where another short one does not "
                         "(default: 45)")
     #CARTESIAN TREE, BETWEEN THE TWO PHASES
-    p.add_argument("--cartesian-seconds", type=float, default=120.0, metavar="SECONDS",
+    p.add_argument("--cartesian-solve-seconds", "--cartesian-seconds", type=float,
+                   default=120.0, metavar="SECONDS", dest="cartesian_solve_seconds",
                    help="how long the Cartesian tree may search a transit that phase one "
-                        "could not solve. It runs between the two phases and only where "
+                        "could not solve before it has found one route. Searches that "
+                        "give up early are restarted from a new seed until this is spent. "
+                        "It runs between the two phases and only where "
                         "--near-panel-mm is in force, so a cell whose transits solve never "
                         "reaches it. Unlike the sampling planner it searches the space the "
                         "tool moves in: every edge it builds is a straight tool move, "
@@ -182,7 +185,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "is also a joint-space route, so it searches strictly less than "
                         "phase two does -- but it concentrates the search into the "
                         "corridor beside the panel, which is where uniform joint sampling "
-                        "spends everything and finds nothing. 0 turns it off (default: 120)")
+                        "spends everything and finds nothing. 0 turns it off "
+                        "(default: %(default)g)")
+    #CARTESIAN TREE: CHOOSE BETWEEN ROUTES
+    p.add_argument("--cartesian-min-seconds", type=float, default=120.0, metavar="SECONDS",
+                   help="least time the Cartesian tree spends on a transit once it has "
+                        "solved it. Further searches, each from a new seed, run until this "
+                        "much time has passed since the first began, and the "
+                        "lowest-penalty route of the set is kept, as phase one keeps its "
+                        "best. Only the kept route goes on to --cartesian-recut. A "
+                        "transit whose first route took longer than this keeps that route "
+                        "alone; 0 always does (default: %(default)g)")
     #HOW FAR ONE EXTEND REACHES
     p.add_argument("--cartesian-extend-mm", type=float, default=80.0, metavar="MM",
                    help="furthest one extend of the Cartesian tree drives the tool. Short "
@@ -923,7 +936,8 @@ def _run(args: argparse.Namespace, directory: str) -> int:
                         phase_one_seconds=args.phase_one_solve_seconds,
                         phase_two_max_runs=args.phase_two_max_runs,
                         phase_two_seconds=args.phase_two_solve_seconds),
-        cartesian=CartesianBudget(seconds=args.cartesian_seconds,
+        cartesian=CartesianBudget(seconds=args.cartesian_solve_seconds,
+                                  min_seconds=args.cartesian_min_seconds,
                                   extend_mm=args.cartesian_extend_mm,
                                   margin_mm=args.cartesian_margin_mm,
                                   tilt_deg=args.cartesian_tilt_deg,
