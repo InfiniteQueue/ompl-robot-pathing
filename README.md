@@ -536,6 +536,17 @@ overall. The old figures were optimistic because they charged nothing for stoppi
 still govern whenever they are slower. No Cartesian acceleration is modelled, because the
 manifest supplies none.
 
+`--stop-time-weight` scales, in the time the optimiser scores routes by and nowhere else,
+what a stop adds to a move over cruising the same distance: `cruise + w * (full - cruise)`.
+Every waypoint is a full stop, so removing one nearly always scores quicker, and the
+clearance penalty only has that saving to outweigh when a waypoint holds the route off the
+parts. Below 1 brings two moves of a distance closer to one of twice it: splitting a 30°
+J1 move scores 1.41x the single move at 1, 1.32x at 0.5 and 1.0x at 0. Scaling the
+acceleration limits instead does not work -- a move too short to reach cruise takes
+`2 * sqrt(d / a)`, so that ratio is sqrt(2) at any acceleration, and a penalty that
+multiplies time sees no difference. Cruise-only scores (shortcut's dense path, ranking raw
+solver routes) have no stops and do not change.
+
 ### Joint 3 is coupled to joint 2
 
 A linkage holds link 3 at a fixed angle to the floor as joint 2 moves, so the number the
@@ -1019,6 +1030,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--joint-max-velocity` | 2π/3, J6 11π/9 | per-joint velocity limits, rad/s, comma separated |
 | `--joint-max-acceleration` | 2.5, J6 11 | per-joint acceleration limits, rad/s², comma separated |
 | `--linear-speed-mm-s` | 250 | tool speed cap on `LIN` moves |
+| `--stop-time-weight` | 1 | share of a stop's acceleration and braking charged in route scoring only; below 1 removes fewer waypoints for time |
 | `--unrefined-output` | off | also write `waypoints-unrefined.json`, pre-optimisation |
 | `--probe-point` | off | name the collision hulls containing `LOCATOR:X,Y,Z` and how far the nearest real material is, then stop |
 | `--export-collision-geometry` | off | write the hulls actually collided against, and the blocking pair at each unplaceable locator, to `<dir>/collision_geometry/` |

@@ -122,6 +122,9 @@ class Cell:
         # band on its way somewhere else, so nothing that samples or checks a move reads it.
         self.stop_band_rad = 0.0
         self.dynamics = None                    # set by attach_dynamics
+        # How much of a stop's acceleration and braking the scored move time keeps; see
+        # move_time.  1 is the real figure.
+        self.stop_time_weight = 1.0
         self.weights = self._joint_weights()
 
     # -- joint metric --------------------------------------------------------
@@ -162,10 +165,22 @@ class Cell:
         **not additive**: splitting a move in two costs an extra ramp, and up to 41% more
         again when neither half reaches cruise.  That is exactly the cost of a surplus
         waypoint, and it is invisible to any distance metric.
+
+        This is the optimiser's currency, not the schedule: ``output.Timing`` times the
+        exported program on the dynamics directly.  ``stop_time_weight`` scales what the
+        stop adds over :meth:`cruise_time`, ``cruise + w * (full - cruise)``, so at 0 two
+        moves of ``d`` score as one of ``2d`` on a single joint and at 1 the full ramp is
+        charged.  Scaling the acceleration instead would not do this: a move too short to
+        reach cruise takes ``2 * sqrt(d / a)``, so the split-to-single ratio is sqrt(2)
+        whatever ``a`` is, and a penalty that multiplies time sees no change at all.
         """
         if self.dynamics is None:
             return self.distance(a, b)
-        return self.dynamics.move_time(a, b)
+        full = self.dynamics.move_time(a, b)
+        if self.stop_time_weight == 1.0:
+            return full
+        cruise = self.cruise_time(a, b)
+        return cruise + self.stop_time_weight * (full - cruise)
 
     def cruise_time(self, a: np.ndarray, b: np.ndarray) -> float:
         """Seconds for ``a`` to ``b`` counting cruise only, ignoring the ramps.

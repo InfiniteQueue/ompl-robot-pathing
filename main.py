@@ -739,6 +739,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--linear-speed-mm-s", type=float, default=250.0,
                    help="commanded tool speed cap on linear moves; the joint limits still "
                         "govern whenever they are slower (default: 250)")
+    #HOW MUCH A STOP COSTS THE OPTIMISER
+    p.add_argument("--stop-time-weight", type=float, default=1.0, metavar="W",
+                   help="multiplies the time a stop adds to a move -- its time over and "
+                        "above cruising the same distance at full speed, which is the "
+                        "acceleration and braking -- in the time the planner scores "
+                        "routes by, and nowhere else: the exported timing is the real "
+                        "one. Every waypoint is a full stop, so deleting one nearly "
+                        "always scores quicker, and the clearance penalty has only that "
+                        "saving to outweigh when a waypoint holds the route off the "
+                        "parts. Below 1 brings two moves of a distance closer to one move "
+                        "of twice it, so waypoints that buy clearance survive simplify "
+                        "and polish more often; 0 charges nothing for stopping, above 1 "
+                        "charges more. Cruise-only scoring (shortcut on the dense path, "
+                        "ranking raw solver routes) has no stops and is unaffected "
+                        "(default: %(default)g)")
     #endregion
     #region ###OUTPUT AND DEBUGGING###
     #WRITE THE PRE-OPTIMISATION PATH TOO
@@ -854,6 +869,9 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    if args.stop_time_weight < 0.0:
+        print("error: --stop-time-weight cannot be negative", file=sys.stderr)
+        return 2
 
     try:
         if args.stepped_penalty:
@@ -916,6 +934,11 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    cell.stop_time_weight = args.stop_time_weight
+    if args.stop_time_weight != 1.0:
+        log(f"route scoring charges {args.stop_time_weight:g}x the time a stop adds over "
+            f"cruising; the exported timing is the real one")
 
     if args.j5_stop_band and args.j5_stop_band_deg > 0.0:
         import math
