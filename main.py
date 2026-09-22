@@ -741,19 +741,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "govern whenever they are slower (default: 250)")
     #HOW MUCH A STOP COSTS THE OPTIMISER
     p.add_argument("--stop-time-weight", type=float, default=1.0, metavar="W",
-                   help="multiplies the time a stop adds to a move -- its time over and "
-                        "above cruising the same distance at full speed, which is the "
-                        "acceleration and braking -- in the time the planner scores "
+                   help="how heavily a stop is charged in the time the planner scores "
                         "routes by, and nowhere else: the exported timing is the real "
                         "one. Every waypoint is a full stop, so deleting one nearly "
                         "always scores quicker, and the clearance penalty has only that "
                         "saving to outweigh when a waypoint holds the route off the "
-                        "parts. Below 1 brings two moves of a distance closer to one move "
-                        "of twice it, so waypoints that buy clearance survive simplify "
-                        "and polish more often; 0 charges nothing for stopping, above 1 "
-                        "charges more. Cruise-only scoring (shortcut on the dense path, "
-                        "ranking raw solver routes) has no stops and is unaffected "
-                        "(default: %(default)g)")
+                        "parts. Where the moves are too short to reach full speed, "
+                        "splitting one into n equal moves really costs sqrt(n) times as "
+                        "long; it scores sqrt(n)**W, the same at every distance. So 1 is "
+                        "the real timing, below 1 lets waypoints that buy clearance "
+                        "survive simplify and polish more often, 0 charges nothing for "
+                        "stopping, and 2 scores every such move alike. Moves long enough "
+                        "to cruise score their real time. Cruise-only scoring (shortcut "
+                        "on the dense path, ranking raw solver routes) has no stops and "
+                        "is unaffected; 0 to 2 (default: %(default)g)")
     #endregion
     #region ###OUTPUT AND DEBUGGING###
     #WRITE THE PRE-OPTIMISATION PATH TOO
@@ -869,8 +870,8 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
-    if args.stop_time_weight < 0.0:
-        print("error: --stop-time-weight cannot be negative", file=sys.stderr)
+    if not 0.0 <= args.stop_time_weight <= 2.0:
+        print("error: --stop-time-weight must be between 0 and 2", file=sys.stderr)
         return 2
 
     try:
@@ -937,8 +938,9 @@ def _run(args: argparse.Namespace, directory: str) -> int:
 
     cell.stop_time_weight = args.stop_time_weight
     if args.stop_time_weight != 1.0:
-        log(f"route scoring charges {args.stop_time_weight:g}x the time a stop adds over "
-            f"cruising; the exported timing is the real one")
+        log(f"route scoring charges stops at weight {args.stop_time_weight:g}: splitting a "
+            f"short move in two scores {2 ** (args.stop_time_weight / 2):.3f}x the whole, "
+            f"against 1.414x real; the exported timing is the real one")
 
     if args.j5_stop_band and args.j5_stop_band_deg > 0.0:
         import math

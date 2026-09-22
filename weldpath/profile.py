@@ -127,6 +127,35 @@ class JointDynamics:
         t = self.joint_times(a, b)
         return float(np.max(t)) if t.size else 0.0
 
+    def scored_joint_times(self, a: np.ndarray, b: np.ndarray, weight: float) -> np.ndarray:
+        """:meth:`joint_times` with the stop's share of a short move reweighted.
+
+        Below the crossover ``D = v^2 / a`` a joint scores ``(2v/a) * (d / D) ** (1 - w/2)``;
+        above it, the real trapezoidal time.  The real triangular time is the ``w = 1`` case,
+        ``2 * sqrt(d / a)``, and the two branches meet at ``2v/a`` for every ``w``.
+
+        A power of distance is the only shape for which splitting a move into ``n`` equal
+        moves costs the same proportion however long it is -- here ``n ** (w/2)``, which is
+        ``r ** w`` against the real ratio ``r = sqrt(n)``.  Every joint takes the same
+        exponent, so the slowest-joint maximum keeps that property on a coordinated move.
+        Trapezoidal moves score their real time and are unaffected on their own.  The score
+        starts at zero, is concave below the crossover for ``w`` in [0, 2] and real above
+        it, so it is subadditive: splitting a move never scores cheaper than making it whole.
+        """
+        d = np.abs(np.asarray(b, dtype=float) - np.asarray(a, dtype=float))
+        v, acc = self.velocity, self.acceleration
+        cruise = v * v / acc
+        exponent = 1.0 - 0.5 * weight
+        scaled = (2.0 * v / acc) * np.power(np.minimum(d / cruise, 1.0), exponent)
+        if exponent == 0.0:
+            scaled = np.where(d > 0.0, scaled, 0.0)     # 0 ** 0 is 1, a still joint takes 0
+        return np.where(d <= cruise, scaled, d / v + v / acc)
+
+    def scored_move_time(self, a: np.ndarray, b: np.ndarray, weight: float) -> float:
+        """:meth:`move_time` under :meth:`scored_joint_times`."""
+        t = self.scored_joint_times(a, b, weight)
+        return float(np.max(t)) if t.size else 0.0
+
     def describe(self, names: list[str] | None = None) -> str:
         names = names or [f"j{i + 1}" for i in range(len(self.velocity))]
         parts = ", ".join(

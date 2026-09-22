@@ -122,8 +122,8 @@ class Cell:
         # band on its way somewhere else, so nothing that samples or checks a move reads it.
         self.stop_band_rad = 0.0
         self.dynamics = None                    # set by attach_dynamics
-        # How much of a stop's acceleration and braking the scored move time keeps; see
-        # move_time.  1 is the real figure.
+        # How heavily the scored move time charges a stop, 0 to 2; see move_time.  1 is
+        # the real figure.
         self.stop_time_weight = 1.0
         self.weights = self._joint_weights()
 
@@ -167,20 +167,21 @@ class Cell:
         waypoint, and it is invisible to any distance metric.
 
         This is the optimiser's currency, not the schedule: ``output.Timing`` times the
-        exported program on the dynamics directly.  ``stop_time_weight`` scales what the
-        stop adds over :meth:`cruise_time`, ``cruise + w * (full - cruise)``, so at 0 two
-        moves of ``d`` score as one of ``2d`` on a single joint and at 1 the full ramp is
-        charged.  Scaling the acceleration instead would not do this: a move too short to
-        reach cruise takes ``2 * sqrt(d / a)``, so the split-to-single ratio is sqrt(2)
-        whatever ``a`` is, and a penalty that multiplies time sees no change at all.
+        exported program on the dynamics directly.  ``stop_time_weight`` reweights a stop
+        through :meth:`~weldpath.profile.JointDynamics.scored_move_time`: where the moves
+        are too short to reach cruise, splitting one into ``n`` equal moves scores
+        ``r ** w`` times the whole, against the real ``r = sqrt(n)``, at every distance.
+        Scaling the acceleration instead would not do this: a move too short to reach
+        cruise takes ``2 * sqrt(d / a)``, so the split-to-single ratio is sqrt(2) whatever
+        ``a`` is, and a penalty that multiplies time sees no change at all.  Nor would
+        blending toward :meth:`cruise_time`, which a short move barely has, so the weight
+        faded out on exactly the hops it was meant for.
         """
         if self.dynamics is None:
             return self.distance(a, b)
-        full = self.dynamics.move_time(a, b)
         if self.stop_time_weight == 1.0:
-            return full
-        cruise = self.cruise_time(a, b)
-        return cruise + self.stop_time_weight * (full - cruise)
+            return self.dynamics.move_time(a, b)
+        return self.dynamics.scored_move_time(a, b, self.stop_time_weight)
 
     def cruise_time(self, a: np.ndarray, b: np.ndarray) -> float:
         """Seconds for ``a`` to ``b`` counting cruise only, ignoring the ramps.
