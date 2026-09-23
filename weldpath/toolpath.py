@@ -82,6 +82,7 @@ class ToolpathPlanner:
                  near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
                  near_panel_min_pct: float = 0.0, linear_speed_mm_s: float = 0.0,
                  linear_crossing_penalty_s: float = 0.0,
+                 linear_introduce_mm: float = 0.0,
                  weld_clearance_mm: float | None = None,
                  stand_off_search: bool = True, stand_off_scan_mm: float = 0.5,
                  stand_off_resolution_mm: float = 0.05,
@@ -115,14 +116,20 @@ class ToolpathPlanner:
         self.zone = LinearZone(near_mm=near_panel_mm, min_run_mm=near_panel_min_mm,
                                min_run_pct=near_panel_min_pct,
                                linear_speed_mm_s=linear_speed_mm_s,
-                               crossing_penalty_s=linear_crossing_penalty_s)
+                               crossing_penalty_s=linear_crossing_penalty_s,
+                               introduce_mm=linear_introduce_mm)
         # Every locator reports its measured clearance against the one it has to meet,
         # placed or not, so the query has to see past the larger threshold with room to
         # spare.  A probe that stops at the threshold can only ever answer "at least the
         # requirement", which is the half of the question already known.
         report_probe = max(cell.obstacle_clearance / man.scale,
                            weld_clearance_mm or 0.0) + CLEARANCE_REPORT_HEADROOM_MM
-        wanted = max(near_panel_mm + NEAR_PANEL_HEADROOM_MM if self.zone.enabled else 0.0,
+        # ``--linear-introduce-mm`` is read by the same at-or-under test as the band, so
+        # the query has to see past whichever of the two is the wider.  Past, not to: a
+        # reading at the probe is "nothing found", and a state exactly at the limit would
+        # otherwise be indistinguishable from one a metre out.
+        wanted = max(max(near_panel_mm, self.zone.reach_mm) + NEAR_PANEL_HEADROOM_MM
+                     if self.zone.enabled else 0.0,
                      report_probe)
         if wanted > 0.0:
             cell.require_proximity(wanted, log=log)

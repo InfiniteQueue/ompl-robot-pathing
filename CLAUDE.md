@@ -119,6 +119,29 @@ the way, so the joint values in between are whatever that line demands.
   - Still read off the joint chord, before any profile is known: `_path_cost` ranking raw
     solver routes, and `_plan_direct`'s check of whether a clear direct move runs close
     enough to the parts to be worth refining.
+- The passes ask one question before checking or pricing anything: `MotionModel.refuses`,
+  which is `demotes` or `overreaches`. The two guard the same thing from opposite sides --
+  one stops a near-panel stretch being dissolved, the other stops one being grown outward.
+- `MotionModel.overreaches` is the `--linear-introduce-mm` limit, default 120 mm. The
+  endpoint rule makes a move `LIN` when *either* end is in the band and says nothing about
+  where the other end is, so a cut from a state a metre clear straight to one against the
+  panel ships as a single straight move whose whole line needs collision-free IK and which
+  flies in under the tool speed cap. A replacement that is `LIN` with an end beyond the
+  limit is refused **unless the stretch it replaces already had such a move**, which is
+  what keeps this a limit on *introducing* linear motion rather than on having it: a
+  Cartesian route recut with a long reach still gets shortened, thinned and relocated.
+  - `LinearZone.reach_mm` never reads under `near_mm`. A move with both ends in the band is
+    linear wherever it runs, so a tighter limit would refuse the reshaping `demotes`
+    deliberately allows and freeze every near-panel stretch. 0 switches the rule off, and
+    `refuses` is then `demotes` exactly.
+  - Measured by `_reads_near` against the limit, so the probe has to see past it:
+    `ToolpathPlanner` asks for `max(near_mm, reach_mm) + NEAR_PANEL_HEADROOM_MM`, 145 mm at
+    the defaults against 75 mm before. Beyond the probe every state reads the same, so this
+    is deliberately a yes-or-no rather than a ranking of one overreach against another --
+    there is no measurement to rank with.
+  - It gates the passes only. The initial split is untouched: the dense route's states sit
+    one check step apart, so a move out of the band into it is short by construction, and
+    the reach only appears once a pass lengthens a move.
 - `MotionModel.demotes` is why the linear stretches survive those passes. Deleting a
   waypoint is nearly always quicker — every retained hop pays its own ramps — so left
   alone the passes collapse a near-panel polyline into one chord whose ends sit outside

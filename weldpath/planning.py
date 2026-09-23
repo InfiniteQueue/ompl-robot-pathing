@@ -68,6 +68,11 @@ class MotionModel:
         # One clearance query per distinct state: the query loads a joint state into the
         # environment, which costs far more than everything else these passes do.
         self._near: dict[bytes, bool] = {}
+        # The same, read against the wider introduce limit rather than the band.
+        self._reach: dict[bytes, bool] = {}
+        # Replacements turned away for reaching in from outside the limit, so a run can
+        # say whether the rule bit at all rather than leaving it to be inferred.
+        self.overreach_refusals = 0
 
     @property
     def tool_step(self) -> float:
@@ -124,6 +129,75 @@ class MotionModel:
         if self.zone is None or self.motion(a, b) == LIN:
             return False
         return any(self.near(q) for q in replaced)
+
+    def within_reach(self, q: np.ndarray) -> bool:
+        """Whether a linear move newly introduced out at ``q`` is allowed to start there.
+
+        The same measurement ``near`` makes, read against ``--linear-introduce-mm``
+        instead of the band, and cached the same way.  A saturated reading is "nothing
+        within the probe", which is further out than the limit and so not within reach --
+        the probe is sized past the limit by ``ToolpathPlanner`` for exactly that reason.
+
+        This is deliberately a yes-or-no and not a distance.  Beyond the probe every state
+        reads the same, so a rule that ranked one overreach against another would be
+        comparing two readings that are both just "out of range".
+        """
+        if self.zone is None or self.zone.reach_mm <= 0.0:
+            return True
+        key = np.asarray(q, dtype=float).tobytes()
+        hit = self._reach.get(key)
+        if hit is None:
+            hit = _reads_near(self.cell, q, self.zone.reach_mm)
+            self._reach[key] = hit
+        return hit
+
+    def _overreaches(self, a: np.ndarray, b: np.ndarray) -> bool:
+        """Whether this one move is linear motion reaching in from outside the limit."""
+        return (self.motion(a, b) == LIN
+                and not (self.within_reach(a) and self.within_reach(b)))
+
+    def overreaches(self, a: np.ndarray, b: np.ndarray, replaced) -> bool:
+        """Would replacing ``replaced`` with a->b start linear motion too far out?
+
+        The counterpart to :meth:`demotes`, and needed for the same reason read the other
+        way round.  The endpoint rule makes a move linear when *either* end is in the
+        band, which says nothing about where the other end is: a pass that cuts from a
+        state 900 mm clear straight to one against the panel produces a single linear move
+        whose line has to have collision-free inverse kinematics for its whole length, and
+        which the robot flies under the tool speed cap all the way in.  Linear motion is
+        wanted where the tool is working, not for the approach to it.
+
+        So a replacement is refused when it is linear and an end of it sits beyond
+        ``--linear-introduce-mm`` -- unless the stretch it replaces already had a move
+        doing the same thing.  That exemption is what keeps this a limit on *introducing*
+        linear motion.  A route that already reaches in from far out, because the band
+        gate labelled it that way or a Cartesian route was recut there, may still be
+        shortened, thinned and relocated; the passes simply cannot create the reach where
+        it was not there before.
+
+        Off by default in the sense that matters: with no limit set, or with none of the
+        three states measured beyond it, this is the constant False it was before.
+        """
+        if self.zone is None or self.zone.reach_mm <= 0.0:
+            return False
+        if not self._overreaches(a, b):
+            return False
+        chain = [a, *replaced, b]
+        if any(self._overreaches(x, y) for x, y in zip(chain, chain[1:])):
+            return False
+        self.overreach_refusals += 1
+        return True
+
+    def refuses(self, a: np.ndarray, b: np.ndarray, replaced) -> bool:
+        """Whether the profile rules forbid replacing ``replaced`` with the move a->b.
+
+        The one question the optimisation passes ask.  Both halves guard the same thing
+        from opposite sides -- :meth:`demotes` stops a near-panel stretch being dissolved
+        into a joint chord through it, :meth:`overreaches` stops a linear one being grown
+        outward into the approach -- and neither is about cost, so they are settled before
+        the move is checked or priced.
+        """
+        return self.demotes(a, b, replaced) or self.overreaches(a, b, replaced)
 
     # -- what it forbids ----------------------------------------------------
     def blocked(self, a: np.ndarray, b: np.ndarray) -> bool:
@@ -458,7 +532,7 @@ def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
             if j < last and model.cell.in_stop_band(path[j]):
                 j -= 1
                 continue
-            if model.demotes(path[i], path[j], path[i + 1:j]):
+            if model.refuses(path[i], path[j], path[i + 1:j]):
                 j -= 1
                 continue
             chord = model.check_and_cost(path[i], path[j],
@@ -577,7 +651,7 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
         # Under the same rule as the sampling loop, so that a relocation accepted past
         # the deadline still gets the removal sweep the pass promises follows every one.
         while k < len(pts) - 1 and unfinished():
-            if model.demotes(pts[k - 1], pts[k + 1], [pts[k]]):
+            if model.refuses(pts[k - 1], pts[k + 1], [pts[k]]):
                 k += 1
                 continue
             direct = model.check_and_cost(pts[k - 1], pts[k + 1], fa=fac[k - 1],
@@ -619,8 +693,8 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
         if (model.bound_time(pts[k - 1], candidate)
                 + model.bound_time(candidate, pts[k + 1])) >= budget - 1e-9:
             continue
-        if (model.demotes(pts[k - 1], candidate, [pts[k]])
-                or model.demotes(candidate, pts[k + 1], [pts[k]])):
+        if (model.refuses(pts[k - 1], candidate, [pts[k]])
+                or model.refuses(candidate, pts[k + 1], [pts[k]])):
             continue
         f = model.penalty_factor(candidate)
         first = model.check_and_cost(pts[k - 1], candidate, fa=fac[k - 1], fb=f,
@@ -668,11 +742,11 @@ def clear_stop_band(model: "MotionModel", path: list[np.ndarray],
 
     Each offender gets two repairs, and the cheaper of those that work is kept:
 
-    * **remove** -- go straight past it, if the move is clear and ``demotes`` allows it.
+    * **remove** -- go straight past it, if the move is clear and ``refuses`` allows it.
       Unlike ``polish``'s removal this is kept even when it costs time.
     * **nudge** -- set joint 5 just outside the band, on the side it is already on first,
       and keep its other joints.  Both moves through it are checked and costed along the
-      path their profile gives them, and a nudge ``demotes`` refuses is not offered.
+      path their profile gives them, and a nudge ``refuses`` rejects is not offered.
 
     Neither working is a ``PlanningError``, which the caller treats like any other failed
     route: the next gun opening, the next fallback pose.
@@ -691,7 +765,7 @@ def clear_stop_band(model: "MotionModel", path: list[np.ndarray],
         a, b = pts[k - 1], pts[k + 1]
         fa, fb = model.penalty_factor(a), model.penalty_factor(b)
         options = []                            # (cost, replacement or None to remove)
-        if not model.demotes(a, b, [q]):
+        if not model.refuses(a, b, [q]):
             direct = model.check_and_cost(a, b, fa=fa, fb=fb, stops=True)
             if direct is not None:
                 options.append((direct, None))
@@ -704,8 +778,8 @@ def clear_stop_band(model: "MotionModel", path: list[np.ndarray],
                                                      + np.deg2rad(extra))
                 if not cell.within_limits(candidate):
                     break                       # further out on this side is no better
-                if (model.demotes(a, candidate, [q])
-                        or model.demotes(candidate, b, [q])):
+                if (model.refuses(a, candidate, [q])
+                        or model.refuses(candidate, b, [q])):
                     continue
                 f = model.penalty_factor(candidate)
                 first = model.check_and_cost(a, candidate, fa=fa, fb=f, stops=True)
@@ -772,6 +846,9 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     # Outside the budgets on purpose: a route refined with none still ships its stops.
     cleared = clear_stop_band(model, polished, log=log)
     stagetrace.stage("stop band", model, cleared)
+    if log and model.overreach_refusals:
+        log(f"      {model.overreach_refusals} replacements refused for starting linear "
+            f"motion beyond {model.zone.reach_mm:g} mm of clearance")
     return cleared
 
 
@@ -1055,7 +1132,7 @@ def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
     outer = span_cost(lo, i) + span_cost(j, hi) if whole else 0.0
     if outer + model.cell.cruise_time(dense[i], dense[j]) >= before - 1e-9:
         return 0
-    if model.demotes(dense[i], dense[j], dense[i + 1:j]):
+    if model.refuses(dense[i], dense[j], dense[i + 1:j]):
         return 0
     # The interior is asked of the model rather than interpolated here.  Under a linear
     # profile the check above runs along the Cartesian line, and joint-space points would
@@ -2113,10 +2190,24 @@ class LinearZone:
     linear_speed_mm_s: float = 0.0  # tool speed cap; 0 leaves linear moves costed on joints
     crossing_penalty_s: float = 0.0  # flat costing-only surcharge on each move that
                                      # reaches into the band from outside it; 0 charges none
+    introduce_mm: float = 0.0       # furthest clearance a refinement pass may introduce a
+                                    # linear move from; 0 places no limit.  See reach_mm
 
     @property
     def enabled(self) -> bool:
         return self.near_mm > 0.0
+
+    @property
+    def reach_mm(self) -> float:
+        """How far out a pass may introduce a linear move, in mm.  See ``overreaches``.
+
+        Never under the band itself.  A move with both ends inside the band is linear by
+        the endpoint rule wherever it runs, so there is nothing for a pass to introduce
+        there; a limit tighter than the band would refuse the reshaping ``demotes``
+        deliberately permits and leave the passes unable to touch a near-panel stretch at
+        all.  0 switches the rule off.
+        """
+        return max(self.introduce_mm, self.near_mm) if self.introduce_mm > 0.0 else 0.0
 
 
 def _flatten(runs: list[Run]) -> list[np.ndarray]:

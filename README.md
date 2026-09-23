@@ -446,7 +446,10 @@ From start to finish:
    tool's straight line and costed under `--linear-speed-mm-s`; a `PTP` one is checked
    along the joint chord. A replacement that would swallow near waypoints into a joint
    move with both ends outside the band is refused, so the passes cannot dissolve a
-   near-panel stretch into one long joint arc. `--linear-crossing-penalty-s` adds a flat
+   near-panel stretch into one long joint arc. Nor may they grow one outward: a
+   replacement that is `LIN` and has an end further than `--linear-introduce-mm` from the
+   parts is refused unless the stretch it replaces already reached in from that far, so
+   the approach to the band stays joint motion. `--linear-crossing-penalty-s` adds a flat
    cost each time a move enters the band from outside.
 6. **Split.** Consecutive moves under the same profile become one phase.
 7. **Verify.** Every move is swept along the path its profile implies. A failure discards
@@ -497,8 +500,15 @@ finds nothing within that it returns the probe distance itself. So a state count
 only when its reading is at or under `--near-panel-mm` *and* short of the probe; a reading at
 the probe means nothing was found, not that something is exactly that far away. The probe
 is sized to `--near-panel-mm` plus 25 mm, so every state inside the band is measured
-properly. It can grow during a run — a fallback-pose search widens it to
-`--fallback-distance-mm` — but it never drops below the band, so that changes no label.
+properly. `--linear-introduce-mm` is read by the same test, so the probe is sized past
+whichever of the two is the wider — 145 mm at the defaults. It can grow further during a
+run — a fallback-pose search widens it to `--fallback-distance-mm` — but it never drops
+below the band, so that changes no label.
+
+Past the probe every state reads the same, which is why the introduce limit is a yes-or-no
+and not a ranking: a state 130 mm clear and one a metre clear are both simply out of
+range, and a rule that compared one overreach against another would be comparing two
+readings that carry no distance.
 
 Until this was fixed the probe was sized to exactly `--near-panel-mm`, and a saturated
 reading passed the "at or under" test. Every state read as near, legs reported 100% in
@@ -1023,6 +1033,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--near-panel-mm` | 50 | clearance at or under which a waypoint is in the band |
 | `--near-panel-min-mm` | 100 | a leg earns `LIN` moves if an unbroken near stretch covers this much tool travel |
 | `--near-panel-min-pct` | 60 | ...or if this share of the leg is near |
+| `--linear-introduce-mm` | 120 | clearance above which the passes may not introduce `LIN` motion that was not already there; 0 for no limit |
 | `--linear-crossing-penalty-s` | 100 | costing-only surcharge on each move entering the band |
 | `--min-shell-mm` | 10 | drop collision shells smaller than this |
 | `--max-shells` | 1500 | cap convex shells per link |

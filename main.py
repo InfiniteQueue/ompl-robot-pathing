@@ -376,6 +376,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "out linear however completely it runs alongside the panel -- a hop "
                         "from one weld to the next being the case that matters. 0 leaves "
                         "--near-panel-min-mm as the only test (default: %(default)g)")
+    #HOW FAR OUT LINEAR MOTION MAY BE CREATED
+    p.add_argument("--linear-introduce-mm", type=float, default=120.0, metavar="MM",
+                   help="clearance above which the optimisation passes may not introduce "
+                        "linear motion that was not already there. A move is linear when "
+                        "either of its ends is inside --near-panel-mm, which says nothing "
+                        "about where the other end is, so a shortcut that cuts from a "
+                        "state well clear of the parts straight to one against them "
+                        "creates a single straight move the robot must have collision-free "
+                        "inverse kinematics along for its whole length and flies under "
+                        "--linear-speed-mm-s all the way in. This caps how far out such a "
+                        "move may start: a replacement reaching in from beyond this is "
+                        "refused unless the stretch it replaces already did the same, so "
+                        "reaches the route arrived with survive being shortened, thinned "
+                        "and relocated while no pass can create one. Never read as less "
+                        "than --near-panel-mm, since a move with both ends in the band is "
+                        "linear wherever it runs and has nothing to introduce. 0 places no "
+                        "limit (default: %(default)g)")
     #PRICE OF REACHING INTO THE BAND FROM OUTSIDE IT
     p.add_argument("--linear-crossing-penalty-s", type=float, default=100.0,
                    metavar="SECONDS",
@@ -873,6 +890,9 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if not 0.0 <= args.stop_time_weight <= 2.0:
         print("error: --stop-time-weight must be between 0 and 2", file=sys.stderr)
         return 2
+    if args.linear_introduce_mm < 0.0:
+        print("error: --linear-introduce-mm cannot be negative", file=sys.stderr)
+        return 2
 
     try:
         if args.stepped_penalty:
@@ -985,6 +1005,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         near_panel_min_pct=args.near_panel_min_pct,
         linear_speed_mm_s=args.linear_speed_mm_s,
         linear_crossing_penalty_s=args.linear_crossing_penalty_s,
+        linear_introduce_mm=args.linear_introduce_mm,
         weld_clearance_mm=args.weld_clearance_mm,
         stand_off_search=args.weld_shift_search,
         stand_off_scan_mm=args.weld_shift_scan_mm,
