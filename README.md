@@ -39,7 +39,12 @@ The generated directories are safe to delete; they are rebuilt on the next run.
    which the arm folds the gun back against in ordinary poses. Any other pair that reads as in contact in the start pose is re-measured
    against the raw concave meshes: a pair that merely grazes keeps its collision check
    under a corrected margin, and only a genuine overlap is disabled. Both outcomes are
-   reported in the run log. Contact between the robot or gun and the panels or tooling is
+   reported in the run log. The same measurement is then made at **every input waypoint**,
+   at each gun opening it could be reached at, because the gap between what the hulls read
+   and what the CAD reads belongs to the pose rather than to the pair: the gun is only
+   refined near the TCP, so a contact at its far end is measured against very coarse hulls.
+   A pair is loosened until it clears at each waypoint the raw geometry says is clear, and
+   never tightened. Contact between the robot or gun and the panels or tooling is
    never waived this way -- a study that starts inside the parts is rejected with the
    offending pairs and their overlaps.
 4. **Planning** (`planning.py`, `cartesian.py`, `toolpath.py`, `fallback/`). Each transit
@@ -70,7 +75,10 @@ make the difference between planning working and not working at all:
   approximating a link's *own* geometry, which is a self-collision concern, so it is
   applied only to link-against-link pairs. Against the panels and tooling the margin is
   `--obstacle-clearance-mm` instead, which defaults to 5 mm of clear air; 0 would mean
-  the robot either clears the part or hits it. Both figures are printed at load.
+  the robot either clears the part or hits it. Both figures are printed at load. That
+  tolerance is spent against the *raw* geometry: the hulls over-read contact on the gun's
+  coarser regions, so a pair that trips is re-measured before it is believed — at the start
+  pose and at every input waypoint, as the collision-matrix step above describes.
 * **Raw meshes are far too slow.** Checking the CAD meshes as concave geometry costs
   ~708 ms per discrete collision check, so the sampling planner exhausts its time budget
   having explored almost nothing. Convex geometry costs 1–2 ms.

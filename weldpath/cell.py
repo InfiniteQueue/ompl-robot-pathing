@@ -1166,6 +1166,111 @@ def _obstacle_margins(man: Manifest) -> list[tuple[str, str]]:
     return [(link.name, s) for link in man.all_links() if link.mesh for s in statics]
 
 
+def _waypoint_openings(man: Manifest, loc) -> list[float]:
+    """Gun openings an input waypoint is worth measuring the internal clearances at.
+
+    A weld's opening is process data and the only one it will ever be reached at.  A via
+    declares none, and the planner is free to open or close the gun to get there, so the
+    openings it would try are measured too -- the moving tip's contacts change with every
+    one of them.
+    """
+    if man.gun_joint is None:
+        return [0.0]
+    if loc.is_weld:
+        return [float(loc.gun_opening_arrive)]
+    widest = man.gun_opening_max
+    out: list[float] = []
+    for value in (0.0, widest, widest / 2.0):
+        value = min(max(float(value), 0.0), widest)
+        if not any(abs(value - seen) < 1e-9 for seen in out):
+            out.append(value)
+    return out
+
+
+def _relax_at_waypoints(cell: Cell, man: Manifest, collision: dict[str, str], out_dir: str,
+                        obstacle: set[tuple[str, str]], margin: float,
+                        overrides: dict[tuple[str, str], float],
+                        disabled: list[tuple[str, str]], start: np.ndarray, log) -> None:
+    """Measure the internal pairs that trip at each input waypoint, and loosen by what the
+    hulls over-read there.
+
+    The start-pose pass above shifts a pair's margin by the hull inflation it measures --
+    the gap between what the hulls read and what the raw CAD reads -- so the pair still
+    trips at the same *true* overlap, ``contact_ok_distance_mm``.  That inflation is a
+    property of the pose, not of the pair: which part of the gun approaches the arm
+    changes as the arm folds, and the gun is only refined within ``--shell-split-tcp-prox``
+    of the TCP, so a contact at its far end is measured against very coarse hulls.  Read at
+    the start pose alone, the shift is right there and nowhere else.  Measured on Path 3's
+    via112: hulls read -23.4 mm against the arm where the raw meshes read -6.1 mm, well
+    inside the 16 mm tolerated, and the locator was refused as unplaceable.
+
+    So every waypoint the study asks for is measured as well, at each gun opening it could
+    be reached at, and a pair is loosened until it clears there.  Loosened, never tightened:
+    a pose that is genuinely clear on the raw geometry has to survive the check, and holding
+    the pair to another pose's smaller inflation would refuse it again, which is the failure
+    this exists to fix.  The cost is that where the inflation is smaller the pair now
+    tolerates more true overlap than ``contact_ok_distance_mm``, by the difference between
+    the two inflations.  Every pair that is loosened is named in the log with the waypoint
+    and the two readings behind it.
+
+    A waypoint whose pairs already clear under the margins settled so far is not measured
+    again, so what a pair ends up at depends on the order the waypoints are read in -- the
+    first pose that needs it sets it, and later poses only loosen it further if they still
+    read in contact.  Every measured waypoint clears either way; this only decides how much
+    of the raw-mesh measuring is skipped.
+
+    Pairs against the panels and tooling are never touched, here or anywhere: a waypoint
+    is not evidence that the robot may sit inside a part.  A pair whose raw geometry really
+    does overlap by more than the tolerance is left alone too, so the waypoint still fails,
+    now with an honest reading behind it.
+    """
+    if not man.locators:
+        return
+    waived = {tuple(sorted(p)) for p in disabled}
+    previous = cell.gun_value
+    log("measuring the internal clearances at each input waypoint; a pair the hulls "
+        "over-report can refuse a waypoint the raw geometry clears")
+    try:
+        for loc in man.locators:
+            for opening in _waypoint_openings(man, loc):
+                cell.set_gun_opening(opening)
+                q = cell.solve_pose(loc.pose_world, [start], require_collision_free=False)
+                if q is None:
+                    continue            # out of reach: a reachability problem, not this one
+                # Only what is still in contact under the margins settled so far, and only
+                # the robot's own geometry.
+                hits = {p: d for p, d in cell.contact_pairs(q).items()
+                        if p not in obstacle and p not in waived
+                        and d < overrides.get(p, margin)}
+                if not hits:
+                    continue
+                log(f"  '{loc.name}' at {opening:g} mm: "
+                    f"{', '.join(f'{a} <-> {b}' for a, b in sorted(hits))} reads in "
+                    f"contact; re-measuring against the raw concave meshes")
+                exact = _exact_contacts(man, collision, out_dir, sorted(hits),
+                                        cell._state_values(q), cell._state_names, log)
+                for (a, b), hull in sorted(hits.items(), key=lambda kv: kv[1]):
+                    if (a, b) not in exact:
+                        continue        # unmeasurable, already reported
+                    true_d = exact[(a, b)]
+                    if true_d < margin:
+                        log(f"  ! {a} <-> {b} really overlaps {-true_d * 1000:.1f} mm at "
+                            f"'{loc.name}' with the gun at {opening:g} mm, past the "
+                            f"{-margin * 1000:.1f} mm tolerated; left on its own margin")
+                        continue
+                    # Only ever looser: a pose the hulls happen to under-read is no reason
+                    # to tighten a pair another pose needs.
+                    wanted = margin + min(0.0, hull - true_d)
+                    if wanted < overrides.get((a, b), margin):
+                        overrides[(a, b)] = wanted
+                        log(f"  margin: {a} <-> {b} set to {wanted * 1000:.1f} mm for "
+                            f"'{loc.name}' at {opening:g} mm (hulls read "
+                            f"{hull * 1000:.1f} mm, exact geometry {true_d * 1000:.1f} mm)")
+    finally:
+        cell.gun_value = previous
+        cell._state = None
+
+
 def _apply_margins(env: Environment, man: Manifest, default: float,
                    overrides: dict[tuple[str, str], float] | None = None,
                    obstacle_clearance: float = 0.0) -> None:
@@ -1331,6 +1436,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         "of the scene and the slowest one")
     always = cell.contact_pairs(start)
     obstacle = {tuple(sorted(p)) for p in _obstacle_margins(man)}
+    disable: list[tuple[str, str]] = []
     if always:
         if export_dir:
             _export_start_contacts(cell, man, export_dir, start, sorted(always), log)
@@ -1342,7 +1448,6 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         # itself holds the gun joint at zero.
         exact = _exact_contacts(man, collision, out_dir, sorted(always),
                                 cell._state_values(start), cell._state_names, log)
-        disable: list[tuple[str, str]] = []
         fatal: list[tuple[str, str, float]] = []
         for (a, b), hull in sorted(always.items(), key=lambda kv: kv[1]):
             if (a, b) not in exact:
@@ -1391,6 +1496,11 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
                 "of the approximation. Collisions against the parts are never waived -- "
                 "fix the start pose or the part placement in the study and re-import.")
 
+    # -- the same measurement at every input waypoint ----------------------------------
+    _relax_at_waypoints(cell, man, collision, out_dir, obstacle, margin, overrides,
+                        disable, start, log)
+
+    if disable or overrides:
         pairs = pairs + [(a, b, "InContactAtStart") for (a, b) in disable]
         log("  reloading the scene with the generated collision matrix; the broadphase is "
             "built a second time")
