@@ -107,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     #COLLISION JOINT STEP RESOLUTION
     p.add_argument("--check-step-deg", type=float, default=3.0,
                    help="joint-space resolution used when checking a move for collision; "
-                        "smaller is safer and slower (default: 3)")
+                        "smaller is safer and slower (default: %(default)g)")
     #COLLISION STEP RESOLUTION AT THE TOOL
     p.add_argument("--check-step-mm", type=float, default=7.0, metavar="MM",
                    help="tool-space companion to --check-step-deg, applied as well as it "
@@ -120,7 +120,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "a straight move is checked at are spaced by this too, so one "
                         "number decides how far the tool may travel between samples "
                         "whichever profile is in force. 0 turns this off, which drops "
-                        "both back to --check-step-deg alone (default: 7)")
+                        "both back to --check-step-deg alone (default: %(default)g)")
     #COLLISION CHECK RESOLUTION
     p.add_argument("--ompl-continuous-check", type=boolean, nargs="?", const=True,
                    default=False, metavar="BOOL",
@@ -134,7 +134,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "no gap to step over, at a higher cost per test. Off by "
                         "default: OMPL's budget is what limits a hard cell, so "
                         "this can buy fewer solutions found for fewer rejected "
-                        "(default: off)")
+                        "(default: %(default)s)")
     p.add_argument("--segment-length-rad", type=float, default=0.01, #was 0.05
                    help="collision checking resolution for the sampling planner "
                         "(default: %(default)g)")
@@ -148,20 +148,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "planner returns whichever route it stumbles on first, and no "
                         "later pass can move a route to the other side of an obstacle, so "
                         "this is the only stage that can choose between them "
-                        "(default: 25)")
+                        "(default: %(default)g)")
     #PHASE ONE RUN TIME
     p.add_argument("--phase-one-solve-seconds", type=float, default=25.0,
                    metavar="SECONDS",
                    help="how long one phase-one run may search before giving up. Every "
                         "run costs this long in the worst case, so it multiplies with "
-                        "--phase-one-runs (default: 25)")
+                        "--phase-one-runs (default: %(default)g)")
     #PHASE TWO: FIND ANY ROUTE AT ALL
     p.add_argument("--phase-two-max-runs", type=int, default=8, metavar="N",
                    help="most sampling-planner runs allowed in phase two, which is "
                         "entered only when phase one found nothing at all. Phase two "
                         "stops at the first solution rather than sampling for a better "
                         "one; if it too comes back empty the transit is retried through "
-                        "the fallback poses, starting again from phase one (default: 8)")
+                        "the fallback poses, starting again from phase one (default: %(default)g)")
     #PHASE TWO RUN TIME
     p.add_argument("--phase-two-solve-seconds", type=float, default=45.0,
                    metavar="SECONDS",
@@ -169,7 +169,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "--phase-one-solve-seconds: a transit that beat phase one is "
                         "usually one where restarting wastes the tree built so far, so a "
                         "longer single search helps where another short one does not "
-                        "(default: 45)")
+                        "(default: %(default)g)")
     #CARTESIAN TREE, BETWEEN THE TWO PHASES
     p.add_argument("--cartesian-solve-seconds", "--cartesian-seconds", type=float,
                    default=120.0, metavar="SECONDS", dest="cartesian_solve_seconds",
@@ -202,20 +202,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "extends explore reliably but grow the tree slowly; long ones "
                         "cover ground but are refused whole the moment any station on "
                         "them fails, wasting the inverse kinematics already spent on the "
-                        "stations before it (default: 80)")
+                        "stations before it (default: %(default)g)")
     #HOW FAR OUTSIDE THE ENDPOINTS IT LOOKS
     p.add_argument("--cartesian-margin-mm", type=float, default=200.0, metavar="MM",
                    help="how far outside the box spanned by the two endpoints the tree "
                         "samples for a way round. A detour has to leave the straight line "
                         "to be worth finding, but one that leaves it by more than the "
-                        "fixture is deep is not a detour (default: 200)")
+                        "fixture is deep is not a detour (default: %(default)g)")
     #HOW FAR THE TOOL MAY BE TURNED OFF THE DIRECT INTERPOLATION
     p.add_argument("--cartesian-tilt-deg", type=float, default=45.0, metavar="DEG",
                    help="how far off the interpolation between the two endpoint "
                         "orientations a sampled orientation may be turned. A tool square "
                         "to the panel at a weld is square to it most of the way in, and "
                         "sampling orientations freely would spend nearly the whole budget "
-                        "on ones no route uses (default: 45)")
+                        "on ones no route uses (default: %(default)g)")
     #GIVE THE OUT-OF-BAND PART OF A CARTESIAN ROUTE BACK TO OMPL
     p.add_argument("--cartesian-recut", type=boolean, nargs="?", const=True, default=True,
                    metavar="BOOL",
@@ -231,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "stretches keep the states the tree validated. A stretch whose "
                         "straight joint move is already clear takes that move and spends "
                         "no runs; one the planner cannot join keeps its Cartesian states, "
-                        "so this can only cost time, never a route (default: true)")
+                        "so this can only cost time, never a route (default: %(default)s)")
     p.add_argument("--extra-gun-openings", type=int, default=2, metavar="N",
                    help="further gun openings to try on a transit, beyond the departure "
                         "and arrival openings and the closed, widest and half-open ones "
@@ -239,13 +239,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "no opening has been tried in yet, so the openings spread over "
                         "the gun's travel rather than clustering. They are tried last, "
                         "after every named opening has failed, and each one costs a "
-                        "further pass over the fallback poses (default: 2)")
+                        "further pass over the fallback poses (default: %(default)g)")
     p.add_argument("--gun-opening-round-mm", type=float, default=5.0, metavar="MM",
                    help="multiple that --extra-gun-openings values are rounded to, so "
                         "that the program commands round figures. An opening that rounds "
                         "onto one already being tried is dropped, so a coarse setting "
                         "over a narrow range yields fewer openings than asked for. 0 "
-                        "rounds nothing (default: 5)")
+                        "rounds nothing (default: %(default)g)")
     #FALLBACK POSES
     #HOW FAR A FALLBACK POSE STAYS OFF THE PARTS
     p.add_argument("--fallback-distance-mm", type=float, default=100.0, metavar="MM",
@@ -254,13 +254,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "the convex hulls the planner collides against. A pose that is "
                         "merely collision free is not enough: the point of routing a "
                         "difficult transit through one is that the arm has room to "
-                        "manoeuvre when it gets there (default: 100)")
+                        "manoeuvre when it gets there (default: %(default)g)")
     #HOW FAR EACH SEARCH STEP MOVES
     p.add_argument("--fallback-step-mm", type=float, default=40.0, metavar="MM",
                    help="distance each step of the fallback-pose search moves the tool, "
                         "for every method that searches by stepping. Smaller finds a pose "
                         "closer in and costs more inverse-kinematics solves to reach the "
-                        "same distance out (default: 40)")
+                        "same distance out (default: %(default)g)")
     #EFFORT ONCE THE PREFERRED ANSWER HAS FAILED
     p.add_argument("--fallback-runs", type=int, default=3, metavar="N",
                    help="sampling-planner runs allowed per phase once the preferred gun "
@@ -271,7 +271,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "then the question is whether there is a route at all. 0 spends "
                         "the full --phase-one-runs and --phase-two-max-runs everywhere, "
                         "which is roughly 35 minutes on a transit that ends up failing "
-                        "against about 8 at the default (default: 3)")
+                        "against about 8 at the default (default: %(default)g)")
     #endregion
     #region ###OPTIMISATION###
 
@@ -282,7 +282,7 @@ def build_parser() -> argparse.ArgumentParser:
     #SHORTCUT PASS TIME
     p.add_argument("--shortcut-seconds", type=float, default=20.0, metavar="SECONDS",
                    help="time budget for shortcutting each freespace transit; longer "
-                        "budgets keep shortening with diminishing returns (default: 20)")
+                        "budgets keep shortening with diminishing returns (default: %(default)g)")
     #POLISH PASS TIME
     p.add_argument("--polish-seconds", type=float, default=50.0, metavar="SECONDS",
                    help="time budget for the final pass over each transit's emitted "
@@ -290,7 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "stop-to-stop time the robot really pays for each one. The "
                         "earlier passes work on a densified path where a waypoint is a "
                         "sampling artefact rather than a stop; this one does not "
-                        "(default: 50)")
+                        "(default: %(default)g)")
     #POLISH PASS MINIMUM ATTEMPTS
     p.add_argument("--polish-min-attempts", type=int, default=20, metavar="N",
                    help="fewest relocation attempts the polish pass must make on a "
@@ -303,20 +303,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "attempt costs a collision check along a Cartesian line. Does "
                         "not override a caller declining the pass: --no-shortcut and a "
                         "leg deferring its refinement still skip it entirely. 0 leaves "
-                        "the clock in sole charge (default: 20)")
+                        "the clock in sole charge (default: %(default)g)")
     #HOW FAR A RELOCATION MOVES A WAYPOINT
     p.add_argument("--relocate-min-mm", type=float, default=5.0, metavar="MM",
                    help="shortest displacement the polish pass tries when "
                         "relocating a waypoint, as approximate tool travel rather than "
                         "joint angle. Below the resolution at which a move changes "
                         "anything, an attempt is a collision check spent to learn "
-                        "nothing (default: 5)")
+                        "nothing (default: %(default)g)")
     p.add_argument("--relocate-max-mm", type=float, default=75.0, metavar="MM",
                    help="longest displacement that pass tries. This is what lets a "
                         "waypoint leave the neighbourhood it was sampled in, so it has "
                         "to cover the distance from a route to the one beside it; too "
                         "small and polish can only ever tidy the route it was given "
-                        "(default: 75)")
+                        "(default: %(default)g)")
     #SHAPE OF THE DRAW BETWEEN THEM
     p.add_argument("--relocate-exponent", type=float, default=2, metavar="E",
                    help="shape of the distance draw between --relocate-min-mm and "
@@ -325,7 +325,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "likely. Above 1 crowds the draw towards the minimum, spending "
                         "most attempts probing around a waypoint rather than throwing it "
                         "across the cell, which suits a route already near its answer; "
-                        "below 1 crowds it towards the maximum (default: 2)")
+                        "below 1 crowds it towards the maximum (default: %(default)g)")
     #endregion
     #region ###WAYPOINT CONSTRAINTS###
     #ENABLE THE JOINT 5 STOP BAND
@@ -334,7 +334,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="forbid waypoints from stopping with joint 5 within "
                         "--j5-stop-band-deg of zero; moves may still pass through that band "
                         "between waypoints. false lets waypoints stop with joint 5 anywhere "
-                        "in its range (default: true)")
+                        "in its range (default: %(default)s)")
     #HOW CLOSE TO ZERO JOINT 5 MAY STOP
     p.add_argument("--j5-stop-band-deg", type=float, default=15.0, metavar="DEG",
                    help="smallest magnitude joint 5 may hold at a waypoint. Enforced "
@@ -342,7 +342,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "joint 5 just outside the band, whichever is quicker; a route "
                         "where neither is collision free is refused like any other failed "
                         "route. Locator poses prefer an IK solution outside the band and "
-                        "are warned about when none exists (default: 15)")
+                        "are warned about when none exists (default: %(default)g)")
     #endregion
     #region ###LINEAR MOTION NEAR THE PARTS###
     #DISABLE LINEAR MOTION NEAR THE PARTS
@@ -356,7 +356,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="clearance from a panel or from tooling at or under which a "
                         "transit counts as working near the parts, and is re-planned as "
                         "linear motion. Larger means more of the route comes out linear, "
-                        "which is more predictable and slower to execute (default: 50)")
+                        "which is more predictable and slower to execute (default: %(default)g)")
     #SHORTEST STRETCH WORTH MAKING LINEAR
     p.add_argument("--near-panel-min-mm", type=float, default=100.0, metavar="MM",
                    help="shortest near-panel stretch worth converting, measured as tool "
@@ -364,7 +364,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "moment is not working near the panel, and cutting it in three to "
                         "say so costs a stop at each end for nothing. A stretch under "
                         "this length still qualifies on --near-panel-min-pct "
-                        "(default: 100)")
+                        "(default: %(default)g)")
     #...OR THIS MUCH OF THE MOVE, HOWEVER SHORT
     p.add_argument("--near-panel-min-pct", type=float, default=60.0, metavar="PCT",
                    help="if this much of a move is within --near-panel-mm of the parts, "
@@ -375,7 +375,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "the move either side of it. Without this no short move could come "
                         "out linear however completely it runs alongside the panel -- a hop "
                         "from one weld to the next being the case that matters. 0 leaves "
-                        "--near-panel-min-mm as the only test (default: 60)")
+                        "--near-panel-min-mm as the only test (default: %(default)g)")
     #PRICE OF REACHING INTO THE BAND FROM OUTSIDE IT
     p.add_argument("--linear-crossing-penalty-s", type=float, default=100.0,
                    metavar="SECONDS",
@@ -395,23 +395,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "on one side of the comparison and does not cancel. A costing "
                         "figure and nothing else: not time the robot spends, absent from "
                         "the exported cycle time, and not scaled by the clearance "
-                        "penalty. 0 charges nothing (default: 100)")
+                        "penalty. 0 charges nothing (default: %(default)g)")
     #endregion
     #region ###COLLISION HULLS###
     #DROP TINY SHELLS
     p.add_argument("--min-shell-mm", type=float, default=10.0,
                    help="drop collision shells smaller than this across their bounding "
-                        "box diagonal (default: 10)")
+                        "box diagonal (default: %(default)g)")
     #SHELL COUNT CAP PER LINK
     p.add_argument("--max-shells", type=int, default=1500,
                    help="keep at most this many convex shells per link; fewer is faster "
-                        "but coarser (default: 1500)")
+                        "but coarser (default: %(default)g)")
     #HULL REFINEMENT CELL SIZE
     p.add_argument("--hull-cell-mm", type=float, default=50.0, metavar="MM",
                    help="split shells that a single convex hull fits badly into cells of "
                         "roughly this size, hulling each one, so the collision geometry "
                         "follows recesses instead of bridging them. Smaller is more "
-                        "accurate and slower; 0 disables (default: 50)")
+                        "accurate and slower; 0 disables (default: %(default)g)")
     #HOW COARSE THE GEOMETRY AWAY FROM THE WELDS AND THE TCP GETS
     p.add_argument("--far-cell-mm", type=float, default=300.0, metavar="MM",
                    help="cell size used beyond --shell-split-weld-prox and "
@@ -421,69 +421,69 @@ def build_parser() -> argparse.ArgumentParser:
                         "and tightening the near side is no reason for the far side to "
                         "follow it down. 0 makes each far shell a single hull, which is "
                         "coarser still and can bridge back across the welds "
-                        "(default: 300)")
+                        "(default: %(default)g)")
     #WHEN A SHELL NEEDS REFINING AT ALL
     p.add_argument("--hull-fill", type=float, default=0.85, metavar="F",
                    help="how much of its own bounding box a shell must fill before a "
                         "single hull is accepted for it; below this it is split by "
                         "--hull-cell-mm. Raise it towards 1 for geometry whose recesses "
                         "matter, such as panelling full of shallow bowls that a hull "
-                        "would skin over (default: 0.85)")
+                        "would skin over (default: %(default)g)")
     #CELL SIZE: ARM
     p.add_argument("--robot-cell-mm", type=float, default=0, metavar="MM",
                    help="--hull-cell-mm for the arm's own links. The arm never comes close "
                         "enough to the parts for hull error to decide anything, so this is "
-                        "the first thing to switch off (default: 0, i.e. off)")
+                        "the first thing to switch off (default: %(default)g, i.e. off)")
     #FAR CELL SIZE: ARM
     p.add_argument("--robot-far-cell-mm", type=float, default=0, metavar="MM",
                    help="--far-cell-mm for the arm's own links. Inert while "
                         "--robot-cell-mm is 0, since nothing on the arm is refined at all "
-                        "(default: 0, i.e. one hull)")
+                        "(default: %(default)g, i.e. one hull)")
     #CELL SIZE: GUN
     p.add_argument("--gun-cell-mm", type=float, default=60, metavar="MM",
                    help="--hull-cell-mm for the gun body and moving tip. Reduces "
-                        "webbing around the electrodes at lower values (default: 60)")
+                        "webbing around the electrodes at lower values (default: %(default)g)")
     #FAR CELL SIZE: GUN
     p.add_argument("--gun-far-cell-mm", type=float, default=360, metavar="MM",
                    help="--far-cell-mm for the gun body and moving tip, i.e. the part of "
                         "the gun further than --shell-split-tcp-prox from the tool centre "
                         "point. The C-frame and the servo behind it never approach "
-                        "anything the electrodes have not reached first (default: 360)")
+                        "anything the electrodes have not reached first (default: %(default)g)")
     #CELL SIZE: TOOLING
     p.add_argument("--tooling-cell-mm", type=float, default=30, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls tooling. "
                         "These are the largest meshes in the cell and refinement runs "
                         "after --max-shells, so a small cell here dominates both "
-                        "preparation and every later collision check (default: 30)")
+                        "preparation and every later collision check (default: %(default)g)")
     #FAR CELL SIZE: TOOLING
     p.add_argument("--tooling-far-cell-mm", type=float, default=250, metavar="MM", #from 150
                    help="--far-cell-mm for static objects the manifest calls tooling. "
                         "These are the largest meshes in the cell, so this is the value "
-                        "that decides most of the shell count (default: 250)")
+                        "that decides most of the shell count (default: %(default)g)")
     #CELL SIZE: PANELS
     p.add_argument("--panel-cell-mm", type=float, default=20, metavar="MM",
                    help="--hull-cell-mm for static objects the manifest calls panel. This "
                         "is the geometry that is concave exactly where the welds are, so "
-                        "it is where a small cell is worth paying for (default: 20)")
+                        "it is where a small cell is worth paying for (default: %(default)g)")
     #FAR CELL SIZE: PANELS
     p.add_argument("--panel-far-cell-mm", type=float, default=40, metavar="MM",
                    help="--far-cell-mm for static objects the manifest calls panel. The "
                         "part of a panel away from every weld still has to be traversed, "
                         "so it is worth keeping finer than the tooling around it "
-                        "(default: 40)")
+                        "(default: %(default)g)")
     #BEND SPLITTING: PANELS
     p.add_argument("--split-panel-bends", type=boolean, nargs="?", const=True, default=True,
                    metavar="BOOL",
                    help="split each panel cell near a weld again wherever the sheet in it "
                         "bends, so a hull cannot fill the corner between a flat face and "
                         "the slope rising out of it; a cell size only limits how far such "
-                        "a bridge reaches, not whether one forms (default: true)")
+                        "a bridge reaches, not whether one forms (default: %(default)s)")
     p.add_argument("--panel-bend-mm", type=float, default=3.0, metavar="MM",
                    help="how far a panel cell may depart from flat before it counts as "
                         "bent: its thickness along the direction it mostly faces, which is "
                         "also the most its hull can then stand off the sheet. Keep it above "
                         "the thickest stack of sheet, or flat cells read as bent "
-                        "(default: 3)")
+                        "(default: %(default)g)")
     #region ###HULL MERGING###
     #MERGE CELL PER CATEGORY
     p.add_argument("--merge-cell-mm", type=float, default=0, metavar="MM",
@@ -501,7 +501,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "that is, which is the opposite trade from --enclosed-probe-mm. "
                         "How much it adds is bounded by the cell. Applies to every "
                         "category at once; prefer the per-category options "
-                        "(default: 0, i.e. off)")
+                        "(default: %(default)g, i.e. off)")
     p.add_argument("--robot-merge-mm", type=float, default=None, metavar="MM",
                    help="--merge-cell-mm for the arm's own links. The arm never comes "
                         "close to anything, so it tolerates the coarsest merge in the "
@@ -537,7 +537,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "wrongly called sealed is a collision that will not be reported; "
                         "read --enclosed-keep-mm and --export-enclosed before trusting it. "
                         "Applies to every category at once, which is rarely what is "
-                        "wanted; prefer the per-category options (default: 0, i.e. off)")
+                        "wanted; prefer the per-category options (default: %(default)g, i.e. off)")
     p.add_argument("--robot-enclosed-mm", type=float, default=None, metavar="MM",
                    help="--enclosed-probe-mm for the arm's own links (default: unset)")
     p.add_argument("--gun-enclosed-mm", type=float, default=40, metavar="MM",
@@ -545,7 +545,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "geometry the filter was written for: the body is a hollow casing "
                         "packed with internals, and it is only 232 mm across its narrow "
                         "axis on the sample cell, so nothing inside it is far enough from "
-                        "the surface to be culled by margin alone (default: 40)")
+                        "the surface to be culled by margin alone (default: %(default)g)")
     p.add_argument("--tooling-enclosed-mm", type=float, default=None, metavar="MM",
                    help="--enclosed-probe-mm for static objects the manifest calls "
                         "tooling. These are the largest meshes in the cell, so the "
@@ -564,14 +564,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "4 mm gave the same answer to within 2%% of components, at 7.6 s "
                         "against 23 s. Coarsened automatically where a mesh is too large "
                         "for the grid to fit in memory, which is reported when it happens "
-                        "(default: 12)")
+                        "(default: %(default)g)")
     #SIZE BACKSTOP
     p.add_argument("--enclosed-keep-mm", type=float, default=0, metavar="MM",
                    help="never drop a shell whose bounding-box diagonal reaches this, "
                         "however sealed it looks. Something this large reading as "
                         "unreachable is more often a rasterisation the geometry defeated "
                         "than a part sealed inside a casing, and the count is reported so "
-                        "the two can be told apart. 0 removes the backstop (default: 0)")
+                        "the two can be told apart. 0 removes the backstop (default: %(default)g)")
     #INSPECTION
     p.add_argument("--export-enclosed", action="store_true",
                    help="write what the reachability screen discarded to "
@@ -590,7 +590,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "Refinement runs after --max-shells, so confining it is the "
                         "cheapest way to cut shell count without losing accuracy where it "
                         "decides anything. Allow for the approach as well as the weld "
-                        "itself. 0 refines everywhere (default: 60)")
+                        "itself. 0 refines everywhere (default: %(default)g)")
     #TCP PROXIMITY FOR SHELL SPLIT
     p.add_argument("--shell-split-tcp-prox", type=float, default=175.0, metavar="MM",
                    help="only refine the gun body and moving tip within this many mm of "
@@ -609,7 +609,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "that cell's hull contains it -- and the round-off argument for "
                         "it did not survive being measured: see split_by_grid. What it "
                         "does buy is duplicate hulls, a flat face on a cell boundary "
-                        "being claimed whole by both sides (default: 0.00)")
+                        "being claimed whole by both sides (default: %(default)g)")
     #endregion
     #region ###CLEARANCE FROM THE PARTS###
     #CLEARANCE EVERYWHERE
@@ -622,12 +622,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--weld-clearance-mm", type=float, default=0.0, metavar="MM",
                    help="obstacle clearance used instead of --obstacle-clearance-mm on "
                         "any move starting or ending at a weld locator, where the gun "
-                        "has to reach the panel (default: 0)")
+                        "has to reach the panel (default: %(default)g)")
     #BACK THE WELD OFF THE PANEL SURFACE
     p.add_argument("--weld-shift-mm", type=float, default=-5.0, metavar="MM",
                    help="move every weld locator this far along its own z axis before "
                         "planning, backing the tool off a pose authored on the panel "
-                        "surface. Negative retreats along -z (default: -5)")
+                        "surface. Negative retreats along -z (default: %(default)g)")
     #WHEN THE SHIFTED WELD POSE IS BLOCKED
     p.add_argument("--no-weld-shift-search", dest="weld_shift_search", action="store_false",
                    help="fail a weld whose shifted pose is blocked, rather than searching "
@@ -636,11 +636,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--weld-shift-scan-mm", type=float, default=0.5, metavar="MM",
                    help="spacing of that search's first scan; gaps between two blocked "
                         "stand-offs are then halved down to --weld-shift-resolution-mm "
-                        "(default: 0.5)")
+                        "(default: %(default)g)")
     p.add_argument("--weld-shift-resolution-mm", type=float, default=0.05, metavar="MM",
                    help="finest spacing the search goes down to, both looking for a clear "
                         "stand-off and refining one. A clear window narrower than the "
-                        "final spacing can be missed (default: 0.05)")
+                        "final spacing can be missed (default: %(default)g)")
     #endregion
     #region ###CLEARANCE PENALTY###
     #DISABLE CLEARANCE PENALTY
@@ -661,20 +661,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "what gets charged: splitting one move at the edge of a tight "
                         "region lets the clear half escape the tight half's factor. Takes "
                         "true/false (yes/no, on/off, 1/0); passing the flag with no value "
-                        "means true (default: False)")
+                        "means true (default: %(default)s)")
     #PENALTY CURVE START
     p.add_argument("--clearance-penalty-max-mm", type=float, default=100.0, metavar="MM",
                    help="clearance at and above which there is no penalty; the curve "
-                        "starts here (default: 100)")
+                        "starts here (default: %(default)g)")
     #PENALTY CURVE PEAK
     p.add_argument("--clearance-penalty-min-mm", type=float, default=0.0, metavar="MM",
                    help="clearance at and below which the penalty is at its peak "
-                        "(default: 0)")
+                        "(default: %(default)g)")
     #PENALTY PEAK STRENGTH
     p.add_argument("--clearance-penalty-multiplier", type=float, default=8.0,
                    metavar="N",
                    help="peak penalty: a second spent at the minimum clearance costs as "
-                        "much as N seconds in open space (default: 8)")
+                        "much as N seconds in open space (default: %(default)g)")
     #PENALTY CURVE SHAPE
     p.add_argument("--clearance-penalty-exponent", type=float, default=5.0, metavar="Y",
                    help="shape of the climb between --clearance-penalty-max-mm and "
@@ -684,13 +684,13 @@ def build_parser() -> argparse.ArgumentParser:
                         "one clearance from another. Above 1 spends that resolution near "
                         "the minimum, which is what a wide maximum needs if very close is "
                         "not to cost about the same as close; below 1 spends it at the "
-                        "open end instead. Must be above 0 (default: 5)")
+                        "open end instead. Must be above 0 (default: %(default)g)")
     #PENALTY QUERY RANGE
     p.add_argument("--clearance-penalty-cutoff-mm", type=float, default=0.0, metavar="MM",
                    help="ignore clearances beyond this, so the proximity query looks no "
                         "further and planning runs faster. Truncates the shallow end of "
                         "the curve without reshaping the rest, so the penalty steps "
-                        "abruptly at this distance; 0 uses the maximum (default: 0)")
+                        "abruptly at this distance; 0 uses the maximum (default: %(default)g)")
     #endregion
     #region ###STEPPED CLEARANCE PENALTY###
     #USE THE STEPPED CURVE INSTEAD
@@ -700,9 +700,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "power curve above. Every --clearance-penalty-* option is ignored "
                         "when it is on, apart from --no-clearance-penalty, which still "
                         "turns all penalties off. Takes true/false (yes/no, on/off, 1/0); "
-                        "passing the flag with no value means true (default: True)")
+                        "passing the flag with no value means true (default: %(default)s)")
     #STRENGTH AT TOUCHING
-    p.add_argument("--stepped-penalty-multiplier", type=float, default=7.0, metavar="N", #was 7
+    p.add_argument("--stepped-penalty-multiplier", type=float, default=14.0, metavar="N", #was 7
                    help="penalty at zero clearance: a second spent touching costs as much "
                         "as N seconds in open space (default: %(default)g)")
     #WHERE THE PENALTY IS SPENT
@@ -711,9 +711,9 @@ def build_parser() -> argparse.ArgumentParser:
                         "Also how far the proximity query has to see, so lowering it "
                         "speeds planning up (default: %(default)g)")
     #STEP LENGTH
-    p.add_argument("--stepped-penalty-step-mm", type=float, default=3.0, metavar="MM", #was 25
+    p.add_argument("--stepped-penalty-step-mm", type=float, default=1.5, metavar="MM", #was 25
                    help="how much extra clearance counts as one step of falloff "
-                        "(default: 3)")
+                        "(default: %(default)g)")
     #STEP FACTOR
     p.add_argument("--stepped-penalty-step-factor", type=float, default=0.7, metavar="F",
                    help="what one step multiplies the penalty by: 0.7 means each "
@@ -722,7 +722,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "off faster and so concentrates the penalty near the part. Holds "
                         "of the curve's exponential term rather than of the multiplier "
                         "exactly, since a quantity scaled by a constant factor per step "
-                        "never reaches zero (default: 0.7)")
+                        "never reaches zero (default: %(default)g)")
     #endregion
     #region ###VELOCITY PROFILE###
     #JOINT VELOCITY LIMITS
@@ -738,7 +738,23 @@ def build_parser() -> argparse.ArgumentParser:
     #TOOL SPEED CAP ON LINEAR MOVES
     p.add_argument("--linear-speed-mm-s", type=float, default=250.0,
                    help="commanded tool speed cap on linear moves; the joint limits still "
-                        "govern whenever they are slower (default: 250)")
+                        "govern whenever they are slower (default: %(default)g)")
+    #HOW MUCH A STOP COSTS THE OPTIMISER
+    p.add_argument("--stop-time-weight", type=float, default=0.5, metavar="W",
+                   help="how heavily a stop is charged in the time the planner scores "
+                        "routes by, and nowhere else: the exported timing is the real "
+                        "one. Every waypoint is a full stop, so deleting one nearly "
+                        "always scores quicker, and the clearance penalty has only that "
+                        "saving to outweigh when a waypoint holds the route off the "
+                        "parts. Where the moves are too short to reach full speed, "
+                        "splitting one into n equal moves really costs sqrt(n) times as "
+                        "long; it scores sqrt(n)**W, the same at every distance. So 1 is "
+                        "the real timing, below 1 lets waypoints that buy clearance "
+                        "survive simplify and polish more often, 0 charges nothing for "
+                        "stopping, and 2 scores every such move alike. Moves long enough "
+                        "to cruise score their real time. Cruise-only scoring (shortcut "
+                        "on the dense path, ranking raw solver routes) has no stops and "
+                        "is unaffected; 0 to 2 (default: %(default)g)")
     #endregion
     #region ###OUTPUT AND DEBUGGING###
     #WRITE THE PRE-OPTIMISATION PATH TOO
@@ -778,7 +794,7 @@ def build_parser() -> argparse.ArgumentParser:
                         f"and each planned route's waypoints before refinement and after "
                         f"each refinement stage to <directory>/{STAGES_NAME}, replacing "
                         f"the previous run's; false prints to the console only "
-                        f"(default: true)")
+                        f"(default: %(default)s)")
     return p
     #endregion
 
@@ -854,6 +870,9 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
+    if not 0.0 <= args.stop_time_weight <= 2.0:
+        print("error: --stop-time-weight must be between 0 and 2", file=sys.stderr)
+        return 2
 
     try:
         if args.stepped_penalty:
@@ -916,6 +935,12 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+    cell.stop_time_weight = args.stop_time_weight
+    if args.stop_time_weight != 1.0:
+        log(f"route scoring charges stops at weight {args.stop_time_weight:g}: splitting a "
+            f"short move in two scores {2 ** (args.stop_time_weight / 2):.3f}x the whole, "
+            f"against 1.414x real; the exported timing is the real one")
 
     if args.j5_stop_band and args.j5_stop_band_deg > 0.0:
         import math

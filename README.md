@@ -536,6 +536,32 @@ overall. The old figures were optimistic because they charged nothing for stoppi
 still govern whenever they are slower. No Cartesian acceleration is modelled, because the
 manifest supplies none.
 
+`--stop-time-weight` sets how heavily a stop is charged in the time the optimiser scores
+routes by, and nowhere else. Every waypoint is a full stop, so removing one nearly always
+scores quicker, and the clearance penalty only has that saving to outweigh when a waypoint
+holds the route off the parts. Each joint scores
+
+```
+(2v/a) * (d / D) ** (1 - w/2)     d <= D = v^2 / a
+d / v + v / a                     d >  D
+```
+
+and the move takes its slowest joint, as the real timing does. At `w = 1` the first line
+is the real triangular time, `2 * sqrt(d / a)`, and the two lines meet at `2v/a` for any
+`w`. Where every move involved is too short to cruise, splitting one into `n` equal moves
+really takes `sqrt(n)` times as long and scores `sqrt(n) ** w` times, the same at every
+distance: two halves score 1.414x the whole at 1, 1.189x at 0.5 and 1.0x at 0, and `w = 2`
+scores every such move alike. Moves that cruise score their real time. Where the whole move
+cruises and its pieces do not, the ratio falls between the two. The score is subadditive
+for any `w` in 0 to 2, so splitting a move never scores cheaper than making it whole.
+
+Two simpler forms were tried and do not work. Scaling the acceleration limits leaves the
+ratio at sqrt(2) whatever the acceleration, and a penalty that multiplies time sees no
+difference. Blending toward cruise time, `cruise + w * (full - cruise)`, fades on short
+moves, which have almost no cruise: at `w = 0.5` halves scored 1.37x at 5° but 1.28x at
+90°. Cruise-only scores (shortcut's dense path, ranking raw solver routes) have no stops and
+do not change.
+
 ### Joint 3 is coupled to joint 2
 
 A linkage holds link 3 at a fixed angle to the floor as joint 2 moves, so the number the
@@ -1019,6 +1045,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--joint-max-velocity` | 2π/3, J6 11π/9 | per-joint velocity limits, rad/s, comma separated |
 | `--joint-max-acceleration` | 2.5, J6 11 | per-joint acceleration limits, rad/s², comma separated |
 | `--linear-speed-mm-s` | 250 | tool speed cap on `LIN` moves |
+| `--stop-time-weight` | 0.5 | how heavily route scoring charges a stop, 0 to 2; splitting a short move into n scores sqrt(n)**W the whole; below 1 removes fewer waypoints for time |
 | `--unrefined-output` | off | also write `waypoints-unrefined.json`, pre-optimisation |
 | `--probe-point` | off | name the collision hulls containing `LOCATOR:X,Y,Z` and how far the nearest real material is, then stop |
 | `--export-collision-geometry` | off | write the hulls actually collided against, and the blocking pair at each unplaceable locator, to `<dir>/collision_geometry/` |
