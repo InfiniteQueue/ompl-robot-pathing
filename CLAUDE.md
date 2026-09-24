@@ -178,6 +178,14 @@ the way, so the joint values in between are whatever that line demands.
     own factor arithmetic — `MotionModel.cost`, `simplify`'s `polyline_cost`, and both
     sides of `shortcut`'s comparison. Charged on the same footing everywhere or it would
     not cancel where it is supposed to.
+- `Deadline` is the wall clock for one segment, `--segment-minutes` (120). Every other
+  budget bounds a part of the search and they multiply -- runs x seconds x openings x
+  fallback poses x pairs of openings at each pose -- so this is the only figure that bounds
+  a segment with no route. `ran_out` is asked where work is about to start rather than
+  interrupting it, since a run stopped halfway leaves nothing usable, and `clamp` cuts each
+  per-run limit to the time left. What is already found is still ranked, refined and
+  shipped; a segment with nothing raises, and `ToolpathPlanner.run` records the reason and
+  goes on, which is what it already did with a segment that failed outright.
 - **The gun opening is a search variable, not a setting picked before the search.**
   `_opening_lists` builds two lists per leg: `main`, the rotation phase one and the
   Cartesian tree deal their runs round, and `extra`, held back for phase two. Both are

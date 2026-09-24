@@ -464,6 +464,19 @@ split for a gun change is gated and labelled per leg, under that leg's own openi
 final per-phase validation checks each phase under its label, and `output.Timing` holds `LIN`
 moves to the tool speed cap.
 
+**One segment's search is bounded by the clock as well as by its budgets.** Every other
+budget bounds a part of the search — runs, seconds per run, gun openings, fallback poses —
+and they multiply: a transit that fails everywhere spends its phase-one runs at each
+opening, then the Cartesian searches, then phase two, then the whole of that again through
+each fallback pose, then a solve for each ordered pair of openings at each of those poses.
+Each of those numbers is defensible on its own and their product is hours, on a segment
+that may simply have no route. `--segment-minutes` (120) is the figure that bounds it:
+past it nothing further is started, whatever routes are already in hand are still ranked,
+refined and shipped, and a segment with none is recorded with its reason and the run
+carries on to the next — which is what already happens to a segment that fails outright.
+Per-run limits are cut to the time remaining, so the last run stops at the deadline rather
+than a run's length past it.
+
 **Brief contact with the band is ignored, but "brief" is measured two ways.** A sweeping
 transit that clips the band for a moment is not working near the panel, and cutting it into
 three phases to say so would cost a stop at each end for nothing, so `--near-panel-min-mm`
@@ -1057,6 +1070,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--cartesian-recut` | true | cut a Cartesian-tree route where it leaves the band and replan the parts outside it with phases one and two |
 | `--phase-two-max-runs` | 8 | further OMPL runs, stopping at the first solution |
 | `--phase-two-solve-seconds` | 45 | how long one of those runs may search |
+| `--segment-minutes` | 120 | wall clock for one segment's search; past it the segment is reported as failed and the run moves on. 0 removes the limit |
 | `--phase-two-cartesian-runs` | 2 | Cartesian searches spread evenly through phase two, at its own gun openings |
 | `--phase-two-cartesian-seconds` | 30 | how long one of those searches may run |
 | `--min-gun-openings` | 5 | gun openings phase one deals its runs round, the cheapest solution of the set shipping |

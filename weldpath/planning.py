@@ -1232,6 +1232,69 @@ _continuous_warned = False
 
 
 @dataclass
+class Deadline:
+    """How long one segment's search may go on for, whatever it is doing.
+
+    Every budget below this is a budget for a part of the search -- runs, seconds per run,
+    seconds of shortcutting -- and they multiply.  A transit that fails everywhere spends
+    its phase-one runs at each opening, then the Cartesian searches, then phase two, then
+    the whole of that again through each fallback pose, then a solve for each ordered pair
+    of openings at each of those poses.  Every one of those numbers is defensible on its
+    own and the product of them is hours, on a segment that may simply have no route.
+
+    So this is the figure that is actually about the operator's afternoon: past it the
+    search stops where it stands and the segment is reported as one that found no route,
+    which is what the run loop already does with a segment that fails outright -- it logs
+    the reason, records it on the segment and goes on to the next.  Nothing part-built is
+    kept, and nothing already found is thrown away: solutions in hand when the clock runs
+    out are still ranked, refined and shipped.
+
+    ``seconds <= 0`` never expires, which is what everything did before this existed.
+    Measured on the monotonic clock, so it is unaffected by the system clock being set.
+    """
+    seconds: float = 0.0
+    started: float = field(default_factory=time.monotonic)
+
+    @property
+    def unlimited(self) -> bool:
+        return self.seconds <= 0.0
+
+    @property
+    def spent(self) -> float:
+        return time.monotonic() - self.started
+
+    @property
+    def left(self) -> float:
+        return float("inf") if self.unlimited else self.seconds - self.spent
+
+    @property
+    def expired(self) -> bool:
+        return not self.unlimited and self.left <= 0.0
+
+    def clamp(self, seconds: float) -> float:
+        """``seconds``, cut to what is left.
+
+        Applied to every per-run limit, so the last run of a segment stops at the deadline
+        rather than a run's length past it.  A search asked for the time remaining and
+        given none is not started at all -- see ``ran_out``.
+        """
+        return seconds if self.unlimited else max(0.0, min(seconds, self.left))
+
+    def ran_out(self, log, what: str) -> bool:
+        """Whether the clock has gone, saying so once at the point work stopped.
+
+        The caller asks this where it is about to start something, rather than being
+        interrupted partway: a run stopped halfway leaves nothing usable behind, so there
+        is no value in cutting one short beyond not beginning it.
+        """
+        if not self.expired:
+            return False
+        log(f"      {self.seconds / 60:g} minutes spent on this segment, which is the "
+            f"limit; giving up on {what}")
+        return True
+
+
+@dataclass
 class OmplBudget:
     """How many sampling-planner runs a transit gets, and how long each may search.
 
@@ -1421,6 +1484,7 @@ def _plan_via(cell: Cell, qa: np.ndarray, via: np.ndarray, qb: np.ndarray, *,
               shortcut_seconds: float, polish_seconds: float,
               zone: LinearZone | None = None,
               openings: "GunOpenings | None" = None,
+              deadline: "Deadline | None" = None,
               relocate: "Relocation | None" = None, log=print,
               record: list | None = None) -> list[Run]:
     """A route from ``qa`` to ``qb`` by way of ``via``, all at the one gun opening.
@@ -1443,11 +1507,12 @@ def _plan_via(cell: Cell, qa: np.ndarray, via: np.ndarray, qb: np.ndarray, *,
     first, _ = _plan_direct(cell, qa, via, ompl=ompl, segment_length=segment_length,
                             check_step=check_step, continuous_check=continuous_check,
                             shortcut_seconds=0.0, polish_seconds=0.0,
-                            openings=openings, log=log, record=halves)
+                            openings=openings, deadline=deadline, log=log, record=halves)
     second, _ = _plan_direct(cell, via, qb, ompl=ompl, segment_length=segment_length,
                              check_step=check_step, continuous_check=continuous_check,
                              shortcut_seconds=0.0, polish_seconds=0.0,
-                             openings=openings, log=log, record=halves)
+                             openings=openings, deadline=deadline, log=log,
+                             record=halves)
     if len(halves) == 2:
         _capture(record, halves[0] + halves[1][1:])
     # Refine the joined route rather than each leg: the detour through the fallback
@@ -1471,6 +1536,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    zone: LinearZone | None = None,
                    cartesian: "CartesianBudget | None" = None,
                    relocate: "Relocation | None" = None,
+                   deadline: "Deadline | None" = None,
                    record: list | None = None,
                    log=print) -> list[tuple[list[Run], float | None]]:
     """Plan a transit, choosing a gun opening for it when the natural one will not do.
@@ -1502,6 +1568,13 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     transit -- see ``OmplBudget.capped``.  That tail is where nearly all of the worst case
     sits, and it is also where the full budget buys least.
 
+    ``deadline`` is the wall clock for this segment.  Every budget here is a budget for
+    a part of the search and they multiply, so it is the one figure that bounds what a
+    transit with no route can cost: past it nothing further is started, whatever is
+    already in hand is still refined and shipped, and a transit with nothing in hand
+    raises like any other failure -- the caller's loop records it and moves on to the next
+    segment.
+
     ``fallback_via`` is either the poses to detour through or a zero-argument callable
     returning them.  The callable form exists because finding them is now a search of its
     own -- see :mod:`weldpath.fallback` -- and most transits solve directly and never need
@@ -1510,6 +1583,19 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     """
     ompl = ompl or OmplBudget()
     reduced = ompl.capped(fallback_runs)
+    deadline = deadline or Deadline()
+
+    def gave_up(exc: PlanningError) -> PlanningError:
+        """The failure to report, naming the clock where that is what stopped it.
+
+        Worth distinguishing: a transit that ran out of time may well have a route, and
+        the segment's log then reads as though none exists.
+        """
+        if not deadline.expired:
+            return exc
+        return PlanningError(
+            f"gave up after {deadline.spent / 60:.0f} minutes, the limit for one "
+            f"segment; the last failure was: {exc}")
 
     def lists(*poses) -> GunOpenings:
         return _opening_lists(cell, openings, list(poses), main_count=main_openings,
@@ -1531,7 +1617,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                      shortcut_seconds=shortcut_seconds,
                                      polish_seconds=polish_seconds,
                                      zone=zone, cartesian=cartesian, relocate=relocate,
-                                     openings=direct, log=log, record=raw)
+                                     openings=direct, deadline=deadline, log=log,
+                                     record=raw)
         if record is not None:
             record.extend(raw)
         return [(runs, opening)]
@@ -1539,6 +1626,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
         log(f"      no direct route over {_openings_note(direct.all)}: {exc}")
         last = exc
 
+    if deadline.ran_out(log, "this segment before looking for a fallback pose"):
+        raise gave_up(last)
     poses = list((fallback_via() if callable(fallback_via) else fallback_via) or [])
     if not poses:
         raise last
@@ -1552,6 +1641,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
         log(f"      retrying via fallback pose {v}/{len(poses)}")
         walked[v] = lists(("start", qa), ("fallback", via), ("goal", qb))
         for opening in walked[v].all:
+            if deadline.ran_out(log, f"this segment at fallback pose {v}/{len(poses)}"):
+                raise gave_up(last)
             log(f"      retrying{_gun_note(opening)}{_effort_note(reduced, ompl)}")
             through: list = []
             try:
@@ -1563,7 +1654,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                      shortcut_seconds=shortcut_seconds,
                                      polish_seconds=polish_seconds, zone=zone,
                                      openings=GunOpenings.pinned(opening),
-                                     relocate=relocate, log=log, record=through)
+                                     deadline=deadline, relocate=relocate, log=log,
+                                     record=through)
             except PlanningError as exc:
                 log(f"      no route{_gun_note(opening)}: {exc}")
                 last = exc
@@ -1587,6 +1679,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                 f"stop band; not changing the gun there")
             continue
         for first_open in options:
+            if deadline.ran_out(log, "this segment before splitting it in two"):
+                raise gave_up(last)
             raw_first: list = []
             try:
                 with cell.gun_opening(first_open):
@@ -1598,7 +1692,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                             zone=zone, cartesian=cartesian,
                                             relocate=relocate,
                                             openings=GunOpenings.pinned(first_open),
-                                            log=log, record=raw_first)
+                                            deadline=deadline, log=log,
+                                            record=raw_first)
             except PlanningError:
                 continue
             for second_open in options:
@@ -1615,7 +1710,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                                  zone=zone, cartesian=cartesian,
                                                  relocate=relocate,
                                                  openings=GunOpenings.pinned(second_open),
-                                                 log=log, record=raw_second)
+                                                 deadline=deadline, log=log,
+                                                 record=raw_second)
                 except PlanningError:
                     continue
                 if record is not None:
@@ -1634,7 +1730,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                           polish_seconds=polish_seconds,
                                           check_step=check_step, log=log)
                 return [(first, first_open), (second, second_open)]
-    raise last or PlanningError("freespace transit failed at every gun opening")
+    raise gave_up(last or PlanningError("freespace transit failed at every gun opening"))
 
 
 def _gun_note(opening: float | None) -> str:
@@ -1954,6 +2050,7 @@ class _Sampler:
     segment_length: float
     check_step: float
     openings: GunOpenings = field(default_factory=lambda: GunOpenings.pinned(None))
+    deadline: Deadline = field(default_factory=Deadline)
     continuous_check: bool = False
     log: object = print
     message: str = ""
@@ -1975,10 +2072,15 @@ class _Sampler:
         self.log(f"      {label}: {self.ompl.phase_one_runs} runs of "
                  f"{self.ompl.phase_one_seconds:g}s each over {_openings_note(cycle)}, "
                  f"keeping the cheapest that solves")
-        found = [self._run(qa, qb, self.ompl.phase_one_seconds, f"{label} run {attempt}",
-                           cycle[(attempt - 1) % len(cycle)])
-                 for attempt in range(1, self.ompl.phase_one_runs + 1)]
-        return [c for c in found if c is not None]
+        found: list[_Solution] = []
+        for attempt in range(1, self.ompl.phase_one_runs + 1):
+            if self.deadline.ran_out(self.log, f"{label} after {attempt - 1} runs"):
+                break
+            got = self._run(qa, qb, self.deadline.clamp(self.ompl.phase_one_seconds),
+                            f"{label} run {attempt}", cycle[(attempt - 1) % len(cycle)])
+            if got is not None:
+                found.append(got)
+        return found
 
     def phase_two(self, qa: np.ndarray, qb: np.ndarray,
                   label: str = "phase 2", rotation: list | None = None,
@@ -2014,9 +2116,12 @@ class _Sampler:
                  + ", stopping at the first solution")
         used = tree_used = 0
         for is_ompl in _interleave(ompl_runs, tree_runs):
+            if self.deadline.ran_out(self.log, f"{label} after {used + tree_used} runs"):
+                return []
             if is_ompl:
                 used += 1
-                found = self._run(qa, qb, self.ompl.phase_two_seconds,
+                found = self._run(qa, qb,
+                                  self.deadline.clamp(self.ompl.phase_two_seconds),
                                   f"{label} run {used}", cycle[(used - 1) % len(cycle)])
             else:
                 tree_used += 1
@@ -2083,7 +2188,8 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
                  zone: LinearZone | None = None,
                  cartesian: "CartesianBudget | None" = None,
                  relocate: "Relocation | None" = None,
-                 openings: "GunOpenings | None" = None, log=print,
+                 openings: "GunOpenings | None" = None,
+                 deadline: "Deadline | None" = None, log=print,
                  record: list | None = None) -> tuple[list[Run], float | None]:
     """A route from ``qa`` to ``qb``, and the gun opening it is to be flown at.
 
@@ -2093,6 +2199,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     are on offer, and a caller that has already fixed one passes ``GunOpenings.pinned``.
     """
     openings = openings or GunOpenings.pinned(None)
+    deadline = deadline or Deadline()
 
     # The clear straight line first, at each opening in turn.  It is normally the best
     # answer there is -- a sampling planner asked to improve on it can only return it
@@ -2143,13 +2250,13 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     # only stage that can make that choice at all -- and since the runs are being spent
     # anyway, dealing them round the openings makes the same choice over a wider set.
     sampler = _Sampler(cell=cell, ompl=ompl, segment_length=segment_length,
-                       check_step=check_step, openings=openings,
+                       check_step=check_step, openings=openings, deadline=deadline,
                        continuous_check=continuous_check, log=log)
     candidates = sampler.phase_one(qa, qb)
 
     tree = cartesian if (cartesian is not None and cartesian.enabled
                          and zone is not None and zone.enabled) else None
-    if not candidates and tree is not None:
+    if not candidates and tree is not None and not deadline.expired:
         # Between the two phases rather than in place of either.  Every route this finds
         # is also a joint-space route -- a path of straight tool moves is still a path
         # through joint space -- so as a fallback it searches a strict *subset* of what
@@ -2163,7 +2270,8 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         # It is gated on the zone because a route made of straight moves only earns its
         # cost where linear motion was wanted in the first place; with no band in force
         # there is nothing here that phase two would not do better.
-        found = _cartesian_solutions(cell, qa, qb, tree, check_step, openings.main, log)
+        found = _cartesian_solutions(cell, qa, qb, tree, check_step, openings.main, log,
+                                     deadline=deadline)
         if found:
             # The best of the set is the only one recut: the recut runs the sampling
             # phases on every stretch outside the band, far too dear to spend on routes
@@ -2182,7 +2290,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
             def tree_run(opening, run):
                 """One short Cartesian search, for phase two to spread among its own."""
                 got = _cartesian_route(cell, qa, qb, tree,
-                                       seconds=tree.phase_two_seconds,
+                                       seconds=deadline.clamp(tree.phase_two_seconds),
                                        seed=tree.seed + PHASE_TWO_SEED_OFFSET + run,
                                        opening=opening, check_step=check_step,
                                        label=f"phase 2 cartesian run {run}", log=log)
@@ -2265,7 +2373,8 @@ def _recut_solution(cell: Cell, best: _Solution, *, zone: "LinearZone",
 
 def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                          budget: "CartesianBudget", check_step: float,
-                         rotation: list, log) -> list[_Solution]:
+                         rotation: list, log,
+                         deadline: "Deadline | None" = None) -> list[_Solution]:
     """Cartesian-tree routes for one transit, each scored as phase one scores its own.
 
     Searches run from successive seeds until one solves or ``budget.seconds`` has passed,
@@ -2281,6 +2390,7 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
     seed could change.
     """
     rotation = list(rotation) or [None]
+    deadline = deadline or Deadline()
     log(f"      cartesian tree: up to {budget.seconds:g}s searching linear space for a "
         f"solution, then until {budget.min_seconds:g}s for better ones, over "
         f"{_openings_note(rotation)}")
@@ -2288,8 +2398,11 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
     found: list[_Solution] = []
     run = 0
     while True:
-        left = start + (budget.min_seconds if found else budget.seconds) - time.time()
+        left = deadline.clamp(
+            start + (budget.min_seconds if found else budget.seconds) - time.time())
         if left <= 0.0:
+            if deadline.expired:
+                deadline.ran_out(log, f"the cartesian tree after {run} runs")
             return found
         run += 1
         got = _cartesian_route(cell, qa, qb, budget, seconds=left,

@@ -23,8 +23,8 @@ from .cell import STOP_BAND_JOINT, Cell
 from .manifest import Locator, Manifest
 from .cartesian import CartesianBudget
 from .fallback import FallbackFinder
-from .planning import (LIN, PTP, LinearZone, OmplBudget, PlanningError, Relocation,
-                       unique_openings,
+from .planning import (LIN, PTP, Deadline, LinearZone, OmplBudget, PlanningError,
+                       Relocation, unique_openings,
                        plan_freespace,
                        validate)
 
@@ -74,6 +74,7 @@ class ToolpathPlanner:
                  ompl: OmplBudget | None = None,
                  cartesian: CartesianBudget | None = None,
                  fallback_runs: int = 0, relocate: Relocation | None = None,
+                 segment_seconds: float = 0.0,
                  main_openings: int = 5, extra_openings: int = 0,
                  opening_round_mm: float = 5.0,
                  fallback_mm: float = 100.0, fallback_step_mm: float = 40.0,
@@ -98,6 +99,11 @@ class ToolpathPlanner:
         # pays for it.
         self.cartesian = cartesian
         self.fallback_runs = fallback_runs
+        # Wall clock for one segment's search.  Every budget below it bounds a part of the
+        # search and they multiply, so this is what bounds a segment that has no route at
+        # all: past it the search stops and the segment is reported as one that found
+        # none, which the run loop already knows how to carry on from.  See Deadline.
+        self.segment_seconds = segment_seconds
         # How many gun openings a transit is planned over: the rotation phase one deals
         # its runs round, the reserve phase two walks afterwards, and the multiple the
         # values found by bisection are rounded to.  See planning._opening_lists.
@@ -507,6 +513,10 @@ class ToolpathPlanner:
         # inverse kinematics and sets the gun's initial opening; it never contributes a
         # waypoint of its own, and it is not what a difficult transit detours through --
         # see weldpath.fallback.
+        # Started here rather than at the transit, so that everything this segment does
+        # counts against it -- placing the weld, searching for a fallback pose, and the
+        # refinement -- even though the search loops are what actually read it.
+        deadline = Deadline(self.segment_seconds)
         phases: list[Phase] = []
         qa, qb = anchors[a.name], anchors[b.name]
         transit_start, transit_end = qa, qb
@@ -533,6 +543,7 @@ class ToolpathPlanner:
             check_step=self.check_step,
             fallback_via=self._fallback_for(a, b, transit_start, transit_end),
             fallback_runs=self.fallback_runs, relocate=self.relocate,
+            deadline=deadline,
             shortcut_seconds=self.shortcut_seconds,
             polish_seconds=self.polish_seconds,
             zone=self.zone,

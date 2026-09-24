@@ -140,6 +140,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: %(default)g)")
 #endregion
     #region ###PATHFINDING###
+    #WHEN TO GIVE UP ON ONE SEGMENT
+    p.add_argument("--segment-minutes", type=float, default=120.0, metavar="MINUTES",
+                   help="how long the planner may spend searching for one segment's route "
+                        "before giving up on it and moving to the next. Every other "
+                        "budget here bounds a part of that search -- runs, seconds per "
+                        "run, gun openings, fallback poses -- and they multiply, so a "
+                        "segment that simply has no route can cost hours before the last "
+                        "of them is exhausted. Past this nothing further is started; "
+                        "whatever routes are already in hand are still ranked, refined "
+                        "and shipped, and a segment with none is reported as a failure "
+                        "like any other and the run carries on. 0 removes the limit "
+                        "(default: %(default)g)")
     #PHASE ONE: CHOOSE BETWEEN ROUTES
     p.add_argument("--phase-one-runs", type=int, default=20, metavar="N",
                    help="sampling-planner runs made per transit in phase one. Every one "
@@ -931,6 +943,9 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.linear_introduce_mm < 0.0:
         print("error: --linear-introduce-mm cannot be negative", file=sys.stderr)
         return 2
+    if args.segment_minutes < 0.0:
+        print("error: --segment-minutes cannot be negative", file=sys.stderr)
+        return 2
     if args.min_gun_openings < 1:
         print("error: --min-gun-openings must be at least 1: a transit is planned at "
               "one gun opening or another", file=sys.stderr)
@@ -1041,6 +1056,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
                                   phase_two_seconds=args.phase_two_cartesian_seconds,
                                   phase_two_runs=args.phase_two_cartesian_runs),
         fallback_runs=args.fallback_runs,
+        segment_seconds=args.segment_minutes * 60.0,
         fallback_mm=args.fallback_distance_mm,
         fallback_step_mm=args.fallback_step_mm,
         main_openings=args.min_gun_openings,
