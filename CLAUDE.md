@@ -178,6 +178,36 @@ the way, so the joint values in between are whatever that line demands.
     own factor arithmetic — `MotionModel.cost`, `simplify`'s `polyline_cost`, and both
     sides of `shortcut`'s comparison. Charged on the same footing everywhere or it would
     not cancel where it is supposed to.
+- **The gun opening is a search variable, not a setting picked before the search.**
+  `_opening_lists` builds two lists per leg: `main`, the rotation phase one and the
+  Cartesian tree deal their runs round, and `extra`, held back for phase two. Both are
+  drawn in preference order -- departure, arrival, closed, widest, half open, then
+  bisections of the widest range nothing has been tried in yet -- and screened as they are
+  built, so an opening that repeats one already offered, or that leaves a pose of the leg
+  in collision, is skipped and counts against neither total. `--min-gun-openings` and
+  `--extra-gun-openings` are counts of openings that can be planned at.
+  - Phase one deals its runs round `main`, and `_cheapest` keeps the best of the whole set
+    whichever opening it came from, ties going to the earlier one, which is the opening
+    already in force. This is why `_Solution` carries an opening: the caller can no longer
+    infer it from the order it asked in, and everything downstream -- `_finish`, the recut,
+    the per-phase validation -- has to run at the opening its route was found at, the tip
+    being part of the machine that has to fit through the gap.
+  - Phase two walks `extra`, one opening per run, and never repeats one phase one had runs
+    at: a longer search where the short ones just failed is the narrower of the two bets.
+    `CartesianBudget.phase_two_seconds` and `phase_two_runs` add short Cartesian searches,
+    spread through those runs by `_interleave`, which takes whichever kind's next turn falls
+    earliest as a fraction of its own count. The phase stops at the first solution either
+    kind finds, so queueing one kind behind the other would let the ordering decide which
+    kind ever ran.
+  - The rotation belongs to the direct transit alone. A route through a fallback pose is one
+    leg whose two halves must agree on one gun state, and so is either half of a two-leg
+    split, so those walk `GunOpenings.pinned` one opening at a time -- the old order, kept
+    where it is still the only one available. A cell with no gun joint gets `pinned(None)`,
+    which is exactly what it did before any of this.
+  - `_Sampler._run` loads a pose through `cell.set_state` inside its own `gun_opening`
+    block. OMPL reads the gun from the environment's current state and not from the program
+    it is handed, and before this each run inherited whatever the last collision query had
+    left there -- right in practice only because the endpoint screen always ran first.
 - `plan_cartesian` is the only search that builds straight tool moves. `_plan_direct`
   reaches it only when OMPL phase one returned nothing and the band is on, and never for
   the halves of a fallback-pose route, which are planned with no zone.

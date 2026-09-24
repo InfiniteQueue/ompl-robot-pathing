@@ -52,8 +52,11 @@ The generated directories are safe to delete; they are rebuilt on the next run.
    the cheapest of several runs; a Cartesian-space tree whose edges are straight tool moves
    (only while the near-panel band is on); longer OMPL runs; the same again through a
    fallback pose searched for that transit; and finally two legs with the gun changing
-   between them. Every gun opening is tried directly before any fallback pose is. Each
-   attempt runs with the gun tip where that phase will hold it. The route is then improved
+   between them. The gun opening is chosen by the search rather than ahead of it: phase
+   one's runs are dealt round several openings and the cheapest solution of the whole set
+   ships, with a reserve of further openings held back for phase two. All of them are
+   tried directly before any fallback pose is. Each run is made with the gun tip where it
+   would hold it. The route is then improved
    under a **time** metric — the same bang-bang joint dynamics the output is scheduled with,
    penalised for running close to the parts — by cutting detours, dropping waypoints that
    are not worth stopping at and relocating the rest. Whether each move is flown `LIN` or
@@ -476,7 +479,10 @@ Its route is dense: states about `--check-step-mm` of tool travel apart, each ga
 tool move, plus one stationary joint move where its two trees meet. Like phase one, it
 searches more than once: new seeds until one solves within `--cartesian-solve-seconds`,
 then more until `--cartesian-min-seconds` has passed, and only the cheapest route of
-the set goes on.
+the set goes on. Those runs are dealt round the same gun openings phase one used, one
+opening each. The tree steers by where the tool can go and a tip 200 mm open sweeps a
+corridor a closed one never enters, so a search that failed is evidence about the opening
+it ran at and about no other.
 
 With `--cartesian-recut` on (the default), the route is then cut wherever it leaves the
 band. Each stretch outside the band is bounded by its own first and last state, which
@@ -675,12 +681,36 @@ of what any phase asked for.
 Where the tip sits genuinely decides what the robot can do. Sampling 600 random poses, 16
 changed collision state with the gun — **in both directions**: some are blocked closed and
 clear wide open, others the reverse. So a destination can be unreachable at the opening the
-robot arrives with, and the transit planner searches openings for one that works: the
-opening the robot departs with first, then the one it has to arrive with, then closed,
-widest and half open, plus `--extra-gun-openings` more. Changing the gun is a real
-operation on the machine, so a single opening for the whole transit is always preferred;
-only when none works is the move split into two legs with the gun changing at the
-intermediate pose, where the robot is stationary anyway.
+robot arrives with, and the transit planner plans over several of them. `--min-gun-openings`
+(5) make up the rotation phase one deals its runs round; `--extra-gun-openings` (3) more
+are held in reserve for phase two. Both are drawn in preference order — the opening the
+robot departs with, the one it has to arrive holding, then closed, widest and half open,
+then bisections of the widest range nothing has been tried in yet, rounded to
+`--gun-opening-round-mm` — and an opening that repeats one already offered, or that puts a
+pose of the leg in collision, is skipped without counting against either total. The two
+numbers therefore count openings that can be planned at rather than openings proposed.
+
+**Phase one chooses between openings rather than working through them.** Its runs are
+spent whichever way they go, so they are dealt round the rotation, one opening each and
+back to the first when it runs out, and the cheapest solution of the whole set ships
+whichever opening it came from — a tie going to the earlier opening, which is the one the
+robot already holds. The old order gave the entire phase to the first opening and reached
+the second only once the first had failed outright, by which time most of what the transit
+had to spend was gone.
+
+**Phase two looks somewhere new rather than looking harder.** It walks the reserve, one
+opening per run: phase one has already had its runs at everything in the rotation, and a
+longer search where three short ones just failed is the narrower of the two bets on offer.
+`--phase-two-cartesian-runs` Cartesian searches of `--phase-two-cartesian-seconds` each are
+spread evenly through those runs rather than queued behind them, since either kind ends the
+phase by solving and queueing one behind the other would let the ordering decide which kind
+ever got a turn.
+
+Changing the gun is a real operation on the machine, so a single opening for the whole
+transit is always preferred; only when none works is the move split into two legs with the
+gun changing at the intermediate pose, where the robot is stationary anyway. A route
+through a fallback pose, and either half of such a split, are fixed to one opening per
+attempt and walked one at a time, their halves having to agree on one gun state.
 
 **The departure opening leads because it is already in force.** Using it costs no gun
 change at the start of the move, and it is the state the robot was proved to stand at the
@@ -689,11 +719,13 @@ weld's arrival opening first, on the grounds that the weld pose was only ever ch
 it; that holds for the destination, but a transit has to leave its start as well as reach
 its end, and the same argument applies there.
 
-**Both endpoints are screened before the planner starts**, for the same reason. Endpoint
-validity at a given opening is two contact queries; letting OMPL find out costs a whole
-solve, and every retry at that opening rediscovers it just as slowly. A rejected opening
-is logged with its reason, since a microsecond screen would otherwise pass in silence
-where a failed OMPL run announces itself at length.
+**Every pose the leg is pinned to is screened as the list is built**, for the same
+reason: both endpoints, and the fallback pose where the route goes through one. Validity at
+a given opening is a contact query apiece; letting OMPL find out costs a whole solve, and
+every further run at that opening rediscovers it just as slowly. A rejected opening is
+logged with its reason — a microsecond screen would otherwise pass in silence where a
+failed OMPL run announces itself at length — and the list is filled from further down the
+order in its place.
 
 A weld's openings are process data and are never overridden — if the robot cannot reach the
 pose at the opening the weld schedule states, that is a failure, not a wider gun. An
@@ -1025,6 +1057,11 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--cartesian-recut` | true | cut a Cartesian-tree route where it leaves the band and replan the parts outside it with phases one and two |
 | `--phase-two-max-runs` | 8 | further OMPL runs, stopping at the first solution |
 | `--phase-two-solve-seconds` | 45 | how long one of those runs may search |
+| `--phase-two-cartesian-runs` | 2 | Cartesian searches spread evenly through phase two, at its own gun openings |
+| `--phase-two-cartesian-seconds` | 30 | how long one of those searches may run |
+| `--min-gun-openings` | 5 | gun openings phase one deals its runs round, the cheapest solution of the set shipping |
+| `--extra-gun-openings` | 3 | further openings held back for phase two to walk |
+| `--gun-opening-round-mm` | 5 | multiple that openings found by bisection are rounded to |
 | `--fallback-distance-mm` | 100 | room a fallback pose must leave around the robot and gun |
 | `--no-shortcut` | off | skip shortcutting and polishing |
 | `--shortcut-seconds` | 20 | time budget for shortcutting each transit |
@@ -1095,8 +1132,8 @@ Exit code is 0 when every segment planned, 1 otherwise.
   positive `--obstacle-clearance-mm` or the clearance penalty both hide this by keeping the
   route away from surfaces, but neither fixes it. The real fix is a swept check — the scene
   already configures `BulletCastBVHManager` as its continuous plugin and nothing uses it.
-* The gun opening search covers a handful of candidate openings rather than treating the
-  opening as a continuous dimension, so a transit that needs some specific intermediate
-  opening will not be found. The manifest supplies no gun speed, so an opening change is
+* The gun opening search covers `--min-gun-openings` plus `--extra-gun-openings`
+  candidates rather than treating the opening as a continuous dimension, so a transit that
+  needs some other specific intermediate opening will not be found. The manifest supplies no gun speed, so an opening change is
   costed as "avoid unless necessary" rather than in seconds.
 * Requires `tesseract-robotics` and `numpy`; both are already in `.venv`.

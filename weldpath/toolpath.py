@@ -74,7 +74,8 @@ class ToolpathPlanner:
                  ompl: OmplBudget | None = None,
                  cartesian: CartesianBudget | None = None,
                  fallback_runs: int = 0, relocate: Relocation | None = None,
-                 extra_openings: int = 0, opening_round_mm: float = 5.0,
+                 main_openings: int = 5, extra_openings: int = 0,
+                 opening_round_mm: float = 5.0,
                  fallback_mm: float = 100.0, fallback_step_mm: float = 40.0,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
                  continuous_check: bool = False,
@@ -97,8 +98,10 @@ class ToolpathPlanner:
         # pays for it.
         self.cartesian = cartesian
         self.fallback_runs = fallback_runs
-        # Openings to try beyond the four the transit's own ends and the gun's shape name,
-        # and the multiple the chosen values are rounded to.  See _bisect_openings.
+        # How many gun openings a transit is planned over: the rotation phase one deals
+        # its runs round, the reserve phase two walks afterwards, and the multiple the
+        # values found by bisection are rounded to.  See planning._opening_lists.
+        self.main_openings = main_openings
         self.extra_openings = extra_openings
         self.opening_round_mm = opening_round_mm
         # How far the shortcut and polish passes displace a waypoint when they try
@@ -534,6 +537,7 @@ class ToolpathPlanner:
             polish_seconds=self.polish_seconds,
             zone=self.zone,
             openings=self._transit_openings(a, b, leave_open, arrive_open),
+            main_openings=self.main_openings,
             extra_openings=self.extra_openings,
             opening_round_mm=self.opening_round_mm,
             record=raw_legs, log=self.log)

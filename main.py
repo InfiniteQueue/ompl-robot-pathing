@@ -170,6 +170,26 @@ def build_parser() -> argparse.ArgumentParser:
                         "usually one where restarting wastes the tree built so far, so a "
                         "longer single search helps where another short one does not "
                         "(default: %(default)g)")
+    #PHASE TWO: CARTESIAN SEARCHES SPREAD THROUGH IT
+    p.add_argument("--phase-two-cartesian-runs", type=int, default=2, metavar="N",
+                   help="Cartesian tree searches made during phase two, spread evenly "
+                        "through its sampling runs rather than queued behind them. Each "
+                        "runs at the next gun opening of the --extra-gun-openings list, "
+                        "as phase two's own runs do. Either kind of search ends the phase "
+                        "by solving, so an order that ran one kind out first would let "
+                        "the ordering decide which kind ever got a turn rather than the "
+                        "clock. Like the searches between the phases these only run where "
+                        "--near-panel-mm is in force. 0 leaves phase two to the sampling "
+                        "planner alone (default: %(default)g)")
+    #PHASE TWO CARTESIAN RUN TIME
+    p.add_argument("--phase-two-cartesian-seconds", type=float, default=30.0,
+                   metavar="SECONDS",
+                   help="how long one of phase two's Cartesian searches may run. Shorter "
+                        "than --cartesian-solve-seconds on purpose: what is wanted by "
+                        "then is not a better route but any route, from a part of the "
+                        "gun's range nothing has tried yet, and phase two is where what "
+                        "the transit has left to spend is thinnest "
+                        "(default: %(default)g)")
     #CARTESIAN TREE, BETWEEN THE TWO PHASES
     p.add_argument("--cartesian-solve-seconds", "--cartesian-seconds", type=float,
                    default=120.0, metavar="SECONDS", dest="cartesian_solve_seconds",
@@ -232,16 +252,34 @@ def build_parser() -> argparse.ArgumentParser:
                         "straight joint move is already clear takes that move and spends "
                         "no runs; one the planner cannot join keeps its Cartesian states, "
                         "so this can only cost time, never a route (default: %(default)s)")
-    p.add_argument("--extra-gun-openings", type=int, default=2, metavar="N",
-                   help="further gun openings to try on a transit, beyond the departure "
-                        "and arrival openings and the closed, widest and half-open ones "
-                        "always tried. Each is placed in the middle of the widest range "
-                        "no opening has been tried in yet, so the openings spread over "
-                        "the gun's travel rather than clustering. They are tried last, "
-                        "after every named opening has failed, and each one costs a "
-                        "further pass over the fallback poses (default: %(default)g)")
+    #HOW MANY GUN OPENINGS A TRANSIT IS PLANNED OVER
+    p.add_argument("--min-gun-openings", type=int, default=5, metavar="N",
+                   help="gun openings a transit is planned over in phase one. The runs of "
+                        "--phase-one-runs are dealt round them, one opening each and back "
+                        "to the first when the list runs out, and the cheapest solution "
+                        "of the whole set ships whichever opening it came from -- so the "
+                        "choice between openings is made on what each produced rather "
+                        "than on the order they were offered in. The list is filled in "
+                        "preference order: the opening the robot departs with, the one it "
+                        "must arrive holding, then closed, widest and half open, then "
+                        "further ones bisecting the widest untried range. An opening that "
+                        "puts either end of the transit in collision is skipped and does "
+                        "not count, so this counts openings that can be planned at rather "
+                        "than openings proposed (default: %(default)g)")
+    #HOW MANY MORE ARE HELD BACK FOR PHASE TWO
+    p.add_argument("--extra-gun-openings", type=int, default=3, metavar="N",
+                   help="further gun openings, beyond --min-gun-openings, held back for "
+                        "phase two. Phase one never runs at these: it has already had its "
+                        "runs at the others, and a longer search where three short ones "
+                        "just failed is the narrower of the two bets on offer, so phase "
+                        "two looks somewhere new instead. It walks this list one opening "
+                        "per run, and so do the Cartesian searches spread through it. "
+                        "Chosen and screened exactly as the others are, so one in "
+                        "collision at either end does not count towards the total. 0 "
+                        "leaves phase two nothing to do on a cell that has a gun "
+                        "(default: %(default)g)")
     p.add_argument("--gun-opening-round-mm", type=float, default=5.0, metavar="MM",
-                   help="multiple that --extra-gun-openings values are rounded to, so "
+                   help="multiple that bisected gun openings are rounded to, so "
                         "that the program commands round figures. An opening that rounds "
                         "onto one already being tried is dropped, so a coarse setting "
                         "over a narrow range yields fewer openings than asked for. 0 "
@@ -893,6 +931,19 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.linear_introduce_mm < 0.0:
         print("error: --linear-introduce-mm cannot be negative", file=sys.stderr)
         return 2
+    if args.min_gun_openings < 1:
+        print("error: --min-gun-openings must be at least 1: a transit is planned at "
+              "one gun opening or another", file=sys.stderr)
+        return 2
+    if args.extra_gun_openings < 0:
+        print("error: --extra-gun-openings cannot be negative", file=sys.stderr)
+        return 2
+    if args.phase_two_cartesian_runs < 0:
+        print("error: --phase-two-cartesian-runs cannot be negative", file=sys.stderr)
+        return 2
+    if args.phase_two_cartesian_seconds < 0.0:
+        print("error: --phase-two-cartesian-seconds cannot be negative", file=sys.stderr)
+        return 2
 
     try:
         if args.stepped_penalty:
@@ -986,10 +1037,13 @@ def _run(args: argparse.Namespace, directory: str) -> int:
                                   extend_mm=args.cartesian_extend_mm,
                                   margin_mm=args.cartesian_margin_mm,
                                   tilt_deg=args.cartesian_tilt_deg,
-                                  recut=args.cartesian_recut),
+                                  recut=args.cartesian_recut,
+                                  phase_two_seconds=args.phase_two_cartesian_seconds,
+                                  phase_two_runs=args.phase_two_cartesian_runs),
         fallback_runs=args.fallback_runs,
         fallback_mm=args.fallback_distance_mm,
         fallback_step_mm=args.fallback_step_mm,
+        main_openings=args.min_gun_openings,
         extra_openings=args.extra_gun_openings,
         opening_round_mm=args.gun_opening_round_mm,
         relocate=Relocation(min_attempts=args.polish_min_attempts,
