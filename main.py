@@ -141,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
 #endregion
     #region ###PATHFINDING###
     #PHASE ONE: CHOOSE BETWEEN ROUTES
-    p.add_argument("--phase-one-runs", type=int, default=25, metavar="N",
+    p.add_argument("--phase-one-runs", type=int, default=20, metavar="N",
                    help="sampling-planner runs made per transit in phase one. Every one "
                         "is spent whether or not earlier runs succeeded, and the "
                         "lowest-penalty solution of the set is the one that ships. The "
@@ -156,7 +156,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "run costs this long in the worst case, so it multiplies with "
                         "--phase-one-runs (default: %(default)g)")
     #PHASE TWO: FIND ANY ROUTE AT ALL
-    p.add_argument("--phase-two-max-runs", type=int, default=8, metavar="N",
+    p.add_argument("--phase-two-max-runs", type=int, default=2, metavar="N",
                    help="most sampling-planner runs allowed in phase two, which is "
                         "entered only when phase one found nothing at all. Phase two "
                         "stops at the first solution rather than sampling for a better "
@@ -318,11 +318,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip the shortcutting pass and emit the sampling planner's own "
                         "route, which is typically much longer")
     #SHORTCUT PASS TIME
-    p.add_argument("--shortcut-seconds", type=float, default=20.0, metavar="SECONDS",
+    p.add_argument("--shortcut-seconds", type=float, default=30.0, metavar="SECONDS",
                    help="time budget for shortcutting each freespace transit; longer "
                         "budgets keep shortening with diminishing returns (default: %(default)g)")
     #POLISH PASS TIME
-    p.add_argument("--polish-seconds", type=float, default=50.0, metavar="SECONDS",
+    p.add_argument("--polish-seconds", type=float, default=120.0, metavar="SECONDS",
                    help="time budget for the final pass over each transit's emitted "
                         "waypoints, which removes and relocates them under the full "
                         "stop-to-stop time the robot really pays for each one. The "
@@ -757,16 +757,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "turns all penalties off. Takes true/false (yes/no, on/off, 1/0); "
                         "passing the flag with no value means true (default: %(default)s)")
     #STRENGTH AT TOUCHING
-    p.add_argument("--stepped-penalty-multiplier", type=float, default=14.0, metavar="N", #was 7
+    p.add_argument("--stepped-penalty-multiplier", type=float, default=12.0, metavar="N", #was 7
                    help="penalty at zero clearance: a second spent touching costs as much "
                         "as N seconds in open space (default: %(default)g)")
     #WHERE THE PENALTY IS SPENT
-    p.add_argument("--stepped-penalty-zero-mm", type=float, default=35.0, metavar="MM", #was 100
+    p.add_argument("--stepped-penalty-zero-mm", type=float, default=25.0, metavar="MM", #was 100
                    help="clearance at which the penalty reaches 1x and stops mattering. "
                         "Also how far the proximity query has to see, so lowering it "
                         "speeds planning up (default: %(default)g)")
     #STEP LENGTH
-    p.add_argument("--stepped-penalty-step-mm", type=float, default=1.5, metavar="MM", #was 25
+    p.add_argument("--stepped-penalty-step-mm", type=float, default=2, metavar="MM", #was 3
                    help="how much extra clearance counts as one step of falloff "
                         "(default: %(default)g)")
     #STEP FACTOR
@@ -795,7 +795,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="commanded tool speed cap on linear moves; the joint limits still "
                         "govern whenever they are slower (default: %(default)g)")
     #HOW MUCH A STOP COSTS THE OPTIMISER
-    p.add_argument("--stop-time-weight", type=float, default=0.5, metavar="W",
+    p.add_argument("--stop-time-weight", type=float, default=0.8, metavar="W",
                    help="how heavily a stop is charged in the time the planner scores "
                         "routes by, and nowhere else: the exported timing is the real "
                         "one. Every waypoint is a full stop, so deleting one nearly "
