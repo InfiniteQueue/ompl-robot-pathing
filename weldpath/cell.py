@@ -541,6 +541,78 @@ class Cell:
             stack.append((t0, tm, p0, pm, depth + 1))
         return False, ([1.0] * n if factors and not want else facs)
 
+    def segment_clearance(self, a: np.ndarray, b: np.ndarray, max_step: float = 0.05,
+                          floor: float | None = None) -> float:
+        """Closest the robot comes to the static objects anywhere on a->b, in mm.
+
+        The walk :meth:`segment_scan` makes -- the joint grid at ``max_step``, then the
+        tool-space bisection under it -- measured rather than merely tested.  The
+        subdivision is included here where scoring leaves it out, and for the reason it
+        was put into the collision check in the first place: the question is how close the
+        move really goes, and a dip between two grid samples is exactly what those
+        midpoints exist to find.  Nothing is being priced, so there is no cost here to
+        make depend on how finely the move had to be checked.
+
+        ``floor`` stops the walk at the first reading under it, for a caller that only
+        wants to know whether the move stays off it.  What comes back is then that
+        reading rather than the worst on the move.
+
+        Assumes the move is already known clear: a state in collision reads at or about
+        zero and is not told apart from one merely close.  Nothing is visible past
+        :attr:`probe_mm`, so the answer saturates there and a ``floor`` beyond the probe
+        can never be met -- a caller wanting one has to have asked for a probe that sees
+        it.
+        """
+        if self._pm is None:
+            return float("inf")
+        a = np.asarray(a, dtype=float)
+        b = np.asarray(b, dtype=float)
+        delta = b - a
+        n = max(2, int(np.ceil(float(np.max(np.abs(delta))) / max_step)) + 1)
+        grid = np.linspace(0.0, 1.0, n)
+        measure_tool = self.tcp_check_mm > 0.0
+
+        def read(t: float):
+            """Clearance at ``t`` along the move, with the tool position when wanted."""
+            q = a + t * delta
+            if not measure_tool:
+                return self.clearance_mm(q), None
+            # The tool transform is read off the loaded state, so the load cannot be left
+            # to the cache the way clearance_mm leaves it.
+            self._load_state(q)
+            return self._clearance_here(q), self._tcp_now()
+
+        worst = float("inf")
+        tools = []
+        for t in grid:
+            got, tcp = read(t)
+            worst = min(worst, got)
+            if floor is not None and worst < floor:
+                return worst
+            if measure_tool:
+                tools.append(tcp)
+        if not measure_tool:
+            return worst
+
+        tool_step = self.tcp_check_mm * self.man.scale
+        # Right to left, so the halves of a split are popped in the order they are flown.
+        stack = [(grid[k], grid[k + 1], tools[k], tools[k + 1], 0)
+                 for k in range(n - 2, -1, -1)]
+        while stack:
+            t0, t1, p0, p1, depth = stack.pop()
+            if depth >= MAX_TOOL_SUBDIVISION:
+                continue
+            if float(np.linalg.norm(p1 - p0)) <= tool_step:
+                continue
+            tm = 0.5 * (t0 + t1)
+            got, pm = read(tm)
+            worst = min(worst, got)
+            if floor is not None and worst < floor:
+                return worst
+            stack.append((tm, t1, pm, p1, depth + 1))
+            stack.append((t0, tm, p0, pm, depth + 1))
+        return worst
+
     def segment_cost(self, a: np.ndarray, b: np.ndarray, max_step: float = 0.05,
                      fa: float | None = None, fb: float | None = None,
                      stops: bool = False, facs: list[float] | None = None) -> float:

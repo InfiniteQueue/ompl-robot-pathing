@@ -505,6 +505,27 @@ carries on to the next — which is what already happens to a segment that fails
 Per-run limits are cut to the time remaining, so the last run stops at the deadline rather
 than a run's length past it.
 
+**The straight move can be asked for room, not just for clearance.** Every transit is
+tried as one straight joint move first, at each gun opening in turn, because it is normally
+the best answer there is and a collision sweep costs nothing beside a phase of solves. The
+only question asked of that move was whether it collided — and a move that slides along a
+panel at the collision margin does not collide, so it ships, and the searches that would
+have gone round it are never run. `--direct-clearance-mm` puts a floor under it: a straight
+move coming closer than this to the parts is passed over, the next opening is tried, and if
+none of them keeps the room the transit goes to the searches like any other.
+
+The reading is taken over the same walk that proved the move clear — the joint grid at
+`--check-step-deg` and the tool-space bisection under it — so a dip between two grid
+samples counts here exactly as it counts for the collision check, and the walk stops at the
+first sample under the floor. Two limits are worth knowing. A floor at or under
+`--obstacle-clearance-mm` (5) can never fire, a move closer than that being a collision
+already. And a floor is only measurable out to the clearance probe, which the planner
+widens to cover it; beyond the probe every state reads the same.
+
+It bounds the *shortcut*, not the route. Nothing enforces the floor on what the searches
+come back with — that is the clearance penalty's job, and the penalty is a price rather
+than a limit. 0, the default, leaves the collision check as the whole of the test.
+
 **Brief contact with the band is no longer ignored.** There used to be a gate ahead of the
 labelling: a leg qualified for linear motion only if an unbroken near stretch covered
 `--near-panel-min-mm` of tool travel, or `--near-panel-min-pct` of its samples read near,
@@ -1144,6 +1165,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--phase-two-max-runs` | 8 | further OMPL runs, stopping at the first solution |
 | `--phase-two-solve-seconds` | 45 | how long one of those runs may search |
 | `--segment-minutes` | 120 | wall clock for one segment's search; past it the segment is reported as failed and the run moves on. 0 removes the limit |
+| `--direct-clearance-mm` | 0 | room the straight joint move has to keep to be taken without searching; under it the next gun opening is tried and then the searches. 0 asks nothing beyond the collision check |
 | `--phase-two-cartesian-runs` | 2 | Cartesian searches spread evenly through phase two, at its own gun openings |
 | `--phase-two-cartesian-seconds` | 30 | how long one of those searches may run |
 | `--min-gun-openings` | 5 | gun openings phase one deals its runs round, the cheapest solution of the set shipping |

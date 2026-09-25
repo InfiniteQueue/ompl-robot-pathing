@@ -152,6 +152,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "and shipped, and a segment with none is reported as a failure "
                         "like any other and the run carries on. 0 removes the limit "
                         "(default: %(default)g)")
+    #HOW MUCH AIR THE STRAIGHT MOVE HAS TO KEEP TO BE TAKEN WITHOUT SEARCHING
+    p.add_argument("--direct-clearance-mm", type=float, default=0.0, metavar="MM",
+                   help="how close the straight joint move between two waypoints may come "
+                        "to the parts and still be taken in preference to searching for a "
+                        "route. The planner tries that move first at every gun opening "
+                        "because it is normally the best answer there is, and until now "
+                        "the only question asked of it was whether it collided -- so a "
+                        "transit that slides along a panel at the collision margin ships "
+                        "as the straight move, and the searches that would have gone "
+                        "round are never run. Measured over the same walk that proves the "
+                        "move clear, tool-space subdivision included, and capped by how "
+                        "far the clearance query can see. Below "
+                        "--obstacle-clearance-mm it can never fire, since a move closer "
+                        "than that is already a collision. 0 leaves the collision check "
+                        "as the whole of the test (default: %(default)g)")
     #PHASE ONE: CHOOSE BETWEEN ROUTES
     p.add_argument("--phase-one-runs", type=int, default=20, metavar="N",
                    help="sampling-planner runs made per transit in phase one. Every one "
@@ -805,7 +820,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="commanded tool speed cap on linear moves; the joint limits still "
                         "govern whenever they are slower (default: %(default)g)")
     #HOW MUCH A STOP COSTS THE OPTIMISER
-    p.add_argument("--stop-time-weight", type=float, default=0.8, metavar="W",
+    p.add_argument("--stop-time-weight", type=float, default=0.6, metavar="W",
                    help="how heavily a stop is charged in the time the planner scores "
                         "routes by, and nowhere else: the exported timing is the real "
                         "one. Every waypoint is a full stop, so deleting one nearly "
@@ -957,6 +972,9 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.phase_two_cartesian_seconds < 0.0:
         print("error: --phase-two-cartesian-seconds cannot be negative", file=sys.stderr)
         return 2
+    if args.direct_clearance_mm < 0.0:
+        print("error: --direct-clearance-mm cannot be negative", file=sys.stderr)
+        return 2
     if args.weld_opening_scan_mm <= 0.0:
         print("error: --weld-opening-scan-mm must be above 0", file=sys.stderr)
         return 2
@@ -1082,6 +1100,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         linear_speed_mm_s=args.linear_speed_mm_s,
         linear_crossing_penalty_s=args.linear_crossing_penalty_s,
         linear_introduce_mm=args.linear_introduce_mm,
+        direct_clearance_mm=args.direct_clearance_mm,
         weld_clearance_mm=args.weld_clearance_mm,
         stand_off_search=args.weld_shift_search,
         stand_off_scan_mm=args.weld_shift_scan_mm,

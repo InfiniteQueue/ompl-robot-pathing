@@ -300,6 +300,33 @@ the way, so the joint values in between are whatever that line demands.
     search. Without it the gun changes as the robot starts moving instead of while it
     stands still at the weld. `_arrive_opening` reads `self.openings` for the same reason:
     the declared arrival is a pose the robot may never have been shown to reach.
+- **`--direct-clearance-mm` is a floor under the straight move, and under nothing else.**
+  `_plan_direct` tries the direct joint chord at each opening before any search, and the
+  only question asked of it was `segment_collides`. That is a yes-or-no at the collision
+  margin, so a transit sliding along a panel at 5 mm is "clear" and ships, and the phases
+  that would have routed round it never run -- the one shape of answer no amount of
+  standing off a straight line can reach, since the passes cannot move a route into
+  another homotopy class. The floor makes the chord earn the shortcut: under it, the loop
+  moves to the next opening, and a set of openings none of which clears it falls through
+  to `_Sampler` as though the move had collided.
+  - Measured by `Cell.segment_clearance`, which walks what `segment_scan` walks -- the
+    joint grid at `--check-step-deg`, then the tool-space bisection under it -- and
+    returns the worst reading. The subdivision **is** included here, where scoring leaves
+    it out: nothing is being priced, so there is no cost to make depend on how finely the
+    move had to be checked, and a dip between two grid samples is the case those midpoints
+    exist to catch.
+  - `floor` stops that walk at the first reading under it, so a move that is going to be
+    refused is not measured to the end. What comes back is then that reading rather than
+    the worst on the move, which is all the log claims.
+  - Bounded below by `--obstacle-clearance-mm`, since a move closer than the margin is
+    already a collision, and above by the probe: `ToolpathPlanner` adds
+    `NEAR_PANEL_HEADROOM_MM` to it when widening the clearance manager, for the reason the
+    band does -- a reading at the probe is "nothing found", so a floor at the probe is one
+    every state meets.
+  - It gates the shortcut only. Nothing re-asks it of what the searches return, or of what
+    the refinement passes do afterwards; the clearance penalty is what governs those, and
+    it is a price rather than a limit. Raising this does not raise the clearance of the
+    routes that ship, it only stops the straight move being taken on trust.
 - `plan_cartesian` is the only search that builds straight tool moves. `_plan_direct`
   runs it on every transit the band is on for, whatever phase one did, and adds its best
   route to the same candidate set -- `_cheapest` then ranks the two searches on one number

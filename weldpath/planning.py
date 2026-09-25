@@ -1545,6 +1545,7 @@ def _plan_via(cell: Cell, qa: np.ndarray, via: np.ndarray, qb: np.ndarray, *,
               continuous_check: bool = False,
               shortcut_seconds: float, polish_seconds: float,
               zone: LinearZone | None = None,
+              direct_clearance: float = 0.0,
               openings: "GunOpenings | None" = None,
               deadline: "Deadline | None" = None,
               relocate: "Relocation | None" = None, log=print,
@@ -1569,10 +1570,12 @@ def _plan_via(cell: Cell, qa: np.ndarray, via: np.ndarray, qb: np.ndarray, *,
     first, _ = _plan_direct(cell, qa, via, ompl=ompl, segment_length=segment_length,
                             check_step=check_step, continuous_check=continuous_check,
                             shortcut_seconds=0.0, polish_seconds=0.0,
+                            direct_clearance=direct_clearance,
                             openings=openings, deadline=deadline, log=log, record=halves)
     second, _ = _plan_direct(cell, via, qb, ompl=ompl, segment_length=segment_length,
                              check_step=check_step, continuous_check=continuous_check,
                              shortcut_seconds=0.0, polish_seconds=0.0,
+                             direct_clearance=direct_clearance,
                              openings=openings, deadline=deadline, log=log,
                              record=halves)
     if len(halves) == 2:
@@ -1596,6 +1599,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    main_openings: int = 5, extra_openings: int = 0,
                    opening_round_mm: float = 0.0,
                    zone: LinearZone | None = None,
+                   direct_clearance: float = 0.0,
                    cartesian: "CartesianBudget | None" = None,
                    relocate: "Relocation | None" = None,
                    deadline: "Deadline | None" = None,
@@ -1678,7 +1682,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                      continuous_check=continuous_check,
                                      shortcut_seconds=shortcut_seconds,
                                      polish_seconds=polish_seconds,
-                                     zone=zone, cartesian=cartesian, relocate=relocate,
+                                     zone=zone, direct_clearance=direct_clearance,
+                                     cartesian=cartesian, relocate=relocate,
                                      openings=direct, deadline=deadline, log=log,
                                      record=raw)
         if record is not None:
@@ -1710,6 +1715,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
             try:
                 with cell.gun_opening(opening):
                     runs = _plan_via(cell, qa, via, qb, ompl=reduced,
+                                     direct_clearance=direct_clearance,
                                      segment_length=segment_length,
                                      check_step=check_step,
                                      continuous_check=continuous_check,
@@ -1752,6 +1758,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                             continuous_check=continuous_check,
                                             shortcut_seconds=0.0, polish_seconds=0.0,
                                             zone=zone, cartesian=cartesian,
+                                            direct_clearance=direct_clearance,
                                             relocate=relocate,
                                             openings=GunOpenings.pinned(first_open),
                                             deadline=deadline, log=log,
@@ -1770,6 +1777,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                                  continuous_check=continuous_check,
                                                  shortcut_seconds=0.0, polish_seconds=0.0,
                                                  zone=zone, cartesian=cartesian,
+                                                 direct_clearance=direct_clearance,
                                                  relocate=relocate,
                                                  openings=GunOpenings.pinned(second_open),
                                                  deadline=deadline, log=log,
@@ -2269,6 +2277,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
                  continuous_check: bool = False,
                  shortcut_seconds: float, polish_seconds: float,
                  zone: LinearZone | None = None,
+                 direct_clearance: float = 0.0,
                  cartesian: "CartesianBudget | None" = None,
                  relocate: "Relocation | None" = None,
                  openings: "GunOpenings | None" = None,
@@ -2280,6 +2289,10 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     several and the cheapest solution wins whichever one it came from, so the caller no
     longer knows it from the order it asked in.  What the caller decides is which openings
     are on offer, and a caller that has already fixed one passes ``GunOpenings.pinned``.
+
+    ``direct_clearance`` is how much air the straight move has to keep, in mm, before it
+    is taken in preference to searching for one.  0 asks nothing of it beyond the
+    collision check.
     """
     openings = openings or GunOpenings.pinned(None)
     deadline = deadline or Deadline()
@@ -2292,6 +2305,21 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         with cell.gun_opening(opening):
             if cell.segment_collides(qa, qb, max_step=check_step):
                 continue
+            if direct_clearance > 0.0:
+                # Clear and roomy are different questions.  The collision margin says the
+                # move does not touch; this says how much air it keeps, and a caller
+                # asking for more than the margin gives is asking for the searches --
+                # which can put the route somewhere else entirely, as no amount of
+                # standing off a straight line can.  Measured over the same walk that
+                # proved it clear, bisection included, so a dip between two grid samples
+                # counts here exactly as it counts there.
+                worst = cell.segment_clearance(qa, qb, max_step=check_step,
+                                               floor=direct_clearance)
+                if worst < direct_clearance:
+                    log(f"      direct move is clear but comes within {worst:.1f} mm of "
+                        f"the parts, under the {direct_clearance:g} mm asked of it"
+                        f"{_gun_note(opening)}; searching for a route instead")
+                    continue
             # "Clear" and "sensible" part company when the line grazes a panel, so when
             # the penalty says this one does, the same pass that stands other routes off
             # is given a chance to bow it away -- there is nothing for OMPL to do here,

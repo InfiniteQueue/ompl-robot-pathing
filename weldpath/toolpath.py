@@ -193,6 +193,7 @@ class ToolpathPlanner:
                  near_panel_mm: float = 0.0, linear_speed_mm_s: float = 0.0,
                  linear_crossing_penalty_s: float = 0.0,
                  linear_introduce_mm: float = 0.0,
+                 direct_clearance_mm: float = 0.0,
                  weld_clearance_mm: float | None = None,
                  stand_off_search: bool = True, stand_off_scan_mm: float = 0.5,
                  stand_off_resolution_mm: float = 0.05,
@@ -238,6 +239,13 @@ class ToolpathPlanner:
                                linear_speed_mm_s=linear_speed_mm_s,
                                crossing_penalty_s=linear_crossing_penalty_s,
                                introduce_mm=linear_introduce_mm)
+        # How much air the straight move between two waypoints has to keep before it is
+        # taken in preference to searching.  A collision check answers whether the move
+        # touches anything, not whether it is a move anybody would choose, and the two
+        # part company on a transit that slides along a panel: clear at the margin, and
+        # the one shape of route the searches would never have proposed.  0 leaves the
+        # collision check as the whole of the test, which is what it was.
+        self.direct_clearance_mm = max(0.0, float(direct_clearance_mm))
         # Every locator reports its measured clearance against the one it has to meet,
         # placed or not, so the query has to see past the larger threshold with room to
         # spare.  A probe that stops at the threshold can only ever answer "at least the
@@ -250,7 +258,12 @@ class ToolpathPlanner:
         # otherwise be indistinguishable from one a metre out.
         wanted = max(max(near_panel_mm, self.zone.reach_mm) + NEAR_PANEL_HEADROOM_MM
                      if self.zone.enabled else 0.0,
-                     report_probe)
+                     report_probe,
+                     # Read by the same at-or-under test, and for the same reason it has
+                     # to be seen past: a floor at the probe is one every state meets by
+                     # the query running out of range.
+                     (self.direct_clearance_mm + NEAR_PANEL_HEADROOM_MM
+                      if self.direct_clearance_mm > 0.0 else 0.0))
         if wanted > 0.0:
             cell.require_proximity(wanted, log=log)
         # Set when --export-collision-geometry is on: a pose that cannot be placed then
@@ -736,6 +749,7 @@ class ToolpathPlanner:
             shortcut_seconds=self.shortcut_seconds,
             polish_seconds=self.polish_seconds,
             zone=self.zone,
+            direct_clearance=self.direct_clearance_mm,
             openings=self._transit_openings(a, b, leave_open, arrive_open),
             main_openings=self.main_openings,
             extra_openings=self.extra_openings,
