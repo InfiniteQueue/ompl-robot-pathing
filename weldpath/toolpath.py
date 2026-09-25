@@ -23,8 +23,8 @@ from .cell import STOP_BAND_JOINT, Cell
 from .manifest import Locator, Manifest
 from .cartesian import CartesianBudget
 from .fallback import FallbackFinder
-from .planning import (LIN, PTP, LinearZone, OmplBudget, PlanningError, Relocation,
-                       unique_openings,
+from .planning import (LIN, PTP, Deadline, LinearZone, OmplBudget, PlanningError,
+                       Relocation, unique_openings,
                        plan_freespace,
                        validate)
 
@@ -74,7 +74,9 @@ class ToolpathPlanner:
                  ompl: OmplBudget | None = None,
                  cartesian: CartesianBudget | None = None,
                  fallback_runs: int = 0, relocate: Relocation | None = None,
-                 extra_openings: int = 0, opening_round_mm: float = 5.0,
+                 segment_seconds: float = 0.0,
+                 main_openings: int = 5, extra_openings: int = 0,
+                 opening_round_mm: float = 5.0,
                  fallback_mm: float = 100.0, fallback_step_mm: float = 40.0,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
                  continuous_check: bool = False,
@@ -82,6 +84,7 @@ class ToolpathPlanner:
                  near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
                  near_panel_min_pct: float = 0.0, linear_speed_mm_s: float = 0.0,
                  linear_crossing_penalty_s: float = 0.0,
+                 linear_introduce_mm: float = 0.0,
                  weld_clearance_mm: float | None = None,
                  stand_off_search: bool = True, stand_off_scan_mm: float = 0.5,
                  stand_off_resolution_mm: float = 0.05,
@@ -96,8 +99,15 @@ class ToolpathPlanner:
         # pays for it.
         self.cartesian = cartesian
         self.fallback_runs = fallback_runs
-        # Openings to try beyond the four the transit's own ends and the gun's shape name,
-        # and the multiple the chosen values are rounded to.  See _bisect_openings.
+        # Wall clock for one segment's search.  Every budget below it bounds a part of the
+        # search and they multiply, so this is what bounds a segment that has no route at
+        # all: past it the search stops and the segment is reported as one that found
+        # none, which the run loop already knows how to carry on from.  See Deadline.
+        self.segment_seconds = segment_seconds
+        # How many gun openings a transit is planned over: the rotation phase one deals
+        # its runs round, the reserve phase two walks afterwards, and the multiple the
+        # values found by bisection are rounded to.  See planning._opening_lists.
+        self.main_openings = main_openings
         self.extra_openings = extra_openings
         self.opening_round_mm = opening_round_mm
         # How far the shortcut and polish passes displace a waypoint when they try
@@ -115,14 +125,20 @@ class ToolpathPlanner:
         self.zone = LinearZone(near_mm=near_panel_mm, min_run_mm=near_panel_min_mm,
                                min_run_pct=near_panel_min_pct,
                                linear_speed_mm_s=linear_speed_mm_s,
-                               crossing_penalty_s=linear_crossing_penalty_s)
+                               crossing_penalty_s=linear_crossing_penalty_s,
+                               introduce_mm=linear_introduce_mm)
         # Every locator reports its measured clearance against the one it has to meet,
         # placed or not, so the query has to see past the larger threshold with room to
         # spare.  A probe that stops at the threshold can only ever answer "at least the
         # requirement", which is the half of the question already known.
         report_probe = max(cell.obstacle_clearance / man.scale,
                            weld_clearance_mm or 0.0) + CLEARANCE_REPORT_HEADROOM_MM
-        wanted = max(near_panel_mm + NEAR_PANEL_HEADROOM_MM if self.zone.enabled else 0.0,
+        # ``--linear-introduce-mm`` is read by the same at-or-under test as the band, so
+        # the query has to see past whichever of the two is the wider.  Past, not to: a
+        # reading at the probe is "nothing found", and a state exactly at the limit would
+        # otherwise be indistinguishable from one a metre out.
+        wanted = max(max(near_panel_mm, self.zone.reach_mm) + NEAR_PANEL_HEADROOM_MM
+                     if self.zone.enabled else 0.0,
                      report_probe)
         if wanted > 0.0:
             cell.require_proximity(wanted, log=log)
@@ -497,6 +513,10 @@ class ToolpathPlanner:
         # inverse kinematics and sets the gun's initial opening; it never contributes a
         # waypoint of its own, and it is not what a difficult transit detours through --
         # see weldpath.fallback.
+        # Started here rather than at the transit, so that everything this segment does
+        # counts against it -- placing the weld, searching for a fallback pose, and the
+        # refinement -- even though the search loops are what actually read it.
+        deadline = Deadline(self.segment_seconds)
         phases: list[Phase] = []
         qa, qb = anchors[a.name], anchors[b.name]
         transit_start, transit_end = qa, qb
@@ -523,10 +543,12 @@ class ToolpathPlanner:
             check_step=self.check_step,
             fallback_via=self._fallback_for(a, b, transit_start, transit_end),
             fallback_runs=self.fallback_runs, relocate=self.relocate,
+            deadline=deadline,
             shortcut_seconds=self.shortcut_seconds,
             polish_seconds=self.polish_seconds,
             zone=self.zone,
             openings=self._transit_openings(a, b, leave_open, arrive_open),
+            main_openings=self.main_openings,
             extra_openings=self.extra_openings,
             opening_round_mm=self.opening_round_mm,
             record=raw_legs, log=self.log)

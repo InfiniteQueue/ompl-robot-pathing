@@ -140,8 +140,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "(default: %(default)g)")
 #endregion
     #region ###PATHFINDING###
+    #WHEN TO GIVE UP ON ONE SEGMENT
+    p.add_argument("--segment-minutes", type=float, default=120.0, metavar="MINUTES",
+                   help="how long the planner may spend searching for one segment's route "
+                        "before giving up on it and moving to the next. Every other "
+                        "budget here bounds a part of that search -- runs, seconds per "
+                        "run, gun openings, fallback poses -- and they multiply, so a "
+                        "segment that simply has no route can cost hours before the last "
+                        "of them is exhausted. Past this nothing further is started; "
+                        "whatever routes are already in hand are still ranked, refined "
+                        "and shipped, and a segment with none is reported as a failure "
+                        "like any other and the run carries on. 0 removes the limit "
+                        "(default: %(default)g)")
     #PHASE ONE: CHOOSE BETWEEN ROUTES
-    p.add_argument("--phase-one-runs", type=int, default=25, metavar="N",
+    p.add_argument("--phase-one-runs", type=int, default=20, metavar="N",
                    help="sampling-planner runs made per transit in phase one. Every one "
                         "is spent whether or not earlier runs succeeded, and the "
                         "lowest-penalty solution of the set is the one that ships. The "
@@ -156,7 +168,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "run costs this long in the worst case, so it multiplies with "
                         "--phase-one-runs (default: %(default)g)")
     #PHASE TWO: FIND ANY ROUTE AT ALL
-    p.add_argument("--phase-two-max-runs", type=int, default=8, metavar="N",
+    p.add_argument("--phase-two-max-runs", type=int, default=2, metavar="N",
                    help="most sampling-planner runs allowed in phase two, which is "
                         "entered only when phase one found nothing at all. Phase two "
                         "stops at the first solution rather than sampling for a better "
@@ -169,6 +181,26 @@ def build_parser() -> argparse.ArgumentParser:
                         "--phase-one-solve-seconds: a transit that beat phase one is "
                         "usually one where restarting wastes the tree built so far, so a "
                         "longer single search helps where another short one does not "
+                        "(default: %(default)g)")
+    #PHASE TWO: CARTESIAN SEARCHES SPREAD THROUGH IT
+    p.add_argument("--phase-two-cartesian-runs", type=int, default=2, metavar="N",
+                   help="Cartesian tree searches made during phase two, spread evenly "
+                        "through its sampling runs rather than queued behind them. Each "
+                        "runs at the next gun opening of the --extra-gun-openings list, "
+                        "as phase two's own runs do. Either kind of search ends the phase "
+                        "by solving, so an order that ran one kind out first would let "
+                        "the ordering decide which kind ever got a turn rather than the "
+                        "clock. Like the searches between the phases these only run where "
+                        "--near-panel-mm is in force. 0 leaves phase two to the sampling "
+                        "planner alone (default: %(default)g)")
+    #PHASE TWO CARTESIAN RUN TIME
+    p.add_argument("--phase-two-cartesian-seconds", type=float, default=30.0,
+                   metavar="SECONDS",
+                   help="how long one of phase two's Cartesian searches may run. Shorter "
+                        "than --cartesian-solve-seconds on purpose: what is wanted by "
+                        "then is not a better route but any route, from a part of the "
+                        "gun's range nothing has tried yet, and phase two is where what "
+                        "the transit has left to spend is thinnest "
                         "(default: %(default)g)")
     #CARTESIAN TREE, BETWEEN THE TWO PHASES
     p.add_argument("--cartesian-solve-seconds", "--cartesian-seconds", type=float,
@@ -232,16 +264,34 @@ def build_parser() -> argparse.ArgumentParser:
                         "straight joint move is already clear takes that move and spends "
                         "no runs; one the planner cannot join keeps its Cartesian states, "
                         "so this can only cost time, never a route (default: %(default)s)")
-    p.add_argument("--extra-gun-openings", type=int, default=2, metavar="N",
-                   help="further gun openings to try on a transit, beyond the departure "
-                        "and arrival openings and the closed, widest and half-open ones "
-                        "always tried. Each is placed in the middle of the widest range "
-                        "no opening has been tried in yet, so the openings spread over "
-                        "the gun's travel rather than clustering. They are tried last, "
-                        "after every named opening has failed, and each one costs a "
-                        "further pass over the fallback poses (default: %(default)g)")
+    #HOW MANY GUN OPENINGS A TRANSIT IS PLANNED OVER
+    p.add_argument("--min-gun-openings", type=int, default=5, metavar="N",
+                   help="gun openings a transit is planned over in phase one. The runs of "
+                        "--phase-one-runs are dealt round them, one opening each and back "
+                        "to the first when the list runs out, and the cheapest solution "
+                        "of the whole set ships whichever opening it came from -- so the "
+                        "choice between openings is made on what each produced rather "
+                        "than on the order they were offered in. The list is filled in "
+                        "preference order: the opening the robot departs with, the one it "
+                        "must arrive holding, then closed, widest and half open, then "
+                        "further ones bisecting the widest untried range. An opening that "
+                        "puts either end of the transit in collision is skipped and does "
+                        "not count, so this counts openings that can be planned at rather "
+                        "than openings proposed (default: %(default)g)")
+    #HOW MANY MORE ARE HELD BACK FOR PHASE TWO
+    p.add_argument("--extra-gun-openings", type=int, default=3, metavar="N",
+                   help="further gun openings, beyond --min-gun-openings, held back for "
+                        "phase two. Phase one never runs at these: it has already had its "
+                        "runs at the others, and a longer search where three short ones "
+                        "just failed is the narrower of the two bets on offer, so phase "
+                        "two looks somewhere new instead. It walks this list one opening "
+                        "per run, and so do the Cartesian searches spread through it. "
+                        "Chosen and screened exactly as the others are, so one in "
+                        "collision at either end does not count towards the total. 0 "
+                        "leaves phase two nothing to do on a cell that has a gun "
+                        "(default: %(default)g)")
     p.add_argument("--gun-opening-round-mm", type=float, default=5.0, metavar="MM",
-                   help="multiple that --extra-gun-openings values are rounded to, so "
+                   help="multiple that bisected gun openings are rounded to, so "
                         "that the program commands round figures. An opening that rounds "
                         "onto one already being tried is dropped, so a coarse setting "
                         "over a narrow range yields fewer openings than asked for. 0 "
@@ -280,11 +330,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip the shortcutting pass and emit the sampling planner's own "
                         "route, which is typically much longer")
     #SHORTCUT PASS TIME
-    p.add_argument("--shortcut-seconds", type=float, default=20.0, metavar="SECONDS",
+    p.add_argument("--shortcut-seconds", type=float, default=30.0, metavar="SECONDS",
                    help="time budget for shortcutting each freespace transit; longer "
                         "budgets keep shortening with diminishing returns (default: %(default)g)")
     #POLISH PASS TIME
-    p.add_argument("--polish-seconds", type=float, default=50.0, metavar="SECONDS",
+    p.add_argument("--polish-seconds", type=float, default=120.0, metavar="SECONDS",
                    help="time budget for the final pass over each transit's emitted "
                         "waypoints, which removes and relocates them under the full "
                         "stop-to-stop time the robot really pays for each one. The "
@@ -376,6 +426,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "out linear however completely it runs alongside the panel -- a hop "
                         "from one weld to the next being the case that matters. 0 leaves "
                         "--near-panel-min-mm as the only test (default: %(default)g)")
+    #HOW FAR OUT LINEAR MOTION MAY BE CREATED
+    p.add_argument("--linear-introduce-mm", type=float, default=120.0, metavar="MM",
+                   help="clearance above which the optimisation passes may not introduce "
+                        "linear motion that was not already there. A move is linear when "
+                        "either of its ends is inside --near-panel-mm, which says nothing "
+                        "about where the other end is, so a shortcut that cuts from a "
+                        "state well clear of the parts straight to one against them "
+                        "creates a single straight move the robot must have collision-free "
+                        "inverse kinematics along for its whole length and flies under "
+                        "--linear-speed-mm-s all the way in. This caps how far out such a "
+                        "move may start: a replacement reaching in from beyond this is "
+                        "refused unless the stretch it replaces already did the same, so "
+                        "reaches the route arrived with survive being shortened, thinned "
+                        "and relocated while no pass can create one. Never read as less "
+                        "than --near-panel-mm, since a move with both ends in the band is "
+                        "linear wherever it runs and has nothing to introduce. 0 places no "
+                        "limit (default: %(default)g)")
     #PRICE OF REACHING INTO THE BAND FROM OUTSIDE IT
     p.add_argument("--linear-crossing-penalty-s", type=float, default=100.0,
                    metavar="SECONDS",
@@ -702,16 +769,16 @@ def build_parser() -> argparse.ArgumentParser:
                         "turns all penalties off. Takes true/false (yes/no, on/off, 1/0); "
                         "passing the flag with no value means true (default: %(default)s)")
     #STRENGTH AT TOUCHING
-    p.add_argument("--stepped-penalty-multiplier", type=float, default=14.0, metavar="N", #was 7
+    p.add_argument("--stepped-penalty-multiplier", type=float, default=12.0, metavar="N", #was 7
                    help="penalty at zero clearance: a second spent touching costs as much "
                         "as N seconds in open space (default: %(default)g)")
     #WHERE THE PENALTY IS SPENT
-    p.add_argument("--stepped-penalty-zero-mm", type=float, default=35.0, metavar="MM", #was 100
+    p.add_argument("--stepped-penalty-zero-mm", type=float, default=25.0, metavar="MM", #was 100
                    help="clearance at which the penalty reaches 1x and stops mattering. "
                         "Also how far the proximity query has to see, so lowering it "
                         "speeds planning up (default: %(default)g)")
     #STEP LENGTH
-    p.add_argument("--stepped-penalty-step-mm", type=float, default=1.5, metavar="MM", #was 25
+    p.add_argument("--stepped-penalty-step-mm", type=float, default=2, metavar="MM", #was 3
                    help="how much extra clearance counts as one step of falloff "
                         "(default: %(default)g)")
     #STEP FACTOR
@@ -740,7 +807,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="commanded tool speed cap on linear moves; the joint limits still "
                         "govern whenever they are slower (default: %(default)g)")
     #HOW MUCH A STOP COSTS THE OPTIMISER
-    p.add_argument("--stop-time-weight", type=float, default=0.5, metavar="W",
+    p.add_argument("--stop-time-weight", type=float, default=0.8, metavar="W",
                    help="how heavily a stop is charged in the time the planner scores "
                         "routes by, and nowhere else: the exported timing is the real "
                         "one. Every waypoint is a full stop, so deleting one nearly "
@@ -873,6 +940,25 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if not 0.0 <= args.stop_time_weight <= 2.0:
         print("error: --stop-time-weight must be between 0 and 2", file=sys.stderr)
         return 2
+    if args.linear_introduce_mm < 0.0:
+        print("error: --linear-introduce-mm cannot be negative", file=sys.stderr)
+        return 2
+    if args.segment_minutes < 0.0:
+        print("error: --segment-minutes cannot be negative", file=sys.stderr)
+        return 2
+    if args.min_gun_openings < 1:
+        print("error: --min-gun-openings must be at least 1: a transit is planned at "
+              "one gun opening or another", file=sys.stderr)
+        return 2
+    if args.extra_gun_openings < 0:
+        print("error: --extra-gun-openings cannot be negative", file=sys.stderr)
+        return 2
+    if args.phase_two_cartesian_runs < 0:
+        print("error: --phase-two-cartesian-runs cannot be negative", file=sys.stderr)
+        return 2
+    if args.phase_two_cartesian_seconds < 0.0:
+        print("error: --phase-two-cartesian-seconds cannot be negative", file=sys.stderr)
+        return 2
 
     try:
         if args.stepped_penalty:
@@ -966,10 +1052,14 @@ def _run(args: argparse.Namespace, directory: str) -> int:
                                   extend_mm=args.cartesian_extend_mm,
                                   margin_mm=args.cartesian_margin_mm,
                                   tilt_deg=args.cartesian_tilt_deg,
-                                  recut=args.cartesian_recut),
+                                  recut=args.cartesian_recut,
+                                  phase_two_seconds=args.phase_two_cartesian_seconds,
+                                  phase_two_runs=args.phase_two_cartesian_runs),
         fallback_runs=args.fallback_runs,
+        segment_seconds=args.segment_minutes * 60.0,
         fallback_mm=args.fallback_distance_mm,
         fallback_step_mm=args.fallback_step_mm,
+        main_openings=args.min_gun_openings,
         extra_openings=args.extra_gun_openings,
         opening_round_mm=args.gun_opening_round_mm,
         relocate=Relocation(min_attempts=args.polish_min_attempts,
@@ -985,6 +1075,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         near_panel_min_pct=args.near_panel_min_pct,
         linear_speed_mm_s=args.linear_speed_mm_s,
         linear_crossing_penalty_s=args.linear_crossing_penalty_s,
+        linear_introduce_mm=args.linear_introduce_mm,
         weld_clearance_mm=args.weld_clearance_mm,
         stand_off_search=args.weld_shift_search,
         stand_off_scan_mm=args.weld_shift_scan_mm,

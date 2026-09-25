@@ -119,6 +119,29 @@ the way, so the joint values in between are whatever that line demands.
   - Still read off the joint chord, before any profile is known: `_path_cost` ranking raw
     solver routes, and `_plan_direct`'s check of whether a clear direct move runs close
     enough to the parts to be worth refining.
+- The passes ask one question before checking or pricing anything: `MotionModel.refuses`,
+  which is `demotes` or `overreaches`. The two guard the same thing from opposite sides --
+  one stops a near-panel stretch being dissolved, the other stops one being grown outward.
+- `MotionModel.overreaches` is the `--linear-introduce-mm` limit, default 120 mm. The
+  endpoint rule makes a move `LIN` when *either* end is in the band and says nothing about
+  where the other end is, so a cut from a state a metre clear straight to one against the
+  panel ships as a single straight move whose whole line needs collision-free IK and which
+  flies in under the tool speed cap. A replacement that is `LIN` with an end beyond the
+  limit is refused **unless the stretch it replaces already had such a move**, which is
+  what keeps this a limit on *introducing* linear motion rather than on having it: a
+  Cartesian route recut with a long reach still gets shortened, thinned and relocated.
+  - `LinearZone.reach_mm` never reads under `near_mm`. A move with both ends in the band is
+    linear wherever it runs, so a tighter limit would refuse the reshaping `demotes`
+    deliberately allows and freeze every near-panel stretch. 0 switches the rule off, and
+    `refuses` is then `demotes` exactly.
+  - Measured by `_reads_near` against the limit, so the probe has to see past it:
+    `ToolpathPlanner` asks for `max(near_mm, reach_mm) + NEAR_PANEL_HEADROOM_MM`, 145 mm at
+    the defaults against 75 mm before. Beyond the probe every state reads the same, so this
+    is deliberately a yes-or-no rather than a ranking of one overreach against another --
+    there is no measurement to rank with.
+  - It gates the passes only. The initial split is untouched: the dense route's states sit
+    one check step apart, so a move out of the band into it is short by construction, and
+    the reach only appears once a pass lengthens a move.
 - `MotionModel.demotes` is why the linear stretches survive those passes. Deleting a
   waypoint is nearly always quicker — every retained hop pays its own ramps — so left
   alone the passes collapse a near-panel polyline into one chord whose ends sit outside
@@ -155,6 +178,44 @@ the way, so the joint values in between are whatever that line demands.
     own factor arithmetic — `MotionModel.cost`, `simplify`'s `polyline_cost`, and both
     sides of `shortcut`'s comparison. Charged on the same footing everywhere or it would
     not cancel where it is supposed to.
+- `Deadline` is the wall clock for one segment, `--segment-minutes` (120). Every other
+  budget bounds a part of the search and they multiply -- runs x seconds x openings x
+  fallback poses x pairs of openings at each pose -- so this is the only figure that bounds
+  a segment with no route. `ran_out` is asked where work is about to start rather than
+  interrupting it, since a run stopped halfway leaves nothing usable, and `clamp` cuts each
+  per-run limit to the time left. What is already found is still ranked, refined and
+  shipped; a segment with nothing raises, and `ToolpathPlanner.run` records the reason and
+  goes on, which is what it already did with a segment that failed outright.
+- **The gun opening is a search variable, not a setting picked before the search.**
+  `_opening_lists` builds two lists per leg: `main`, the rotation phase one and the
+  Cartesian tree deal their runs round, and `extra`, held back for phase two. Both are
+  drawn in preference order -- departure, arrival, closed, widest, half open, then
+  bisections of the widest range nothing has been tried in yet -- and screened as they are
+  built, so an opening that repeats one already offered, or that leaves a pose of the leg
+  in collision, is skipped and counts against neither total. `--min-gun-openings` and
+  `--extra-gun-openings` are counts of openings that can be planned at.
+  - Phase one deals its runs round `main`, and `_cheapest` keeps the best of the whole set
+    whichever opening it came from, ties going to the earlier one, which is the opening
+    already in force. This is why `_Solution` carries an opening: the caller can no longer
+    infer it from the order it asked in, and everything downstream -- `_finish`, the recut,
+    the per-phase validation -- has to run at the opening its route was found at, the tip
+    being part of the machine that has to fit through the gap.
+  - Phase two walks `extra`, one opening per run, and never repeats one phase one had runs
+    at: a longer search where the short ones just failed is the narrower of the two bets.
+    `CartesianBudget.phase_two_seconds` and `phase_two_runs` add short Cartesian searches,
+    spread through those runs by `_interleave`, which takes whichever kind's next turn falls
+    earliest as a fraction of its own count. The phase stops at the first solution either
+    kind finds, so queueing one kind behind the other would let the ordering decide which
+    kind ever ran.
+  - The rotation belongs to the direct transit alone. A route through a fallback pose is one
+    leg whose two halves must agree on one gun state, and so is either half of a two-leg
+    split, so those walk `GunOpenings.pinned` one opening at a time -- the old order, kept
+    where it is still the only one available. A cell with no gun joint gets `pinned(None)`,
+    which is exactly what it did before any of this.
+  - `_Sampler._run` loads a pose through `cell.set_state` inside its own `gun_opening`
+    block. OMPL reads the gun from the environment's current state and not from the program
+    it is handed, and before this each run inherited whatever the last collision query had
+    left there -- right in practice only because the endpoint screen always ran first.
 - `plan_cartesian` is the only search that builds straight tool moves. `_plan_direct`
   reaches it only when OMPL phase one returned nothing and the band is on, and never for
   the halves of a fallback-pose route, which are planned with no zone.

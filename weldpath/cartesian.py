@@ -58,6 +58,12 @@ class CartesianBudget:
     are refused whole the moment any station on them fails, wasting the inverse kinematics
     already spent on the stations before it.
 
+    ``phase_two_seconds`` and ``phase_two_runs`` are a second, shorter set of searches,
+    made during phase two and at the gun openings phase two walks rather than the ones the
+    searches above have already been through.  They are short because phase two is where
+    the transit's remaining time is thinnest and because what is wanted there has changed:
+    not a better route but any route, from a part of the machine's range nothing has tried.
+
     ``recut`` is the one setting here that is not about the search.  The tree has to reach
     the far endpoint, so it returns straight tool moves over the whole transit including
     the part of it that runs nowhere near a panel, where a straight-line route was never
@@ -76,11 +82,24 @@ class CartesianBudget:
     orient_weight_mm_per_rad: float = 200.0     # a radian of turn as this much tool travel
     branch_seeds: int = 8           # scattered seeds tried when the continuing one fails
     recut: bool = True              # re-plan the stretches outside the band with OMPL
+    phase_two_seconds: float = 0.0  # length of one search made during phase two
+    phase_two_runs: int = 0         # how many of those, spread through phase two's runs
     seed: int = 0
 
     @property
     def enabled(self) -> bool:
         return self.seconds > 0.0 and self.max_iters > 0
+
+    @property
+    def phase_two_enabled(self) -> bool:
+        """Whether phase two gets Cartesian searches of its own.
+
+        Independent of ``enabled``: a cell may want the long searches between the phases
+        and not the short ones inside phase two, or the other way about.  What they share
+        is ``max_iters``, which is a bound on one search rather than on a phase.
+        """
+        return (self.phase_two_seconds > 0.0 and self.phase_two_runs > 0
+                and self.max_iters > 0)
 
 
 # ---------------------------------------------------------------------------
