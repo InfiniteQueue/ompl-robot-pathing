@@ -1174,29 +1174,67 @@ def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
 # ---------------------------------------------------------------------------
 # freespace
 # ---------------------------------------------------------------------------
-def _path_cost(cell: Cell, path: list[np.ndarray], max_step: float
-               ) -> tuple[float, float]:
-    """Penalised time for a whole path, and its plain time.
+def _scored_points(cell: Cell, model: "MotionModel", path: list[np.ndarray],
+                   step: float) -> list[np.ndarray]:
+    """``path`` at the one spacing every candidate is scored at.
 
-    Cruise time, not stop-to-stop time: this scores a raw sampling-planner solution, whose
-    waypoint count is an artefact of how the tree happened to grow rather than a decision
-    anyone made.  Ranking solutions on stop-to-stop time would mostly rank them on how many
-    nodes each one took, which says nothing about the route.
+    The point counts routes arrive with are facts about the searches, not about the
+    routes.  OMPL returns the handful of nodes its tree happened to stop at -- four is
+    typical -- while the Cartesian tree returns every station it validated, one per
+    ``Cell.tcp_check_mm`` of tool travel, which is hundreds.  Scoring stop-to-stop over
+    those as they stand would charge one route three ramps and the other three hundred,
+    and rank the two searches on how each reports itself.
 
-    With no penalty in force the two figures are equal, so ranking on the first still ranks
-    on time and the choice degrades to "quickest raw solution" rather than to nothing.
+    Filling in and thinning back to ``step`` gives both a waypoint count that follows the
+    route's own geometry instead.  The fill is the profile-aware one, so a stretch that
+    will ship linear is described by the tool's line rather than the joint chord, which is
+    also what keeps the pricing below finite: a linear move with no reachable line has no
+    price, and the long moves of an unfilled raw route are exactly the ones whose lines do
+    not solve.
+    """
+    dense, _ = _densify_marked(cell, path, step, model=model)
+    if len(dense) < 3:
+        return dense
+    return [dense[0], *_thin(dense[0], dense[1:-1], dense[-1], step), dense[-1]]
+
+
+def _path_cost(cell: Cell, path: list[np.ndarray], max_step: float,
+               *, zone: "LinearZone | None" = None) -> tuple[float, float]:
+    """Penalised stop-to-stop time for a whole path, and its plain time.
+
+    Scored through the same ``MotionModel`` the refinement passes are scored through, so a
+    stretch that will ship linear is costed under the tool speed cap, charged the crossing
+    penalty, and has its clearance penalty read along the tool's own line rather than the
+    joint chord.  This used to go straight to ``Cell.segment_cost``, which knows nothing of
+    any of that, and so systematically undercharged the routes most likely to be capped --
+    the Cartesian tree's, whose every edge is a straight tool move -- against phase one's,
+    which mostly ship as joint motion and were priced about right.  The two now compete on
+    every transit, so that asymmetry decided transits rather than merely misreporting them.
+
+    Stop-to-stop rather than cruise, which is the currency ``--stop-time-weight`` acts in
+    and the one every later comparison is made in.  It is only safe to use here because
+    ``_scored_points`` puts every candidate at one spacing first; on the routes as they
+    arrive it would rank them by node count.
+
+    The second figure is the same time without the clearance and crossing penalties -- real
+    seconds, cap included -- so "cost against plain" still reads as what the penalties added.
     Endpoint factors are threaded from one segment to the next so each waypoint costs one
-    clearance query rather than two.
+    clearance query rather than two; they reach only the joint moves, a linear one being
+    priced off the stations along its line.
     """
     if len(path) < 2:
         return 0.0, 0.0
+    model = MotionModel(cell, max_step=max_step, zone=zone)
+    pts = _scored_points(cell, model, path, max_step)
+    if len(pts) < 2:
+        return 0.0, 0.0
     penalised = cell.penalty is not None and cell.penalty.enabled
     total = plain = 0.0
-    prev_f = cell.penalty_factor(path[0]) if penalised else None
-    for a, b in zip(path, path[1:]):
+    prev_f = cell.penalty_factor(pts[0]) if penalised else None
+    for a, b in zip(pts, pts[1:]):
         next_f = cell.penalty_factor(b) if penalised else None
-        total += cell.segment_cost(a, b, max_step=max_step, fa=prev_f, fb=next_f)
-        plain += cell.cruise_time(a, b)
+        total += model.cost(a, b, fa=prev_f, fb=next_f, stops=True)
+        plain += model.move_time(a, b)
         prev_f = next_f
     return total, plain
 
@@ -2059,6 +2097,10 @@ class _Sampler:
     ompl: OmplBudget
     segment_length: float
     check_step: float
+    # For scoring only.  Nothing here plans differently because of it: OMPL cannot produce
+    # linear motion, so the zone says how the route it returns will be flown, not how it
+    # is searched for.  See _path_cost.
+    zone: "LinearZone | None" = None
     openings: GunOpenings = field(default_factory=lambda: GunOpenings.pinned(None))
     deadline: Deadline = field(default_factory=Deadline)
     continuous_check: bool = False
@@ -2185,7 +2227,7 @@ class _Sampler:
                                 f"own check ({fault})")
                 self.log(f"      {label}{note}: {self.message} ({dt:.1f}s)")
                 return None
-            cost, plain = _path_cost(self.cell, raw, self.check_step)
+            cost, plain = _path_cost(self.cell, raw, self.check_step, zone=self.zone)
         self.log(f"      {label}{note}: solved in {dt:.1f}s ({len(raw)} raw points, "
                  f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
         return _Solution(cost, plain, raw, opening)
@@ -2260,8 +2302,8 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     # only stage that can make that choice at all -- and since the runs are being spent
     # anyway, dealing them round the openings makes the same choice over a wider set.
     sampler = _Sampler(cell=cell, ompl=ompl, segment_length=segment_length,
-                       check_step=check_step, openings=openings, deadline=deadline,
-                       continuous_check=continuous_check, log=log)
+                       check_step=check_step, zone=zone, openings=openings,
+                       deadline=deadline, continuous_check=continuous_check, log=log)
     candidates = sampler.phase_one(qa, qb)
 
     tree = cartesian if (cartesian is not None and cartesian.enabled
@@ -2291,7 +2333,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         # Still gated on the zone, because a route made of straight moves only earns its
         # cost where linear motion was wanted in the first place.
         found = _cartesian_solutions(cell, qa, qb, tree, check_step, openings.main, log,
-                                     deadline=deadline)
+                                     deadline=deadline, zone=zone)
         if found:
             # The best of the set is the only one recut: the recut runs the sampling
             # phases on every stretch outside the band, far too dear to spend on routes
@@ -2315,7 +2357,8 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
                                        seconds=deadline.clamp(tree.phase_two_seconds),
                                        seed=tree.seed + PHASE_TWO_SEED_OFFSET + run,
                                        opening=opening, check_step=check_step,
-                                       label=f"phase 2 cartesian run {run}", log=log)
+                                       label=f"phase 2 cartesian run {run}", log=log,
+                                       zone=zone)
                 if got is not None and tree.recut:
                     got = _recut_solution(cell, got, zone=zone, sampler=sampler,
                                           check_step=check_step, log=log)
@@ -2349,7 +2392,8 @@ PHASE_TWO_SEED_OFFSET = 1000
 
 def _cartesian_route(cell: Cell, qa: np.ndarray, qb: np.ndarray, budget: "CartesianBudget",
                      *, seconds: float, seed: int, opening: float | None,
-                     check_step: float, label: str, log) -> _Solution | None:
+                     check_step: float, label: str, log,
+                     zone: "LinearZone | None" = None) -> _Solution | None:
     """One Cartesian search at one gun opening, scored as phase one scores its own.
 
     The gun is not a detail of the check here but part of the shape being steered around:
@@ -2367,7 +2411,7 @@ def _cartesian_route(cell: Cell, qa: np.ndarray, qb: np.ndarray, budget: "Cartes
         except PlanningError as exc:
             log(f"      {exc} ({label}{_gun_note(opening)}, {time.time() - t0:.1f}s)")
             return None
-        cost, plain = _path_cost(cell, route, check_step)
+        cost, plain = _path_cost(cell, route, check_step, zone=zone)
     log(f"      {label}{_gun_note(opening)}: solved in {time.time() - t0:.1f}s "
         f"({len(route)} points, cost {cost:.2f} s against {plain:.2f} s unpenalised)")
     return _Solution(cost, plain, route, opening, STEERED)
@@ -2387,7 +2431,7 @@ def _recut_solution(cell: Cell, best: _Solution, *, zone: "LinearZone",
                                     check_step=check_step, opening=best.opening, log=log)
         if route is best.route:
             return best
-        cost, plain = _path_cost(cell, route, check_step)
+        cost, plain = _path_cost(cell, route, check_step, zone=zone)
     log(f"      cartesian tree after the recut: {len(route)} points, cost {cost:.2f} s "
         f"against {plain:.2f} s unpenalised")
     return _Solution(cost, plain, route, best.opening, best.source)
@@ -2396,7 +2440,8 @@ def _recut_solution(cell: Cell, best: _Solution, *, zone: "LinearZone",
 def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                          budget: "CartesianBudget", check_step: float,
                          rotation: list, log,
-                         deadline: "Deadline | None" = None) -> list[_Solution]:
+                         deadline: "Deadline | None" = None,
+                         zone: "LinearZone | None" = None) -> list[_Solution]:
     """Cartesian-tree routes for one transit, each scored as phase one scores its own.
 
     Searches run from successive seeds until one solves or ``budget.seconds`` has passed,
@@ -2430,7 +2475,7 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                 deadline.ran_out(log, f"the cartesian tree after {run} runs")
             return found
         run += 1
-        got = _cartesian_route(cell, qa, qb, budget, seconds=left,
+        got = _cartesian_route(cell, qa, qb, budget, seconds=left, zone=zone,
                                seed=budget.seed + run - 1,
                                opening=rotation[(run - 1) % len(rotation)],
                                check_step=check_step,
@@ -2557,7 +2602,7 @@ def _recut_outside_band(cell: Cell, route: list[np.ndarray], *, zone: LinearZone
             log(f"      recut {n}: the joining route does not start and end at the cuts, "
                 f"so it cannot be spliced in; keeping the Cartesian stretch")
             continue
-        was, _ = _path_cost(cell, dropped, check_step)
+        was, _ = _path_cost(cell, dropped, check_step, zone=zone)
         log(f"      recut {n}: joined with {len(bridge)} points at cost {cost:.2f} s, "
             f"against {was:.2f} s for the {len(dropped)} Cartesian points it replaces")
         plans.append((i, j, bridge))

@@ -125,9 +125,38 @@ the way, so the joint values in between are whatever that line demands.
     at 54.4 s off a chord reaching 64.5 mm into the panel, against 3.6 s off its line, so
     simplify and polish kept a joint detour up and over rather than take it. Shortcut's
     cuts were never affected; they priced the chain they installed.
-  - Still read off the joint chord, before any profile is known: `_path_cost` ranking raw
-    solver routes, and `_plan_direct`'s check of whether a clear direct move runs close
-    enough to the parts to be worth refining.
+  - `_path_cost` reads it the same way now. Ranking used to go straight to
+    `Cell.segment_cost`, which knows nothing of profiles, so a candidate was scored on
+    cruise time with the penalty off its joint chord -- no tool speed cap, no crossing
+    penalty, no line. That undercharged exactly the routes most likely to be capped, the
+    Cartesian tree's being straight tool moves throughout, against phase one's, which
+    mostly ship as joint motion and were priced about right. Harmless while the tree was a
+    fallback; deciding, once the two started competing on every transit.
+  - Still read off the joint chord: `_plan_direct`'s check of whether a clear direct move
+    runs close enough to the parts to be worth refining.
+- **Candidate routes are scored the way the refinement passes score.** `_path_cost`
+  builds a `MotionModel` with the leg's zone and sums `model.cost(a, b, stops=True)`, so a
+  stretch that will ship linear is capped at `--linear-speed-mm-s`, charged
+  `--linear-crossing-penalty-s`, and has its clearance penalty read along the tool's line.
+  The second figure it returns is the same time without either penalty -- cap included --
+  so "cost against plain" still reads as what the penalties added.
+  - Stop-to-stop, not cruise, so `--stop-time-weight` acts here as it does everywhere
+    else. That is only safe because `_scored_points` puts every candidate at one spacing
+    first: the counts they arrive with are facts about the searches, not the routes. OMPL
+    returns the handful of nodes its tree stopped at, the Cartesian tree returns every
+    station it validated one `tcp_check_mm` apart, and scoring those as they stand would
+    charge one route three ramps and the other three hundred. Filling in at
+    `--check-step-deg` and thinning back to it gives both a count that follows the route's
+    own geometry.
+  - The fill is the profile-aware one, which is also what keeps the pricing finite: a
+    linear move with no reachable line costs infinity, and the long moves of an unfilled
+    raw route are exactly the ones whose lines do not solve.
+  - What it costs is one profile-aware densify per candidate rather than one per transit,
+    the winner being densified again in `_finish`. Phase one returns at most
+    `--phase-one-runs` of them.
+  - `_Sampler` carries the zone for scoring only. Nothing plans differently for it: OMPL
+    cannot produce linear motion, so the zone says how the route it returns will be flown,
+    not how it is searched for.
 - The passes ask one question before checking or pricing anything: `MotionModel.refuses`,
   which is `demotes` or `overreaches`. The two guard the same thing from opposite sides --
   one stops a near-panel stretch being dissolved, the other stops one being grown outward.

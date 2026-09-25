@@ -304,7 +304,25 @@ The minimum is a floor rather than a cap. Once it is met and at least one soluti
 planning moves on; if nothing has solved, runs continue up to `--ompl-attempts`. Each run is
 a full solve of several seconds, so this is the most expensive knob in the tool — it is also
 the only one that can change the route's basic shape. With `--no-clearance-penalty` the score
-degrades to plain cruise time, so it still picks the quickest of the sampled solutions.
+degrades to plain time, so it still picks the quickest of the sampled solutions.
+
+**Candidates are scored the way the refinement passes score.** A route is priced through the
+same motion model that later judges its moves: a stretch that will ship linear is held to
+`--linear-speed-mm-s`, charged `--linear-crossing-penalty-s` where it enters the band, and
+has its clearance penalty read along the tool's line rather than the joint chord. Ranking
+used to skip all three, which quietly undercharged the routes most likely to be capped — the
+Cartesian tree's, whose every edge is a straight tool move — against phase one's, which
+mostly ship as joint motion and were priced about right. That mattered little while the tree
+was only reached when phase one failed; it decides transits now the two compete on every one.
+
+The score is stop-to-stop, so `--stop-time-weight` applies here too. That is only sound
+because every candidate is first brought to one spacing: the point counts routes arrive with
+say more about the search than the route. OMPL returns the handful of nodes its tree stopped
+at; the tree returns every station it validated, one `--check-step-mm` of tool travel apart.
+Scored as they stand, one route would pay three ramps and the other three hundred. Each is
+therefore filled in at `--check-step-deg` and thinned back to it before scoring, which gives
+both a waypoint count that follows the route's own geometry. The cost is one extra fill per
+candidate.
 
 ### Seeing what the refinement changed
 
@@ -369,6 +387,7 @@ applied at two scopes, and the distinction is load-bearing:
 
 | Pass | Works on | Measure |
 | --- | --- | --- |
+| candidate ranking | route at a common spacing | full stop-to-stop time |
 | shortcut | densified path | **cruise** time — ramps excluded |
 | simplify | dense → emitted | full stop-to-stop time |
 | polish | emitted waypoints | full stop-to-stop time |
