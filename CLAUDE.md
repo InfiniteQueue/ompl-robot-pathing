@@ -17,8 +17,7 @@ shape falls out of the arm's configuration and is not visible anywhere in the ce
 - Collision checking interpolates **in joint space**: `Cell.segment_collides` steps
   `a + t*(b - a)` over the joint vector, bisecting further wherever the tool moves more
   than `--check-step-mm` between samples, which is exactly the path the robot takes.
-- This is what OMPL produces, and what every move keeps that has neither end in the band
-  or sits on a leg the gate refused.
+- This is what OMPL produces, and what every move keeps that has neither end in the band.
 
 ### Linear profile (`LIN`)
 
@@ -58,7 +57,7 @@ the way, so the joint values in between are whatever that line demands.
     let a line that ends a whole joint 6 turn away, or on another wrist branch, pass
     with the flip hidden in its last joint gap. Measured on Path 1, real lines end
     within 1.1e-4 rad of their target and step at most 0.031 rad per station.
-- `_densify` fills the OMPL path in at `--check-step-deg` resolution, measured as the
+- `_densify_marked` fills the OMPL path in at `--check-step-deg` resolution, measured as the
   **largest joint delta** — not time, not tool distance. OMPL itself returns very few
   points (four is typical); everything downstream runs on the dense list.
   - The fill follows **the curve each move will really be flown along**: the joint
@@ -91,9 +90,19 @@ the way, so the joint values in between are whatever that line demands.
 - The profile is **not stored** against a waypoint. `MotionModel.motion(a, b)` derives it
   from the two states a move runs between: linear when either end is inside the band. That
   is what lets `shortcut` and `polish` move points around without invalidating anything.
-  - Only on a leg `_linear_allowed` admits (`--near-panel-min-pct` of the samples near,
-    or one unbroken near stretch of `--near-panel-min-mm` tool travel). A refused leg gets
-    a model with no zone, and every move on it is joint motion however close it runs.
+  - **There is no per-leg gate any more.** `_linear_allowed` used to ask, before any move
+    was labelled, whether the leg earned linear motion at all -- `--near-panel-min-pct` of
+    its samples near, or one unbroken near stretch of `--near-panel-min-mm` tool travel --
+    and a leg meeting neither was given a model with no zone, so every move on it was
+    joint motion however close it ran. Both flags and the function are gone. The band is
+    now the whole of the decision and it is asked per move, so a route that touches the
+    band once comes out with the two moves either side of that state linear, where before
+    it came out entirely `PTP`. Expect more phases per transit and more short `LIN` runs;
+    `--near-panel-mm 0` or `--no-near-panel-linear` is what turns linear motion off.
+  - Dropping it took the second sampling pass in `_finish` with it. The fill has to follow
+    the curve each move will really be flown along, which needs a model, and the model
+    could not exist until the gate had ruled -- so the route was densified once along the
+    chord to answer the gate and again along the real curves afterwards. One pass now.
   - "Near" is `_reads_near`: `clearance_mm(q) <= near_mm` **and** `< cell.probe_mm`.
     `clearance_mm` returns the probe distance when nothing is in range, so a saturated
     reading is "nothing seen", never a distance. `ToolpathPlanner` asks for a probe of
@@ -275,18 +284,17 @@ the way, so the joint values in between are whatever that line demands.
     alone, since that query is the one phase one just failed.
   - Afterwards it is treated exactly like an OMPL route. With the recut off, joint motion
     enters it only through the endpoint rule, and the refinement passes then replace
-    out-of-band stretches with long joint chords. A leg the gate refuses ships with no
-    linear moves at all, even though it was found by searching linear space.
+    out-of-band stretches with long joint chords, so a route found by searching linear
+    space can still ship with few linear moves on it.
   - `_fill` hands stations straight through only while consecutive ones are within
     `--check-step-deg`. `jump_rad` allows 0.5 rad per station, and a linear gap wider
     than the step is re-derived by `plan_linear`, which need not reproduce the chain the
     tree validated.
   - `--unrefined-output` writes every transit as one `PTP` phase regardless.
-- Order in `_finish` is sample → gate → densify → refine → split → verify. The gate and the
-  fill each need the other's answer, so the route is sampled twice: whether the leg
-  earns linear motion is a proportion over the route, which a chord sample answers
-  perfectly well, and only once that is settled is there a model to say which
-  stretches are linear. The second pass is free where it changes nothing — gate
-  refused means no zone, every move a joint move, and the profile-aware fill is the
-  chord again. The split is a reading of the finished path, not a decision imposed
-  before it.
+- Order in `_finish` is densify → refine → split → verify, one sampling pass. It was
+  sample → gate → densify → … while the gate stood: the fill follows the curve each move
+  will really be flown along, which needs a model, and there was no model until the gate
+  had said whether the leg was to have a zone, so the route was sampled once along the
+  chord for the gate and again along the real curves for the passes. With the band
+  answering per move the model exists first and the profile-aware fill is the only fill.
+  The split is a reading of the finished path, not a decision imposed before it.

@@ -190,8 +190,7 @@ class ToolpathPlanner:
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
                  continuous_check: bool = False,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
-                 near_panel_mm: float = 0.0, near_panel_min_mm: float = 0.0,
-                 near_panel_min_pct: float = 0.0, linear_speed_mm_s: float = 0.0,
+                 near_panel_mm: float = 0.0, linear_speed_mm_s: float = 0.0,
                  linear_crossing_penalty_s: float = 0.0,
                  linear_introduce_mm: float = 0.0,
                  weld_clearance_mm: float | None = None,
@@ -230,11 +229,12 @@ class ToolpathPlanner:
         self.shortcut_seconds = shortcut_seconds
         self.polish_seconds = polish_seconds
         # Stretches of a transit that run this close to a panel or to tooling come out as
-        # linear motion instead of joint motion.  The clearance query has to see past the
-        # band, not just to it: a reading at the probe means nothing was found, so a probe
-        # equal to the band reads every state outside it as sitting on its edge.
-        self.zone = LinearZone(near_mm=near_panel_mm, min_run_mm=near_panel_min_mm,
-                               min_run_pct=near_panel_min_pct,
+        # linear motion instead of joint motion.  The band is the whole of that decision:
+        # it is asked of each move, and no leg has to qualify before its moves may be
+        # linear.  The clearance query has to see past the band, not just to it: a reading
+        # at the probe means nothing was found, so a probe equal to the band reads every
+        # state outside it as sitting on its edge.
+        self.zone = LinearZone(near_mm=near_panel_mm,
                                linear_speed_mm_s=linear_speed_mm_s,
                                crossing_penalty_s=linear_crossing_penalty_s,
                                introduce_mm=linear_introduce_mm)

@@ -407,25 +407,6 @@ def build_parser() -> argparse.ArgumentParser:
                         "transit counts as working near the parts, and is re-planned as "
                         "linear motion. Larger means more of the route comes out linear, "
                         "which is more predictable and slower to execute (default: %(default)g)")
-    #SHORTEST STRETCH WORTH MAKING LINEAR
-    p.add_argument("--near-panel-min-mm", type=float, default=100.0, metavar="MM",
-                   help="shortest near-panel stretch worth converting, measured as tool "
-                        "travel. A sweeping transit that clips the proximity band for a "
-                        "moment is not working near the panel, and cutting it in three to "
-                        "say so costs a stop at each end for nothing. A stretch under "
-                        "this length still qualifies on --near-panel-min-pct "
-                        "(default: %(default)g)")
-    #...OR THIS MUCH OF THE MOVE, HOWEVER SHORT
-    p.add_argument("--near-panel-min-pct", type=float, default=60.0, metavar="PCT",
-                   help="if this much of a move is within --near-panel-mm of the parts, "
-                        "every near-panel stretch of it is made linear however short each "
-                        "one is. Measured over the whole move, not over each stretch: time "
-                        "spent near the panel does not have to be continuous, so a retract "
-                        "whose apex leaves the band for an instant no longer disqualifies "
-                        "the move either side of it. Without this no short move could come "
-                        "out linear however completely it runs alongside the panel -- a hop "
-                        "from one weld to the next being the case that matters. 0 leaves "
-                        "--near-panel-min-mm as the only test (default: %(default)g)")
     #HOW FAR OUT LINEAR MOTION MAY BE CREATED
     p.add_argument("--linear-introduce-mm", type=float, default=120.0, metavar="MM",
                    help="clearance above which the optimisation passes may not introduce "
@@ -1098,8 +1079,6 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,
         polish_seconds=args.polish_seconds if args.shortcut else 0.0,
         near_panel_mm=args.near_panel_mm if args.near_panel_linear else 0.0,
-        near_panel_min_mm=args.near_panel_min_mm,
-        near_panel_min_pct=args.near_panel_min_pct,
         linear_speed_mm_s=args.linear_speed_mm_s,
         linear_crossing_penalty_s=args.linear_crossing_penalty_s,
         linear_introduce_mm=args.linear_introduce_mm,

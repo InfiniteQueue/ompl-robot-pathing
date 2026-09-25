@@ -438,14 +438,11 @@ From start to finish:
    it off: every transit move is `PTP`, and the Cartesian tree is never tried either.
 2. **Solve.** Whichever solver succeeds (see [How it works](#how-it-works)) returns an
    unlabelled route.
-3. **Gate, per leg.** The route is sampled at `--check-step-deg` and each sample is marked
-   near or not. The leg earns linear motion if at least `--near-panel-min-pct` of the
-   samples are near, or if any unbroken near stretch covers `--near-panel-min-mm` of tool
-   travel. A leg that meets neither is `PTP` throughout, however close it runs.
-4. **Label, per move.** On a leg that passed, `LIN` if either end is near, else `PTP`. So a
-   waypoint is reached by a linear move when it is in the band or the waypoint before it
-   was.
-5. **Refine.** Shortcut, simplify and polish move and delete waypoints, and each move they
+3. **Label, per move.** `LIN` if either end is near, else `PTP`. So a waypoint is reached
+   by a linear move when it is in the band or the waypoint before it was. Nothing is asked
+   of the leg as a whole: there is no threshold a route has to clear before any of its
+   moves may be linear.
+4. **Refine.** Shortcut, simplify and polish move and delete waypoints, and each move they
    propose takes its profile from its new ends. A `LIN` candidate is checked along the
    tool's straight line and costed under `--linear-speed-mm-s`; a `PTP` one is checked
    along the joint chord. A replacement that would swallow near waypoints into a joint
@@ -455,15 +452,15 @@ From start to finish:
    parts is refused unless the stretch it replaces already reached in from that far, so
    the approach to the band stays joint motion. `--linear-crossing-penalty-s` adds a flat
    cost each time a move enters the band from outside.
-6. **Split.** Consecutive moves under the same profile become one phase.
-7. **Verify.** Every move is swept along the path its profile implies. A failure discards
+5. **Split.** Consecutive moves under the same profile become one phase.
+6. **Verify.** Every move is swept along the path its profile implies. A failure discards
    the whole route, and the planner moves on to its next gun opening or fallback pose;
    nothing is relabelled or re-planned to rescue it.
 
-A route through a fallback pose is gated and labelled once, over the joined route. A transit
-split for a gun change is gated and labelled per leg, under that leg's own opening. The
-final per-phase validation checks each phase under its label, and `output.Timing` holds `LIN`
-moves to the tool speed cap.
+A route through a fallback pose is labelled once, over the joined route. A transit split for
+a gun change is labelled per leg, under that leg's own opening. The final per-phase
+validation checks each phase under its label, and `output.Timing` holds `LIN` moves to the
+tool speed cap.
 
 **One segment's search is bounded by the clock as well as by its budgets.** Every other
 budget bounds a part of the search — runs, seconds per run, gun openings, fallback poses —
@@ -478,14 +475,20 @@ carries on to the next — which is what already happens to a segment that fails
 Per-run limits are cut to the time remaining, so the last run stops at the deadline rather
 than a run's length past it.
 
-**Brief contact with the band is ignored, but "brief" is measured two ways.** A sweeping
-transit that clips the band for a moment is not working near the panel, and cutting it into
-three phases to say so would cost a stop at each end for nothing, so `--near-panel-min-mm`
-asks for a stretch of real length. On its own that fails a short move: a 60 mm hop from one
-weld to the next is near the panel for its whole length, yet no threshold worth setting for
-transits would admit it. `--near-panel-min-pct` covers that case. It is measured over the
-whole leg rather than per stretch, so a retract whose apex leaves the band for an instant
-does not disqualify the leg either side of it.
+**Brief contact with the band is no longer ignored.** There used to be a gate ahead of the
+labelling: a leg qualified for linear motion only if an unbroken near stretch covered
+`--near-panel-min-mm` of tool travel, or `--near-panel-min-pct` of its samples read near,
+and a leg meeting neither shipped `PTP` throughout however close it ran. Both options and
+the gate are gone. The band is the whole of the decision now, asked of each move and of
+nothing larger.
+
+What that changes in the output: a transit that clips the band once picks up a linear run of
+the two moves either side of that state, where before the leg came out entirely `PTP`.
+Expect more phases per transit and some very short `LIN` ones. What it does not change is
+the reverse case — a stretch genuinely alongside the panel was already labelled linear and
+still is. If the short runs are unwanted, `--near-panel-mm` is the control: it is the one
+number the labelling reads, and narrowing it takes the marginal states out of the band
+rather than overruling them after the fact.
 
 **Routes from the Cartesian tree.** The tree runs on every transit the band is on for,
 whether or not OMPL's first phase found anything, and its route is ranked against phase
@@ -518,11 +521,10 @@ with nothing between its cuts, and a route with no state in the band at all, sin
 replanning that would repeat the search phase one has just failed. Each gap that needs a
 search can cost up to the full phase-one and phase-two budget.
 
-The route then goes through exactly the same gate and labelling as an OMPL route. With
+The route then goes through exactly the same labelling as an OMPL route. With
 `--cartesian-recut false`, nothing turns the out-of-band stretches into joint motion
 beforehand: those moves label `PTP` by the endpoint rule, and refinement turns them into
-long joint moves by cutting across them once both ends of a cut lie outside the band. If
-the gate refuses the leg, the whole route ships `PTP`.
+long joint moves by cutting across them once both ends of a cut lie outside the band.
 
 **How "near" is measured.** The clearance query only looks as far as its probe, and when it
 finds nothing within that it returns the probe distance itself. So a state counts as near
@@ -1122,9 +1124,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--shortcut-seconds` | 20 | time budget for shortcutting each transit |
 | `--polish-seconds` | 50 | time budget for the final pass over the emitted waypoints |
 | `--no-near-panel-linear` | off | every transit move `PTP`; also disables the Cartesian tree |
-| `--near-panel-mm` | 50 | clearance at or under which a waypoint is in the band |
-| `--near-panel-min-mm` | 100 | a leg earns `LIN` moves if an unbroken near stretch covers this much tool travel |
-| `--near-panel-min-pct` | 60 | ...or if this share of the leg is near |
+| `--near-panel-mm` | 50 | clearance at or under which a waypoint is in the band, and the whole of what decides a move's profile |
 | `--linear-introduce-mm` | 120 | clearance above which the passes may not introduce `LIN` motion that was not already there; 0 for no limit |
 | `--linear-crossing-penalty-s` | 100 | costing-only surcharge on each move entering the band |
 | `--min-shell-mm` | 10 | drop collision shells smaller than this |

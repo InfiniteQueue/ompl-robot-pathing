@@ -858,17 +858,6 @@ def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.
     return [a + (b - a) * (k / n) for k in range(1, n)]
 
 
-def _densify(cell: Cell, path: list[np.ndarray], step: float) -> list[np.ndarray]:
-    """A sampling planner's handful of states, filled in at collision-check resolution.
-
-    OMPL returns very few points -- four is typical -- and every pass downstream wants the
-    route rather than the tree's nodes.  Without a model the spacing is a joint-space one,
-    the same ``--check-step-deg`` the checking uses, so consecutive points differ by less
-    than the resolution anything here can resolve.
-    """
-    return _densify_marked(cell, path, step)[0]
-
-
 def _thin(a: np.ndarray, points: list[np.ndarray], b: np.ndarray,
           step: float) -> list[np.ndarray]:
     """Enough of a chain to describe it at ``step``, and no more.
@@ -948,7 +937,11 @@ def _fill(cell: Cell, model: "MotionModel | None", a: np.ndarray, b: np.ndarray,
 def _densify_marked(cell: Cell, path: list[np.ndarray], step: float,
                     model: "MotionModel | None" = None
                     ) -> tuple[list[np.ndarray], list[int]]:
-    """:func:`_densify`, plus where the points it was given ended up.
+    """A solver's handful of states filled in, plus where the points it was given ended up.
+
+    OMPL returns very few points -- four is typical -- and every pass downstream wants the
+    route rather than the tree's nodes.  The spacing is the same ``--check-step-deg`` the
+    checking uses, so consecutive points differ by less than anything here can resolve.
 
     The second return is the index in the dense list of each point of ``path``, in order.
     Those are the route's real waypoints; everything between them is fill.  Nothing
@@ -2598,10 +2591,13 @@ class Run:
 
 @dataclass
 class LinearZone:
-    """Settings for turning the near-panel parts of a transit into linear motion."""
+    """Settings for turning the near-panel parts of a transit into linear motion.
+
+    The band is the whole of the decision.  A move is linear when either of its ends reads
+    within ``near_mm`` of the parts, asked of every move and of nothing larger; there is no
+    per-leg qualification a route has to pass before any of its moves may be linear.
+    """
     near_mm: float = 0.0            # clearance at or under which the route counts as near
-    min_run_mm: float = 0.0         # shortest stretch worth converting, in tool travel
-    min_run_pct: float = 0.0        # ...or this much of the leg, whichever it meets first
     linear_speed_mm_s: float = 0.0  # tool speed cap; 0 leaves linear moves costed on joints
     crossing_penalty_s: float = 0.0  # flat costing-only surcharge on each move that
                                      # reaches into the band from outside it; 0 charges none
@@ -2648,14 +2644,9 @@ def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
     pts = _flatten(runs)
     if len(pts) < 2:
         return runs
-    # Gated on the route filled in, as _finish gates it.  These runs have already been
-    # reduced to their waypoints, and a share "of the leg in range" counted over a handful
-    # of stops says nothing about how much of the leg runs near the panel.
-    allowed = zone is not None and _linear_allowed(cell, _densify(cell, pts, check_step),
-                                                   zone, log=log)
-    model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
+    model = MotionModel(cell, max_step=check_step, zone=zone)
     stagetrace.route("refining a leg planned earlier without a budget")
-    stagetrace.note(_trace_gate(zone, allowed))
+    stagetrace.note(_trace_zone(zone))
     stagetrace.stage("input", model, pts)
     refined = _refine(model, pts, shortcut_seconds=shortcut_seconds,
                       polish_seconds=polish_seconds, relocate=relocate, log=log)
@@ -2709,24 +2700,20 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     """
     before, t0 = getattr(cell, "counters", None), time.time()
     before = dict(before) if before is not None else None
-    # Two passes, because the gate and the fill each need the other's answer.  Whether the
-    # leg earns linear motion is a proportion over the route, so a chord-interpolated
-    # sample answers it perfectly well -- the question is how much of the leg runs near
-    # the panel, not exactly which states it passes through.  Only once that is settled is
-    # there a model to say which stretches are linear, and so where the chord is the wrong
-    # curve to have sampled.
-    #
-    # The second pass is free where it changes nothing: with the gate refused there is no
-    # zone, every move is a joint move, and the profile-aware fill is the chord again.
-    gate = _densify(cell, path, check_step)
-    allowed = zone is not None and _linear_allowed(cell, gate, zone, log=log)
-    model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
+    # One sampling pass.  There were two while a per-leg gate stood here: the fill has to
+    # follow the curve each move will really be flown along, which needs a model, and the
+    # model could not be built until the gate had said whether the leg was to have a zone
+    # at all -- so the route was sampled once along the chord to answer that, and again
+    # along the real curves afterwards.  Nothing asks that question now.  The band answers
+    # it per move through MotionModel.motion, so the model exists before anything is
+    # sampled and the profile-aware fill is the only fill.
+    model = MotionModel(cell, max_step=check_step, zone=zone)
     dense, anchors = _densify_marked(cell, path, check_step, model=model)
     stagetrace.route(f"planned route, refinement budgets shortcut {shortcut_seconds:g} s, "
                      f"polish {polish_seconds:g} s"
                      + ("" if shortcut_seconds > 0 or polish_seconds > 0 else
                         " (unrefined for now: may be refined again later or discarded)"))
-    stagetrace.note(_trace_gate(zone, allowed))
+    stagetrace.note(_trace_zone(zone))
     stagetrace.stage("solver", model, path, sources=range(len(path)))
     stagetrace.stage("densify", model, dense, sources=anchors)
     refined = _refine(model, dense, shortcut_seconds=shortcut_seconds,
@@ -2744,12 +2731,12 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     return runs
 
 
-def _trace_gate(zone: "LinearZone | None", allowed: bool) -> str:
-    """The linear gate's answer, as the stage trace reports it."""
+def _trace_zone(zone: "LinearZone | None") -> str:
+    """Which band is in force, as the stage trace reports it."""
     if zone is None or not zone.enabled:
         return "linear band: off, every move is PTP"
-    return (f"linear gate: {'admitted' if allowed else 'refused, every move is PTP'} "
-            f"(band {zone.near_mm:g})")
+    return (f"linear band: {zone.near_mm:g} mm, a move is LIN when either end reads "
+            f"inside it (reach {zone.reach_mm:g} mm)")
 
 
 def _traced_verify(model: "MotionModel", runs: list[Run], where: str, log=None) -> None:
@@ -2769,9 +2756,9 @@ def _verify_runs(model: "MotionModel", runs: list[Run], where: str, log=None) ->
     The optimisation passes check the moves they *propose*, and only those.  ``shortcut``
     never offers an adjacent pair -- ``_try_cut`` returns early on ``j - i < 2`` -- and
     ``simplify``'s reach loop runs ``while j > i + 1``, so the pair it finally settles on
-    is appended without a check.  A move that came out of ``_densify`` and that nothing
-    happened to replace therefore leaves here carrying only the guarantee the route
-    arrived with.
+    is appended without a check.  A move that came out of ``_densify_marked`` and that
+    nothing happened to replace therefore leaves here carrying only the guarantee the
+    route arrived with.
 
     That guarantee is weaker than this module's.  A sampling planner validates a uniform
     joint-space grid at ``--segment-length-rad``; ``segment_collides`` lays down the same
@@ -2952,56 +2939,6 @@ def _reads_near(cell: Cell, q: np.ndarray, near_mm: float) -> bool:
     """
     reading = cell.clearance_mm(q)
     return reading < cell.probe_mm and reading <= near_mm
-
-
-def _linear_allowed(cell: Cell, dense: list[np.ndarray], zone: "LinearZone",
-                    log=None) -> bool:
-    """Whether this leg earns linear motion at all, and the report explaining the verdict.
-
-    Being near the panel is measured over the leg rather than over any one stretch of it.
-    The points are a collision-check step apart, so the share of them in range is how much
-    of the route runs near the panel, whether or not it does so in one go -- which matters
-    because the apex of a retract between two welds leaves the band for an instant and
-    would otherwise split an 85% leg into runs of 45% and 40% that a 50% threshold rejects
-    twice over.
-
-    Either test admits the leg: one stretch long enough in tool travel, or enough of the
-    leg in range whatever the stretches look like individually.  ``min_run_mm`` is what a
-    transit needs, since a sweeping move that clips the band for a moment is not working
-    near the panel; ``min_run_pct`` is what a hop from one weld to the next needs, being
-    entirely near the panel and far too short to pass any absolute threshold.
-
-    A leg that meets neither is planned as joint motion throughout.
-    """
-    if not zone.enabled or len(dense) < 2:
-        return False
-
-    if log and len(dense) > 200:
-        log(f"      measuring clearance at {len(dense)} points along the route to find "
-            f"its near-panel stretches")
-    near = [_reads_near(cell, q, zone.near_mm) for q in dense]
-    in_range = 100.0 * sum(near) / len(near) if near else 0.0
-    by_share = zone.min_run_pct > 0.0 and in_range >= zone.min_run_pct
-
-    stretches = [_tcp_travel(cell, dense[i:j + 1])
-                 for i, j in _runs_of(near, True) if j > i]
-
-    by_length = any(t >= zone.min_run_mm for t in stretches)
-    allowed = bool(by_length or by_share)
-
-    if log and (stretches or in_range > 0.0):
-        note = [f"{in_range:.0f}% of the leg in range"]
-        if stretches:
-            note.append(f"longest stretch {max(stretches):.0f} mm of "
-                        f"{sum(stretches):.0f} mm near the panel, against a "
-                        f"{zone.min_run_mm:g} mm threshold")
-        if allowed:
-            why = "on length" if by_length else f"on share against {zone.min_run_pct:g}%"
-            note.append(f"near-panel moves run under the linear profile ({why})")
-        else:
-            note.append("neither threshold met, so the leg stays joint motion throughout")
-        log("      " + ", ".join(note))
-    return allowed
 
 
 def _split_runs(model: "MotionModel", pts: list[np.ndarray]) -> list[Run]:
