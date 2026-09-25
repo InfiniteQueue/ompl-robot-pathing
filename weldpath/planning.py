@@ -858,17 +858,6 @@ def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.
     return [a + (b - a) * (k / n) for k in range(1, n)]
 
 
-def _densify(cell: Cell, path: list[np.ndarray], step: float) -> list[np.ndarray]:
-    """A sampling planner's handful of states, filled in at collision-check resolution.
-
-    OMPL returns very few points -- four is typical -- and every pass downstream wants the
-    route rather than the tree's nodes.  Without a model the spacing is a joint-space one,
-    the same ``--check-step-deg`` the checking uses, so consecutive points differ by less
-    than the resolution anything here can resolve.
-    """
-    return _densify_marked(cell, path, step)[0]
-
-
 def _thin(a: np.ndarray, points: list[np.ndarray], b: np.ndarray,
           step: float) -> list[np.ndarray]:
     """Enough of a chain to describe it at ``step``, and no more.
@@ -948,7 +937,11 @@ def _fill(cell: Cell, model: "MotionModel | None", a: np.ndarray, b: np.ndarray,
 def _densify_marked(cell: Cell, path: list[np.ndarray], step: float,
                     model: "MotionModel | None" = None
                     ) -> tuple[list[np.ndarray], list[int]]:
-    """:func:`_densify`, plus where the points it was given ended up.
+    """A solver's handful of states filled in, plus where the points it was given ended up.
+
+    OMPL returns very few points -- four is typical -- and every pass downstream wants the
+    route rather than the tree's nodes.  The spacing is the same ``--check-step-deg`` the
+    checking uses, so consecutive points differ by less than anything here can resolve.
 
     The second return is the index in the dense list of each point of ``path``, in order.
     Those are the route's real waypoints; everything between them is fill.  Nothing
@@ -1181,31 +1174,100 @@ def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
 # ---------------------------------------------------------------------------
 # freespace
 # ---------------------------------------------------------------------------
-def _path_cost(cell: Cell, path: list[np.ndarray], max_step: float
-               ) -> tuple[float, float]:
-    """Penalised time for a whole path, and its plain time.
+def _scored_points(cell: Cell, model: "MotionModel", path: list[np.ndarray],
+                   step: float) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """``path`` to score the moves of, and a thinned copy to count its stops on.
 
-    Cruise time, not stop-to-stop time: this scores a raw sampling-planner solution, whose
-    waypoint count is an artefact of how the tree happened to grow rather than a decision
-    anyone made.  Ranking solutions on stop-to-stop time would mostly rank them on how many
-    nodes each one took, which says nothing about the route.
+    The two are not the same list and must not be, which is the whole of what this is for.
 
-    With no penalty in force the two figures are equal, so ranking on the first still ranks
-    on time and the choice degrades to "quickest raw solution" rather than to nothing.
-    Endpoint factors are threaded from one segment to the next so each waypoint costs one
-    clearance query rather than two.
+    *Moves* are scored on the route as it stands, filled in where it is coarser than
+    ``step``.  Consecutive states of a route are the only pairs anything has validated:
+    the Cartesian tree's guarantee is that each pair of its stations is a straight tool
+    move it solved and swept, and a route of straight moves is a **polyline**, not a line.
+    The straight line between two of its non-adjacent stations cuts the corner, was never
+    checked, and frequently has no inverse kinematics at all -- which is the shape the tree
+    exists to find.  Scoring such a span prices a route the candidate does not contain, and
+    where its line will not solve ``MotionModel.cost`` rightly calls it infinite, which
+    took the tree's route out of the ranking on exactly the transits it was winning.
+
+    *Stops* are counted on a copy thinned back to ``step``, and have to be, because the
+    point counts routes arrive with are facts about the searches rather than about the
+    routes: OMPL stops at four or so nodes, the tree hands back every station it validated
+    one ``tcp_check_mm`` apart.  Charging a ramp at each would rank the two searches on how
+    each reports itself.  Thinning is sound for counting -- how many stops a route of this
+    shape needs is a question about its geometry -- and unsound for pricing, which is the
+    asymmetry this returns two lists to keep.
+    """
+    dense, _ = _densify_marked(cell, path, step, model=model)
+    if len(dense) < 3:
+        return dense, dense
+    return dense, [dense[0], *_thin(dense[0], dense[1:-1], dense[-1], step), dense[-1]]
+
+
+def _path_cost(cell: Cell, path: list[np.ndarray], max_step: float,
+               *, zone: "LinearZone | None" = None) -> tuple[float, float]:
+    """Penalised stop-to-stop time for a whole path, and its plain time.
+
+    Scored through the same ``MotionModel`` the refinement passes are scored through, so a
+    stretch that will ship linear is costed under the tool speed cap, charged the crossing
+    penalty, and has its clearance penalty read along the tool's own line rather than the
+    joint chord.  This used to go straight to ``Cell.segment_cost``, which knows nothing of
+    any of that, and so systematically undercharged the routes most likely to be capped --
+    the Cartesian tree's, whose every edge is a straight tool move -- against phase one's,
+    which mostly ship as joint motion and were priced about right.  The two now compete on
+    every transit, so that asymmetry decided transits rather than merely misreporting them.
+
+    Two terms, because the two questions have different right answers:
+
+    * **Travel** is summed over the route's own moves in **cruise** time, which is additive
+      under subdivision and so does not depend on how finely the route happens to be
+      described.  This is where the cap, the crossing penalty and the clearance penalty
+      along the real curve are charged.
+    * **Stops** are the ramps a route of this shape would really pay, taken as the
+      difference between the full move time and the cruise time over the thinned copy.
+      That is the term ``--stop-time-weight`` acts in, and it is read off the joint
+      dynamics alone -- no line is asked for, so a thinned span that cuts a corner cannot
+      make the route unpriceable.
+
+    The second figure returned is the same time without the clearance and crossing
+    penalties -- real seconds, cap included -- so "cost against plain" still reads as what
+    the penalties added.  Endpoint factors are threaded from one segment to the next so
+    each waypoint costs one clearance query rather than two; they reach only the joint
+    moves, a linear one being priced off the stations along its line.
+
+    A move whose line will not price is charged as a joint move instead of costing
+    infinity.  ``MotionModel.cost`` answers infinity because a pass must never *install* a
+    move it cannot price, but ranking installs nothing, and a candidate dropped here is
+    dropped before the passes have had their chance to move the waypoint that could not be
+    reached.  ``_fill`` already takes this view of the same question -- it falls back to
+    the chord rather than reject a route it is only sampling -- and leaves the verdict to
+    ``_verify_runs``, which sweeps the finished path along the curve each move really
+    takes and is where an unflyable route is supposed to die.
     """
     if len(path) < 2:
         return 0.0, 0.0
+    model = MotionModel(cell, max_step=max_step, zone=zone)
+    moves, stops = _scored_points(cell, model, path, max_step)
+    if len(moves) < 2:
+        return 0.0, 0.0
     penalised = cell.penalty is not None and cell.penalty.enabled
     total = plain = 0.0
-    prev_f = cell.penalty_factor(path[0]) if penalised else None
-    for a, b in zip(path, path[1:]):
+    prev_f = cell.penalty_factor(moves[0]) if penalised else None
+    for a, b in zip(moves, moves[1:]):
         next_f = cell.penalty_factor(b) if penalised else None
-        total += cell.segment_cost(a, b, max_step=max_step, fa=prev_f, fb=next_f)
-        plain += cell.cruise_time(a, b)
+        priced = model.cost(a, b, fa=prev_f, fb=next_f)
+        if not np.isfinite(priced):
+            # No flyable line, so there is no linear price to read and no tool speed cap
+            # to apply either -- what is charged is the joint move the states describe,
+            # plus the crossing charge, which is about where the move goes and not how.
+            priced = (cell.segment_cost(a, b, max_step=max_step, fa=prev_f, fb=next_f)
+                      + model.crossing_penalty(a, b))
+        total += priced
+        plain += model.cruise_time(a, b)
         prev_f = next_f
-    return total, plain
+    ramps = sum(cell.move_time(a, b) - cell.cruise_time(a, b)
+                for a, b in zip(stops, stops[1:]))
+    return total + ramps, plain + ramps
 
 
 def _make_program(cell: Cell, qa: np.ndarray, qb: np.ndarray) -> cl.CompositeInstruction:
@@ -1483,6 +1545,7 @@ def _plan_via(cell: Cell, qa: np.ndarray, via: np.ndarray, qb: np.ndarray, *,
               continuous_check: bool = False,
               shortcut_seconds: float, polish_seconds: float,
               zone: LinearZone | None = None,
+              direct_clearance: float = 0.0,
               openings: "GunOpenings | None" = None,
               deadline: "Deadline | None" = None,
               relocate: "Relocation | None" = None, log=print,
@@ -1507,10 +1570,12 @@ def _plan_via(cell: Cell, qa: np.ndarray, via: np.ndarray, qb: np.ndarray, *,
     first, _ = _plan_direct(cell, qa, via, ompl=ompl, segment_length=segment_length,
                             check_step=check_step, continuous_check=continuous_check,
                             shortcut_seconds=0.0, polish_seconds=0.0,
+                            direct_clearance=direct_clearance,
                             openings=openings, deadline=deadline, log=log, record=halves)
     second, _ = _plan_direct(cell, via, qb, ompl=ompl, segment_length=segment_length,
                              check_step=check_step, continuous_check=continuous_check,
                              shortcut_seconds=0.0, polish_seconds=0.0,
+                             direct_clearance=direct_clearance,
                              openings=openings, deadline=deadline, log=log,
                              record=halves)
     if len(halves) == 2:
@@ -1534,6 +1599,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    main_openings: int = 5, extra_openings: int = 0,
                    opening_round_mm: float = 0.0,
                    zone: LinearZone | None = None,
+                   direct_clearance: float = 0.0,
                    cartesian: "CartesianBudget | None" = None,
                    relocate: "Relocation | None" = None,
                    deadline: "Deadline | None" = None,
@@ -1616,7 +1682,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                      continuous_check=continuous_check,
                                      shortcut_seconds=shortcut_seconds,
                                      polish_seconds=polish_seconds,
-                                     zone=zone, cartesian=cartesian, relocate=relocate,
+                                     zone=zone, direct_clearance=direct_clearance,
+                                     cartesian=cartesian, relocate=relocate,
                                      openings=direct, deadline=deadline, log=log,
                                      record=raw)
         if record is not None:
@@ -1648,6 +1715,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
             try:
                 with cell.gun_opening(opening):
                     runs = _plan_via(cell, qa, via, qb, ompl=reduced,
+                                     direct_clearance=direct_clearance,
                                      segment_length=segment_length,
                                      check_step=check_step,
                                      continuous_check=continuous_check,
@@ -1690,6 +1758,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                             continuous_check=continuous_check,
                                             shortcut_seconds=0.0, polish_seconds=0.0,
                                             zone=zone, cartesian=cartesian,
+                                            direct_clearance=direct_clearance,
                                             relocate=relocate,
                                             openings=GunOpenings.pinned(first_open),
                                             deadline=deadline, log=log,
@@ -1708,6 +1777,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                                  continuous_check=continuous_check,
                                                  shortcut_seconds=0.0, polish_seconds=0.0,
                                                  zone=zone, cartesian=cartesian,
+                                                 direct_clearance=direct_clearance,
                                                  relocate=relocate,
                                                  openings=GunOpenings.pinned(second_open),
                                                  deadline=deadline, log=log,
@@ -1968,6 +2038,11 @@ def _route_fault(cell: Cell, path: list[np.ndarray], check_step: float) -> str |
     return None
 
 
+# Which search a solution came from.  Reporting only: they are ranked on cost alone.
+SAMPLED = "the sampling planner"
+STEERED = "the cartesian tree"
+
+
 @dataclass
 class _Solution:
     """A scored route: penalised cost, plain time, the states, and the gun it was found at.
@@ -1976,11 +2051,17 @@ class _Solution:
     part of the machine that has to fit through the gap -- and because the phases now
     solve at several of them, so which one a route came from is no longer something the
     caller can infer from the order it asked in.
+
+    ``source`` is which search found it, and is reporting only.  Both searches now run on
+    every transit and are ranked together, so the winning route no longer says which of
+    them produced it -- and that is the one figure that says whether running both is
+    buying anything.
     """
     cost: float
     plain: float
     route: list[np.ndarray]
     opening: float | None = None
+    source: str = SAMPLED
 
 
 def _cheapest(candidates: list[_Solution], log) -> _Solution:
@@ -1994,13 +2075,19 @@ def _cheapest(candidates: list[_Solution], log) -> _Solution:
     Ties go to the earlier candidate, which is the earlier opening, the runs having been
     made in the rotation's order.  A route no better than one at the opening the robot
     already holds does not earn a gun change.
+
+    Where the set holds routes from both searches the winner's is named.  The two are
+    ranked on one number and the cheaper wins, but which one that was is the only evidence
+    there is that the tree is worth the time it now spends on every transit.
     """
     best = min(candidates, key=lambda c: c.cost)
     if log and len(candidates) > 1:
         worst = max(c.cost for c in candidates)
+        mixed = (f", from {best.source}"
+                 if len({c.source for c in candidates}) > 1 else "")
         log(f"      keeping the best of {len(candidates)} solutions: cost "
             f"{best.cost:.2f} s against {worst:.2f} s for the worst"
-            f"{_gun_note(best.opening)}")
+            f"{_gun_note(best.opening)}{mixed}")
     return best
 
 
@@ -2049,6 +2136,10 @@ class _Sampler:
     ompl: OmplBudget
     segment_length: float
     check_step: float
+    # For scoring only.  Nothing here plans differently because of it: OMPL cannot produce
+    # linear motion, so the zone says how the route it returns will be flown, not how it
+    # is searched for.  See _path_cost.
+    zone: "LinearZone | None" = None
     openings: GunOpenings = field(default_factory=lambda: GunOpenings.pinned(None))
     deadline: Deadline = field(default_factory=Deadline)
     continuous_check: bool = False
@@ -2175,7 +2266,7 @@ class _Sampler:
                                 f"own check ({fault})")
                 self.log(f"      {label}{note}: {self.message} ({dt:.1f}s)")
                 return None
-            cost, plain = _path_cost(self.cell, raw, self.check_step)
+            cost, plain = _path_cost(self.cell, raw, self.check_step, zone=self.zone)
         self.log(f"      {label}{note}: solved in {dt:.1f}s ({len(raw)} raw points, "
                  f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
         return _Solution(cost, plain, raw, opening)
@@ -2186,6 +2277,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
                  continuous_check: bool = False,
                  shortcut_seconds: float, polish_seconds: float,
                  zone: LinearZone | None = None,
+                 direct_clearance: float = 0.0,
                  cartesian: "CartesianBudget | None" = None,
                  relocate: "Relocation | None" = None,
                  openings: "GunOpenings | None" = None,
@@ -2197,6 +2289,10 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     several and the cheapest solution wins whichever one it came from, so the caller no
     longer knows it from the order it asked in.  What the caller decides is which openings
     are on offer, and a caller that has already fixed one passes ``GunOpenings.pinned``.
+
+    ``direct_clearance`` is how much air the straight move has to keep, in mm, before it
+    is taken in preference to searching for one.  0 asks nothing of it beyond the
+    collision check.
     """
     openings = openings or GunOpenings.pinned(None)
     deadline = deadline or Deadline()
@@ -2209,6 +2305,21 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         with cell.gun_opening(opening):
             if cell.segment_collides(qa, qb, max_step=check_step):
                 continue
+            if direct_clearance > 0.0:
+                # Clear and roomy are different questions.  The collision margin says the
+                # move does not touch; this says how much air it keeps, and a caller
+                # asking for more than the margin gives is asking for the searches --
+                # which can put the route somewhere else entirely, as no amount of
+                # standing off a straight line can.  Measured over the same walk that
+                # proved it clear, bisection included, so a dip between two grid samples
+                # counts here exactly as it counts there.
+                worst = cell.segment_clearance(qa, qb, max_step=check_step,
+                                               floor=direct_clearance)
+                if worst < direct_clearance:
+                    log(f"      direct move is clear but comes within {worst:.1f} mm of "
+                        f"the parts, under the {direct_clearance:g} mm asked of it"
+                        f"{_gun_note(opening)}; searching for a route instead")
+                    continue
             # "Clear" and "sensible" part company when the line grazes a panel, so when
             # the penalty says this one does, the same pass that stands other routes off
             # is given a chance to bow it away -- there is nothing for OMPL to do here,
@@ -2250,32 +2361,44 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     # only stage that can make that choice at all -- and since the runs are being spent
     # anyway, dealing them round the openings makes the same choice over a wider set.
     sampler = _Sampler(cell=cell, ompl=ompl, segment_length=segment_length,
-                       check_step=check_step, openings=openings, deadline=deadline,
-                       continuous_check=continuous_check, log=log)
+                       check_step=check_step, zone=zone, openings=openings,
+                       deadline=deadline, continuous_check=continuous_check, log=log)
     candidates = sampler.phase_one(qa, qb)
 
     tree = cartesian if (cartesian is not None and cartesian.enabled
                          and zone is not None and zone.enabled) else None
-    if not candidates and tree is not None and not deadline.expired:
-        # Between the two phases rather than in place of either.  Every route this finds
-        # is also a joint-space route -- a path of straight tool moves is still a path
-        # through joint space -- so as a fallback it searches a strict *subset* of what
-        # phase two searches and cannot stand in for it.  What it has instead is guidance:
-        # steering along the tool's own line, with orientations drawn near the endpoints',
-        # concentrates the search into the corridor beside the panel, which is exactly
-        # where uniform joint sampling spends its whole budget and finds nothing.
+    if tree is not None and not deadline.expired:
+        # Run whatever phase one did, and rank what it finds against phase one's own.
         #
-        # It goes before phase two because phase two is the expensive half of the worst
-        # case, so a transit this solves is one whose failure never has to be paid for.
-        # It is gated on the zone because a route made of straight moves only earns its
-        # cost where linear motion was wanted in the first place; with no band in force
-        # there is nothing here that phase two would not do better.
+        # The two searches do not differ in whether they succeed so much as in what they
+        # come back with.  OMPL samples joint space uniformly and returns the first route
+        # its seed leads it to, so beside a panel it usually returns the one that stands
+        # well off it -- there is nothing drawing the search into the gap.  The tree
+        # steers along the tool's own line with orientations drawn near the endpoints',
+        # which concentrates it into exactly that corridor.  So a phase one that solved is
+        # not evidence that the tree had nothing better to offer, and the only way to find
+        # out is to run both and score them together, which _cheapest below does over the
+        # whole set.  Before this the tree was a fallback and a transit phase one solved
+        # never saw it, which meant the cheaper route of the two was never even costed.
+        #
+        # What that costs is the tree's full budget on every transit that reaches here
+        # rather than only on the ones nothing else could reach: --cartesian-solve-seconds
+        # until it solves and then --cartesian-min-seconds looking for better ones,
+        # whether or not a route is already in hand.  The segment clock is what bounds it.
+        #
+        # Still before phase two, which is unchanged in running only when nothing has been
+        # found at all: every route the tree finds is also a joint-space route, so it
+        # searches a strict *subset* of what phase two searches and cannot stand in for it.
+        # Still gated on the zone, because a route made of straight moves only earns its
+        # cost where linear motion was wanted in the first place.
         found = _cartesian_solutions(cell, qa, qb, tree, check_step, openings.main, log,
-                                     deadline=deadline)
+                                     deadline=deadline, zone=zone)
         if found:
             # The best of the set is the only one recut: the recut runs the sampling
             # phases on every stretch outside the band, far too dear to spend on routes
-            # that are then thrown away.
+            # that are then thrown away.  It is also what makes the tree's route
+            # comparable with phase one's -- the stretches where it has no business being
+            # a chain of straight moves are replanned before anything is scored.
             best = _cheapest(found, log)
             if tree.recut:
                 best = _recut_solution(cell, best, zone=zone, sampler=sampler,
@@ -2293,7 +2416,8 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
                                        seconds=deadline.clamp(tree.phase_two_seconds),
                                        seed=tree.seed + PHASE_TWO_SEED_OFFSET + run,
                                        opening=opening, check_step=check_step,
-                                       label=f"phase 2 cartesian run {run}", log=log)
+                                       label=f"phase 2 cartesian run {run}", log=log,
+                                       zone=zone)
                 if got is not None and tree.recut:
                     got = _recut_solution(cell, got, zone=zone, sampler=sampler,
                                           check_step=check_step, log=log)
@@ -2327,7 +2451,8 @@ PHASE_TWO_SEED_OFFSET = 1000
 
 def _cartesian_route(cell: Cell, qa: np.ndarray, qb: np.ndarray, budget: "CartesianBudget",
                      *, seconds: float, seed: int, opening: float | None,
-                     check_step: float, label: str, log) -> _Solution | None:
+                     check_step: float, label: str, log,
+                     zone: "LinearZone | None" = None) -> _Solution | None:
     """One Cartesian search at one gun opening, scored as phase one scores its own.
 
     The gun is not a detail of the check here but part of the shape being steered around:
@@ -2345,10 +2470,10 @@ def _cartesian_route(cell: Cell, qa: np.ndarray, qb: np.ndarray, budget: "Cartes
         except PlanningError as exc:
             log(f"      {exc} ({label}{_gun_note(opening)}, {time.time() - t0:.1f}s)")
             return None
-        cost, plain = _path_cost(cell, route, check_step)
+        cost, plain = _path_cost(cell, route, check_step, zone=zone)
     log(f"      {label}{_gun_note(opening)}: solved in {time.time() - t0:.1f}s "
         f"({len(route)} points, cost {cost:.2f} s against {plain:.2f} s unpenalised)")
-    return _Solution(cost, plain, route, opening)
+    return _Solution(cost, plain, route, opening, STEERED)
 
 
 def _recut_solution(cell: Cell, best: _Solution, *, zone: "LinearZone",
@@ -2365,16 +2490,17 @@ def _recut_solution(cell: Cell, best: _Solution, *, zone: "LinearZone",
                                     check_step=check_step, opening=best.opening, log=log)
         if route is best.route:
             return best
-        cost, plain = _path_cost(cell, route, check_step)
+        cost, plain = _path_cost(cell, route, check_step, zone=zone)
     log(f"      cartesian tree after the recut: {len(route)} points, cost {cost:.2f} s "
         f"against {plain:.2f} s unpenalised")
-    return _Solution(cost, plain, route, best.opening)
+    return _Solution(cost, plain, route, best.opening, best.source)
 
 
 def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                          budget: "CartesianBudget", check_step: float,
                          rotation: list, log,
-                         deadline: "Deadline | None" = None) -> list[_Solution]:
+                         deadline: "Deadline | None" = None,
+                         zone: "LinearZone | None" = None) -> list[_Solution]:
     """Cartesian-tree routes for one transit, each scored as phase one scores its own.
 
     Searches run from successive seeds until one solves or ``budget.seconds`` has passed,
@@ -2388,6 +2514,9 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
     no endpoint screen here any more: ``_opening_lists`` has already established that both
     ends are clear at every opening in that rotation, which is the one failure no further
     seed could change.
+
+    Called on every transit, not only on the ones phase one failed, so these budgets are
+    now spent whether or not a route is already in hand -- see ``_plan_direct``.
     """
     rotation = list(rotation) or [None]
     deadline = deadline or Deadline()
@@ -2405,7 +2534,7 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                 deadline.ran_out(log, f"the cartesian tree after {run} runs")
             return found
         run += 1
-        got = _cartesian_route(cell, qa, qb, budget, seconds=left,
+        got = _cartesian_route(cell, qa, qb, budget, seconds=left, zone=zone,
                                seed=budget.seed + run - 1,
                                opening=rotation[(run - 1) % len(rotation)],
                                check_step=check_step,
@@ -2532,7 +2661,7 @@ def _recut_outside_band(cell: Cell, route: list[np.ndarray], *, zone: LinearZone
             log(f"      recut {n}: the joining route does not start and end at the cuts, "
                 f"so it cannot be spliced in; keeping the Cartesian stretch")
             continue
-        was, _ = _path_cost(cell, dropped, check_step)
+        was, _ = _path_cost(cell, dropped, check_step, zone=zone)
         log(f"      recut {n}: joined with {len(bridge)} points at cost {cost:.2f} s, "
             f"against {was:.2f} s for the {len(dropped)} Cartesian points it replaces")
         plans.append((i, j, bridge))
@@ -2566,10 +2695,13 @@ class Run:
 
 @dataclass
 class LinearZone:
-    """Settings for turning the near-panel parts of a transit into linear motion."""
+    """Settings for turning the near-panel parts of a transit into linear motion.
+
+    The band is the whole of the decision.  A move is linear when either of its ends reads
+    within ``near_mm`` of the parts, asked of every move and of nothing larger; there is no
+    per-leg qualification a route has to pass before any of its moves may be linear.
+    """
     near_mm: float = 0.0            # clearance at or under which the route counts as near
-    min_run_mm: float = 0.0         # shortest stretch worth converting, in tool travel
-    min_run_pct: float = 0.0        # ...or this much of the leg, whichever it meets first
     linear_speed_mm_s: float = 0.0  # tool speed cap; 0 leaves linear moves costed on joints
     crossing_penalty_s: float = 0.0  # flat costing-only surcharge on each move that
                                      # reaches into the band from outside it; 0 charges none
@@ -2616,14 +2748,9 @@ def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
     pts = _flatten(runs)
     if len(pts) < 2:
         return runs
-    # Gated on the route filled in, as _finish gates it.  These runs have already been
-    # reduced to their waypoints, and a share "of the leg in range" counted over a handful
-    # of stops says nothing about how much of the leg runs near the panel.
-    allowed = zone is not None and _linear_allowed(cell, _densify(cell, pts, check_step),
-                                                   zone, log=log)
-    model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
+    model = MotionModel(cell, max_step=check_step, zone=zone)
     stagetrace.route("refining a leg planned earlier without a budget")
-    stagetrace.note(_trace_gate(zone, allowed))
+    stagetrace.note(_trace_zone(zone))
     stagetrace.stage("input", model, pts)
     refined = _refine(model, pts, shortcut_seconds=shortcut_seconds,
                       polish_seconds=polish_seconds, relocate=relocate, log=log)
@@ -2677,24 +2804,20 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     """
     before, t0 = getattr(cell, "counters", None), time.time()
     before = dict(before) if before is not None else None
-    # Two passes, because the gate and the fill each need the other's answer.  Whether the
-    # leg earns linear motion is a proportion over the route, so a chord-interpolated
-    # sample answers it perfectly well -- the question is how much of the leg runs near
-    # the panel, not exactly which states it passes through.  Only once that is settled is
-    # there a model to say which stretches are linear, and so where the chord is the wrong
-    # curve to have sampled.
-    #
-    # The second pass is free where it changes nothing: with the gate refused there is no
-    # zone, every move is a joint move, and the profile-aware fill is the chord again.
-    gate = _densify(cell, path, check_step)
-    allowed = zone is not None and _linear_allowed(cell, gate, zone, log=log)
-    model = MotionModel(cell, max_step=check_step, zone=zone if allowed else None)
+    # One sampling pass.  There were two while a per-leg gate stood here: the fill has to
+    # follow the curve each move will really be flown along, which needs a model, and the
+    # model could not be built until the gate had said whether the leg was to have a zone
+    # at all -- so the route was sampled once along the chord to answer that, and again
+    # along the real curves afterwards.  Nothing asks that question now.  The band answers
+    # it per move through MotionModel.motion, so the model exists before anything is
+    # sampled and the profile-aware fill is the only fill.
+    model = MotionModel(cell, max_step=check_step, zone=zone)
     dense, anchors = _densify_marked(cell, path, check_step, model=model)
     stagetrace.route(f"planned route, refinement budgets shortcut {shortcut_seconds:g} s, "
                      f"polish {polish_seconds:g} s"
                      + ("" if shortcut_seconds > 0 or polish_seconds > 0 else
                         " (unrefined for now: may be refined again later or discarded)"))
-    stagetrace.note(_trace_gate(zone, allowed))
+    stagetrace.note(_trace_zone(zone))
     stagetrace.stage("solver", model, path, sources=range(len(path)))
     stagetrace.stage("densify", model, dense, sources=anchors)
     refined = _refine(model, dense, shortcut_seconds=shortcut_seconds,
@@ -2712,12 +2835,12 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     return runs
 
 
-def _trace_gate(zone: "LinearZone | None", allowed: bool) -> str:
-    """The linear gate's answer, as the stage trace reports it."""
+def _trace_zone(zone: "LinearZone | None") -> str:
+    """Which band is in force, as the stage trace reports it."""
     if zone is None or not zone.enabled:
         return "linear band: off, every move is PTP"
-    return (f"linear gate: {'admitted' if allowed else 'refused, every move is PTP'} "
-            f"(band {zone.near_mm:g})")
+    return (f"linear band: {zone.near_mm:g} mm, a move is LIN when either end reads "
+            f"inside it (reach {zone.reach_mm:g} mm)")
 
 
 def _traced_verify(model: "MotionModel", runs: list[Run], where: str, log=None) -> None:
@@ -2737,9 +2860,9 @@ def _verify_runs(model: "MotionModel", runs: list[Run], where: str, log=None) ->
     The optimisation passes check the moves they *propose*, and only those.  ``shortcut``
     never offers an adjacent pair -- ``_try_cut`` returns early on ``j - i < 2`` -- and
     ``simplify``'s reach loop runs ``while j > i + 1``, so the pair it finally settles on
-    is appended without a check.  A move that came out of ``_densify`` and that nothing
-    happened to replace therefore leaves here carrying only the guarantee the route
-    arrived with.
+    is appended without a check.  A move that came out of ``_densify_marked`` and that
+    nothing happened to replace therefore leaves here carrying only the guarantee the
+    route arrived with.
 
     That guarantee is weaker than this module's.  A sampling planner validates a uniform
     joint-space grid at ``--segment-length-rad``; ``segment_collides`` lays down the same
@@ -2920,56 +3043,6 @@ def _reads_near(cell: Cell, q: np.ndarray, near_mm: float) -> bool:
     """
     reading = cell.clearance_mm(q)
     return reading < cell.probe_mm and reading <= near_mm
-
-
-def _linear_allowed(cell: Cell, dense: list[np.ndarray], zone: "LinearZone",
-                    log=None) -> bool:
-    """Whether this leg earns linear motion at all, and the report explaining the verdict.
-
-    Being near the panel is measured over the leg rather than over any one stretch of it.
-    The points are a collision-check step apart, so the share of them in range is how much
-    of the route runs near the panel, whether or not it does so in one go -- which matters
-    because the apex of a retract between two welds leaves the band for an instant and
-    would otherwise split an 85% leg into runs of 45% and 40% that a 50% threshold rejects
-    twice over.
-
-    Either test admits the leg: one stretch long enough in tool travel, or enough of the
-    leg in range whatever the stretches look like individually.  ``min_run_mm`` is what a
-    transit needs, since a sweeping move that clips the band for a moment is not working
-    near the panel; ``min_run_pct`` is what a hop from one weld to the next needs, being
-    entirely near the panel and far too short to pass any absolute threshold.
-
-    A leg that meets neither is planned as joint motion throughout.
-    """
-    if not zone.enabled or len(dense) < 2:
-        return False
-
-    if log and len(dense) > 200:
-        log(f"      measuring clearance at {len(dense)} points along the route to find "
-            f"its near-panel stretches")
-    near = [_reads_near(cell, q, zone.near_mm) for q in dense]
-    in_range = 100.0 * sum(near) / len(near) if near else 0.0
-    by_share = zone.min_run_pct > 0.0 and in_range >= zone.min_run_pct
-
-    stretches = [_tcp_travel(cell, dense[i:j + 1])
-                 for i, j in _runs_of(near, True) if j > i]
-
-    by_length = any(t >= zone.min_run_mm for t in stretches)
-    allowed = bool(by_length or by_share)
-
-    if log and (stretches or in_range > 0.0):
-        note = [f"{in_range:.0f}% of the leg in range"]
-        if stretches:
-            note.append(f"longest stretch {max(stretches):.0f} mm of "
-                        f"{sum(stretches):.0f} mm near the panel, against a "
-                        f"{zone.min_run_mm:g} mm threshold")
-        if allowed:
-            why = "on length" if by_length else f"on share against {zone.min_run_pct:g}%"
-            note.append(f"near-panel moves run under the linear profile ({why})")
-        else:
-            note.append("neither threshold met, so the leg stays joint motion throughout")
-        log("      " + ", ".join(note))
-    return allowed
 
 
 def _split_runs(model: "MotionModel", pts: list[np.ndarray]) -> list[Run]:

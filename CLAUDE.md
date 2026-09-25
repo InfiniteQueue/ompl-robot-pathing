@@ -17,8 +17,7 @@ shape falls out of the arm's configuration and is not visible anywhere in the ce
 - Collision checking interpolates **in joint space**: `Cell.segment_collides` steps
   `a + t*(b - a)` over the joint vector, bisecting further wherever the tool moves more
   than `--check-step-mm` between samples, which is exactly the path the robot takes.
-- This is what OMPL produces, and what every move keeps that has neither end in the band
-  or sits on a leg the gate refused.
+- This is what OMPL produces, and what every move keeps that has neither end in the band.
 
 ### Linear profile (`LIN`)
 
@@ -58,7 +57,7 @@ the way, so the joint values in between are whatever that line demands.
     let a line that ends a whole joint 6 turn away, or on another wrist branch, pass
     with the flip hidden in its last joint gap. Measured on Path 1, real lines end
     within 1.1e-4 rad of their target and step at most 0.031 rad per station.
-- `_densify` fills the OMPL path in at `--check-step-deg` resolution, measured as the
+- `_densify_marked` fills the OMPL path in at `--check-step-deg` resolution, measured as the
   **largest joint delta** — not time, not tool distance. OMPL itself returns very few
   points (four is typical); everything downstream runs on the dense list.
   - The fill follows **the curve each move will really be flown along**: the joint
@@ -91,9 +90,19 @@ the way, so the joint values in between are whatever that line demands.
 - The profile is **not stored** against a waypoint. `MotionModel.motion(a, b)` derives it
   from the two states a move runs between: linear when either end is inside the band. That
   is what lets `shortcut` and `polish` move points around without invalidating anything.
-  - Only on a leg `_linear_allowed` admits (`--near-panel-min-pct` of the samples near,
-    or one unbroken near stretch of `--near-panel-min-mm` tool travel). A refused leg gets
-    a model with no zone, and every move on it is joint motion however close it runs.
+  - **There is no per-leg gate any more.** `_linear_allowed` used to ask, before any move
+    was labelled, whether the leg earned linear motion at all -- `--near-panel-min-pct` of
+    its samples near, or one unbroken near stretch of `--near-panel-min-mm` tool travel --
+    and a leg meeting neither was given a model with no zone, so every move on it was
+    joint motion however close it ran. Both flags and the function are gone. The band is
+    now the whole of the decision and it is asked per move, so a route that touches the
+    band once comes out with the two moves either side of that state linear, where before
+    it came out entirely `PTP`. Expect more phases per transit and more short `LIN` runs;
+    `--near-panel-mm 0` or `--no-near-panel-linear` is what turns linear motion off.
+  - Dropping it took the second sampling pass in `_finish` with it. The fill has to follow
+    the curve each move will really be flown along, which needs a model, and the model
+    could not exist until the gate had ruled -- so the route was densified once along the
+    chord to answer the gate and again along the real curves afterwards. One pass now.
   - "Near" is `_reads_near`: `clearance_mm(q) <= near_mm` **and** `< cell.probe_mm`.
     `clearance_mm` returns the probe distance when nothing is in range, so a saturated
     reading is "nothing seen", never a distance. `ToolpathPlanner` asks for a probe of
@@ -116,9 +125,51 @@ the way, so the joint values in between are whatever that line demands.
     at 54.4 s off a chord reaching 64.5 mm into the panel, against 3.6 s off its line, so
     simplify and polish kept a joint detour up and over rather than take it. Shortcut's
     cuts were never affected; they priced the chain they installed.
-  - Still read off the joint chord, before any profile is known: `_path_cost` ranking raw
-    solver routes, and `_plan_direct`'s check of whether a clear direct move runs close
-    enough to the parts to be worth refining.
+  - `_path_cost` reads it the same way now. Ranking used to go straight to
+    `Cell.segment_cost`, which knows nothing of profiles, so a candidate was scored on
+    cruise time with the penalty off its joint chord -- no tool speed cap, no crossing
+    penalty, no line. That undercharged exactly the routes most likely to be capped, the
+    Cartesian tree's being straight tool moves throughout, against phase one's, which
+    mostly ship as joint motion and were priced about right. Harmless while the tree was a
+    fallback; deciding, once the two started competing on every transit.
+  - Still read off the joint chord: `_plan_direct`'s check of whether a clear direct move
+    runs close enough to the parts to be worth refining.
+- **Candidate routes are scored the way the refinement passes score.** `_path_cost`
+  builds a `MotionModel` with the leg's zone and sums `model.cost(a, b, stops=True)`, so a
+  stretch that will ship linear is capped at `--linear-speed-mm-s`, charged
+  `--linear-crossing-penalty-s`, and has its clearance penalty read along the tool's line.
+  The second figure it returns is the same time without either penalty -- cap included --
+  so "cost against plain" still reads as what the penalties added.
+  - **Two terms, and `_scored_points` returns two lists to keep them apart.** Travel is
+    summed over the route's *own* moves, filled in where it is coarser than
+    `--check-step-deg`, in **cruise** time -- additive under subdivision, so it does not
+    depend on how finely the route is described. Stops are the ramps a route of that shape
+    would pay, taken as full-move minus cruise over a copy *thinned* back to
+    `--check-step-deg`. That second term is the one `--stop-time-weight` acts in.
+  - Thinning is sound for counting stops and unsound for pricing moves, which is the whole
+    reason the two lists exist. A route of straight tool moves is a **polyline**: the
+    tree's guarantee is that each consecutive pair of its stations is a straight move it
+    solved and swept, and the line between two non-adjacent stations cuts the corner, was
+    never checked, and often has no IK at all -- which is the shape the tree exists to
+    find. Pricing such a span prices a route the candidate does not contain, and where its
+    line will not solve `MotionModel.cost` calls it infinity. Scored on one thinned list,
+    cartesian solutions came back at `inf` and `_cheapest` dropped them, on exactly the
+    transits where the tree was winning.
+  - The stop term asks the joint dynamics only and never for a line, so a thinned span
+    that cuts a corner cannot make a route unpriceable.
+  - A move whose line will not price is charged as a joint move rather than costing
+    infinity. `MotionModel.cost` answers infinity because a pass must never *install* what
+    it cannot price; ranking installs nothing, and dropping a candidate there is dropping
+    it before the passes could move the waypoint that could not be reached. `_fill` takes
+    the same view of the same question. `_verify_runs` is where an unflyable route dies.
+  - The fill is the profile-aware one, so where the route is coarse the states scored are
+    on the curve each move will really be flown along.
+  - What it costs is one profile-aware densify per candidate rather than one per transit,
+    the winner being densified again in `_finish`. Phase one returns at most
+    `--phase-one-runs` of them.
+  - `_Sampler` carries the zone for scoring only. Nothing plans differently for it: OMPL
+    cannot produce linear motion, so the zone says how the route it returns will be flown,
+    not how it is searched for.
 - The passes ask one question before checking or pricing anything: `MotionModel.refuses`,
   which is `demotes` or `overreaches`. The two guard the same thing from opposite sides --
   one stops a near-panel stretch being dissolved, the other stops one being grown outward.
@@ -216,9 +267,76 @@ the way, so the joint values in between are whatever that line demands.
     block. OMPL reads the gun from the environment's current state and not from the program
     it is handed, and before this each run inherited whatever the last collision query had
     left there -- right in practice only because the endpoint screen always ran first.
+- **A weld's two gun openings describe the transits either side of it, not a squeeze.**
+  The squeeze is not modelled -- the robot is stationary through the weld -- so a study
+  chains them, one weld's `gun_opening_leave` being the next weld's `gun_opening_arrive`,
+  which is the same transit read from its two ends. Checked across Paths 2 and 3: every
+  pair agrees. Anything that reasons about `leave` as "the gun closing on the part" is
+  wrong, and a weld declaring 0/0 is not a weld that does nothing, it is one planned with
+  the gun shut throughout.
+  - `manifest._opening` parses an absent field as `None`, not `0.0`. The two were the same
+    value, so a manifest missing the field planned the weld closed with nothing said, which
+    either failed to place or placed somewhere nobody chose. `None` means "nobody said" and
+    is what `toolpath._search_opening` fills in.
+  - `_search_opening` sweeps the gun's travel for the reachable opening with the most
+    clearance, for a weld that declares none and for one whose declared opening places the
+    robot nowhere. **Arrival only.** An independent sweep of the departure opening would be
+    the same function of the same pose and the same ranking, so it would return the same
+    value every time -- and the departure opening is not a geometric question here anyway.
+  - The two axes are searched in order, never as one grid: a stand-off is restored before
+    export and costs nothing visible, an opening is process data that ships. So the
+    declared opening at the declared stand-off, then the declared opening across the
+    stand-offs, then other openings at the chosen stand-off, and only then both together --
+    one stand-off sweep per opening, coarse grid, since each sample is already a whole
+    sweep of the other axis. Searched as one grid, an opening reading a millimetre more
+    clearance could displace the study's own choice.
+  - `_scan_for_clear` is that sweep, shared by both axes: scan, split every gap between two
+    *blocked* samples down to the resolution, then climb from each window's best. Not a
+    bisection, because clear is not monotonic in either parameter -- backing a weld off
+    frees the tip but can put the throat into tooling, and opening the gun frees the throat
+    but swings the electrode into what is beside it.
+  - `_plan_pair` writes the departure opening back over the weld phase from what the
+    transit out of it was actually solved at, the declared value having only seeded that
+    search. Without it the gun changes as the robot starts moving instead of while it
+    stands still at the weld. `_arrive_opening` reads `self.openings` for the same reason:
+    the declared arrival is a pose the robot may never have been shown to reach.
+- **`--direct-clearance-mm` is a floor under the straight move, and under nothing else.**
+  `_plan_direct` tries the direct joint chord at each opening before any search, and the
+  only question asked of it was `segment_collides`. That is a yes-or-no at the collision
+  margin, so a transit sliding along a panel at 5 mm is "clear" and ships, and the phases
+  that would have routed round it never run -- the one shape of answer no amount of
+  standing off a straight line can reach, since the passes cannot move a route into
+  another homotopy class. The floor makes the chord earn the shortcut: under it, the loop
+  moves to the next opening, and a set of openings none of which clears it falls through
+  to `_Sampler` as though the move had collided.
+  - Measured by `Cell.segment_clearance`, which walks what `segment_scan` walks -- the
+    joint grid at `--check-step-deg`, then the tool-space bisection under it -- and
+    returns the worst reading. The subdivision **is** included here, where scoring leaves
+    it out: nothing is being priced, so there is no cost to make depend on how finely the
+    move had to be checked, and a dip between two grid samples is the case those midpoints
+    exist to catch.
+  - `floor` stops that walk at the first reading under it, so a move that is going to be
+    refused is not measured to the end. What comes back is then that reading rather than
+    the worst on the move, which is all the log claims.
+  - Bounded below by `--obstacle-clearance-mm`, since a move closer than the margin is
+    already a collision, and above by the probe: `ToolpathPlanner` adds
+    `NEAR_PANEL_HEADROOM_MM` to it when widening the clearance manager, for the reason the
+    band does -- a reading at the probe is "nothing found", so a floor at the probe is one
+    every state meets.
+  - It gates the shortcut only. Nothing re-asks it of what the searches return, or of what
+    the refinement passes do afterwards; the clearance penalty is what governs those, and
+    it is a price rather than a limit. Raising this does not raise the clearance of the
+    routes that ship, it only stops the straight move being taken on trust.
 - `plan_cartesian` is the only search that builds straight tool moves. `_plan_direct`
-  reaches it only when OMPL phase one returned nothing and the band is on, and never for
-  the halves of a fallback-pose route, which are planned with no zone.
+  runs it on every transit the band is on for, whatever phase one did, and adds its best
+  route to the same candidate set -- `_cheapest` then ranks the two searches on one number
+  and names the winner's `_Solution.source`. It used to run only where phase one returned
+  nothing, which meant a transit phase one solved never had the tree's route costed at all;
+  the two differ less in whether they solve than in what they return, uniform joint
+  sampling having nothing drawing it into the corridor beside the panel that the tree
+  steers along. What it costs is `--cartesian-solve-seconds` plus `--cartesian-min-seconds`
+  on every transit rather than only on the ones nothing else reached, bounded by `Deadline`
+  alone. Never run for the halves of a fallback-pose route, which are planned with no zone.
   - `_cartesian_solutions` runs it from successive seeds: until one solves or
     `--cartesian-solve-seconds` passes, then on until `--cartesian-min-seconds` has, both
     timed from the first run. Routes are ranked by `_path_cost`, as phase one's are, and
@@ -235,18 +353,17 @@ the way, so the joint values in between are whatever that line demands.
     alone, since that query is the one phase one just failed.
   - Afterwards it is treated exactly like an OMPL route. With the recut off, joint motion
     enters it only through the endpoint rule, and the refinement passes then replace
-    out-of-band stretches with long joint chords. A leg the gate refuses ships with no
-    linear moves at all, even though it was found by searching linear space.
+    out-of-band stretches with long joint chords, so a route found by searching linear
+    space can still ship with few linear moves on it.
   - `_fill` hands stations straight through only while consecutive ones are within
     `--check-step-deg`. `jump_rad` allows 0.5 rad per station, and a linear gap wider
     than the step is re-derived by `plan_linear`, which need not reproduce the chain the
     tree validated.
   - `--unrefined-output` writes every transit as one `PTP` phase regardless.
-- Order in `_finish` is sample → gate → densify → refine → split → verify. The gate and the
-  fill each need the other's answer, so the route is sampled twice: whether the leg
-  earns linear motion is a proportion over the route, which a chord sample answers
-  perfectly well, and only once that is settled is there a model to say which
-  stretches are linear. The second pass is free where it changes nothing — gate
-  refused means no zone, every move a joint move, and the profile-aware fill is the
-  chord again. The split is a reading of the finished path, not a decision imposed
-  before it.
+- Order in `_finish` is densify → refine → split → verify, one sampling pass. It was
+  sample → gate → densify → … while the gate stood: the fill follows the curve each move
+  will really be flown along, which needs a model, and there was no model until the gate
+  had said whether the leg was to have a zone, so the route was sampled once along the
+  chord for the gate and again along the real curves for the passes. With the band
+  answering per move the model exists first and the profile-aware fill is the only fill.
+  The split is a reading of the finished path, not a decision imposed before it.

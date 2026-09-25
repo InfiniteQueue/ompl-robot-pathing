@@ -152,6 +152,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "and shipped, and a segment with none is reported as a failure "
                         "like any other and the run carries on. 0 removes the limit "
                         "(default: %(default)g)")
+    #HOW MUCH AIR THE STRAIGHT MOVE HAS TO KEEP TO BE TAKEN WITHOUT SEARCHING
+    p.add_argument("--direct-clearance-mm", type=float, default=0.0, metavar="MM",
+                   help="how close the straight joint move between two waypoints may come "
+                        "to the parts and still be taken in preference to searching for a "
+                        "route. The planner tries that move first at every gun opening "
+                        "because it is normally the best answer there is, and until now "
+                        "the only question asked of it was whether it collided -- so a "
+                        "transit that slides along a panel at the collision margin ships "
+                        "as the straight move, and the searches that would have gone "
+                        "round are never run. Measured over the same walk that proves the "
+                        "move clear, tool-space subdivision included, and capped by how "
+                        "far the clearance query can see. Below "
+                        "--obstacle-clearance-mm it can never fire, since a move closer "
+                        "than that is already a collision. 0 leaves the collision check "
+                        "as the whole of the test (default: %(default)g)")
     #PHASE ONE: CHOOSE BETWEEN ROUTES
     p.add_argument("--phase-one-runs", type=int, default=20, metavar="N",
                    help="sampling-planner runs made per transit in phase one. Every one "
@@ -407,25 +422,6 @@ def build_parser() -> argparse.ArgumentParser:
                         "transit counts as working near the parts, and is re-planned as "
                         "linear motion. Larger means more of the route comes out linear, "
                         "which is more predictable and slower to execute (default: %(default)g)")
-    #SHORTEST STRETCH WORTH MAKING LINEAR
-    p.add_argument("--near-panel-min-mm", type=float, default=100.0, metavar="MM",
-                   help="shortest near-panel stretch worth converting, measured as tool "
-                        "travel. A sweeping transit that clips the proximity band for a "
-                        "moment is not working near the panel, and cutting it in three to "
-                        "say so costs a stop at each end for nothing. A stretch under "
-                        "this length still qualifies on --near-panel-min-pct "
-                        "(default: %(default)g)")
-    #...OR THIS MUCH OF THE MOVE, HOWEVER SHORT
-    p.add_argument("--near-panel-min-pct", type=float, default=60.0, metavar="PCT",
-                   help="if this much of a move is within --near-panel-mm of the parts, "
-                        "every near-panel stretch of it is made linear however short each "
-                        "one is. Measured over the whole move, not over each stretch: time "
-                        "spent near the panel does not have to be continuous, so a retract "
-                        "whose apex leaves the band for an instant no longer disqualifies "
-                        "the move either side of it. Without this no short move could come "
-                        "out linear however completely it runs alongside the panel -- a hop "
-                        "from one weld to the next being the case that matters. 0 leaves "
-                        "--near-panel-min-mm as the only test (default: %(default)g)")
     #HOW FAR OUT LINEAR MOTION MAY BE CREATED
     p.add_argument("--linear-introduce-mm", type=float, default=120.0, metavar="MM",
                    help="clearance above which the optimisation passes may not introduce "
@@ -708,6 +704,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="finest spacing the search goes down to, both looking for a clear "
                         "stand-off and refining one. A clear window narrower than the "
                         "final spacing can be missed (default: %(default)g)")
+    #WHEN THE WELD'S GUN OPENING IS MISSING OR UNREACHABLE
+    p.add_argument("--no-weld-opening-search", dest="weld_opening_search",
+                   action="store_false",
+                   help="fail a weld that declares no gun opening, or whose declared one "
+                        "places the robot nowhere, rather than sweeping the gun's travel "
+                        "for the reachable opening with the most clearance. The declared "
+                        "opening is still tried first either way, at every stand-off, so "
+                        "this only governs what happens once it has failed everywhere")
+    p.add_argument("--weld-opening-scan-mm", type=float, default=10.0, metavar="MM",
+                   help="spacing of that sweep's first scan across the gun's travel; gaps "
+                        "between two blocked openings are then halved down to "
+                        "--weld-opening-resolution-mm (default: %(default)g)")
+    p.add_argument("--weld-opening-resolution-mm", type=float, default=1.0, metavar="MM",
+                   help="finest opening spacing the sweep goes down to. Where no opening "
+                        "works at the chosen stand-off the two are then searched together "
+                        "on the --weld-opening-scan-mm grid, which costs one stand-off "
+                        "sweep per opening (default: %(default)g)")
     #endregion
     #region ###CLEARANCE PENALTY###
     #DISABLE CLEARANCE PENALTY
@@ -807,7 +820,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="commanded tool speed cap on linear moves; the joint limits still "
                         "govern whenever they are slower (default: %(default)g)")
     #HOW MUCH A STOP COSTS THE OPTIMISER
-    p.add_argument("--stop-time-weight", type=float, default=0.8, metavar="W",
+    p.add_argument("--stop-time-weight", type=float, default=0.6, metavar="W",
                    help="how heavily a stop is charged in the time the planner scores "
                         "routes by, and nowhere else: the exported timing is the real "
                         "one. Every waypoint is a full stop, so deleting one nearly "
@@ -959,6 +972,19 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.phase_two_cartesian_seconds < 0.0:
         print("error: --phase-two-cartesian-seconds cannot be negative", file=sys.stderr)
         return 2
+    if args.direct_clearance_mm < 0.0:
+        print("error: --direct-clearance-mm cannot be negative", file=sys.stderr)
+        return 2
+    if args.weld_opening_scan_mm <= 0.0:
+        print("error: --weld-opening-scan-mm must be above 0", file=sys.stderr)
+        return 2
+    if args.weld_opening_resolution_mm <= 0.0:
+        print("error: --weld-opening-resolution-mm must be above 0", file=sys.stderr)
+        return 2
+    if args.weld_opening_resolution_mm > args.weld_opening_scan_mm:
+        print("error: --weld-opening-resolution-mm cannot exceed --weld-opening-scan-mm: "
+              "the sweep refines the first scan, it does not coarsen it", file=sys.stderr)
+        return 2
 
     try:
         if args.stepped_penalty:
@@ -1071,15 +1097,17 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         shortcut_seconds=args.shortcut_seconds if args.shortcut else 0.0,
         polish_seconds=args.polish_seconds if args.shortcut else 0.0,
         near_panel_mm=args.near_panel_mm if args.near_panel_linear else 0.0,
-        near_panel_min_mm=args.near_panel_min_mm,
-        near_panel_min_pct=args.near_panel_min_pct,
         linear_speed_mm_s=args.linear_speed_mm_s,
         linear_crossing_penalty_s=args.linear_crossing_penalty_s,
         linear_introduce_mm=args.linear_introduce_mm,
+        direct_clearance_mm=args.direct_clearance_mm,
         weld_clearance_mm=args.weld_clearance_mm,
         stand_off_search=args.weld_shift_search,
         stand_off_scan_mm=args.weld_shift_scan_mm,
         stand_off_resolution_mm=args.weld_shift_resolution_mm,
+        opening_search=args.weld_opening_search,
+        opening_scan_mm=args.weld_opening_scan_mm,
+        opening_resolution_mm=args.weld_opening_resolution_mm,
         export_dir=directory if args.export_collision_geometry else None,
         keep_unrefined=args.unrefined_output,
         log=log)

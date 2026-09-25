@@ -80,11 +80,21 @@ class StaticObject:
 
 @dataclass
 class Locator:
+    """An ordered stop on the tour, and the gun state it is reached and left in.
+
+    ``None`` for an opening means the study did not say, which is not the same claim as
+    ``0``.  Zero is a weld made with the gun shut; absent is a weld whose opening nobody
+    has chosen yet, and one the planner may therefore choose for -- see
+    ``toolpath._search_opening``.  They were the same value until this was split, so a
+    manifest missing the field silently welded with the tip closed, which either failed to
+    place at all or placed and then stepped the gun from 0 to 0, emitting a weld phase in
+    which nothing happens.
+    """
     name: str
     pose_world: np.ndarray          # 4x4, translation in mm -- the pose planned against
     is_weld: bool
-    gun_opening_arrive: float       # mm
-    gun_opening_leave: float        # mm
+    gun_opening_arrive: float | None    # mm, None where the study named none
+    gun_opening_leave: float | None     # mm, None where the study named none
     pose_world_import: np.ndarray | None = None   # set when pose_world has been shifted
 
     @property
@@ -247,6 +257,15 @@ def shift_weld_locators(man: Manifest, distance: float) -> int:
     return moved
 
 
+def _opening(value) -> float | None:
+    """A declared gun opening, or ``None`` where the study named none.
+
+    Absent and null both read as None.  This used to default to 0.0, which made "weld with
+    the gun shut" and "nobody said" the same input to every reader downstream.
+    """
+    return None if value is None else float(value)
+
+
 def _mat(v: Any) -> np.ndarray:
     return np.array(v, dtype=np.float64)
 
@@ -298,8 +317,8 @@ def load(directory: str) -> Manifest:
                 name=l["name"],
                 pose_world=_mat(l["pose_world"]),
                 is_weld=bool(l.get("is_weld", False)),
-                gun_opening_arrive=float(l.get("gun_opening_arrive", 0.0)),
-                gun_opening_leave=float(l.get("gun_opening_leave", 0.0)),
+                gun_opening_arrive=_opening(l.get("gun_opening_arrive")),
+                gun_opening_leave=_opening(l.get("gun_opening_leave")),
             )
             for l in raw.get("locators", [])
         ],

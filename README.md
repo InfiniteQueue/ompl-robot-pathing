@@ -48,11 +48,12 @@ The generated directories are safe to delete; they are rebuilt on the next run.
    never waived this way -- a study that starts inside the parts is rejected with the
    offending pairs and their overlaps.
 4. **Planning** (`planning.py`, `cartesian.py`, `toolpath.py`, `fallback/`). Each transit
-   is solved whole, by the first of these that works: a direct joint move; OMPL, keeping
-   the cheapest of several runs; a Cartesian-space tree whose edges are straight tool moves
-   (only while the near-panel band is on); longer OMPL runs; the same again through a
-   fallback pose searched for that transit; and finally two legs with the gun changing
-   between them. The gun opening is chosen by the search rather than ahead of it: phase
+   is solved whole. A direct joint move is taken where one is clear; otherwise two
+   searches run and the cheaper of everything they find ships -- OMPL, keeping the best of
+   several runs, and a Cartesian-space tree whose edges are straight tool moves (only
+   while the near-panel band is on). Where that finds nothing the fallbacks follow in
+   turn: longer OMPL runs, the same again through a fallback pose searched for that
+   transit, and finally two legs with the gun changing between them. The gun opening is chosen by the search rather than ahead of it: phase
    one's runs are dealt round several openings and the cheapest solution of the whole set
    ships, with a reserve of further openings held back for phase two. All of them are
    tried directly before any fallback pose is. Each run is made with the gun tip where it
@@ -303,7 +304,36 @@ The minimum is a floor rather than a cap. Once it is met and at least one soluti
 planning moves on; if nothing has solved, runs continue up to `--ompl-attempts`. Each run is
 a full solve of several seconds, so this is the most expensive knob in the tool — it is also
 the only one that can change the route's basic shape. With `--no-clearance-penalty` the score
-degrades to plain cruise time, so it still picks the quickest of the sampled solutions.
+degrades to plain time, so it still picks the quickest of the sampled solutions.
+
+**Candidates are scored the way the refinement passes score.** A route is priced through the
+same motion model that later judges its moves: a stretch that will ship linear is held to
+`--linear-speed-mm-s`, charged `--linear-crossing-penalty-s` where it enters the band, and
+has its clearance penalty read along the tool's line rather than the joint chord. Ranking
+used to skip all three, which quietly undercharged the routes most likely to be capped — the
+Cartesian tree's, whose every edge is a straight tool move — against phase one's, which
+mostly ship as joint motion and were priced about right. That mattered little while the tree
+was only reached when phase one failed; it decides transits now the two compete on every one.
+
+The score has two terms, and the split matters. **Travel** is summed over the route's own
+moves — filled in where the route is coarser than `--check-step-deg` — in cruise time, which
+is unchanged by subdivision and so does not depend on how finely a solver described its
+answer. **Stops** are the ramps a route of that shape would really pay, measured over a copy
+thinned back to `--check-step-deg`, and that is the term `--stop-time-weight` acts in. The
+thinned copy is needed because the point counts routes arrive with say more about the search
+than the route: OMPL returns the handful of nodes its tree stopped at, the Cartesian tree
+returns every station it validated, and charging a ramp at each would rank the two searches
+on how each reports itself.
+
+Thinning is right for counting stops and wrong for pricing moves, which is why it is only
+used for the first. A route of straight tool moves is a polyline, and the tree only ever
+promised that each *consecutive pair* of its stations is a move it solved and swept; the
+line between two non-adjacent stations cuts the corner and frequently has no reachable
+inverse kinematics, that being the shape the tree exists to find. A move with no reachable
+line has no linear price, so scoring a thinned copy made whole Cartesian routes cost
+infinity and drop out of the ranking. Where a move the route really contains still will not
+price, it is charged as a joint move: ranking installs nothing, and an unflyable route is
+supposed to die at verification, after the passes have had their chance at it.
 
 ### Seeing what the refinement changed
 
@@ -368,6 +398,7 @@ applied at two scopes, and the distinction is load-bearing:
 
 | Pass | Works on | Measure |
 | --- | --- | --- |
+| candidate ranking | route at a common spacing | full stop-to-stop time |
 | shortcut | densified path | **cruise** time — ramps excluded |
 | simplify | dense → emitted | full stop-to-stop time |
 | polish | emitted waypoints | full stop-to-stop time |
@@ -437,14 +468,11 @@ From start to finish:
    it off: every transit move is `PTP`, and the Cartesian tree is never tried either.
 2. **Solve.** Whichever solver succeeds (see [How it works](#how-it-works)) returns an
    unlabelled route.
-3. **Gate, per leg.** The route is sampled at `--check-step-deg` and each sample is marked
-   near or not. The leg earns linear motion if at least `--near-panel-min-pct` of the
-   samples are near, or if any unbroken near stretch covers `--near-panel-min-mm` of tool
-   travel. A leg that meets neither is `PTP` throughout, however close it runs.
-4. **Label, per move.** On a leg that passed, `LIN` if either end is near, else `PTP`. So a
-   waypoint is reached by a linear move when it is in the band or the waypoint before it
-   was.
-5. **Refine.** Shortcut, simplify and polish move and delete waypoints, and each move they
+3. **Label, per move.** `LIN` if either end is near, else `PTP`. So a waypoint is reached
+   by a linear move when it is in the band or the waypoint before it was. Nothing is asked
+   of the leg as a whole: there is no threshold a route has to clear before any of its
+   moves may be linear.
+4. **Refine.** Shortcut, simplify and polish move and delete waypoints, and each move they
    propose takes its profile from its new ends. A `LIN` candidate is checked along the
    tool's straight line and costed under `--linear-speed-mm-s`; a `PTP` one is checked
    along the joint chord. A replacement that would swallow near waypoints into a joint
@@ -454,15 +482,15 @@ From start to finish:
    parts is refused unless the stretch it replaces already reached in from that far, so
    the approach to the band stays joint motion. `--linear-crossing-penalty-s` adds a flat
    cost each time a move enters the band from outside.
-6. **Split.** Consecutive moves under the same profile become one phase.
-7. **Verify.** Every move is swept along the path its profile implies. A failure discards
+5. **Split.** Consecutive moves under the same profile become one phase.
+6. **Verify.** Every move is swept along the path its profile implies. A failure discards
    the whole route, and the planner moves on to its next gun opening or fallback pose;
    nothing is relabelled or re-planned to rescue it.
 
-A route through a fallback pose is gated and labelled once, over the joined route. A transit
-split for a gun change is gated and labelled per leg, under that leg's own opening. The
-final per-phase validation checks each phase under its label, and `output.Timing` holds `LIN`
-moves to the tool speed cap.
+A route through a fallback pose is labelled once, over the joined route. A transit split for
+a gun change is labelled per leg, under that leg's own opening. The final per-phase
+validation checks each phase under its label, and `output.Timing` holds `LIN` moves to the
+tool speed cap.
 
 **One segment's search is bounded by the clock as well as by its budgets.** Every other
 budget bounds a part of the search — runs, seconds per run, gun openings, fallback poses —
@@ -477,18 +505,54 @@ carries on to the next — which is what already happens to a segment that fails
 Per-run limits are cut to the time remaining, so the last run stops at the deadline rather
 than a run's length past it.
 
-**Brief contact with the band is ignored, but "brief" is measured two ways.** A sweeping
-transit that clips the band for a moment is not working near the panel, and cutting it into
-three phases to say so would cost a stop at each end for nothing, so `--near-panel-min-mm`
-asks for a stretch of real length. On its own that fails a short move: a 60 mm hop from one
-weld to the next is near the panel for its whole length, yet no threshold worth setting for
-transits would admit it. `--near-panel-min-pct` covers that case. It is measured over the
-whole leg rather than per stretch, so a retract whose apex leaves the band for an instant
-does not disqualify the leg either side of it.
+**The straight move can be asked for room, not just for clearance.** Every transit is
+tried as one straight joint move first, at each gun opening in turn, because it is normally
+the best answer there is and a collision sweep costs nothing beside a phase of solves. The
+only question asked of that move was whether it collided — and a move that slides along a
+panel at the collision margin does not collide, so it ships, and the searches that would
+have gone round it are never run. `--direct-clearance-mm` puts a floor under it: a straight
+move coming closer than this to the parts is passed over, the next opening is tried, and if
+none of them keeps the room the transit goes to the searches like any other.
 
-**Routes from the Cartesian tree.** The tree is tried only when OMPL's first phase found
-nothing and the band is on, and never for the two halves of a route through a fallback pose.
-Its route is dense: states about `--check-step-mm` of tool travel apart, each gap a straight
+The reading is taken over the same walk that proved the move clear — the joint grid at
+`--check-step-deg` and the tool-space bisection under it — so a dip between two grid
+samples counts here exactly as it counts for the collision check, and the walk stops at the
+first sample under the floor. Two limits are worth knowing. A floor at or under
+`--obstacle-clearance-mm` (5) can never fire, a move closer than that being a collision
+already. And a floor is only measurable out to the clearance probe, which the planner
+widens to cover it; beyond the probe every state reads the same.
+
+It bounds the *shortcut*, not the route. Nothing enforces the floor on what the searches
+come back with — that is the clearance penalty's job, and the penalty is a price rather
+than a limit. 0, the default, leaves the collision check as the whole of the test.
+
+**Brief contact with the band is no longer ignored.** There used to be a gate ahead of the
+labelling: a leg qualified for linear motion only if an unbroken near stretch covered
+`--near-panel-min-mm` of tool travel, or `--near-panel-min-pct` of its samples read near,
+and a leg meeting neither shipped `PTP` throughout however close it ran. Both options and
+the gate are gone. The band is the whole of the decision now, asked of each move and of
+nothing larger.
+
+What that changes in the output: a transit that clips the band once picks up a linear run of
+the two moves either side of that state, where before the leg came out entirely `PTP`.
+Expect more phases per transit and some very short `LIN` ones. What it does not change is
+the reverse case — a stretch genuinely alongside the panel was already labelled linear and
+still is. If the short runs are unwanted, `--near-panel-mm` is the control: it is the one
+number the labelling reads, and narrowing it takes the marginal states out of the band
+rather than overruling them after the fact.
+
+**Routes from the Cartesian tree.** The tree runs on every transit the band is on for,
+whether or not OMPL's first phase found anything, and its route is ranked against phase
+one's -- the cheaper of the two ships, and the log names which search it came from. It is
+not a fallback: the two searches differ less in whether they succeed than in what they come
+back with. OMPL samples joint space uniformly and returns the first route its seed leads it
+to, so beside a panel that is usually the one standing well off it, there being nothing to
+draw the search into the gap; the tree steers along the tool's own line and stays in exactly
+that corridor. A phase one that solved is therefore no evidence that the tree had nothing
+better, and running only one of them leaves the cheaper route uncosted. What it costs is the
+budgets below on every transit rather than only on the ones nothing else could reach; the
+segment clock is what bounds that. The tree is still never run for the two halves of a route
+through a fallback pose. Its route is dense: states about `--check-step-mm` of tool travel apart, each gap a straight
 tool move, plus one stationary joint move where its two trees meet. Like phase one, it
 searches more than once: new seeds until one solves within `--cartesian-solve-seconds`,
 then more until `--cartesian-min-seconds` has passed, and only the cheapest route of
@@ -508,11 +572,10 @@ with nothing between its cuts, and a route with no state in the band at all, sin
 replanning that would repeat the search phase one has just failed. Each gap that needs a
 search can cost up to the full phase-one and phase-two budget.
 
-The route then goes through exactly the same gate and labelling as an OMPL route. With
+The route then goes through exactly the same labelling as an OMPL route. With
 `--cartesian-recut false`, nothing turns the out-of-band stretches into joint motion
 beforehand: those moves label `PTP` by the endpoint rule, and refinement turns them into
-long joint moves by cutting across them once both ends of a cut lie outside the band. If
-the gate refuses the leg, the whole route ships `PTP`.
+long joint moves by cutting across them once both ends of a cut lie outside the band.
 
 **How "near" is measured.** The clearance query only looks as far as its probe, and when it
 finds nothing within that it returns the probe distance itself. So a state counts as near
@@ -634,7 +697,7 @@ comes out as a phase boundary:
 
 | Phase | motion | contact_allowed | gun_opening_mm |
 | --- | --- | --- | --- |
-| the weld itself — one waypoint, robot stationary | `LIN` | true | `gun_opening_leave` |
+| the weld itself — one waypoint, robot stationary | `LIN` | true | the opening the transit below was solved at |
 | transit to the next locator | `LIN` and `PTP` phases, per [Linear motion near the parts](#linear-motion-near-the-parts) | false | chosen; `gun_opening_leave` tried first |
 
 No motion is planned for the closing itself. The weld phase has a single waypoint, so its
@@ -661,6 +724,37 @@ this is not a bisection:
 
 The log names every clear window and the stand-off chosen. If nothing is clear the weld fails
 as before, diagnosed at the full shift. `--no-weld-shift-search` turns it off.
+
+**The gun opening is searched the same way, along its own axis.** A weld's two openings
+describe the **transits either side of it**, not a squeeze — the squeeze is not modelled at
+all, the robot being stationary through the weld — which is why a study chains them, one
+weld's `gun_opening_leave` being the next weld's `gun_opening_arrive`. Two cases leave the
+arrival opening undecided: a locator that declares none, and one whose declared opening
+places the robot nowhere. Both sweep the gun's travel with the same scan, gap splitting and
+climb as above, at `--weld-opening-scan-mm` (10) down to `--weld-opening-resolution-mm` (1),
+keeping the reachable opening with the most clearance.
+
+An absent opening and a declared `0` are different claims and are told apart: absent is one
+nobody has chosen, `0` is a weld made with the gun shut. They used to be the same value, so a
+manifest missing the field silently planned the weld closed.
+
+The two axes are searched in order rather than as one grid, and the order is the point. A
+stand-off is invisible downstream — the waypoint is put back on the imported pose before
+anything is written — while an opening is process data that ships. So the declared opening at
+the declared stand-off is tried first and ships wherever it works, then the declared opening
+across the stand-offs, and only then other openings. Only if no opening works at the chosen
+stand-off are the two searched together, one stand-off sweep per opening on the coarse grid.
+The log flags every weld whose declared opening was overridden. `--no-weld-opening-search`
+turns it off, and such a weld then fails as it did before.
+
+**The departure opening is not searched; it is written back.** It says which opening the
+transit *out of* the weld is flown at, and that transit now chooses its own from a rotation
+of several. So the declared value seeds that search as a preference, and once the transit is
+solved the weld phase is corrected to what it was actually solved at. Otherwise the gun would
+have to change at the moment the robot starts moving, rather than while it stands still at
+the weld — the one place the change is deliberately not simulated. The arriving side needs
+nothing done to it: a transit into a weld carries its opening on its own phases, and the next
+segment corrects that weld the same way.
 
 `contact_allowed` marks the phases where the gun is deliberately up against a panel. It
 records intent: no margin is relaxed for those phases, so a weld whose gun tip genuinely
@@ -1065,12 +1159,13 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--segment-length-rad` | 0.01 | collision resolution inside the sampling planner |
 | `--phase-one-runs` | 25 | OMPL runs per transit, keeping the cheapest that solves |
 | `--phase-one-solve-seconds` | 25 | how long one of those runs may search |
-| `--cartesian-solve-seconds` | 120 | Cartesian tree time to find a first route, tried when phase one finds nothing; 0 disables. `--cartesian-seconds` still works |
+| `--cartesian-solve-seconds` | 120 | Cartesian tree time to find a first route, spent on every transit the band is on for; 0 disables. `--cartesian-seconds` still works |
 | `--cartesian-min-seconds` | 120 | least time the tree spends once solved, re-solving from new seeds and keeping the cheapest route |
 | `--cartesian-recut` | true | cut a Cartesian-tree route where it leaves the band and replan the parts outside it with phases one and two |
 | `--phase-two-max-runs` | 8 | further OMPL runs, stopping at the first solution |
 | `--phase-two-solve-seconds` | 45 | how long one of those runs may search |
 | `--segment-minutes` | 120 | wall clock for one segment's search; past it the segment is reported as failed and the run moves on. 0 removes the limit |
+| `--direct-clearance-mm` | 0 | room the straight joint move has to keep to be taken without searching; under it the next gun opening is tried and then the searches. 0 asks nothing beyond the collision check |
 | `--phase-two-cartesian-runs` | 2 | Cartesian searches spread evenly through phase two, at its own gun openings |
 | `--phase-two-cartesian-seconds` | 30 | how long one of those searches may run |
 | `--min-gun-openings` | 5 | gun openings phase one deals its runs round, the cheapest solution of the set shipping |
@@ -1081,9 +1176,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--shortcut-seconds` | 20 | time budget for shortcutting each transit |
 | `--polish-seconds` | 50 | time budget for the final pass over the emitted waypoints |
 | `--no-near-panel-linear` | off | every transit move `PTP`; also disables the Cartesian tree |
-| `--near-panel-mm` | 50 | clearance at or under which a waypoint is in the band |
-| `--near-panel-min-mm` | 100 | a leg earns `LIN` moves if an unbroken near stretch covers this much tool travel |
-| `--near-panel-min-pct` | 60 | ...or if this share of the leg is near |
+| `--near-panel-mm` | 50 | clearance at or under which a waypoint is in the band, and the whole of what decides a move's profile |
 | `--linear-introduce-mm` | 120 | clearance above which the passes may not introduce `LIN` motion that was not already there; 0 for no limit |
 | `--linear-crossing-penalty-s` | 100 | costing-only surcharge on each move entering the band |
 | `--min-shell-mm` | 10 | drop collision shells smaller than this |
@@ -1104,6 +1197,9 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--no-weld-shift-search` | off | fail a blocked shifted weld rather than search shorter stand-offs |
 | `--weld-shift-scan-mm` | 0.5 | first scan spacing of that search; halved while nothing is clear |
 | `--weld-shift-resolution-mm` | 0.05 | finest spacing the search refines to |
+| `--no-weld-opening-search` | off | fail a weld that declares no gun opening, or whose declared one reaches nowhere, rather than sweeping the gun's travel for one that does |
+| `--weld-opening-scan-mm` | 10 | first scan spacing of that sweep, across the gun's travel; also the grid used when opening and stand-off are searched together |
+| `--weld-opening-resolution-mm` | 1 | finest opening spacing the sweep refines to |
 | `--no-clearance-penalty` | off | avoid only hard collisions, ignoring proximity |
 | `--clearance-penalty-max-mm` | 100 | clearance at and above which there is no penalty |
 | `--clearance-penalty-min-mm` | 0 | clearance at and below which the penalty peaks |
