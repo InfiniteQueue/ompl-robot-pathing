@@ -48,11 +48,12 @@ The generated directories are safe to delete; they are rebuilt on the next run.
    never waived this way -- a study that starts inside the parts is rejected with the
    offending pairs and their overlaps.
 4. **Planning** (`planning.py`, `cartesian.py`, `toolpath.py`, `fallback/`). Each transit
-   is solved whole, by the first of these that works: a direct joint move; OMPL, keeping
-   the cheapest of several runs; a Cartesian-space tree whose edges are straight tool moves
-   (only while the near-panel band is on); longer OMPL runs; the same again through a
-   fallback pose searched for that transit; and finally two legs with the gun changing
-   between them. The gun opening is chosen by the search rather than ahead of it: phase
+   is solved whole. A direct joint move is taken where one is clear; otherwise two
+   searches run and the cheaper of everything they find ships -- OMPL, keeping the best of
+   several runs, and a Cartesian-space tree whose edges are straight tool moves (only
+   while the near-panel band is on). Where that finds nothing the fallbacks follow in
+   turn: longer OMPL runs, the same again through a fallback pose searched for that
+   transit, and finally two legs with the gun changing between them. The gun opening is chosen by the search rather than ahead of it: phase
    one's runs are dealt round several openings and the cheapest solution of the whole set
    ships, with a reserve of further openings held back for phase two. All of them are
    tried directly before any fallback pose is. Each run is made with the gun tip where it
@@ -486,9 +487,18 @@ transits would admit it. `--near-panel-min-pct` covers that case. It is measured
 whole leg rather than per stretch, so a retract whose apex leaves the band for an instant
 does not disqualify the leg either side of it.
 
-**Routes from the Cartesian tree.** The tree is tried only when OMPL's first phase found
-nothing and the band is on, and never for the two halves of a route through a fallback pose.
-Its route is dense: states about `--check-step-mm` of tool travel apart, each gap a straight
+**Routes from the Cartesian tree.** The tree runs on every transit the band is on for,
+whether or not OMPL's first phase found anything, and its route is ranked against phase
+one's -- the cheaper of the two ships, and the log names which search it came from. It is
+not a fallback: the two searches differ less in whether they succeed than in what they come
+back with. OMPL samples joint space uniformly and returns the first route its seed leads it
+to, so beside a panel that is usually the one standing well off it, there being nothing to
+draw the search into the gap; the tree steers along the tool's own line and stays in exactly
+that corridor. A phase one that solved is therefore no evidence that the tree had nothing
+better, and running only one of them leaves the cheaper route uncosted. What it costs is the
+budgets below on every transit rather than only on the ones nothing else could reach; the
+segment clock is what bounds that. The tree is still never run for the two halves of a route
+through a fallback pose. Its route is dense: states about `--check-step-mm` of tool travel apart, each gap a straight
 tool move, plus one stationary joint move where its two trees meet. Like phase one, it
 searches more than once: new seeds until one solves within `--cartesian-solve-seconds`,
 then more until `--cartesian-min-seconds` has passed, and only the cheapest route of
@@ -1065,7 +1075,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--segment-length-rad` | 0.01 | collision resolution inside the sampling planner |
 | `--phase-one-runs` | 25 | OMPL runs per transit, keeping the cheapest that solves |
 | `--phase-one-solve-seconds` | 25 | how long one of those runs may search |
-| `--cartesian-solve-seconds` | 120 | Cartesian tree time to find a first route, tried when phase one finds nothing; 0 disables. `--cartesian-seconds` still works |
+| `--cartesian-solve-seconds` | 120 | Cartesian tree time to find a first route, spent on every transit the band is on for; 0 disables. `--cartesian-seconds` still works |
 | `--cartesian-min-seconds` | 120 | least time the tree spends once solved, re-solving from new seeds and keeping the cheapest route |
 | `--cartesian-recut` | true | cut a Cartesian-tree route where it leaves the band and replan the parts outside it with phases one and two |
 | `--phase-two-max-runs` | 8 | further OMPL runs, stopping at the first solution |

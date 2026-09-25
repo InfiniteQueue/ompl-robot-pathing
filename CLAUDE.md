@@ -217,8 +217,15 @@ the way, so the joint values in between are whatever that line demands.
     it is handed, and before this each run inherited whatever the last collision query had
     left there -- right in practice only because the endpoint screen always ran first.
 - `plan_cartesian` is the only search that builds straight tool moves. `_plan_direct`
-  reaches it only when OMPL phase one returned nothing and the band is on, and never for
-  the halves of a fallback-pose route, which are planned with no zone.
+  runs it on every transit the band is on for, whatever phase one did, and adds its best
+  route to the same candidate set -- `_cheapest` then ranks the two searches on one number
+  and names the winner's `_Solution.source`. It used to run only where phase one returned
+  nothing, which meant a transit phase one solved never had the tree's route costed at all;
+  the two differ less in whether they solve than in what they return, uniform joint
+  sampling having nothing drawing it into the corridor beside the panel that the tree
+  steers along. What it costs is `--cartesian-solve-seconds` plus `--cartesian-min-seconds`
+  on every transit rather than only on the ones nothing else reached, bounded by `Deadline`
+  alone. Never run for the halves of a fallback-pose route, which are planned with no zone.
   - `_cartesian_solutions` runs it from successive seeds: until one solves or
     `--cartesian-solve-seconds` passes, then on until `--cartesian-min-seconds` has, both
     timed from the first run. Routes are ranked by `_path_cost`, as phase one's are, and

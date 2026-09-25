@@ -1968,6 +1968,11 @@ def _route_fault(cell: Cell, path: list[np.ndarray], check_step: float) -> str |
     return None
 
 
+# Which search a solution came from.  Reporting only: they are ranked on cost alone.
+SAMPLED = "the sampling planner"
+STEERED = "the cartesian tree"
+
+
 @dataclass
 class _Solution:
     """A scored route: penalised cost, plain time, the states, and the gun it was found at.
@@ -1976,11 +1981,17 @@ class _Solution:
     part of the machine that has to fit through the gap -- and because the phases now
     solve at several of them, so which one a route came from is no longer something the
     caller can infer from the order it asked in.
+
+    ``source`` is which search found it, and is reporting only.  Both searches now run on
+    every transit and are ranked together, so the winning route no longer says which of
+    them produced it -- and that is the one figure that says whether running both is
+    buying anything.
     """
     cost: float
     plain: float
     route: list[np.ndarray]
     opening: float | None = None
+    source: str = SAMPLED
 
 
 def _cheapest(candidates: list[_Solution], log) -> _Solution:
@@ -1994,13 +2005,19 @@ def _cheapest(candidates: list[_Solution], log) -> _Solution:
     Ties go to the earlier candidate, which is the earlier opening, the runs having been
     made in the rotation's order.  A route no better than one at the opening the robot
     already holds does not earn a gun change.
+
+    Where the set holds routes from both searches the winner's is named.  The two are
+    ranked on one number and the cheaper wins, but which one that was is the only evidence
+    there is that the tree is worth the time it now spends on every transit.
     """
     best = min(candidates, key=lambda c: c.cost)
     if log and len(candidates) > 1:
         worst = max(c.cost for c in candidates)
+        mixed = (f", from {best.source}"
+                 if len({c.source for c in candidates}) > 1 else "")
         log(f"      keeping the best of {len(candidates)} solutions: cost "
             f"{best.cost:.2f} s against {worst:.2f} s for the worst"
-            f"{_gun_note(best.opening)}")
+            f"{_gun_note(best.opening)}{mixed}")
     return best
 
 
@@ -2256,26 +2273,38 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
 
     tree = cartesian if (cartesian is not None and cartesian.enabled
                          and zone is not None and zone.enabled) else None
-    if not candidates and tree is not None and not deadline.expired:
-        # Between the two phases rather than in place of either.  Every route this finds
-        # is also a joint-space route -- a path of straight tool moves is still a path
-        # through joint space -- so as a fallback it searches a strict *subset* of what
-        # phase two searches and cannot stand in for it.  What it has instead is guidance:
-        # steering along the tool's own line, with orientations drawn near the endpoints',
-        # concentrates the search into the corridor beside the panel, which is exactly
-        # where uniform joint sampling spends its whole budget and finds nothing.
+    if tree is not None and not deadline.expired:
+        # Run whatever phase one did, and rank what it finds against phase one's own.
         #
-        # It goes before phase two because phase two is the expensive half of the worst
-        # case, so a transit this solves is one whose failure never has to be paid for.
-        # It is gated on the zone because a route made of straight moves only earns its
-        # cost where linear motion was wanted in the first place; with no band in force
-        # there is nothing here that phase two would not do better.
+        # The two searches do not differ in whether they succeed so much as in what they
+        # come back with.  OMPL samples joint space uniformly and returns the first route
+        # its seed leads it to, so beside a panel it usually returns the one that stands
+        # well off it -- there is nothing drawing the search into the gap.  The tree
+        # steers along the tool's own line with orientations drawn near the endpoints',
+        # which concentrates it into exactly that corridor.  So a phase one that solved is
+        # not evidence that the tree had nothing better to offer, and the only way to find
+        # out is to run both and score them together, which _cheapest below does over the
+        # whole set.  Before this the tree was a fallback and a transit phase one solved
+        # never saw it, which meant the cheaper route of the two was never even costed.
+        #
+        # What that costs is the tree's full budget on every transit that reaches here
+        # rather than only on the ones nothing else could reach: --cartesian-solve-seconds
+        # until it solves and then --cartesian-min-seconds looking for better ones,
+        # whether or not a route is already in hand.  The segment clock is what bounds it.
+        #
+        # Still before phase two, which is unchanged in running only when nothing has been
+        # found at all: every route the tree finds is also a joint-space route, so it
+        # searches a strict *subset* of what phase two searches and cannot stand in for it.
+        # Still gated on the zone, because a route made of straight moves only earns its
+        # cost where linear motion was wanted in the first place.
         found = _cartesian_solutions(cell, qa, qb, tree, check_step, openings.main, log,
                                      deadline=deadline)
         if found:
             # The best of the set is the only one recut: the recut runs the sampling
             # phases on every stretch outside the band, far too dear to spend on routes
-            # that are then thrown away.
+            # that are then thrown away.  It is also what makes the tree's route
+            # comparable with phase one's -- the stretches where it has no business being
+            # a chain of straight moves are replanned before anything is scored.
             best = _cheapest(found, log)
             if tree.recut:
                 best = _recut_solution(cell, best, zone=zone, sampler=sampler,
@@ -2348,7 +2377,7 @@ def _cartesian_route(cell: Cell, qa: np.ndarray, qb: np.ndarray, budget: "Cartes
         cost, plain = _path_cost(cell, route, check_step)
     log(f"      {label}{_gun_note(opening)}: solved in {time.time() - t0:.1f}s "
         f"({len(route)} points, cost {cost:.2f} s against {plain:.2f} s unpenalised)")
-    return _Solution(cost, plain, route, opening)
+    return _Solution(cost, plain, route, opening, STEERED)
 
 
 def _recut_solution(cell: Cell, best: _Solution, *, zone: "LinearZone",
@@ -2368,7 +2397,7 @@ def _recut_solution(cell: Cell, best: _Solution, *, zone: "LinearZone",
         cost, plain = _path_cost(cell, route, check_step)
     log(f"      cartesian tree after the recut: {len(route)} points, cost {cost:.2f} s "
         f"against {plain:.2f} s unpenalised")
-    return _Solution(cost, plain, route, best.opening)
+    return _Solution(cost, plain, route, best.opening, best.source)
 
 
 def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
@@ -2388,6 +2417,9 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
     no endpoint screen here any more: ``_opening_lists`` has already established that both
     ends are clear at every opening in that rotation, which is the one failure no further
     seed could change.
+
+    Called on every transit, not only on the ones phase one failed, so these budgets are
+    now spent whether or not a route is already in hand -- see ``_plan_direct``.
     """
     rotation = list(rotation) or [None]
     deadline = deadline or Deadline()
