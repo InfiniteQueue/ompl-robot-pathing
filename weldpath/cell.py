@@ -1173,10 +1173,15 @@ def _waypoint_openings(man: Manifest, loc) -> list[float]:
     declares none, and the planner is free to open or close the gun to get there, so the
     openings it would try are measured too -- the moving tip's contacts change with every
     one of them.
+
+    A weld that declares none is in the via's position rather than the weld's: the planner
+    will search for one, so the spread is what has to be measured here too.  Measuring a
+    single opening it might not end up at would relax the pairs for a configuration the
+    robot never holds and leave the one it does hold unrelaxed.
     """
     if man.gun_joint is None:
         return [0.0]
-    if loc.is_weld:
+    if loc.is_weld and loc.gun_opening_arrive is not None:
         return [float(loc.gun_opening_arrive)]
     widest = man.gun_opening_max
     out: list[float] = []

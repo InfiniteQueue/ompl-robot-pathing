@@ -644,7 +644,7 @@ comes out as a phase boundary:
 
 | Phase | motion | contact_allowed | gun_opening_mm |
 | --- | --- | --- | --- |
-| the weld itself — one waypoint, robot stationary | `LIN` | true | `gun_opening_leave` |
+| the weld itself — one waypoint, robot stationary | `LIN` | true | the opening the transit below was solved at |
 | transit to the next locator | `LIN` and `PTP` phases, per [Linear motion near the parts](#linear-motion-near-the-parts) | false | chosen; `gun_opening_leave` tried first |
 
 No motion is planned for the closing itself. The weld phase has a single waypoint, so its
@@ -671,6 +671,37 @@ this is not a bisection:
 
 The log names every clear window and the stand-off chosen. If nothing is clear the weld fails
 as before, diagnosed at the full shift. `--no-weld-shift-search` turns it off.
+
+**The gun opening is searched the same way, along its own axis.** A weld's two openings
+describe the **transits either side of it**, not a squeeze — the squeeze is not modelled at
+all, the robot being stationary through the weld — which is why a study chains them, one
+weld's `gun_opening_leave` being the next weld's `gun_opening_arrive`. Two cases leave the
+arrival opening undecided: a locator that declares none, and one whose declared opening
+places the robot nowhere. Both sweep the gun's travel with the same scan, gap splitting and
+climb as above, at `--weld-opening-scan-mm` (10) down to `--weld-opening-resolution-mm` (1),
+keeping the reachable opening with the most clearance.
+
+An absent opening and a declared `0` are different claims and are told apart: absent is one
+nobody has chosen, `0` is a weld made with the gun shut. They used to be the same value, so a
+manifest missing the field silently planned the weld closed.
+
+The two axes are searched in order rather than as one grid, and the order is the point. A
+stand-off is invisible downstream — the waypoint is put back on the imported pose before
+anything is written — while an opening is process data that ships. So the declared opening at
+the declared stand-off is tried first and ships wherever it works, then the declared opening
+across the stand-offs, and only then other openings. Only if no opening works at the chosen
+stand-off are the two searched together, one stand-off sweep per opening on the coarse grid.
+The log flags every weld whose declared opening was overridden. `--no-weld-opening-search`
+turns it off, and such a weld then fails as it did before.
+
+**The departure opening is not searched; it is written back.** It says which opening the
+transit *out of* the weld is flown at, and that transit now chooses its own from a rotation
+of several. So the declared value seeds that search as a preference, and once the transit is
+solved the weld phase is corrected to what it was actually solved at. Otherwise the gun would
+have to change at the moment the robot starts moving, rather than while it stands still at
+the weld — the one place the change is deliberately not simulated. The arriving side needs
+nothing done to it: a transit into a weld carries its opening on its own phases, and the next
+segment corrects that weld the same way.
 
 `contact_allowed` marks the phases where the gun is deliberately up against a panel. It
 records intent: no margin is relaxed for those phases, so a weld whose gun tip genuinely
@@ -1114,6 +1145,9 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--no-weld-shift-search` | off | fail a blocked shifted weld rather than search shorter stand-offs |
 | `--weld-shift-scan-mm` | 0.5 | first scan spacing of that search; halved while nothing is clear |
 | `--weld-shift-resolution-mm` | 0.05 | finest spacing the search refines to |
+| `--no-weld-opening-search` | off | fail a weld that declares no gun opening, or whose declared one reaches nowhere, rather than sweeping the gun's travel for one that does |
+| `--weld-opening-scan-mm` | 10 | first scan spacing of that sweep, across the gun's travel; also the grid used when opening and stand-off are searched together |
+| `--weld-opening-resolution-mm` | 1 | finest opening spacing the sweep refines to |
 | `--no-clearance-penalty` | off | avoid only hard collisions, ignoring proximity |
 | `--clearance-penalty-max-mm` | 100 | clearance at and above which there is no penalty |
 | `--clearance-penalty-min-mm` | 0 | clearance at and below which the penalty peaks |

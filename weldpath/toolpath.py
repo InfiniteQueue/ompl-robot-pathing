@@ -31,6 +31,115 @@ from .planning import (LIN, PTP, Deadline, LinearZone, OmplBudget, PlanningError
 
 
 @dataclass
+class _Scan:
+    """What one sweep of a parameter found: the winner, every sample, and the windows."""
+    best: float | None              # the value kept, or None where nothing was clear
+    samples: dict                   # value -> (state or None, clearance)
+    windows: list                   # runs of consecutive clear samples, in order
+    spacing: float                  # how fine the sweep ended up
+
+    @property
+    def tried(self) -> int:
+        return len(self.samples)
+
+    def describe(self, scale: float = 1.0, plus: bool = False) -> str:
+        """The clear windows, as a log line says them.  ``scale`` carries a sign.
+
+        ``plus`` prints the sign on positive values, which a stand-off wants -- it is a
+        displacement, and the direction is half of what it says -- and an opening does not.
+        """
+        fmt = "{:+.2f}" if plus else "{:.2f}"
+        return ", ".join(
+            fmt.format(scale * r[0]) if len(r) == 1 else
+            f"{fmt.format(scale * r[0])} to {fmt.format(scale * r[-1])}"
+            for r in self.windows)
+
+
+def _scan_for_clear(lo: float, hi: float, *, scan: float, resolution: float,
+                    measure, known: dict | None = None) -> _Scan:
+    """The value in ``lo..hi`` placing the robot with the most room, and where else was clear.
+
+    One algorithm on one parameter, shared by the two axes a blocked weld can be freed
+    along: how far its pose stands off the panel, and how far the gun is open.  All it
+    wants of the caller is ``measure(x) -> (state, clearance)``, a blocked value reading
+    ``-inf``.  The two were the same code written twice before this; they are the same
+    question asked of different numbers.
+
+    Not a bisection, because clear is not monotonic in either parameter.  Backing a weld
+    off frees the tip from the panel but can put the throat into tooling behind it, and
+    opening the gun frees the throat but swings the moving electrode into whatever is
+    beside it -- so in both cases there may be several clear windows with blocked ground
+    between them, some narrower than any fixed scan.  So:
+
+    1. scan the range every ``scan``;
+    2. split every gap between two blocked samples in half, and again, until the spacing is
+       at or below ``resolution`` -- carrying on after something is clear, since a better
+       window may be narrower.  A window narrower than the final spacing can still fall
+       between samples and be missed.  A gap with a clear end is not split: anything clear
+       inside it runs on from that sample's window, which the climb below explores;
+    3. in every clear window, climb from its best sample -- try half the scan spacing either
+       side, keep whichever reads more clearance, halve, stop at the resolution.  That finds
+       the best point near that sample, not necessarily a narrower peak elsewhere in a wide
+       window.
+
+    ``known`` pre-seeds values the caller has already measured, so a sweep bounded by a
+    solve that has just failed does not pay for it twice.
+    """
+    samples: dict = dict(known or {})
+
+    def sample(x: float) -> float:
+        x = round(min(max(x, lo), hi), 9)
+        if x not in samples:
+            samples[x] = measure(x)
+        return x
+
+    def clear(x: float) -> bool:
+        return samples[x][0] is not None
+
+    def rank(x: float) -> tuple[float, float]:
+        return samples[x][1], x
+
+    cells = max(1, int(np.ceil((hi - lo) / scan - 1e-9)))
+    step = (hi - lo) / cells
+    for k in range(cells + 1):
+        sample(lo + k * step)
+    coarse = step
+
+    while step > resolution + 1e-9:
+        grid = sorted(samples)
+        step /= 2.0
+        gaps = [(a + b) / 2.0 for a, b in zip(grid, grid[1:])
+                if not clear(a) and not clear(b)]
+        if not gaps:
+            break
+        for x in gaps:
+            sample(x)
+
+    windows: list[list[float]] = []
+    run: list[float] = []
+    for x in sorted(samples):
+        if clear(x):
+            run.append(x)
+        elif run:
+            windows.append(run)
+            run = []
+    if run:
+        windows.append(run)
+    if not windows:
+        return _Scan(None, samples, [], step)
+
+    for run in windows:
+        x = max(run, key=rank)
+        h = coarse / 2.0
+        while True:
+            x = max((x, sample(x - h), sample(x + h)), key=rank)
+            if h <= resolution + 1e-9:
+                break
+            h /= 2.0
+    return _Scan(max((x for x in samples if clear(x)), key=rank), samples, windows, step)
+
+
+@dataclass
 class Phase:
     """A run of waypoints sharing one motion type and one gun state.
 
@@ -88,6 +197,8 @@ class ToolpathPlanner:
                  weld_clearance_mm: float | None = None,
                  stand_off_search: bool = True, stand_off_scan_mm: float = 0.5,
                  stand_off_resolution_mm: float = 0.05,
+                 opening_search: bool = True, opening_scan_mm: float = 10.0,
+                 opening_resolution_mm: float = 1.0,
                  export_dir: str | None = None,
                  keep_unrefined: bool = False, log=print):
         self.cell = cell
@@ -156,6 +267,13 @@ class ToolpathPlanner:
         self.stand_off_search = bool(stand_off_search)
         self.stand_off_scan_mm = float(stand_off_scan_mm)
         self.stand_off_resolution_mm = float(stand_off_resolution_mm)
+        # A weld that declares no gun opening, or whose declared one places nowhere at all,
+        # has one searched for over the gun's travel; see _search_opening.
+        if opening_scan_mm <= 0.0 or opening_resolution_mm <= 0.0:
+            raise ValueError("the gun-opening scan spacing and resolution must be positive")
+        self.opening_search = bool(opening_search)
+        self.opening_scan_mm = float(opening_scan_mm)
+        self.opening_resolution_mm = float(opening_resolution_mm)
         self.start_q = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
         # Gun opening each locator turned out to be reachable at, filled in by run().
         self.openings: dict[str, float] = {}
@@ -225,21 +343,28 @@ class ToolpathPlanner:
     def _locator_openings(self, loc: Locator) -> list[float]:
         """Gun openings worth trying when reaching this locator, most preferred first.
 
-        A weld's openings are process data: the gun has to be where the weld schedule says,
-        so if the robot cannot reach the pose at that opening the answer is a failure, not
-        a wider gun.  An ordinary via carries no such requirement -- its declared opening is
-        simply zero -- so if the tip fouls something there, opening or closing it is a
-        legitimate way through and is tried.
+        A weld's declared opening is process data: the gun has to be where the weld
+        schedule says, so a wider one is not offered here as an alternative to it.  What
+        happens when it does not place is ``_search_opening``, which runs only after this
+        list is exhausted -- so the schedule is still what is tried first and what ships
+        wherever it works.  An empty list is a weld that declares nothing at all, where
+        there is no schedule to honour and the search is the primary path rather than a
+        fallback.
+
+        An ordinary via carries no such requirement -- it declares nothing and is planned
+        closed by default -- so if the tip fouls something there, opening or closing it is
+        a legitimate way through and is tried straight away.
         """
-        declared = loc.gun_opening_arrive if loc.is_weld else 0.0
-        if loc.is_weld or not self.cell.gun_joint_name:
-            return [declared]
+        if not self.cell.gun_joint_name:
+            return [0.0]
+        if loc.is_weld:
+            return [] if loc.gun_opening_arrive is None else [float(loc.gun_opening_arrive)]
         widest = self.man.gun_opening_max
         # Deduped for the same reason a transit's list is: a gun with no travel to speak of
         # collapses all three of these onto zero, and solving the same pose three times
         # over means three identical failures, three diagnoses and three geometry exports
         # before the locator is given up on.
-        return unique_openings([declared, widest, widest / 2.0], widest)
+        return unique_openings([0.0, widest, widest / 2.0], widest)
 
     def _diagnose(self, loc: Locator, seed: np.ndarray, tag: str = "",
                   opening: float = 0.0) -> str:
@@ -297,6 +422,10 @@ class ToolpathPlanner:
     def _solve_locator(self, loc: Locator, seed: np.ndarray) -> tuple[np.ndarray, float]:
         """Joint solution for a locator, plus the gun opening it was reached at."""
         problems = []
+        # Snapshot: an inner stand-off sweep replaces ``pose_world`` on success, and the
+        # opening search has to start from the stand-off the study asked for rather than
+        # from wherever a failed attempt left the pose.
+        full_shift = np.array(loc.pose_world, dtype=float)
         for opening in self._locator_openings(loc):
             with self._clearance_for(loc), self.cell.gun_opening(opening):
                 q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q],
@@ -323,7 +452,26 @@ class ToolpathPlanner:
                     self.log(f"    '{loc.name}' needs the gun at {opening:g} mm to be "
                              f"reachable")
                 return q, opening
-        detail = "; ".join(problems)
+        # A weld that declares no opening, or whose declared one places nowhere at all,
+        # is what _search_opening is for.  Reached only once the declared opening has been
+        # tried at every stand-off, so the schedule is honoured wherever it can be.
+        if (loc.is_weld and self.opening_search and self.cell.gun_joint_name
+                and self.man.gun_opening_max > 0.0):
+            loc.pose_world = np.array(full_shift, dtype=float)
+            with self._clearance_for(loc):
+                q, opening, note = self._search_opening(loc, seed)
+                if q is not None:
+                    self._report_clearance(loc, q, opening, placed=True)
+            if q is not None:
+                if self.cell.in_stop_band(q):
+                    self.log(f"    ! '{loc.name}' has no solution outside the joint 5 "
+                             f"stop band; placed at "
+                             f"{np.rad2deg(q[STOP_BAND_JOINT]):.1f} deg")
+                return q, opening
+            problems.append(f"no gun opening reaches it{note}")
+
+        detail = ("; ".join(problems)
+                  or "it declares no gun opening and --weld-opening-search is off")
         hint = ("" if "reachable, but" not in detail else
                 ". Hulls over-report contact on concave parts: check the pair against the "
                 "raw geometry before trusting it, and see --hull-cell-mm")
@@ -340,19 +488,9 @@ class ToolpathPlanner:
         replaced, so the transits, the fallback search and the endpoint check all read the
         pose that was actually placed; the imported pose is left alone.
 
-        Not a bisection: clear is not monotonic in the distance.  Backing off frees the tip
-        from the panel but can put the throat into tooling behind it, so there may be several
-        clear windows, some narrower than any fixed scan.  So:
-
-        1. scan the range every ``stand_off_scan_mm``;
-        2. split every gap between two blocked samples in half, and again, until the spacing
-           is at or below ``stand_off_resolution_mm`` -- carrying on after something is
-           clear, since a better window may be narrower.  A window narrower than the final
-           spacing can still fall between samples and be missed;
-        3. in every clear window, climb from its best sample: try half the scan spacing
-           either side, keep whichever reads more clearance, halve, and stop once the step is
-           at or below the resolution.  This finds the best point near that sample, not
-           necessarily a narrower peak elsewhere in a wide window.
+        The sweep is :func:`_scan_for_clear`, which the gun-opening search runs too.  Why it
+        is a scan with gap splitting rather than a bisection is argued there, and holds for
+        the same reason on both axes.
 
         Returns the state, or None and a note for the failure message.  Call inside the
         clearance and gun-opening context the locator is being solved in.
@@ -364,92 +502,141 @@ class ToolpathPlanner:
             return None, ""
         # Signed as --weld-shift-mm is, along the locator's own z.
         sign = 1.0 if float(offset @ imported[:3, 2]) >= 0.0 else -1.0
-        cells = max(1, int(np.ceil(span / self.stand_off_scan_mm - 1e-9)))
-        step = span / cells
 
         def pose_at(d: float) -> np.ndarray:
             P = imported.copy()
             P[:3, 3] += offset * (d / span)
             return P
 
-        # Distance -> (state, clearance), a blocked pose reading -inf.  The full shift has
-        # just failed, so it bounds the search without being solved again.
-        samples: dict[float, tuple[np.ndarray | None, float]] = {
-            round(span, 9): (None, -np.inf)}
+        def measure(d: float):
+            q = self.cell.solve_pose(pose_at(d), [seed, self.start_q],
+                                     avoid_stop_band=True)
+            return q, (-np.inf if q is None else self.cell.clearance_mm(q))
 
-        def sample(d: float) -> float:
-            d = round(min(max(d, 0.0), span), 9)
-            if d not in samples:
-                q = self.cell.solve_pose(pose_at(d), [seed, self.start_q],
-                                         avoid_stop_band=True)
-                samples[d] = (q, -np.inf if q is None else self.cell.clearance_mm(q))
-            return d
-
-        def clear(d: float) -> bool:
-            return samples[d][0] is not None
-
-        def rank(d: float) -> tuple[float, float]:
-            return samples[d][1], d
-
-        for k in range(cells):
-            sample(k * step)
-        coarse = step
-        # Split every gap between two blocked samples, whether or not something is already
-        # clear elsewhere: the first window found need not be the best one, and stopping there
-        # measured 1.2 mm of clearance with a 3.3 mm window sitting unsampled further out.
-        # A gap with a clear end is not split -- anything clear inside it runs on from that
-        # sample's window, which the climb below explores.  Blocked samples are cheap, being
-        # rejected before any clearance is measured.
-        while step > self.stand_off_resolution_mm + 1e-9:
-            grid = sorted(samples)
-            step /= 2.0
-            gaps = [(a + b) / 2.0 for a, b in zip(grid, grid[1:])
-                    if not clear(a) and not clear(b)]
-            if not gaps:
-                break
-            for d in gaps:
-                sample(d)
-
-        # A run of clear samples with no blocked one between them is a window.
-        windows: list[list[float]] = []
-        run: list[float] = []
-        for d in sorted(samples):
-            if clear(d):
-                run.append(d)
-            elif run:
-                windows.append(run)
-                run = []
-        if run:
-            windows.append(run)
-        if not windows:
-            return None, (f"; no shorter stand-off is clear either ({len(samples) - 1} tried "
-                          f"between 0 and {sign * span:+g} mm, {step:.3g} mm apart)")
-
-        for run in windows:
-            d = max(run, key=rank)
-            h = coarse / 2.0
-            while True:
-                d = max((d, sample(d - h), sample(d + h)), key=rank)
-                if h <= self.stand_off_resolution_mm + 1e-9:
-                    break
-                h /= 2.0
-
-        best = max((d for d in samples if clear(d)), key=rank)
-        shown = ", ".join(f"{sign * r[0]:+.2f}" if len(r) == 1 else
-                          f"{sign * r[0]:+.2f} to {sign * r[-1]:+.2f}" for r in windows)
+        # The full shift has just failed, so it bounds the sweep without being solved again.
+        found = _scan_for_clear(0.0, span, scan=self.stand_off_scan_mm,
+                                resolution=self.stand_off_resolution_mm, measure=measure,
+                                known={round(span, 9): (None, -np.inf)})
+        if found.best is None:
+            return None, (f"; no shorter stand-off is clear either ({found.tried - 1} tried "
+                          f"between 0 and {sign * span:+g} mm, {found.spacing:.3g} mm apart)")
         self.log(f"    '{loc.name}' is blocked at the full {sign * span:+g} mm stand-off; "
-                 f"clear at {shown} mm ({len(samples) - 1} tried), standing off "
-                 f"{sign * best:+.2f} mm")
-        loc.pose_world = pose_at(best)
-        return samples[best][0], ""
+                 f"clear at {found.describe(sign, plus=True)} mm ({found.tried - 1} tried), "
+                 f"standing off {sign * found.best:+.2f} mm")
+        loc.pose_world = pose_at(found.best)
+        return found.samples[found.best][0], ""
+
+    def _search_opening(self, loc: Locator, seed: np.ndarray
+                        ) -> tuple[np.ndarray | None, float, str]:
+        """The gun opening to reach this weld at, where the declared one will not do.
+
+        Two cases arrive here and they are the same question.  A weld the study gave no
+        opening for, where there is nothing to honour and something has to be chosen; and a
+        weld whose declared opening places the robot nowhere at all, neither at the
+        stand-off it asked for nor at any shorter one.  Both ask "which openings is this
+        pose reachable at", and it is asked the way the stand-off asks its own question,
+        through :func:`_scan_for_clear`.
+
+        **The two axes are searched in order, not as one grid, and the order is the point.**
+        A stand-off is a planning device: ``_restore_weld_poses`` puts the waypoint back on
+        the imported pose before anything is written, so deviating along it costs nothing
+        anyone downstream can see.  An opening is process data that ships.  So the declared
+        opening at the declared stand-off is still tried first and still ships wherever it
+        works -- which is exactly what happened before this existed -- and only once no
+        opening works at the stand-off already settled on is the pose allowed to move as
+        well.  Searched as one grid, an opening reading a millimetre more clearance could
+        displace the study's own choice, which is not a trade anyone asked for.
+
+        Only the arrival opening is searched.  The departure one describes the *transit out
+        of* the weld rather than anything geometric here -- see ``_leave_opening`` -- and is
+        settled by that transit's own search.
+
+        Returns the state, the opening it was reached at, and a note for the failure message.
+        """
+        widest = float(self.man.gun_opening_max)
+        declared = loc.gun_opening_arrive
+
+        def measure(o: float):
+            with self.cell.gun_opening(o):
+                q = self.cell.solve_pose(loc.pose_world, [seed, self.start_q],
+                                         avoid_stop_band=True)
+                return q, (-np.inf if q is None else self.cell.clearance_mm(q))
+
+        found = _scan_for_clear(0.0, widest, scan=self.opening_scan_mm,
+                                resolution=self.opening_resolution_mm, measure=measure)
+        if found.best is not None:
+            why = ("declares no gun opening" if declared is None else
+                   f"cannot be placed at the {declared:g} mm the study asks for")
+            # Flagged where it overrides the study, plain where it fills in a blank.
+            mark = "" if declared is None else "! "
+            self.log(f"    {mark}'{loc.name}' {why}; clear at {found.describe()} mm "
+                     f"({found.tried} tried), reaching it at {found.best:g} mm")
+            return found.samples[found.best][0], found.best, ""
+
+        if not (self.stand_off_search and loc.pose_world_import is not None):
+            return None, 0.0, (f"; and no opening between 0 and {widest:g} mm places it "
+                               f"either ({found.tried} tried)")
+
+        # Both wrong at once -- the tip through the panel *and* the throat in tooling, so
+        # neither axis frees it alone.  One inner sweep of the stand-off per opening, on the
+        # coarse grid only: each sample here is already a whole sweep of the other axis
+        # rather than a single solve, so splitting this axis too would multiply the two.
+        self.log(f"    '{loc.name}' is blocked at every gun opening at this stand-off; "
+                 f"searching the stand-off at each of them")
+        keep = np.array(loc.pose_world, dtype=float)
+        cells = max(1, int(np.ceil(widest / self.opening_scan_mm - 1e-9)))
+        pairs: list[tuple[float, float, np.ndarray, np.ndarray]] = []
+        for k in range(cells + 1):
+            opening = min(widest, k * widest / cells)
+            with self.cell.gun_opening(opening):
+                q, _ = self._search_stand_off(loc, seed)
+                if q is not None:
+                    pairs.append((self.cell.clearance_mm(q), opening, q,
+                                  np.array(loc.pose_world, dtype=float)))
+            # Restored between trials: the inner sweep replaces the pose on success, and the
+            # next opening has to be measured from the stand-off this weld started at.
+            loc.pose_world = np.array(keep, dtype=float)
+        if not pairs:
+            return None, 0.0, (f"; and no combination of opening and stand-off places it "
+                               f"either ({cells + 1} openings swept)")
+        _, opening, q, pose = max(pairs, key=lambda t: (t[0], t[1]))
+        loc.pose_world = pose
+        self.log(f"    ! '{loc.name}' needed both: reaching it at {opening:g} mm with the "
+                 f"pose moved off the full stand-off as well")
+        return q, opening, ""
 
     def _leave_opening(self, loc: Locator) -> float:
-        """Gun opening in force as the robot leaves this locator."""
-        return loc.gun_opening_leave if loc.is_weld else self.openings.get(loc.name, 0.0)
+        """Gun opening the study asks the robot to leave this locator holding.
+
+        A preference rather than a commitment.  It seeds the transit's opening list, and
+        what that transit is actually solved at is written back over the weld phase once
+        it is -- see ``_plan_pair``.
+
+        The two openings a weld declares describe the **transits either side of it**, not
+        the squeeze: the squeeze is not modelled at all, the robot being stationary through
+        the weld.  A study chains them, one weld's leave being the next weld's arrive
+        (measured across Paths 2 and 3: every pair agrees), which is the same statement
+        read from the two ends of one transit.  So this is not searched -- there is nothing
+        geometric to search for.  What decides it is which opening that transit can be
+        flown at, which is the transit search's question and not this one's.
+        """
+        if loc.is_weld:
+            return 0.0 if loc.gun_opening_leave is None else float(loc.gun_opening_leave)
+        placed = self.openings.get(loc.name)
+        return 0.0 if placed is None else float(placed)
 
     def _arrive_opening(self, loc: Locator) -> float:
-        """Gun opening the robot must be holding as it reaches this locator."""
-        return loc.gun_opening_arrive if loc.is_weld else self.openings.get(loc.name, 0.0)
+        """Gun opening the robot must be holding as it reaches this locator.
+
+        Read from what the locator was actually placed at rather than from what it
+        declared.  A weld whose declared opening placed nowhere, or that declared none,
+        has had one found for it, and it is that one every transit arriving here has to be
+        holding -- the declared value is a pose the robot was never shown to reach.
+        """
+        placed = self.openings.get(loc.name)
+        if placed is not None:
+            return float(placed)
+        return 0.0 if loc.gun_opening_arrive is None else float(loc.gun_opening_arrive)
 
     # -- main ----------------------------------------------------------------
     def run(self) -> list[Segment]:
@@ -534,6 +721,8 @@ class ToolpathPlanner:
         # move, so it is the same motion in both files.
         raw_phases: list[Phase] = list(phases) if self.keep_unrefined else []
 
+        # The weld phase, corrected once the transit out of it has been solved.
+        weld_phase = phases[-1] if a.is_weld else None
         raw_legs: list | None = [] if self.keep_unrefined else None
         legs = plan_freespace(
             self.cell, transit_start, transit_end,
@@ -552,6 +741,23 @@ class ToolpathPlanner:
             extra_openings=self.extra_openings,
             opening_round_mm=self.opening_round_mm,
             record=raw_legs, log=self.log)
+        # What the robot leaves a weld holding is what the transit out of it was solved
+        # at, which is only known now.  The declared value seeded that search and is a
+        # preference, not a commitment: writing it out unchanged would have the gun change
+        # at the moment the robot starts moving, instead of while it stands still at the
+        # weld -- the one place the change is deliberately not simulated, because there the
+        # robot is stationary and the tip's own travel is clear by inspection.  The arriving
+        # side needs nothing done to it: the transit into a weld carries its opening on its
+        # own phases, and the next segment corrects that weld's phase the same way.  Held by
+        # reference in the unrefined copy, so this lands on both at once.
+        if weld_phase is not None and legs and legs[0][1] is not None:
+            flown = float(legs[0][1])
+            if abs(flown - weld_phase.gun_opening_mm) > 1e-9:
+                self.log(f"    '{a.name}' leaves at {flown:g} mm rather than the "
+                         f"{weld_phase.gun_opening_mm:g} mm declared, that being what the "
+                         f"transit out of it was solved at")
+            weld_phase.gun_opening_mm = flown
+
         for i, (runs, opening) in enumerate(legs):
             opening_mm = 0.0 if opening is None else opening
             for run in runs:

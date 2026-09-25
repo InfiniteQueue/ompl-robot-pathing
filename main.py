@@ -708,6 +708,23 @@ def build_parser() -> argparse.ArgumentParser:
                    help="finest spacing the search goes down to, both looking for a clear "
                         "stand-off and refining one. A clear window narrower than the "
                         "final spacing can be missed (default: %(default)g)")
+    #WHEN THE WELD'S GUN OPENING IS MISSING OR UNREACHABLE
+    p.add_argument("--no-weld-opening-search", dest="weld_opening_search",
+                   action="store_false",
+                   help="fail a weld that declares no gun opening, or whose declared one "
+                        "places the robot nowhere, rather than sweeping the gun's travel "
+                        "for the reachable opening with the most clearance. The declared "
+                        "opening is still tried first either way, at every stand-off, so "
+                        "this only governs what happens once it has failed everywhere")
+    p.add_argument("--weld-opening-scan-mm", type=float, default=10.0, metavar="MM",
+                   help="spacing of that sweep's first scan across the gun's travel; gaps "
+                        "between two blocked openings are then halved down to "
+                        "--weld-opening-resolution-mm (default: %(default)g)")
+    p.add_argument("--weld-opening-resolution-mm", type=float, default=1.0, metavar="MM",
+                   help="finest opening spacing the sweep goes down to. Where no opening "
+                        "works at the chosen stand-off the two are then searched together "
+                        "on the --weld-opening-scan-mm grid, which costs one stand-off "
+                        "sweep per opening (default: %(default)g)")
     #endregion
     #region ###CLEARANCE PENALTY###
     #DISABLE CLEARANCE PENALTY
@@ -959,6 +976,16 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.phase_two_cartesian_seconds < 0.0:
         print("error: --phase-two-cartesian-seconds cannot be negative", file=sys.stderr)
         return 2
+    if args.weld_opening_scan_mm <= 0.0:
+        print("error: --weld-opening-scan-mm must be above 0", file=sys.stderr)
+        return 2
+    if args.weld_opening_resolution_mm <= 0.0:
+        print("error: --weld-opening-resolution-mm must be above 0", file=sys.stderr)
+        return 2
+    if args.weld_opening_resolution_mm > args.weld_opening_scan_mm:
+        print("error: --weld-opening-resolution-mm cannot exceed --weld-opening-scan-mm: "
+              "the sweep refines the first scan, it does not coarsen it", file=sys.stderr)
+        return 2
 
     try:
         if args.stepped_penalty:
@@ -1080,6 +1107,9 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         stand_off_search=args.weld_shift_search,
         stand_off_scan_mm=args.weld_shift_scan_mm,
         stand_off_resolution_mm=args.weld_shift_resolution_mm,
+        opening_search=args.weld_opening_search,
+        opening_scan_mm=args.weld_opening_scan_mm,
+        opening_resolution_mm=args.weld_opening_resolution_mm,
         export_dir=directory if args.export_collision_geometry else None,
         keep_unrefined=args.unrefined_output,
         log=log)

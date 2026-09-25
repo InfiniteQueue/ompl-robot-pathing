@@ -216,6 +216,39 @@ the way, so the joint values in between are whatever that line demands.
     block. OMPL reads the gun from the environment's current state and not from the program
     it is handed, and before this each run inherited whatever the last collision query had
     left there -- right in practice only because the endpoint screen always ran first.
+- **A weld's two gun openings describe the transits either side of it, not a squeeze.**
+  The squeeze is not modelled -- the robot is stationary through the weld -- so a study
+  chains them, one weld's `gun_opening_leave` being the next weld's `gun_opening_arrive`,
+  which is the same transit read from its two ends. Checked across Paths 2 and 3: every
+  pair agrees. Anything that reasons about `leave` as "the gun closing on the part" is
+  wrong, and a weld declaring 0/0 is not a weld that does nothing, it is one planned with
+  the gun shut throughout.
+  - `manifest._opening` parses an absent field as `None`, not `0.0`. The two were the same
+    value, so a manifest missing the field planned the weld closed with nothing said, which
+    either failed to place or placed somewhere nobody chose. `None` means "nobody said" and
+    is what `toolpath._search_opening` fills in.
+  - `_search_opening` sweeps the gun's travel for the reachable opening with the most
+    clearance, for a weld that declares none and for one whose declared opening places the
+    robot nowhere. **Arrival only.** An independent sweep of the departure opening would be
+    the same function of the same pose and the same ranking, so it would return the same
+    value every time -- and the departure opening is not a geometric question here anyway.
+  - The two axes are searched in order, never as one grid: a stand-off is restored before
+    export and costs nothing visible, an opening is process data that ships. So the
+    declared opening at the declared stand-off, then the declared opening across the
+    stand-offs, then other openings at the chosen stand-off, and only then both together --
+    one stand-off sweep per opening, coarse grid, since each sample is already a whole
+    sweep of the other axis. Searched as one grid, an opening reading a millimetre more
+    clearance could displace the study's own choice.
+  - `_scan_for_clear` is that sweep, shared by both axes: scan, split every gap between two
+    *blocked* samples down to the resolution, then climb from each window's best. Not a
+    bisection, because clear is not monotonic in either parameter -- backing a weld off
+    frees the tip but can put the throat into tooling, and opening the gun frees the throat
+    but swings the electrode into what is beside it.
+  - `_plan_pair` writes the departure opening back over the weld phase from what the
+    transit out of it was actually solved at, the declared value having only seeded that
+    search. Without it the gun changes as the robot starts moving instead of while it
+    stands still at the weld. `_arrive_opening` reads `self.openings` for the same reason:
+    the declared arrival is a pose the robot may never have been shown to reach.
 - `plan_cartesian` is the only search that builds straight tool moves. `_plan_direct`
   runs it on every transit the band is on for, whatever phase one did, and adds its best
   route to the same candidate set -- `_cheapest` then ranks the two searches on one number
