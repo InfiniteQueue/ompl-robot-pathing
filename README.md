@@ -315,14 +315,25 @@ Cartesian tree's, whose every edge is a straight tool move — against phase one
 mostly ship as joint motion and were priced about right. That mattered little while the tree
 was only reached when phase one failed; it decides transits now the two compete on every one.
 
-The score is stop-to-stop, so `--stop-time-weight` applies here too. That is only sound
-because every candidate is first brought to one spacing: the point counts routes arrive with
-say more about the search than the route. OMPL returns the handful of nodes its tree stopped
-at; the tree returns every station it validated, one `--check-step-mm` of tool travel apart.
-Scored as they stand, one route would pay three ramps and the other three hundred. Each is
-therefore filled in at `--check-step-deg` and thinned back to it before scoring, which gives
-both a waypoint count that follows the route's own geometry. The cost is one extra fill per
-candidate.
+The score has two terms, and the split matters. **Travel** is summed over the route's own
+moves — filled in where the route is coarser than `--check-step-deg` — in cruise time, which
+is unchanged by subdivision and so does not depend on how finely a solver described its
+answer. **Stops** are the ramps a route of that shape would really pay, measured over a copy
+thinned back to `--check-step-deg`, and that is the term `--stop-time-weight` acts in. The
+thinned copy is needed because the point counts routes arrive with say more about the search
+than the route: OMPL returns the handful of nodes its tree stopped at, the Cartesian tree
+returns every station it validated, and charging a ramp at each would rank the two searches
+on how each reports itself.
+
+Thinning is right for counting stops and wrong for pricing moves, which is why it is only
+used for the first. A route of straight tool moves is a polyline, and the tree only ever
+promised that each *consecutive pair* of its stations is a move it solved and swept; the
+line between two non-adjacent stations cuts the corner and frequently has no reachable
+inverse kinematics, that being the shape the tree exists to find. A move with no reachable
+line has no linear price, so scoring a thinned copy made whole Cartesian routes cost
+infinity and drop out of the ranking. Where a move the route really contains still will not
+price, it is charged as a joint move: ranking installs nothing, and an unflyable route is
+supposed to die at verification, after the passes have had their chance at it.
 
 ### Seeing what the refinement changed
 

@@ -1175,27 +1175,33 @@ def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
 # freespace
 # ---------------------------------------------------------------------------
 def _scored_points(cell: Cell, model: "MotionModel", path: list[np.ndarray],
-                   step: float) -> list[np.ndarray]:
-    """``path`` at the one spacing every candidate is scored at.
+                   step: float) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """``path`` to score the moves of, and a thinned copy to count its stops on.
 
-    The point counts routes arrive with are facts about the searches, not about the
-    routes.  OMPL returns the handful of nodes its tree happened to stop at -- four is
-    typical -- while the Cartesian tree returns every station it validated, one per
-    ``Cell.tcp_check_mm`` of tool travel, which is hundreds.  Scoring stop-to-stop over
-    those as they stand would charge one route three ramps and the other three hundred,
-    and rank the two searches on how each reports itself.
+    The two are not the same list and must not be, which is the whole of what this is for.
 
-    Filling in and thinning back to ``step`` gives both a waypoint count that follows the
-    route's own geometry instead.  The fill is the profile-aware one, so a stretch that
-    will ship linear is described by the tool's line rather than the joint chord, which is
-    also what keeps the pricing below finite: a linear move with no reachable line has no
-    price, and the long moves of an unfilled raw route are exactly the ones whose lines do
-    not solve.
+    *Moves* are scored on the route as it stands, filled in where it is coarser than
+    ``step``.  Consecutive states of a route are the only pairs anything has validated:
+    the Cartesian tree's guarantee is that each pair of its stations is a straight tool
+    move it solved and swept, and a route of straight moves is a **polyline**, not a line.
+    The straight line between two of its non-adjacent stations cuts the corner, was never
+    checked, and frequently has no inverse kinematics at all -- which is the shape the tree
+    exists to find.  Scoring such a span prices a route the candidate does not contain, and
+    where its line will not solve ``MotionModel.cost`` rightly calls it infinite, which
+    took the tree's route out of the ranking on exactly the transits it was winning.
+
+    *Stops* are counted on a copy thinned back to ``step``, and have to be, because the
+    point counts routes arrive with are facts about the searches rather than about the
+    routes: OMPL stops at four or so nodes, the tree hands back every station it validated
+    one ``tcp_check_mm`` apart.  Charging a ramp at each would rank the two searches on how
+    each reports itself.  Thinning is sound for counting -- how many stops a route of this
+    shape needs is a question about its geometry -- and unsound for pricing, which is the
+    asymmetry this returns two lists to keep.
     """
     dense, _ = _densify_marked(cell, path, step, model=model)
     if len(dense) < 3:
-        return dense
-    return [dense[0], *_thin(dense[0], dense[1:-1], dense[-1], step), dense[-1]]
+        return dense, dense
+    return dense, [dense[0], *_thin(dense[0], dense[1:-1], dense[-1], step), dense[-1]]
 
 
 def _path_cost(cell: Cell, path: list[np.ndarray], max_step: float,
@@ -1211,32 +1217,57 @@ def _path_cost(cell: Cell, path: list[np.ndarray], max_step: float,
     which mostly ship as joint motion and were priced about right.  The two now compete on
     every transit, so that asymmetry decided transits rather than merely misreporting them.
 
-    Stop-to-stop rather than cruise, which is the currency ``--stop-time-weight`` acts in
-    and the one every later comparison is made in.  It is only safe to use here because
-    ``_scored_points`` puts every candidate at one spacing first; on the routes as they
-    arrive it would rank them by node count.
+    Two terms, because the two questions have different right answers:
 
-    The second figure is the same time without the clearance and crossing penalties -- real
-    seconds, cap included -- so "cost against plain" still reads as what the penalties added.
-    Endpoint factors are threaded from one segment to the next so each waypoint costs one
-    clearance query rather than two; they reach only the joint moves, a linear one being
-    priced off the stations along its line.
+    * **Travel** is summed over the route's own moves in **cruise** time, which is additive
+      under subdivision and so does not depend on how finely the route happens to be
+      described.  This is where the cap, the crossing penalty and the clearance penalty
+      along the real curve are charged.
+    * **Stops** are the ramps a route of this shape would really pay, taken as the
+      difference between the full move time and the cruise time over the thinned copy.
+      That is the term ``--stop-time-weight`` acts in, and it is read off the joint
+      dynamics alone -- no line is asked for, so a thinned span that cuts a corner cannot
+      make the route unpriceable.
+
+    The second figure returned is the same time without the clearance and crossing
+    penalties -- real seconds, cap included -- so "cost against plain" still reads as what
+    the penalties added.  Endpoint factors are threaded from one segment to the next so
+    each waypoint costs one clearance query rather than two; they reach only the joint
+    moves, a linear one being priced off the stations along its line.
+
+    A move whose line will not price is charged as a joint move instead of costing
+    infinity.  ``MotionModel.cost`` answers infinity because a pass must never *install* a
+    move it cannot price, but ranking installs nothing, and a candidate dropped here is
+    dropped before the passes have had their chance to move the waypoint that could not be
+    reached.  ``_fill`` already takes this view of the same question -- it falls back to
+    the chord rather than reject a route it is only sampling -- and leaves the verdict to
+    ``_verify_runs``, which sweeps the finished path along the curve each move really
+    takes and is where an unflyable route is supposed to die.
     """
     if len(path) < 2:
         return 0.0, 0.0
     model = MotionModel(cell, max_step=max_step, zone=zone)
-    pts = _scored_points(cell, model, path, max_step)
-    if len(pts) < 2:
+    moves, stops = _scored_points(cell, model, path, max_step)
+    if len(moves) < 2:
         return 0.0, 0.0
     penalised = cell.penalty is not None and cell.penalty.enabled
     total = plain = 0.0
-    prev_f = cell.penalty_factor(pts[0]) if penalised else None
-    for a, b in zip(pts, pts[1:]):
+    prev_f = cell.penalty_factor(moves[0]) if penalised else None
+    for a, b in zip(moves, moves[1:]):
         next_f = cell.penalty_factor(b) if penalised else None
-        total += model.cost(a, b, fa=prev_f, fb=next_f, stops=True)
-        plain += model.move_time(a, b)
+        priced = model.cost(a, b, fa=prev_f, fb=next_f)
+        if not np.isfinite(priced):
+            # No flyable line, so there is no linear price to read and no tool speed cap
+            # to apply either -- what is charged is the joint move the states describe,
+            # plus the crossing charge, which is about where the move goes and not how.
+            priced = (cell.segment_cost(a, b, max_step=max_step, fa=prev_f, fb=next_f)
+                      + model.crossing_penalty(a, b))
+        total += priced
+        plain += model.cruise_time(a, b)
         prev_f = next_f
-    return total, plain
+    ramps = sum(cell.move_time(a, b) - cell.cruise_time(a, b)
+                for a, b in zip(stops, stops[1:]))
+    return total + ramps, plain + ramps
 
 
 def _make_program(cell: Cell, qa: np.ndarray, qb: np.ndarray) -> cl.CompositeInstruction:

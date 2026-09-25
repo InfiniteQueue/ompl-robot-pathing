@@ -140,17 +140,30 @@ the way, so the joint values in between are whatever that line demands.
   `--linear-crossing-penalty-s`, and has its clearance penalty read along the tool's line.
   The second figure it returns is the same time without either penalty -- cap included --
   so "cost against plain" still reads as what the penalties added.
-  - Stop-to-stop, not cruise, so `--stop-time-weight` acts here as it does everywhere
-    else. That is only safe because `_scored_points` puts every candidate at one spacing
-    first: the counts they arrive with are facts about the searches, not the routes. OMPL
-    returns the handful of nodes its tree stopped at, the Cartesian tree returns every
-    station it validated one `tcp_check_mm` apart, and scoring those as they stand would
-    charge one route three ramps and the other three hundred. Filling in at
-    `--check-step-deg` and thinning back to it gives both a count that follows the route's
-    own geometry.
-  - The fill is the profile-aware one, which is also what keeps the pricing finite: a
-    linear move with no reachable line costs infinity, and the long moves of an unfilled
-    raw route are exactly the ones whose lines do not solve.
+  - **Two terms, and `_scored_points` returns two lists to keep them apart.** Travel is
+    summed over the route's *own* moves, filled in where it is coarser than
+    `--check-step-deg`, in **cruise** time -- additive under subdivision, so it does not
+    depend on how finely the route is described. Stops are the ramps a route of that shape
+    would pay, taken as full-move minus cruise over a copy *thinned* back to
+    `--check-step-deg`. That second term is the one `--stop-time-weight` acts in.
+  - Thinning is sound for counting stops and unsound for pricing moves, which is the whole
+    reason the two lists exist. A route of straight tool moves is a **polyline**: the
+    tree's guarantee is that each consecutive pair of its stations is a straight move it
+    solved and swept, and the line between two non-adjacent stations cuts the corner, was
+    never checked, and often has no IK at all -- which is the shape the tree exists to
+    find. Pricing such a span prices a route the candidate does not contain, and where its
+    line will not solve `MotionModel.cost` calls it infinity. Scored on one thinned list,
+    cartesian solutions came back at `inf` and `_cheapest` dropped them, on exactly the
+    transits where the tree was winning.
+  - The stop term asks the joint dynamics only and never for a line, so a thinned span
+    that cuts a corner cannot make a route unpriceable.
+  - A move whose line will not price is charged as a joint move rather than costing
+    infinity. `MotionModel.cost` answers infinity because a pass must never *install* what
+    it cannot price; ranking installs nothing, and dropping a candidate there is dropping
+    it before the passes could move the waypoint that could not be reached. `_fill` takes
+    the same view of the same question. `_verify_runs` is where an unflyable route dies.
+  - The fill is the profile-aware one, so where the route is coarse the states scored are
+    on the curve each move will really be flown along.
   - What it costs is one profile-aware densify per candidate rather than one per transit,
     the winner being densified again in `_finish`. Phase one returns at most
     `--phase-one-runs` of them.
