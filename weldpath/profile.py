@@ -61,6 +61,26 @@ def commanded(q: np.ndarray, coupled: bool = True) -> np.ndarray:
     return out
 
 
+def kinematic(q: np.ndarray, coupled: bool = True) -> np.ndarray:
+    """Register joint values as the URDF's kinematics read them; inverse of :func:`commanded`.
+
+    The manifest states its start position in register terms, the same terms the output
+    file is written in -- so reading it as though it were kinematic leaves joint 3 out by
+    the whole of joint 2.  Measured on the three studies to hand: uncorrected, the start
+    pose put the gun 11-13 mm inside the panels and the tooling and its TCP 200-260 mm from
+    any locator; corrected, the TCP lands on the study's own first via to 0.00 mm and
+    0.000 deg in all three, and the gun stands 619 mm clear.
+
+    Applied where the start state becomes a joint vector and nowhere else.  Everything
+    downstream -- planning, IK, collision checking, timing -- works in kinematic values,
+    and :func:`commanded` puts them back into registers on the way out.
+    """
+    out = np.array(q, dtype=float)
+    if coupled and len(out) >= COUPLED_JOINT:
+        out[COUPLED_JOINT - 1] = out[COUPLED_JOINT - 1] + out[COUPLING_SOURCE - 1]
+    return out
+
+
 def default_velocity(n: int) -> list[float]:
     out = [DEFAULT_VELOCITY] * n
     if n >= 6:

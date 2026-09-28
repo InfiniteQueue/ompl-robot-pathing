@@ -123,6 +123,20 @@ class Manifest:
     raw: dict[str, Any] = field(repr=False, default_factory=dict)
 
     # ---- derived -----------------------------------------------------------
+    def start_q(self, joint_names: list[str]) -> np.ndarray:
+        """The start position as kinematic joint values, in ``joint_names`` order.
+
+        ``start_state`` is quoted in the robot's own registers, which is what the study
+        records and what :func:`weldpath.output` writes back out.  Joint 3's register is
+        measured against the floor rather than against link 2, so it has to be undone here
+        or the forearm sits a whole joint 2 out -- see :func:`weldpath.profile.kinematic`.
+
+        The gun is not part of this: it is not an IK variable, it is quoted as an opening
+        in millimetres rather than as a joint value, and ``gun_joint_value`` converts it.
+        """
+        from .profile import kinematic
+        return kinematic(np.array([self.start_state[n] for n in joint_names], dtype=float))
+
     @property
     def scale(self) -> float:
         """Factor converting manifest length units into metres."""

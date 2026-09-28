@@ -287,7 +287,7 @@ class ToolpathPlanner:
         self.opening_search = bool(opening_search)
         self.opening_scan_mm = float(opening_scan_mm)
         self.opening_resolution_mm = float(opening_resolution_mm)
-        self.start_q = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
+        self.start_q = man.start_q(cell.joint_names)
         # Gun opening each locator turned out to be reachable at, filled in by run().
         self.openings: dict[str, float] = {}
         # Poses to route a difficult transit through are searched for per transit and only
