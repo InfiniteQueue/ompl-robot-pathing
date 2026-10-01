@@ -222,3 +222,73 @@ class SteppedPenalty:
                 f"by {self.step_factor:g} every {self.step_mm:g} mm to 1x at "
                 f"{self.zero_mm:g} mm -- {walk}; below 0 mm it continues as a straight "
                 f"line at {-self.slope:.3f}x per mm") + _spread(self.whole_move)
+
+
+class GunPreference:
+    """Cost multiplier discouraging a route flown with the gun held open.
+
+    A wider opening is not a collision and it is not slower, so nothing else in this
+    program has any reason to prefer a narrow one -- and two things quietly prefer a wide
+    one.  The clearance penalty is the larger: swinging the tip back out of the way is the
+    cheapest clearance there is to buy, so a search free to choose the opening drifts to
+    the widest its endpoints allow.  The endpoint screen is the other, an opening being
+    kept or dropped on whether the tip fits, which a wide one fails less often near a
+    fixture than a shut one fails inside a panel.  On the shop floor the preference runs
+    the other way: a tip further open is more of the gun in places nobody measured, a
+    longer squeeze at the weld, and a wider gap between the cell as planned and as built.
+
+    So the opening is **priced** rather than constrained, on the same footing as
+    clearance.  ``multiplier`` is what a second costs with the gun at full travel, 1x is
+    what it costs shut, and in between it is linear::
+
+        factor = 1 + (multiplier - 1) * opening / widest
+
+    A straight line and not a curve, unlike the clearance penalties either side of it,
+    because there is no geometry here to put a knee at.  Clearance has one -- the last few
+    millimetres before contact are where the difference stops being a matter of degree --
+    and the gun's travel has nothing of the kind: 50 mm open differs from 40 mm by exactly
+    what 10 mm is worth, wherever on the travel the pair sits.  The line is the shape that
+    says so, and it is also the shape that makes the multiplier readable, being the whole
+    of the preference between the two extremes rather than a peak reached somewhere.
+
+    Charged on **time**, as the clearance penalty is, so it composes with the same factor
+    arithmetic rather than sitting beside it.  That does mean the preference scales with
+    how long the route takes: on a long transit the gun weight is worth more seconds than
+    on a short one.  That is the intended reading -- "a second flown with the gun open
+    counts as this many" -- and it is what keeps the two preferences commensurable, a
+    route being allowed to trade a little clearance for a narrower gun and the reverse.
+
+    Like the clearance penalty this is a preference and not a limit.  What the gun is
+    *allowed* to do is set by its joint limits and by whether the tip fits where the route
+    goes; this only decides which of the openings that do fit a route it is scored at.
+    """
+
+    def __init__(self, multiplier: float = 1.0):
+        if multiplier < 1.0:
+            raise ValueError(
+                f"gun opening weight must be at least 1, got {multiplier:g}: below 1 it "
+                f"would pay a route to hold the gun open")
+        self.multiplier = float(multiplier)
+
+    @property
+    def enabled(self) -> bool:
+        """1x at full travel is no preference at all: every factor is then exactly 1."""
+        return self.multiplier > 1.0
+
+    def factor(self, opening_mm: float | None, widest_mm: float) -> float:
+        """Cost multiplier for a route flown at one opening.  1.0 means no preference.
+
+        ``None`` is a cell with no gun joint, and a ``widest_mm`` of zero is a gun with no
+        travel; neither has an opening to charge for.
+        """
+        if not self.enabled or opening_mm is None or widest_mm <= 0.0:
+            return 1.0
+        u = float(opening_mm) / float(widest_mm)
+        u = 0.0 if u < 0.0 else (1.0 if u > 1.0 else u)
+        return 1.0 + (self.multiplier - 1.0) * u
+
+    def describe(self) -> str:
+        if not self.enabled:
+            return "gun opening weight: off, so a route is scored the same at any opening"
+        return (f"gun opening weight: 1x with the gun shut rising linearly to "
+                f"{self.multiplier:g}x at full travel")

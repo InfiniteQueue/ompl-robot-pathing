@@ -495,10 +495,10 @@ tool speed cap.
 **One segment's search is bounded by the clock as well as by its budgets.** Every other
 budget bounds a part of the search — runs, seconds per run, gun openings, fallback poses —
 and they multiply: a transit that fails everywhere spends its phase-one runs at each
-opening, then the Cartesian searches, then phase two, then the whole of that again through
-each fallback pose, then a solve for each ordered pair of openings at each of those poses.
+opening, then the Cartesian searches, then phase two, then one detour's two halves over
+the openings its second half can be flown at.
 Each of those numbers is defensible on its own and their product is hours, on a segment
-that may simply have no route. `--segment-minutes` (120) is the figure that bounds it:
+that may simply have no route. `--segment-minutes` (60) is the figure that bounds it:
 past it nothing further is started, whatever routes are already in hand are still ranked,
 refined and shipped, and a segment with none is recorded with its reason and the run
 carries on to the next — which is what already happens to a segment that fails outright.
@@ -797,6 +797,40 @@ then bisections of the widest range nothing has been tried in yet, rounded to
 pose of the leg in collision, is skipped without counting against either total. The two
 numbers therefore count openings that can be planned at rather than openings proposed.
 
+**A narrow gun is worth something, so it is priced.** A wider opening is neither a
+collision nor slower, so nothing in the search prefers a narrow one — and the clearance
+penalty actively prefers a wide one, since swinging the tip out of the way is the cheapest
+clearance there is to buy. On the shop floor the preference runs the other way: a tip
+further open is more of the gun in places nobody measured and a wider gap between the cell
+as planned and as built. `--gun-opening-weight` (1.5) is what a second counts as with the
+gun at full travel against 1x with it shut, linear in between, and it multiplies the whole
+penalised cost of a route rather than just the part the clearance penalty added — a
+transit nowhere near the panels would otherwise have nothing to scale and could open the
+gun for free. It decides between candidate routes found at different openings and nothing
+else: wherever the opening is fixed it is the same factor on both sides of every
+comparison and cancels, so the refinement passes are untouched. 1 switches it off.
+
+**The opening is chosen twice: once to find the route, once to fly it.** Everything above
+picks an opening in order to *find* a route, and a clear straight move is simply taken at
+the first opening that clears it. Once the route is fixed the opening is still free, so
+`--retune-gun-openings` (4) is a last pass over each finished leg: the same screened
+preference order, each candidate validated along the *whole* leg rather than at its ends —
+the tip is part of the machine that has to fit, so an opening both endpoints are clear at
+can still foul something halfway — and then priced with the weight above. The cheapest
+wins, ties keeping the opening the leg was planned at, and the route itself is never
+re-planned or re-refined: the passes ran with the gun where the route was found, and
+re-running them would be a fresh search rather than a reading of the one already done.
+0 leaves each leg where it was found.
+
+Each run is checked and priced under the profile it will actually be flown under, rather
+than having it re-derived from the band. The route is fixed by this point, so travel,
+ramps, the tool speed cap and the crossing count are the same at every opening and cancel
+out of the comparison; what genuinely varies is the clearance penalty, which reads the tip
+where the gun has put it, and the weight above. Re-deriving would break that, because the
+band moves with the gun — the clearance a state reads depends on where the tip is — so the
+*profiles* would become a function of the opening and feed back into the comparison as
+though they were a real difference between one opening and another.
+
 **Phase one chooses between openings rather than working through them.** Its runs are
 spent whichever way they go, so they are dealt round the rotation, one opening each and
 back to the first when it runs out, and the cheapest solution of the whole set ships
@@ -815,9 +849,18 @@ ever got a turn.
 
 Changing the gun is a real operation on the machine, so a single opening for the whole
 transit is always preferred; only when none works is the move split into two legs with the
-gun changing at the intermediate pose, where the robot is stationary anyway. A route
-through a fallback pose, and either half of such a split, are fixed to one opening per
-attempt and walked one at a time, their halves having to agree on one gun state.
+gun changing at the intermediate pose, where the robot is stationary anyway. Each half of a
+detour is planned at one opening, the gun not changing partway through a move.
+
+**A detour commits to its pose and to the half that reached it.** The first opening that
+carries the route to a fallback pose settles the detour: that half is kept, no other pose is
+tried, and the only question left — the gun — is asked of the second half alone, which is
+the only part still looking for a route. The opening the first half flies at is tried first,
+so the answer looked for first is still one leg with no gun change in it. The planner used
+to work the other way round, solving both halves at each opening in turn and then starting
+over at the next pose, which charged for the easy half once per opening per pose; nearly all
+of the worst case was those repeats. What committing costs is coverage: a second half that
+reaches at no opening now ends the transit rather than falling through to another pose.
 
 **The departure opening leads because it is already in force.** Using it costs no gun
 change at the start of the move, and it is the state the robot was proved to stand at the
@@ -1164,13 +1207,15 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--cartesian-recut` | true | cut a Cartesian-tree route where it leaves the band and replan the parts outside it with phases one and two |
 | `--phase-two-max-runs` | 8 | further OMPL runs, stopping at the first solution |
 | `--phase-two-solve-seconds` | 45 | how long one of those runs may search |
-| `--segment-minutes` | 120 | wall clock for one segment's search; past it the segment is reported as failed and the run moves on. 0 removes the limit |
+| `--segment-minutes` | 60 | wall clock for one segment's search; past it the segment is reported as failed and the run moves on. 0 removes the limit |
 | `--direct-clearance-mm` | 0 | room the straight joint move has to keep to be taken without searching; under it the next gun opening is tried and then the searches. 0 asks nothing beyond the collision check |
 | `--phase-two-cartesian-runs` | 2 | Cartesian searches spread evenly through phase two, at its own gun openings |
 | `--phase-two-cartesian-seconds` | 30 | how long one of those searches may run |
 | `--min-gun-openings` | 5 | gun openings phase one deals its runs round, the cheapest solution of the set shipping |
 | `--extra-gun-openings` | 3 | further openings held back for phase two to walk |
 | `--gun-opening-round-mm` | 5 | multiple that openings found by bisection are rounded to |
+| `--gun-opening-weight` | 1.5 | what a second counts as with the gun at full travel, against 1x shut; multiplies a route's whole penalised cost, so candidates found at different openings compete on it. 1 switches it off |
+| `--retune-gun-openings` | 4 | openings each finished leg is re-priced at, after every other pass, validated along the whole leg and never re-planned. 0 leaves it at the opening it was found at |
 | `--fallback-distance-mm` | 100 | room a fallback pose must leave around the robot and gun |
 | `--no-shortcut` | off | skip shortcutting and polishing |
 | `--shortcut-seconds` | 20 | time budget for shortcutting each transit |
@@ -1243,7 +1288,10 @@ Exit code is 0 when every segment planned, 1 otherwise.
   route away from surfaces, but neither fixes it. The real fix is a swept check — the scene
   already configures `BulletCastBVHManager` as its continuous plugin and nothing uses it.
 * The gun opening search covers `--min-gun-openings` plus `--extra-gun-openings`
-  candidates rather than treating the opening as a continuous dimension, so a transit that
-  needs some other specific intermediate opening will not be found. The manifest supplies no gun speed, so an opening change is
-  costed as "avoid unless necessary" rather than in seconds.
+  candidates, and the retune `--retune-gun-openings` more, rather than treating the
+  opening as a continuous dimension — so a transit that needs some other specific
+  intermediate opening will not be found. The manifest supplies no gun speed, so the
+  *change* of opening is still costed as "avoid unless necessary" rather than in seconds;
+  `--gun-opening-weight` prices how far open the gun is held, which is a different
+  question.
 * Requires `tesseract-robotics` and `numpy`; both are already in `.venv`.

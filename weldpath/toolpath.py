@@ -23,6 +23,7 @@ from .cell import STOP_BAND_JOINT, Cell
 from .manifest import Locator, Manifest
 from .cartesian import CartesianBudget
 from .fallback import FallbackFinder
+from .penalty import GunPreference
 from .planning import (LIN, PTP, Deadline, LinearZone, OmplBudget, PlanningError,
                        Relocation, unique_openings,
                        plan_freespace,
@@ -186,6 +187,7 @@ class ToolpathPlanner:
                  segment_seconds: float = 0.0,
                  main_openings: int = 5, extra_openings: int = 0,
                  opening_round_mm: float = 5.0,
+                 gun: GunPreference | None = None, retune_openings: int = 0,
                  fallback_mm: float = 100.0, fallback_step_mm: float = 40.0,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
                  continuous_check: bool = False,
@@ -221,6 +223,12 @@ class ToolpathPlanner:
         self.main_openings = main_openings
         self.extra_openings = extra_openings
         self.opening_round_mm = opening_round_mm
+        # What an opening costs, and how many the finished leg is re-priced at once the
+        # searching is done.  The first is a weight on every candidate's score; the second
+        # is a pass of its own, after all the others.  See penalty.GunPreference and
+        # planning._retune_opening.
+        self.gun = gun or GunPreference(1.0)
+        self.retune_openings = max(0, int(retune_openings))
         # How far the shortcut and polish passes displace a waypoint when they try
         # relocating one, and how the distance is drawn between those bounds.
         self.relocate = relocate or Relocation()
@@ -287,7 +295,7 @@ class ToolpathPlanner:
         self.opening_search = bool(opening_search)
         self.opening_scan_mm = float(opening_scan_mm)
         self.opening_resolution_mm = float(opening_resolution_mm)
-        self.start_q = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
+        self.start_q = man.start_q(cell.joint_names)
         # Gun opening each locator turned out to be reachable at, filled in by run().
         self.openings: dict[str, float] = {}
         # Poses to route a difficult transit through are searched for per transit and only
@@ -754,6 +762,7 @@ class ToolpathPlanner:
             main_openings=self.main_openings,
             extra_openings=self.extra_openings,
             opening_round_mm=self.opening_round_mm,
+            gun=self.gun, retune_openings=self.retune_openings,
             record=raw_legs, log=self.log)
         # What the robot leaves a weld holding is what the transit out of it was solved
         # at, which is only known now.  The declared value seeded that search and is a

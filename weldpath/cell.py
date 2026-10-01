@@ -137,7 +137,7 @@ class Cell:
         Weighting distances by this makes "short" mean short in the cell, not in the
         joint vector.
         """
-        q = np.array([self.man.start_state[n] for n in self.joint_names], dtype=float)
+        q = self.man.start_q(self.joint_names)
         base = self.fk(q)[:3, 3]
         weights = np.ones(len(self.joint_names))
         for i in range(len(self.joint_names)):
@@ -1508,7 +1508,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         hullexport.export(cell.env, man, export_dir, log=log)
 
     # -- pairs in contact at the start pose: re-measure, then loosen or disable ---------
-    start = np.array([man.start_state[n] for n in cell.joint_names], dtype=float)
+    start = man.start_q(cell.joint_names)
     log("testing the start pose against every collision pair; this is the first full test "
         "of the scene and the slowest one")
     always = cell.contact_pairs(start)
