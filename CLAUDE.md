@@ -230,9 +230,10 @@ the way, so the joint values in between are whatever that line demands.
     sides of `shortcut`'s comparison. Charged on the same footing everywhere or it would
     not cancel where it is supposed to.
 - `Deadline` is the wall clock for one segment, `--segment-minutes` (120). Every other
-  budget bounds a part of the search and they multiply -- runs x seconds x openings x
-  fallback poses x pairs of openings at each pose -- so this is the only figure that bounds
-  a segment with no route. `ran_out` is asked where work is about to start rather than
+  budget bounds a part of the search and they multiply -- runs x seconds x openings, plus
+  one detour's two halves -- so this is the only figure that bounds a segment with no route.
+  The product used to carry fallback poses and pairs of openings at each pose as factors of
+  their own; committing the pose and its first half removed both. `ran_out` is asked where work is about to start rather than
   interrupting it, since a run stopped halfway leaves nothing usable, and `clamp` cuts each
   per-run limit to the time left. What is already found is still ranked, refined and
   shipped; a segment with nothing raises, and `ToolpathPlanner.run` records the reason and
@@ -258,11 +259,43 @@ the way, so the joint values in between are whatever that line demands.
     earliest as a fraction of its own count. The phase stops at the first solution either
     kind finds, so queueing one kind behind the other would let the ordering decide which
     kind ever ran.
-  - The rotation belongs to the direct transit alone. A route through a fallback pose is one
-    leg whose two halves must agree on one gun state, and so is either half of a two-leg
-    split, so those walk `GunOpenings.pinned` one opening at a time -- the old order, kept
-    where it is still the only one available. A cell with no gun joint gets `pinned(None)`,
-    which is exactly what it did before any of this.
+  - The rotation belongs to the direct transit alone. Each half of a detour is planned at
+    one pinned opening -- the gun does not change partway through a move -- so those walk
+    `GunOpenings.pinned` one opening at a time, the old order, kept where it is still the
+    only one available. A cell with no gun joint gets `pinned(None)`, which is exactly what
+    it did before any of this.
+- **A detour commits to its pose and to the half that reached it.** The fallback tier used
+  to pin one opening, solve *both* halves at it, and on failure move to the next opening and
+  solve the first half over again -- then do the whole of that again at the next pose, and a
+  third time in a separate split tier that re-solved both halves per ordered pair of
+  openings. A transit whose second half was the hard one therefore paid for the easy half
+  once per opening per pose, and nearly all of the worst case was those repeats. Now the
+  first opening that reaches the pose settles it: that half is kept, no further pose is
+  tried, and the remaining question -- the gun -- is asked of the second half alone, which
+  is the only part still looking for a route.
+  - The two tiers are one loop. `_plan_via` is gone, having planned both halves at one
+    opening and joined them by taking `first[0].states`, which read only the *first* run of
+    each half and is why it had to plan them with no zone: with no zone there is exactly one
+    run. The join is `_flatten` now, so the halves carry the zone like anything else.
+  - `lead_open` leads the second half's list, so the answer looked for first is still one
+    leg with no gun change in it. That case is joined and refined whole, the detour through
+    the pose being exactly the kind of corner those passes cut; a second half that only
+    flies at a different opening ships as two legs refined separately, each with its own
+    opening in force.
+  - What committing costs is coverage: a second half that reaches at no opening now ends the
+    transit, where before it fell through to the next pose. The repeats were buying a second
+    chance at a route whose first half had already been found, and charging for it on every
+    transit that took the detour at all. The failure says which pose it was stuck at, that
+    being the diagnosis for why no other was tried.
+  - A pose never reached at any opening commits to nothing and the next pose is still tried.
+    Only a pose actually *reached* closes the others off.
+  - A `via` inside the joint 5 stop band cannot change the gun -- the robot stands still
+    there and nothing downstream moves an endpoint -- so the second half is offered
+    `lead_open` and nothing else. The old code skipped such a pose in the split tier
+    entirely, which is the same rule read from the other side.
+  - A cell with no gun joint has `pinned(None)` in both lists, so `GunOpenings.all` offers
+    the same nothing twice. Collapsed to one entry here, or the first half would be solved
+    twice at nothing and the second half's list would subtract `None` from `None`.
   - `_Sampler._run` loads a pose through `cell.set_state` inside its own `gun_opening`
     block. OMPL reads the gun from the environment's current state and not from the program
     it is handed, and before this each run inherited whatever the last collision query had
@@ -300,6 +333,79 @@ the way, so the joint values in between are whatever that line demands.
     search. Without it the gun changes as the robot starts moving instead of while it
     stands still at the weld. `_arrive_opening` reads `self.openings` for the same reason:
     the declared arrival is a pose the robot may never have been shown to reach.
+- **The opening is priced as well as searched over.** `penalty.GunPreference` is a flat
+  multiplier on a route's penalised cost for the opening it is to be flown at: 1x shut,
+  `--gun-opening-weight` (1.5) at full travel, linear between. Without it nothing in the
+  program prefers a narrow gun and two things prefer a wide one -- the clearance penalty
+  most of all, swinging the tip out of the way being the cheapest clearance there is to
+  buy, and the endpoint screen second, a wide tip failing less often beside a fixture than
+  a shut one fails inside a panel. Linear rather than a curve because there is no geometry
+  to put a knee at: clearance has one in the last few millimetres before contact, the
+  gun's travel has nothing of the kind.
+  - Applied to the **whole** penalised figure, not to the part the clearance penalty
+    added. A transit nowhere near the panels has no penalty to scale, and scaling nothing
+    would make the widest opening free exactly where nothing else objects to it either --
+    which is the case this exists for. The plain figure is untouched, being real seconds.
+  - It lands in `_path_cost` and therefore on every candidate route: phase one's, phase
+    two's, the Cartesian tree's and the recut's, all of which `_cheapest` ranks on one
+    number. It reaches nothing else. Wherever the opening is held fixed -- inside
+    `_finish`, and so in shortcut, simplify and polish -- it is the same constant on both
+    sides of every comparison and cancels exactly, which is why `MotionModel` knows
+    nothing about it and those passes are untouched.
+- **`_retune_opening` is the last pass of a segment, and it moves the gun rather than the
+  route.** Everything before it picks an opening in order to *find* a route: the phases
+  search at several and the cheapest answer ships whichever one it came from, and a clear
+  straight move is simply taken at the first opening that clears it, never scored against
+  another at all. So the opening ends up decided by what it did for the search. The search
+  is then over, the route is fixed, and the opening is still free -- the route is a list of
+  robot joint vectors and the gun is not one of them. This asks, last, which of the
+  openings that fly it is the one worth flying it at.
+  - Candidates come from `_opening_lists`, the same screened preference order the search
+    uses, `--retune-gun-openings` (4) of them. Each is then **validated along the whole
+    leg**, which is the reason for doing this here rather than in the list: the tip is
+    200 mm of swing and part of the machine that has to fit, so an opening both endpoints
+    are clear at can still put the electrode through a fixture halfway along. Upstream
+    that is a route the search would have failed to find; here there is a route in hand
+    and the only question is whether it survives the gun moving under it.
+  - The incumbent is scored on the same terms and kept on a tie, so a leg changes hands
+    only where another opening is strictly cheaper. An opening that fails validation is
+    dropped and nothing is offered in its place -- the count bounds the expensive half of
+    the test, which is the validation and not the proposal.
+  - The route is **not** re-planned or re-refined at the winning opening. The passes ran
+    with the gun where the route was found, and running them again would be a fresh search
+    rather than a reading of the one already done, and would leave the leg costing
+    something other than what was ranked.
+  - Both the check and the price read each run under the profile it will really be flown
+    under, `_path_cost` being **pinned** to `run.motion`. Deriving from the band is right
+    for a candidate, no split having happened yet, and wrong twice over here: the split is
+    settled, so a derived profile prices a leg the controller will not execute; and the
+    band moves with the gun -- `_reads_near` measures a clearance the tip is part of -- so
+    deriving would make the *profiles* a function of the opening and feed that back into
+    the comparison as a real difference between openings. `MotionModel.pinned` is the only
+    exception to "the profile is not stored", and it exists for the one caller that is
+    reading a settled split rather than deciding one; `_crosses` returns False under a pin
+    for the same reason, the crossing count belonging to the split.
+  - That is the shape of the whole pass. The route is fixed, so travel, ramps, the tool
+    speed cap and the crossing count are identical at every opening and cancel in the
+    comparison. What genuinely varies is the clearance penalty, which reads the tip where
+    the gun has put it, and the gun's own weight. Anything else that varied with the
+    opening would be an artefact.
+  - Its cost is therefore internal to the pass. Priced per run, it charges a stop at each
+    run boundary -- which is what the robot does there, that boundary being a phase
+    boundary -- where a candidate's cost is taken over its whole route at once. The two
+    numbers are not comparable and nothing compares them.
+  - Applied per **leg**, a leg being the unit that has one opening, so it covers the
+    direct transit, a route through a fallback pose and both halves of a two-leg split
+    alike. The halves of a split retune independently, which is sound because they meet at
+    a pose the robot is stationary at: the gun changes there whatever the two openings turn
+    out to be, and a split whose halves retune onto the same opening is a phase boundary
+    with nothing happening at it.
+  - `_plan_pair` writes the first leg's opening back over the departing weld phase, so a
+    retuned opening is what the weld is recorded as leaving at -- which is the point, that
+    figure describing the transit out rather than anything at the weld.
+  - Skipped when the segment clock has run out. There is already a valid answer and this
+    only improves it, so it is dropped whole rather than clamped: half a pass proves
+    nothing.
 - **`--direct-clearance-mm` is a floor under the straight move, and under nothing else.**
   `_plan_direct` tries the direct joint chord at each opening before any search, and the
   only question asked of it was `segment_collides`. That is a yes-or-no at the collision
@@ -336,7 +442,12 @@ the way, so the joint values in between are whatever that line demands.
   sampling having nothing drawing it into the corridor beside the panel that the tree
   steers along. What it costs is `--cartesian-solve-seconds` plus `--cartesian-min-seconds`
   on every transit rather than only on the ones nothing else reached, bounded by `Deadline`
-  alone. Never run for the halves of a fallback-pose route, which are planned with no zone.
+  alone. It runs for the halves of a detour too, which the old split tier already did and
+  the old `_plan_via` did not -- that claim was true of one tier and false of the other.
+  A half is a candidate for being shipped as its own leg, so it is searched and scored under
+  the band it will be flown in; and with a second half's failure now ending the transit, the
+  one solver that searches a space OMPL cannot is worth having there. What that costs is the
+  tree's budget per half per opening tried, against the repeats the commit removed.
   - `_cartesian_solutions` runs it from successive seeds: until one solves or
     `--cartesian-solve-seconds` passes, then on until `--cartesian-min-seconds` has, both
     timed from the first run. Routes are ranked by `_path_cost`, as phase one's are, and

@@ -190,7 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "one; if it too comes back empty the transit is retried through "
                         "the fallback poses, starting again from phase one (default: %(default)g)")
     #PHASE TWO RUN TIME
-    p.add_argument("--phase-two-solve-seconds", type=float, default=45.0,
+    p.add_argument("--phase-two-solve-seconds", type=float, default=240.0,
                    metavar="SECONDS",
                    help="how long one phase-two run may search. Worth setting higher than "
                         "--phase-one-solve-seconds: a transit that beat phase one is "
@@ -209,7 +209,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "--near-panel-mm is in force. 0 leaves phase two to the sampling "
                         "planner alone (default: %(default)g)")
     #PHASE TWO CARTESIAN RUN TIME
-    p.add_argument("--phase-two-cartesian-seconds", type=float, default=30.0,
+    p.add_argument("--phase-two-cartesian-seconds", type=float, default=240.0,
                    metavar="SECONDS",
                    help="how long one of phase two's Cartesian searches may run. Shorter "
                         "than --cartesian-solve-seconds on purpose: what is wanted by "
@@ -311,6 +311,41 @@ def build_parser() -> argparse.ArgumentParser:
                         "onto one already being tried is dropped, so a coarse setting "
                         "over a narrow range yields fewer openings than asked for. 0 "
                         "rounds nothing (default: %(default)g)")
+    #WHAT A WIDE GUN COSTS A ROUTE
+    p.add_argument("--gun-opening-weight", type=float, default=1.5, metavar="X",
+                   help="what a second counts as when it is flown with the gun at full "
+                        "travel, 1x being what it counts as with the gun shut and the "
+                        "figures in between linear in the opening. A wider gun is neither "
+                        "a collision nor slower, so without this nothing prefers a narrow "
+                        "one and the clearance penalty actively prefers a wide one -- "
+                        "swinging the tip out of the way is the cheapest clearance there "
+                        "is to buy. This prices the opening instead, so a route buys a "
+                        "wider gun only where it is worth the seconds: it is charged on "
+                        "the whole penalised cost of a route, not just on the part the "
+                        "clearance penalty added, or a transit nowhere near the panels "
+                        "would have nothing to scale and could open the gun for free. It "
+                        "decides between candidate routes found at different openings and "
+                        "drives --retune-gun-openings; wherever the opening is fixed it "
+                        "is the same factor on both sides of every comparison and cancels "
+                        "exactly, so the refinement passes are untouched. 1 switches it "
+                        "off (default: %(default)g)")
+    #HOW MANY OPENINGS THE FINISHED ROUTE IS RE-PRICED AT
+    p.add_argument("--retune-gun-openings", type=int, default=4, metavar="N",
+                   help="gun openings each finished leg is re-priced at, after every "
+                        "other pass, keeping the cheapest. Everything before this picks "
+                        "an opening in order to FIND a route -- the phases search at "
+                        "several and the cheapest answer ships whichever one it came "
+                        "from, and a clear straight move is simply taken at the first "
+                        "opening that clears it -- so the opening ends up decided by what "
+                        "it did for the search. The route is then fixed and the opening "
+                        "is still free, and this is what asks which of the openings that "
+                        "fly it is worth flying it at. Candidates come in the same "
+                        "preference order the search uses and are validated along the "
+                        "whole leg rather than at its ends, the tip being part of the "
+                        "machine that has to fit; the route itself is never re-planned or "
+                        "re-refined. Costs one validation and one scoring of an "
+                        "already-reduced leg per opening. 0 leaves each leg at the "
+                        "opening it was found at (default: %(default)g)")
     #FALLBACK POSES
     #HOW FAR A FALLBACK POSE STAYS OFF THE PARTS
     p.add_argument("--fallback-distance-mm", type=float, default=100.0, metavar="MM",
@@ -914,7 +949,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     from weldpath import cell as cell_mod
     from weldpath import manifest as manifest_mod
     from weldpath import output as output_mod
-    from weldpath.penalty import ClearancePenalty, SteppedPenalty
+    from weldpath.penalty import ClearancePenalty, GunPreference, SteppedPenalty
     from weldpath import profile as profile_mod
     from weldpath.cartesian import CartesianBudget
     from weldpath.planning import OmplBudget, Relocation
@@ -966,6 +1001,13 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.extra_gun_openings < 0:
         print("error: --extra-gun-openings cannot be negative", file=sys.stderr)
         return 2
+    if args.gun_opening_weight < 1.0:
+        print("error: --gun-opening-weight must be at least 1: below 1 it would pay a "
+              "route to hold the gun open", file=sys.stderr)
+        return 2
+    if args.retune_gun_openings < 0:
+        print("error: --retune-gun-openings cannot be negative", file=sys.stderr)
+        return 2
     if args.phase_two_cartesian_runs < 0:
         print("error: --phase-two-cartesian-runs cannot be negative", file=sys.stderr)
         return 2
@@ -1008,6 +1050,8 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         print(f"error: {exc}", file=sys.stderr)
         return 2
     log(penalty.describe())
+    gun = GunPreference(args.gun_opening_weight)
+    log(gun.describe())
 
     def by_category(option: str) -> dict[str, float | None]:
         """``--<category>-<option>`` for every hull category, e.g. ``--gun-cell-mm``."""
@@ -1088,6 +1132,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         main_openings=args.min_gun_openings,
         extra_openings=args.extra_gun_openings,
         opening_round_mm=args.gun_opening_round_mm,
+        gun=gun, retune_openings=args.retune_gun_openings,
         relocate=Relocation(min_attempts=args.polish_min_attempts,
                             min_mm=args.relocate_min_mm, max_mm=args.relocate_max_mm,
                             exponent=args.relocate_exponent),

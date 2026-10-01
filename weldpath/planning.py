@@ -59,12 +59,24 @@ class MotionModel:
 
     With no zone in force every move is ``PTP`` and every method here reduces to the plain
     joint-space one it wraps, so the un-zoned path through the planner is unchanged.
+
+    ``pinned`` is the one exception to the derivation, for the one caller that is not
+    deciding profiles but reading them: ``_retune_opening`` holds a leg whose runs have
+    already been split, and their profiles are what ``_plan_pair`` will emit and what the
+    controller will execute.  Deriving there would re-ask a settled question of a cell the
+    gun has been moved in -- ``near`` measures a clearance the tip is part of, so the same
+    state reads differently at a different opening -- and price a leg the robot will not
+    fly.  Pinned, every method here follows the profile the run really carries, which is
+    the same property the class has unpinned: one derivation point, and everything else
+    reading it.
     """
 
-    def __init__(self, cell: Cell, *, max_step: float, zone: "LinearZone | None" = None):
+    def __init__(self, cell: Cell, *, max_step: float, zone: "LinearZone | None" = None,
+                 pinned: str | None = None):
         self.cell = cell
         self.max_step = max_step
         self.zone = zone if (zone is not None and zone.enabled) else None
+        self.pinned = pinned
         # One clearance query per distinct state: the query loads a joint state into the
         # environment, which costs far more than everything else these passes do.
         self._near: dict[bytes, bool] = {}
@@ -108,6 +120,8 @@ class MotionModel:
         return hit
 
     def motion(self, a: np.ndarray, b: np.ndarray) -> str:
+        if self.pinned is not None:
+            return self.pinned
         return LIN if (self.near(a) or self.near(b)) else PTP
 
     def demotes(self, a: np.ndarray, b: np.ndarray, replaced) -> bool:
@@ -311,7 +325,15 @@ class MotionModel:
 
     # -- what it costs ------------------------------------------------------
     def _crosses(self, a: np.ndarray, b: np.ndarray) -> bool:
-        """Whether this move reaches into the band from outside it, or back out."""
+        """Whether this move reaches into the band from outside it, or back out.
+
+        Never, when the profile is pinned.  How many times a route enters the band is a
+        property of the split that produced these runs, and a pinned model is reading that
+        split rather than re-deciding it -- asking the band again would count the crossings
+        of a route with different profiles from the one in hand.
+        """
+        if self.pinned is not None:
+            return False
         return self.zone is not None and self.near(a) != self.near(b)
 
     def crossing_penalty(self, a: np.ndarray, b: np.ndarray) -> float:
@@ -1204,8 +1226,26 @@ def _scored_points(cell: Cell, model: "MotionModel", path: list[np.ndarray],
     return dense, [dense[0], *_thin(dense[0], dense[1:-1], dense[-1], step), dense[-1]]
 
 
+def _gun_factor(cell: Cell, gun: "GunPreference | None",
+                opening: float | None) -> float:
+    """``gun``'s multiplier for one opening, or 1 where there is no preference to apply.
+
+    Every comparison this appears in is between routes at **different** openings, which is
+    the only place it can change an answer.  Wherever the opening is held fixed -- inside
+    ``_finish``, and so in shortcut, simplify and polish -- the factor is the same constant
+    on both sides of every comparison and cancels exactly, which is why it is not threaded
+    into ``MotionModel`` and why those passes are untouched.
+    """
+    if gun is None or opening is None:
+        return 1.0
+    return gun.factor(opening, cell.man.gun_opening_max)
+
+
 def _path_cost(cell: Cell, path: list[np.ndarray], max_step: float,
-               *, zone: "LinearZone | None" = None) -> tuple[float, float]:
+               *, zone: "LinearZone | None" = None,
+               pinned: str | None = None,
+               gun: "GunPreference | None" = None,
+               opening: float | None = None) -> tuple[float, float]:
     """Penalised stop-to-stop time for a whole path, and its plain time.
 
     Scored through the same ``MotionModel`` the refinement passes are scored through, so a
@@ -1235,6 +1275,19 @@ def _path_cost(cell: Cell, path: list[np.ndarray], max_step: float,
     each waypoint costs one clearance query rather than two; they reach only the joint
     moves, a linear one being priced off the stations along its line.
 
+    ``pinned`` prices every move of ``path`` under one profile instead of deriving it
+    from the band -- see ``MotionModel``.  For a caller scoring a *candidate*, deriving is
+    right: no split has happened yet and the band is what will decide.  For one scoring a
+    leg whose runs are already split it is wrong, and ``_retune_opening`` pins.
+
+    ``gun`` and ``opening`` add the gun's own weight, a flat multiplier on the whole
+    penalised figure for the opening the route is to be flown at -- see
+    :class:`weldpath.penalty.GunPreference`.  It is applied to the whole of that figure
+    rather than to the part of it the clearance penalty added, because a transit that runs
+    nowhere near the panels has no clearance penalty to scale: scaling nothing would make
+    the widest opening free exactly where nothing else objects to it either, which is the
+    case the preference exists for.  The plain figure is left alone, being real seconds.
+
     A move whose line will not price is charged as a joint move instead of costing
     infinity.  ``MotionModel.cost`` answers infinity because a pass must never *install* a
     move it cannot price, but ranking installs nothing, and a candidate dropped here is
@@ -1246,7 +1299,7 @@ def _path_cost(cell: Cell, path: list[np.ndarray], max_step: float,
     """
     if len(path) < 2:
         return 0.0, 0.0
-    model = MotionModel(cell, max_step=max_step, zone=zone)
+    model = MotionModel(cell, max_step=max_step, zone=zone, pinned=pinned)
     moves, stops = _scored_points(cell, model, path, max_step)
     if len(moves) < 2:
         return 0.0, 0.0
@@ -1267,7 +1320,7 @@ def _path_cost(cell: Cell, path: list[np.ndarray], max_step: float,
         prev_f = next_f
     ramps = sum(cell.move_time(a, b) - cell.cruise_time(a, b)
                 for a, b in zip(stops, stops[1:]))
-    return total + ramps, plain + ramps
+    return (total + ramps) * _gun_factor(cell, gun, opening), plain + ramps
 
 
 def _make_program(cell: Cell, qa: np.ndarray, qb: np.ndarray) -> cl.CompositeInstruction:
@@ -1540,52 +1593,137 @@ def _capture(record: list | None, path: list[np.ndarray]) -> list[np.ndarray]:
     return path
 
 
-def _plan_via(cell: Cell, qa: np.ndarray, via: np.ndarray, qb: np.ndarray, *,
-              ompl: OmplBudget, segment_length: float, check_step: float,
-              continuous_check: bool = False,
-              shortcut_seconds: float, polish_seconds: float,
-              zone: LinearZone | None = None,
-              direct_clearance: float = 0.0,
-              openings: "GunOpenings | None" = None,
-              deadline: "Deadline | None" = None,
-              relocate: "Relocation | None" = None, log=print,
-              record: list | None = None) -> list[Run]:
-    """A route from ``qa`` to ``qb`` by way of ``via``, all at the one gun opening.
+def _silent(*_args, **_kwargs) -> None:
+    """A log that says nothing, for a screening step whose lines belong to another pass."""
 
-    Routing through a fallback pose is what a robot programmer would do by hand -- it turns
-    a long detour around the panels into two easy problems -- but it costs two full solves
-    rather than one, which is why it is not reached until directness has been given up on
-    at every opening.
 
-    One opening for the whole leg, and therefore no rotation.  The gun does not change
-    partway through a move and these two halves are one leg of the output, so the caller
-    walks the openings one at a time and ``openings`` holds that single value in both
-    lists.  Each phase then spends its own runs on it, which is what every opening got
-    before the rotation existed.
+def _retune_opening(cell: Cell, runs: list[Run], opening: float | None, *,
+                    named: list[float] | None, count: int, round_mm: float,
+                    zone: "LinearZone | None", check_step: float,
+                    gun: "GunPreference | None",
+                    deadline: "Deadline | None" = None,
+                    log=print) -> tuple[list[Run], float | None]:
+    """The finished leg's gun opening re-chosen over the route it has, route unchanged.
+
+    Everything upstream picks an opening in order to **find** a route.  The phases search
+    at several and the cheapest answer ships whichever one it came from; the straight move
+    is taken at the first opening that clears it and is never scored against any other at
+    all.  Either way the opening is decided by what it did for the search, and the search
+    is over.  The opening is still free -- the route is a list of robot joint vectors and
+    the gun is not one of them -- and until now nothing has asked which of the openings
+    that fly it is the one worth flying it at.
+
+    So this asks, last, after every other pass has had the route.  The route is held and
+    the gun is walked through the same preference order the search walks -- the transit's
+    own two openings, then closed, widest, half open, then bisections, by way of
+    ``_opening_lists``, so this is the same list the search would have been given.  Each
+    candidate is then **validated along the whole leg** and priced through ``_path_cost``,
+    the gun's own weight included.
+
+    Validating the whole leg and not just its ends is the point of doing this here rather
+    than in the list: the tip is 200 mm of swing and part of the machine that has to fit,
+    so an opening both endpoints are clear at can still put the electrode through a
+    fixture halfway along.  Upstream that is a route the search would simply have failed to
+    find; here there is a route in hand and the only question is whether it survives the
+    gun being moved under it.
+
+    The incumbent is scored on the same terms and kept on a tie, so the leg changes hands
+    only where a different opening is strictly cheaper.  ``count`` is how many further
+    openings are offered, screened at the endpoints as the search screens them; a
+    candidate that then fails the full validation is dropped and nothing is offered in its
+    place, the expensive half of the test being the one being bounded.
+
+    The route is **not** re-refined at the winning opening.  Shortcut, simplify and polish
+    ran with the gun where the route was found, and running them again here would be a
+    fresh search rather than a reading of the one already done -- and would leave the leg
+    costing something other than what was ranked.
+
+    Both halves of the test read the leg under the profiles it will really be flown
+    under, run by run, ``_path_cost`` being pinned to each run's own.  Deriving them from
+    the band instead -- which is right for a candidate, no split having happened yet --
+    would be wrong here twice over.  The split is settled: ``_plan_pair`` emits
+    ``run.motion`` and the controller executes it, so a derived profile prices a leg that
+    will not be flown.  And the band moves with the gun, ``_reads_near`` measuring a
+    clearance the tip is part of, so the same state reads differently at a different
+    opening: the derivation would make the *profiles* a function of the opening and feed
+    that back into the comparison as though it were a real difference between them.
+
+    That is the shape of the whole pass.  The route is fixed, so travel, ramps, the tool
+    speed cap and the crossing count are the same at every opening and cancel in the
+    comparison; what genuinely varies is the clearance penalty, which reads the tip where
+    the gun has put it, and the gun's own weight.  Anything else that varies with the
+    opening is an artefact, which is what the pin removes.
+
+    The cost is therefore internal to this pass.  Priced per run, it charges a stop at
+    each run boundary -- which is what the robot does there, the boundary being a phase
+    boundary -- where a candidate's cost is taken over its whole route at once, so the two
+    numbers are not comparable and nothing compares them.
     """
-    halves: list[list[np.ndarray]] = []
-    # Planned without a linear zone: the two legs are joined below and the whole route is
-    # split afterwards, so splitting each half here would put a phase boundary at the
-    # fallback pose whether the geometry called for one or not.
-    first, _ = _plan_direct(cell, qa, via, ompl=ompl, segment_length=segment_length,
-                            check_step=check_step, continuous_check=continuous_check,
-                            shortcut_seconds=0.0, polish_seconds=0.0,
-                            direct_clearance=direct_clearance,
-                            openings=openings, deadline=deadline, log=log, record=halves)
-    second, _ = _plan_direct(cell, via, qb, ompl=ompl, segment_length=segment_length,
-                             check_step=check_step, continuous_check=continuous_check,
-                             shortcut_seconds=0.0, polish_seconds=0.0,
-                             direct_clearance=direct_clearance,
-                             openings=openings, deadline=deadline, log=log,
-                             record=halves)
-    if len(halves) == 2:
-        _capture(record, halves[0] + halves[1][1:])
-    # Refine the joined route rather than each leg: the detour through the fallback
-    # pose is exactly the kind of corner these passes exist to cut.
-    joined = first[0].states + second[0].states[1:]
-    return _finish(cell, joined, zone=zone, relocate=relocate,
-                   shortcut_seconds=shortcut_seconds,
-                   polish_seconds=polish_seconds, check_step=check_step, log=log)
+    if opening is None or count < 1 or not runs or not cell.gun_joint_name:
+        return runs, opening
+    widest = float(cell.man.gun_opening_max)
+    states = [q for run in runs for q in run.states]
+    if widest <= 0.0 or len(states) < 2:
+        return runs, opening
+    if deadline is not None and deadline.expired:
+        # There is already a valid answer; this pass only improves it.  Skipped rather
+        # than clamped because it has no budget of its own to cut -- what it costs is one
+        # validation and one scoring per opening, and half of them would prove nothing.
+        log(f"      keeping the gun at {opening:g} mm: the segment clock has run out")
+        return runs, opening
+
+    def price(value: float) -> float | None:
+        """This exact leg flown at ``value``: its cost, or ``None`` where it will not fly.
+
+        Checked and priced run by run under that run's own profile, which is what
+        ``_plan_pair`` will check it under and what ``_verify_runs`` checked it under at
+        the opening it was found at.  A linear run is followed along the tool's line, so
+        an opening that moves the tip into something is caught on the curve the robot
+        really takes rather than on a joint chord it does not.
+        """
+        total = 0.0
+        with cell.gun_opening(value):
+            for run in runs:
+                if validate(cell, run.states, max_step=check_step,
+                            motion=run.motion, zone=zone) is not None:
+                    return None
+                total += _path_cost(cell, run.states, check_step, zone=zone,
+                                    pinned=run.motion, gun=gun, opening=value)[0]
+        return total
+
+    t0 = time.time()
+    was = price(opening)
+    if was is None:
+        # The leg was validated at this opening as it was built, so this should not
+        # happen.  If it somehow does, the route is faulty and swapping its opening would
+        # only move the fault somewhere _plan_pair's own check reports it less clearly.
+        log(f"      keeping the gun at {opening:g} mm: the finished leg does not "
+            f"validate at the opening it was planned at")
+        return runs, opening
+
+    ends = [("start", states[0]), ("goal", states[-1])]
+    best, best_cost, scored = opening, was, 1
+    for value in _opening_lists(cell, named, ends, main_count=count, extra_count=0,
+                                round_mm=round_mm, log=_silent).main:
+        if abs(value - opening) < OPENING_TOL_MM:
+            continue                        # the incumbent, already scored as the baseline
+        if deadline is not None and deadline.expired:
+            break
+        cost = price(value)
+        if cost is None:
+            continue
+        scored += 1
+        if cost < best_cost:
+            best, best_cost = value, cost
+    dt = time.time() - t0
+    note = f"{scored} opening{'' if scored == 1 else 's'} in {dt:.1f}s"
+    if abs(best - opening) < OPENING_TOL_MM:
+        log(f"      keeping the gun at {opening:g} mm for this leg: nothing cheaper over "
+            f"{note}")
+        return runs, opening
+    log(f"      flying this leg at {best:g} mm rather than the {opening:g} mm it was "
+        f"planned at: cost {best_cost:.2f} s against {was:.2f} s, over {note}")
+    return runs, best
 
 
 def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
@@ -1598,6 +1736,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    openings: list[float] | None = None,
                    main_openings: int = 5, extra_openings: int = 0,
                    opening_round_mm: float = 0.0,
+                   gun: "GunPreference | None" = None,
+                   retune_openings: int = 0,
                    zone: LinearZone | None = None,
                    direct_clearance: float = 0.0,
                    cartesian: "CartesianBudget | None" = None,
@@ -1622,9 +1762,14 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     **The direct transit picks its own opening**, which is why it is one call here rather
     than one per opening.  Phase one deals its runs round the main list and keeps the
     cheapest solution of the whole set, so the choice between openings is made on what
-    each one produced rather than on the order they were offered in.  Everything after it
-    fixes one opening per attempt instead, because a route through a fallback pose and
-    either half of a two-leg split are legs whose parts have to agree on one gun state.
+    each one produced rather than on the order they were offered in.
+
+    **A detour commits to its pose and to the half that reached it**, and then asks the gun
+    question of the second half alone -- one opening per attempt, since a half is one leg
+    or part of one and the gun does not change partway through a move.  Reaching the pose
+    is what settles it: that half is never re-solved, no further pose is tried, and the two
+    halves are free to disagree about the gun, in which case they ship as two legs changing
+    over at the pose.  They agree far more often than not, and that is one leg.
 
     ``record``, if given, is extended with each leg's route as the sampling planner
     returned it, one entry per returned leg and in the same order.  Failed attempts leave
@@ -1646,10 +1791,32 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     own -- see :mod:`weldpath.fallback` -- and most transits solve directly and never need
     one.  It is called at most once, and only after the direct transit has failed at every
     opening, so a transit that solves pays nothing for the search it did not use.
+
+    ``gun`` weights the opening itself in every score, and ``retune_openings`` is how many
+    further openings each finished leg is re-priced at before it is returned -- see
+    ``_retune_opening``.  Every leg goes through it, however it was found, because every
+    leg is one route at one opening by the time it gets here.
     """
     ompl = ompl or OmplBudget()
     reduced = ompl.capped(fallback_runs)
     deadline = deadline or Deadline()
+
+    def tuned(legs: list) -> list:
+        """Every leg's opening re-chosen over its finished route.  See ``_retune_opening``.
+
+        Applied per leg and not per transit, a leg being the unit that has one opening.
+        Where a transit is split in two the halves are retuned independently, which is
+        sound because they meet at a pose the robot is stationary at: the gun changes
+        there whatever the two openings turn out to be, and a split whose halves retune
+        onto the same opening is simply a phase boundary with nothing happening at it.
+        """
+        if retune_openings < 1:
+            return legs
+        return [_retune_opening(cell, runs, opening, named=openings,
+                                count=retune_openings, round_mm=opening_round_mm,
+                                zone=zone, check_step=check_step, gun=gun,
+                                deadline=deadline, log=log)
+                for runs, opening in legs]
 
     def gave_up(exc: PlanningError) -> PlanningError:
         """The failure to report, naming the clock where that is what stopped it.
@@ -1684,11 +1851,12 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                      polish_seconds=polish_seconds,
                                      zone=zone, direct_clearance=direct_clearance,
                                      cartesian=cartesian, relocate=relocate,
-                                     openings=direct, deadline=deadline, log=log,
+                                     openings=direct, gun=gun,
+                                     deadline=deadline, log=log,
                                      record=raw)
         if record is not None:
             record.extend(raw)
-        return [(runs, opening)]
+        return tuned([(runs, opening)])
     except PlanningError as exc:
         log(f"      no direct route over {_openings_note(direct.all)}: {exc}")
         last = exc
@@ -1699,107 +1867,143 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     if not poses:
         raise last
 
-    # Through a fallback pose, one opening at a time.  Directness is still the outer
-    # question -- a detour costs two full solves against one, so it is not started
-    # anywhere until the cheap answer has been exhausted everywhere -- but the gun is no
-    # longer the inner question for the transit itself, only for these.
-    walked: dict[int, GunOpenings] = {}
+    # Through a fallback pose, and the first half of one commits the detour.  Directness
+    # is still the outer question -- a detour costs two full solves against one, so none of
+    # this is started until the cheap answer has been exhausted everywhere -- but once
+    # ``qa -> via`` is in hand the pose is settled and that half is never solved again.
+    #
+    # What is left to decide is the gun, and it is decided on the second half alone, that
+    # being the only part still looking for a route.  The old order asked it the other way
+    # round: it pinned one opening, solved *both* halves at it, and on failure moved to the
+    # next opening and solved the first half over again -- then did the whole of that again
+    # at the next pose, and a third time in a split tier that re-solved both halves per
+    # ordered pair of openings.  A transit whose second half was the hard one paid for the
+    # easy half once per opening per pose, and nearly all of the worst case was those
+    # repeats.
+    #
+    # What committing costs is coverage: a second half that reaches at no opening now ends
+    # the transit, where before it fell through to the next pose.  That is the trade --
+    # the repeats were buying a second chance at a route whose first half had already been
+    # found, and charging for it on every transit that took the detour at all.
     for v, via in enumerate(poses, 1):
         log(f"      retrying via fallback pose {v}/{len(poses)}")
-        walked[v] = lists(("start", qa), ("fallback", via), ("goal", qb))
-        for opening in walked[v].all:
+        options = lists(("start", qa), ("fallback", via), ("goal", qb)).all
+        if options and options[0] is None:
+            # A cell with no gun joint: ``pinned(None)`` holds that None in both lists, so
+            # ``all`` offers the same nothing twice.  There is one thing to try here.
+            options = [None]
+        lead = lead_open = None
+        raw_lead: list = []
+        for opening in options:
             if deadline.ran_out(log, f"this segment at fallback pose {v}/{len(poses)}"):
                 raise gave_up(last)
-            log(f"      retrying{_gun_note(opening)}{_effort_note(reduced, ompl)}")
-            through: list = []
+            log(f"      reaching fallback pose {v}/{len(poses)}{_gun_note(opening)}"
+                f"{_effort_note(reduced, ompl)}")
+            attempt: list = []
             try:
                 with cell.gun_opening(opening):
-                    runs = _plan_via(cell, qa, via, qb, ompl=reduced,
-                                     direct_clearance=direct_clearance,
-                                     segment_length=segment_length,
-                                     check_step=check_step,
-                                     continuous_check=continuous_check,
-                                     shortcut_seconds=shortcut_seconds,
-                                     polish_seconds=polish_seconds, zone=zone,
-                                     openings=GunOpenings.pinned(opening),
-                                     deadline=deadline, relocate=relocate, log=log,
-                                     record=through)
+                    runs, _ = _plan_direct(cell, qa, via, ompl=reduced,
+                                           segment_length=segment_length,
+                                           check_step=check_step,
+                                           continuous_check=continuous_check,
+                                           shortcut_seconds=0.0, polish_seconds=0.0,
+                                           zone=zone, cartesian=cartesian,
+                                           direct_clearance=direct_clearance,
+                                           relocate=relocate,
+                                           openings=GunOpenings.pinned(opening),
+                                           gun=gun, deadline=deadline, log=log,
+                                           record=attempt)
             except PlanningError as exc:
-                log(f"      no route{_gun_note(opening)}: {exc}")
+                log(f"      no route to fallback pose {v}/{len(poses)}"
+                    f"{_gun_note(opening)}: {exc}")
                 last = exc
                 continue
-            if record is not None:
-                record.extend(through)
-            return [(runs, opening)]
+            lead, lead_open, raw_lead = runs, opening, attempt
+            break
+        if lead is None:
+            # Never reached at any opening, so nothing was committed to and the next pose
+            # is still open.  Only a pose actually *reached* closes the others off.
+            continue
 
-    # No single opening reaches: split the move and change the gun partway, at a pose the
-    # robot is already passing through and stationary at.
-    for i, mid in enumerate(poses, 1):
-        options = walked[i].all
-        if len(options) < 2:
-            # A split that does not change the gun is the single-opening route that has
-            # already failed, and the halves cost two solves to establish it again.
-            continue
-        if cell.in_stop_band(mid):
+        # The gun is the only question left.  ``lead_open`` leads: a second half that flies
+        # at it is one leg with no gun change anywhere in it, which is both the cheaper
+        # answer and the one the old order looked for first.
+        others = ([] if lead_open is None else
+                  [o for o in options if abs(o - lead_open) >= OPENING_TOL_MM])
+        order = [lead_open] + others
+        if cell.in_stop_band(via):
             # The robot stands still here while the gun changes, and nothing downstream
-            # moves an endpoint.
-            log(f"      fallback pose {i}/{len(poses)} holds joint 5 inside the "
-                f"stop band; not changing the gun there")
-            continue
-        for first_open in options:
-            if deadline.ran_out(log, "this segment before splitting it in two"):
+            # moves an endpoint, so the gun cannot change at this pose at all: the one
+            # opening on offer for the way out is the one the way in is flown at.
+            log(f"      fallback pose {v}/{len(poses)} holds joint 5 inside the stop "
+                f"band; not changing the gun there")
+            order = [lead_open]
+        for tail_open in order:
+            if deadline.ran_out(log, f"this segment on the way out of fallback pose "
+                                     f"{v}/{len(poses)}"):
                 raise gave_up(last)
-            raw_first: list = []
+            log(f"      leaving fallback pose {v}/{len(poses)}{_gun_note(tail_open)}")
+            raw_tail: list = []
             try:
-                with cell.gun_opening(first_open):
-                    first, _ = _plan_direct(cell, qa, mid, ompl=reduced,
-                                            segment_length=segment_length,
-                                            check_step=check_step,
-                                            continuous_check=continuous_check,
-                                            shortcut_seconds=0.0, polish_seconds=0.0,
-                                            zone=zone, cartesian=cartesian,
-                                            direct_clearance=direct_clearance,
-                                            relocate=relocate,
-                                            openings=GunOpenings.pinned(first_open),
-                                            deadline=deadline, log=log,
-                                            record=raw_first)
-            except PlanningError:
+                with cell.gun_opening(tail_open):
+                    tail, _ = _plan_direct(cell, via, qb, ompl=reduced,
+                                           segment_length=segment_length,
+                                           check_step=check_step,
+                                           continuous_check=continuous_check,
+                                           shortcut_seconds=0.0, polish_seconds=0.0,
+                                           zone=zone, cartesian=cartesian,
+                                           direct_clearance=direct_clearance,
+                                           relocate=relocate,
+                                           openings=GunOpenings.pinned(tail_open),
+                                           gun=gun, deadline=deadline, log=log,
+                                           record=raw_tail)
+            except PlanningError as exc:
+                log(f"      no route on from fallback pose {v}/{len(poses)}"
+                    f"{_gun_note(tail_open)}: {exc}")
+                last = exc
                 continue
-            for second_open in options:
-                if abs(second_open - first_open) < OPENING_TOL_MM:
-                    continue                    # already ruled out as a single opening
-                raw_second: list = []
-                try:
-                    with cell.gun_opening(second_open):
-                        second, _ = _plan_direct(cell, mid, qb, ompl=reduced,
-                                                 segment_length=segment_length,
-                                                 check_step=check_step,
-                                                 continuous_check=continuous_check,
-                                                 shortcut_seconds=0.0, polish_seconds=0.0,
-                                                 zone=zone, cartesian=cartesian,
-                                                 direct_clearance=direct_clearance,
-                                                 relocate=relocate,
-                                                 openings=GunOpenings.pinned(second_open),
-                                                 deadline=deadline, log=log,
-                                                 record=raw_second)
-                except PlanningError:
-                    continue
-                if record is not None:
-                    record.extend(raw_first + raw_second)
-                log(f"      no single gun opening reaches; changing from "
-                    f"{first_open:g} mm to {second_open:g} mm at fallback pose "
-                    f"{i}/{len(poses)}")
-                with cell.gun_opening(first_open):
-                    first = _refine_runs(cell, first, zone=zone, relocate=relocate,
-                                         shortcut_seconds=shortcut_seconds,
-                                         polish_seconds=polish_seconds,
-                                         check_step=check_step, log=log)
-                with cell.gun_opening(second_open):
-                    second = _refine_runs(cell, second, zone=zone, relocate=relocate,
-                                          shortcut_seconds=shortcut_seconds,
-                                          polish_seconds=polish_seconds,
-                                          check_step=check_step, log=log)
-                return [(first, first_open), (second, second_open)]
+
+            if lead_open is None or abs(tail_open - lead_open) < OPENING_TOL_MM:
+                # One gun state throughout, so one leg.  Joined and refined whole rather
+                # than half by half: the detour through the pose is exactly the kind of
+                # corner these passes exist to cut, and the split that follows is a reading
+                # of the finished route, so a phase boundary lands at the pose only where
+                # the geometry puts one there.
+                if raw_lead and raw_tail:
+                    _capture(record, raw_lead[0] + raw_tail[0][1:])
+                joined = _flatten(lead) + _flatten(tail)[1:]
+                with cell.gun_opening(lead_open):
+                    whole = _finish(cell, joined, zone=zone, relocate=relocate,
+                                    shortcut_seconds=shortcut_seconds,
+                                    polish_seconds=polish_seconds,
+                                    check_step=check_step, log=log)
+                return tuned([(whole, lead_open)])
+
+            if record is not None:
+                record.extend(raw_lead + raw_tail)
+            log(f"      no single gun opening reaches; changing from {lead_open:g} mm to "
+                f"{tail_open:g} mm at fallback pose {v}/{len(poses)}")
+            # Each half refined with its own opening in force: every question these passes
+            # ask is a question about a cell with the tip in a particular place.
+            with cell.gun_opening(lead_open):
+                first = _refine_runs(cell, lead, zone=zone, relocate=relocate,
+                                     shortcut_seconds=shortcut_seconds,
+                                     polish_seconds=polish_seconds,
+                                     check_step=check_step, log=log)
+            with cell.gun_opening(tail_open):
+                second = _refine_runs(cell, tail, zone=zone, relocate=relocate,
+                                      shortcut_seconds=shortcut_seconds,
+                                      polish_seconds=polish_seconds,
+                                      check_step=check_step, log=log)
+            return tuned([(first, lead_open), (second, tail_open)])
+
+        # The pose is committed and the way out of it has been tried at every opening it
+        # could be flown at.  Going on to another pose would discard a first half already
+        # in hand and solve it again, which is the repeat this ordering exists to remove.
+        raise gave_up(PlanningError(
+            f"reached fallback pose {v}/{len(poses)}{_gun_note(lead_open)} but no gun "
+            f"opening carries the route on from it; the last failure was: {last}"))
+
     raise gave_up(last or PlanningError("freespace transit failed at every gun opening"))
 
 
@@ -2141,6 +2345,9 @@ class _Sampler:
     # is searched for.  See _path_cost.
     zone: "LinearZone | None" = None
     openings: GunOpenings = field(default_factory=lambda: GunOpenings.pinned(None))
+    # For scoring only as well, and for the same reason: the gun's weight decides between
+    # routes found at different openings, and nothing searches differently because of it.
+    gun: "GunPreference | None" = None
     deadline: Deadline = field(default_factory=Deadline)
     continuous_check: bool = False
     log: object = print
@@ -2266,7 +2473,8 @@ class _Sampler:
                                 f"own check ({fault})")
                 self.log(f"      {label}{note}: {self.message} ({dt:.1f}s)")
                 return None
-            cost, plain = _path_cost(self.cell, raw, self.check_step, zone=self.zone)
+            cost, plain = _path_cost(self.cell, raw, self.check_step, zone=self.zone,
+                                     gun=self.gun, opening=opening)
         self.log(f"      {label}{note}: solved in {dt:.1f}s ({len(raw)} raw points, "
                  f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
         return _Solution(cost, plain, raw, opening)
@@ -2281,6 +2489,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
                  cartesian: "CartesianBudget | None" = None,
                  relocate: "Relocation | None" = None,
                  openings: "GunOpenings | None" = None,
+                 gun: "GunPreference | None" = None,
                  deadline: "Deadline | None" = None, log=print,
                  record: list | None = None) -> tuple[list[Run], float | None]:
     """A route from ``qa`` to ``qb``, and the gun opening it is to be flown at.
@@ -2293,6 +2502,11 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     ``direct_clearance`` is how much air the straight move has to keep, in mm, before it
     is taken in preference to searching for one.  0 asks nothing of it beyond the
     collision check.
+
+    ``gun`` is the weight on the opening itself, which enters every candidate's score --
+    see ``_path_cost``.  It reaches the searched routes and not the straight move, which
+    is taken at the first opening that clears it rather than being scored against
+    anything; ``plan_freespace``'s retune is where that choice is revisited.
     """
     openings = openings or GunOpenings.pinned(None)
     deadline = deadline or Deadline()
@@ -2361,7 +2575,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     # only stage that can make that choice at all -- and since the runs are being spent
     # anyway, dealing them round the openings makes the same choice over a wider set.
     sampler = _Sampler(cell=cell, ompl=ompl, segment_length=segment_length,
-                       check_step=check_step, zone=zone, openings=openings,
+                       check_step=check_step, zone=zone, openings=openings, gun=gun,
                        deadline=deadline, continuous_check=continuous_check, log=log)
     candidates = sampler.phase_one(qa, qb)
 
@@ -2392,7 +2606,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         # Still gated on the zone, because a route made of straight moves only earns its
         # cost where linear motion was wanted in the first place.
         found = _cartesian_solutions(cell, qa, qb, tree, check_step, openings.main, log,
-                                     deadline=deadline, zone=zone)
+                                     deadline=deadline, zone=zone, gun=gun)
         if found:
             # The best of the set is the only one recut: the recut runs the sampling
             # phases on every stretch outside the band, far too dear to spend on routes
@@ -2402,7 +2616,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
             best = _cheapest(found, log)
             if tree.recut:
                 best = _recut_solution(cell, best, zone=zone, sampler=sampler,
-                                       check_step=check_step, log=log)
+                                       check_step=check_step, gun=gun, log=log)
             candidates.append(best)
 
     if not candidates:
@@ -2417,10 +2631,10 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
                                        seed=tree.seed + PHASE_TWO_SEED_OFFSET + run,
                                        opening=opening, check_step=check_step,
                                        label=f"phase 2 cartesian run {run}", log=log,
-                                       zone=zone)
+                                       zone=zone, gun=gun)
                 if got is not None and tree.recut:
                     got = _recut_solution(cell, got, zone=zone, sampler=sampler,
-                                          check_step=check_step, log=log)
+                                          check_step=check_step, gun=gun, log=log)
                 return got
         candidates = sampler.phase_two(
             qa, qb, cartesian_runs=tree.phase_two_runs if tree_run is not None else 0,
@@ -2452,7 +2666,8 @@ PHASE_TWO_SEED_OFFSET = 1000
 def _cartesian_route(cell: Cell, qa: np.ndarray, qb: np.ndarray, budget: "CartesianBudget",
                      *, seconds: float, seed: int, opening: float | None,
                      check_step: float, label: str, log,
-                     zone: "LinearZone | None" = None) -> _Solution | None:
+                     zone: "LinearZone | None" = None,
+                     gun: "GunPreference | None" = None) -> _Solution | None:
     """One Cartesian search at one gun opening, scored as phase one scores its own.
 
     The gun is not a detail of the check here but part of the shape being steered around:
@@ -2470,14 +2685,16 @@ def _cartesian_route(cell: Cell, qa: np.ndarray, qb: np.ndarray, budget: "Cartes
         except PlanningError as exc:
             log(f"      {exc} ({label}{_gun_note(opening)}, {time.time() - t0:.1f}s)")
             return None
-        cost, plain = _path_cost(cell, route, check_step, zone=zone)
+        cost, plain = _path_cost(cell, route, check_step, zone=zone,
+                                 gun=gun, opening=opening)
     log(f"      {label}{_gun_note(opening)}: solved in {time.time() - t0:.1f}s "
         f"({len(route)} points, cost {cost:.2f} s against {plain:.2f} s unpenalised)")
     return _Solution(cost, plain, route, opening, STEERED)
 
 
 def _recut_solution(cell: Cell, best: _Solution, *, zone: "LinearZone",
-                    sampler: _Sampler, check_step: float, log) -> _Solution:
+                    sampler: _Sampler, check_step: float, log,
+                    gun: "GunPreference | None" = None) -> _Solution:
     """``best`` with its out-of-band stretches replanned, or ``best`` where none were.
 
     Held at the route's own opening throughout.  Every question the recut asks -- which
@@ -2490,7 +2707,8 @@ def _recut_solution(cell: Cell, best: _Solution, *, zone: "LinearZone",
                                     check_step=check_step, opening=best.opening, log=log)
         if route is best.route:
             return best
-        cost, plain = _path_cost(cell, route, check_step, zone=zone)
+        cost, plain = _path_cost(cell, route, check_step, zone=zone,
+                                 gun=gun, opening=best.opening)
     log(f"      cartesian tree after the recut: {len(route)} points, cost {cost:.2f} s "
         f"against {plain:.2f} s unpenalised")
     return _Solution(cost, plain, route, best.opening, best.source)
@@ -2500,7 +2718,8 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                          budget: "CartesianBudget", check_step: float,
                          rotation: list, log,
                          deadline: "Deadline | None" = None,
-                         zone: "LinearZone | None" = None) -> list[_Solution]:
+                         zone: "LinearZone | None" = None,
+                         gun: "GunPreference | None" = None) -> list[_Solution]:
     """Cartesian-tree routes for one transit, each scored as phase one scores its own.
 
     Searches run from successive seeds until one solves or ``budget.seconds`` has passed,
@@ -2534,7 +2753,7 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                 deadline.ran_out(log, f"the cartesian tree after {run} runs")
             return found
         run += 1
-        got = _cartesian_route(cell, qa, qb, budget, seconds=left, zone=zone,
+        got = _cartesian_route(cell, qa, qb, budget, seconds=left, zone=zone, gun=gun,
                                seed=budget.seed + run - 1,
                                opening=rotation[(run - 1) % len(rotation)],
                                check_step=check_step,
