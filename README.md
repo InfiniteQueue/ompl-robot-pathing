@@ -498,7 +498,7 @@ and they multiply: a transit that fails everywhere spends its phase-one runs at 
 opening, then the Cartesian searches, then phase two, then one detour's two halves over
 the openings its second half can be flown at.
 Each of those numbers is defensible on its own and their product is hours, on a segment
-that may simply have no route. `--segment-minutes` (120) is the figure that bounds it:
+that may simply have no route. `--segment-minutes` (60) is the figure that bounds it:
 past it nothing further is started, whatever routes are already in hand are still ranked,
 refined and shipped, and a segment with none is recorded with its reason and the run
 carries on to the next — which is what already happens to a segment that fails outright.
@@ -1207,7 +1207,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--cartesian-recut` | true | cut a Cartesian-tree route where it leaves the band and replan the parts outside it with phases one and two |
 | `--phase-two-max-runs` | 8 | further OMPL runs, stopping at the first solution |
 | `--phase-two-solve-seconds` | 45 | how long one of those runs may search |
-| `--segment-minutes` | 120 | wall clock for one segment's search; past it the segment is reported as failed and the run moves on. 0 removes the limit |
+| `--segment-minutes` | 60 | wall clock for one segment's search; past it the segment is reported as failed and the run moves on. 0 removes the limit |
 | `--direct-clearance-mm` | 0 | room the straight joint move has to keep to be taken without searching; under it the next gun opening is tried and then the searches. 0 asks nothing beyond the collision check |
 | `--phase-two-cartesian-runs` | 2 | Cartesian searches spread evenly through phase two, at its own gun openings |
 | `--phase-two-cartesian-seconds` | 30 | how long one of those searches may run |

@@ -141,7 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
 #endregion
     #region ###PATHFINDING###
     #WHEN TO GIVE UP ON ONE SEGMENT
-    p.add_argument("--segment-minutes", type=float, default=120.0, metavar="MINUTES",
+    p.add_argument("--segment-minutes", type=float, default=60.0, metavar="MINUTES",
                    help="how long the planner may spend searching for one segment's route "
                         "before giving up on it and moving to the next. Every other "
                         "budget here bounds a part of that search -- runs, seconds per "
@@ -153,7 +153,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "like any other and the run carries on. 0 removes the limit "
                         "(default: %(default)g)")
     #HOW MUCH AIR THE STRAIGHT MOVE HAS TO KEEP TO BE TAKEN WITHOUT SEARCHING
-    p.add_argument("--direct-clearance-mm", type=float, default=0.0, metavar="MM",
+    p.add_argument("--direct-clearance-mm", type=float, default=4.0, metavar="MM",
                    help="how close the straight joint move between two waypoints may come "
                         "to the parts and still be taken in preference to searching for a "
                         "route. The planner tries that move first at every gun opening "

@@ -229,7 +229,7 @@ the way, so the joint values in between are whatever that line demands.
     own factor arithmetic — `MotionModel.cost`, `simplify`'s `polyline_cost`, and both
     sides of `shortcut`'s comparison. Charged on the same footing everywhere or it would
     not cancel where it is supposed to.
-- `Deadline` is the wall clock for one segment, `--segment-minutes` (120). Every other
+- `Deadline` is the wall clock for one segment, `--segment-minutes` (60). Every other
   budget bounds a part of the search and they multiply -- runs x seconds x openings, plus
   one detour's two halves -- so this is the only figure that bounds a segment with no route.
   The product used to carry fallback poses and pairs of openings at each pose as factors of
