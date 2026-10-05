@@ -2681,6 +2681,7 @@ def _cartesian_route(cell: Cell, qa: np.ndarray, qb: np.ndarray, budget: "Cartes
         cell.set_state(qa)
         try:
             route = plan_cartesian(cell, qa, qb, max_step=check_step, log=log,
+                                   label=f"{label}{_gun_note(opening)}",
                                    budget=replace(budget, seconds=seconds, seed=seed))
         except PlanningError as exc:
             log(f"      {exc} ({label}{_gun_note(opening)}, {time.time() - t0:.1f}s)")

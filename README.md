@@ -492,6 +492,24 @@ a gun change is labelled per leg, under that leg's own opening. The final per-ph
 validation checks each phase under its label, and `output.Timing` holds `LIN` moves to the
 tool speed cap.
 
+**A segment that fails leaves something to look at.** Every budget above decides how hard
+to search; none of them says why a particular transit could not be solved, and the log can
+only say that OMPL returned no solution. So when a segment fails, `--treeview` writes the
+search into the export directory as a page that opens on a double click — no server, no
+install, nothing fetched. It shows the cell as the planner collided against it, the biggest
+pair of Cartesian trees the segment built, each node coloured by how much clearance the
+robot had there, and the robot itself — arm and gun — wherever a node is clicked.
+
+The two trees grow towards each other from the start and the goal, so what the picture is
+for is the gap between them: which one got how far, and where they stopped short of meeting.
+The geometry drawn is the convex decomposition the collision check actually used rather than
+the source meshes, because those differ — a viewer showing the pretty meshes would show the
+gun comfortably clear of something the planner was certain it had hit.
+
+It is written whatever the segment failed on. Where no tree was built — the band was off, or
+the segment failed at a locator and never attempted a transit — what lands there is the cell,
+the straight chord between the two endpoints with its clearance along it, and the reason.
+
 **One segment's search is bounded by the clock as well as by its budgets.** Every other
 budget bounds a part of the search — runs, seconds per run, gun openings, fallback poses —
 and they multiply: a transit that fails everywhere spends its phase-one runs at each
@@ -1216,6 +1234,8 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--gun-opening-round-mm` | 5 | multiple that openings found by bisection are rounded to |
 | `--gun-opening-weight` | 1.5 | what a second counts as with the gun at full travel, against 1x shut; multiplies a route's whole penalised cost, so candidates found at different openings compete on it. 1 switches it off |
 | `--retune-gun-openings` | 4 | openings each finished leg is re-priced at, after every other pass, validated along the whole leg and never re-planned. 0 leaves it at the opening it was found at |
+| `--treeview` | on | write a failed segment's search into the export directory as a page that can be opened and looked at |
+| `--treeview-max-poses` | 1500 | how many of a tree's nodes get the robot's pose baked in, those being most of the file's size |
 | `--fallback-distance-mm` | 100 | room a fallback pose must leave around the robot and gun |
 | `--no-shortcut` | off | skip shortcutting and polishing |
 | `--shortcut-seconds` | 20 | time budget for shortcutting each transit |
