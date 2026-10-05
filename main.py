@@ -177,7 +177,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "this is the only stage that can choose between them "
                         "(default: %(default)g)")
     #PHASE ONE RUN TIME
-    p.add_argument("--phase-one-solve-seconds", type=float, default=25.0,
+    p.add_argument("--phase-one-solve-seconds", type=float, default=30.0,
                    metavar="SECONDS",
                    help="how long one phase-one run may search before giving up. Every "
                         "run costs this long in the worst case, so it multiplies with "
@@ -380,11 +380,11 @@ def build_parser() -> argparse.ArgumentParser:
                    help="skip the shortcutting pass and emit the sampling planner's own "
                         "route, which is typically much longer")
     #SHORTCUT PASS TIME
-    p.add_argument("--shortcut-seconds", type=float, default=30.0, metavar="SECONDS",
+    p.add_argument("--shortcut-seconds", type=float, default=60.0, metavar="SECONDS",
                    help="time budget for shortcutting each freespace transit; longer "
                         "budgets keep shortening with diminishing returns (default: %(default)g)")
     #POLISH PASS TIME
-    p.add_argument("--polish-seconds", type=float, default=120.0, metavar="SECONDS",
+    p.add_argument("--polish-seconds", type=float, default=240.0, metavar="SECONDS",
                    help="time budget for the final pass over each transit's emitted "
                         "waypoints, which removes and relocates them under the full "
                         "stop-to-stop time the robot really pays for each one. The "
@@ -889,6 +889,31 @@ def build_parser() -> argparse.ArgumentParser:
                         "it is a hull bridging a void, and the decomposition settings that "
                         "produced it are printed alongside (default: off)")
     #WRITE THE HULLS THE PLANNER SEES
+    #WHAT A FAILED SEGMENT LEAVES BEHIND TO LOOK AT
+    p.add_argument("--treeview", type=boolean, nargs="?", const=True, default=True,
+                   metavar="BOOL",
+                   help="write a failed segment's search into the export directory as "
+                        "something that can be opened and looked at: the cell as the "
+                        "planner collided against it, the biggest pair of Cartesian trees "
+                        "the segment built, and the robot wherever a node is clicked. "
+                        "Three files per failure -- a page, its data, and the viewer "
+                        "itself, shared -- and the page opens on a double click with no "
+                        "server and nothing to install. Written whatever the segment "
+                        "failed on: where no tree was built, because the band was off or "
+                        "a locator never placed, what lands there is the cell, the "
+                        "straight chord between the endpoints and the reason "
+                        "(default: %(default)s)")
+    p.add_argument("--treeview-max-poses", type=int, default=1500, metavar="N",
+                   help="how many of a tree's nodes get the robot's pose baked into the "
+                        "failure view. A pose is every moving link's position and "
+                        "orientation and it is most of the file's size, so a search that "
+                        "explored tens of thousands of nodes would otherwise write tens of "
+                        "megabytes. Every node is still drawn and every edge still joins "
+                        "them, so the shape of the search is whole; the nodes past this "
+                        "are simply not clickable, and they are chosen evenly over the "
+                        "search rather than taking the first N, so what is clickable is "
+                        "spread over everything it reached. 0 bakes all of them "
+                        "(default: %(default)g)")
     p.add_argument("--export-collision-geometry", action="store_true",
                    help="write the convex geometry the planner actually collides against "
                         "to <directory>/collision_geometry, one OBJ per link with each "
@@ -1007,6 +1032,9 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         return 2
     if args.retune_gun_openings < 0:
         print("error: --retune-gun-openings cannot be negative", file=sys.stderr)
+        return 2
+    if args.treeview_max_poses < 0:
+        print("error: --treeview-max-poses cannot be negative", file=sys.stderr)
         return 2
     if args.phase_two_cartesian_runs < 0:
         print("error: --phase-two-cartesian-runs cannot be negative", file=sys.stderr)
@@ -1133,6 +1161,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         extra_openings=args.extra_gun_openings,
         opening_round_mm=args.gun_opening_round_mm,
         gun=gun, retune_openings=args.retune_gun_openings,
+        treeview=args.treeview, treeview_max_poses=args.treeview_max_poses,
         relocate=Relocation(min_attempts=args.polish_min_attempts,
                             min_mm=args.relocate_min_mm, max_mm=args.relocate_max_mm,
                             exponent=args.relocate_exponent),

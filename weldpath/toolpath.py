@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from . import stagetrace
+from . import treetrace
 from .cell import STOP_BAND_JOINT, Cell
 from .manifest import Locator, Manifest
 from .cartesian import CartesianBudget
@@ -202,6 +203,7 @@ class ToolpathPlanner:
                  opening_search: bool = True, opening_scan_mm: float = 10.0,
                  opening_resolution_mm: float = 1.0,
                  export_dir: str | None = None,
+                 treeview: bool = True, treeview_max_poses: int = 1500,
                  keep_unrefined: bool = False, log=print):
         self.cell = cell
         self.man = man
@@ -277,6 +279,11 @@ class ToolpathPlanner:
         # Set when --export-collision-geometry is on: a pose that cannot be placed then
         # also writes the two links that blocked it, as they sat when it was rejected.
         self.export_dir = export_dir
+        # A segment that fails writes what its Cartesian search reached into the export
+        # directory, as something that can be opened and looked at.  See treeview; the cap
+        # is on how many nodes get a baked robot pose, those being most of the file.
+        self.treeview = bool(treeview)
+        self.treeview_max_poses = max(0, int(treeview_max_poses))
         self.keep_unrefined = keep_unrefined
         # None means "no separate weld rule", i.e. the cell's own clearance throughout.
         self.weld_clearance = (None if weld_clearance_mm is None
@@ -682,6 +689,8 @@ class ToolpathPlanner:
             seg = Segment(a.name, b.name)
             self.log(f"  segment {a.name} -> {b.name} [{index + 1}/{len(pairs)}]")
             stagetrace.section(f"segment {a.name} -> {b.name} [{index + 1}/{len(pairs)}]")
+            if self.treeview:
+                treetrace.start()
             try:
                 if a.name not in anchors:
                     raise PlanningError(f"no reachable joint solution for '{a.name}'")
@@ -693,8 +702,36 @@ class ToolpathPlanner:
             except PlanningError as exc:
                 seg.error = str(exc)
                 self.log(f"    ! {exc}")
+                self._write_failure_view(a, b, anchors, str(exc))
+            finally:
+                treetrace.stop()
             segments.append(seg)
         return segments
+
+    def _write_failure_view(self, a: Locator, b: Locator, anchors, failure: str) -> None:
+        """Write the failed segment's search out as something that can be looked at.
+
+        Written whatever the segment failed on, which is why the endpoints are allowed to
+        be missing: a segment can fail because a locator never placed, and then there is no
+        transit and no tree, only the cell and the reason.  ``treeview`` writes what exists.
+
+        Held to the export directory, there being nowhere else the operator is already
+        looking, and every file it writes is named in the log so nothing lands there
+        silently.
+        """
+        if not self.treeview:
+            return
+        if not self.export_dir:
+            self.log("      no --export-dir, so there is nowhere to write the failure view")
+            return
+        from . import treeview
+        treeview.write(
+            self.cell, self.man, self.export_dir,
+            segment=f"{a.name}--to--{b.name}", failure=failure,
+            qa=anchors.get(a.name), qb=anchors.get(b.name),
+            kept=treetrace.kept(), searches=treetrace.searches(),
+            opening=self.openings.get(b.name),
+            max_poses=self.treeview_max_poses, log=self.log)
 
     @staticmethod
     def _transit_openings(a: Locator, b: Locator, leave_open: float,

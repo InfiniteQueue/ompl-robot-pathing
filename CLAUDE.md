@@ -471,6 +471,49 @@ the way, so the joint values in between are whatever that line demands.
     than the step is re-derived by `plan_linear`, which need not reproduce the chain the
     tree validated.
   - `--unrefined-output` writes every transit as one `PTP` phase regardless.
+- **A segment that fails leaves a viewer behind.** `treetrace` keeps the biggest pair of
+  Cartesian trees a segment built -- most nodes over both, offered by `plan_cartesian` at
+  each of its two exits -- and `ToolpathPlanner.run` hands them to `treeview` from the
+  `except` that records the failure. Three files land in the export directory: the viewer
+  (`weldpath-treeview.js`, shared), one segment's data, and a stub page that pulls both in.
+  `--treeview` turns it off.
+  - `treetrace` mirrors `stagetrace`: off until `start`, every call a no-op while it is, so
+    the search offers its trees without knowing whether anyone is listening. It reads
+    nothing and touches no disk -- a segment that succeeds must not pay for a diagnostic it
+    will never write -- so all of the work is `treeview`'s, done once, after the failure.
+  - **Biggest is most nodes and both trees are kept.** The two grow towards each other and
+    the thing worth looking at is the gap between them: which got how far, and where they
+    stopped short. The deeper branch of one tree would hide exactly that.
+  - **The geometry written is the geometry the planner collided against** --
+    `hullexport._link_hulls`, the convex decomposition, not the source meshes. They differ,
+    badly on the C-shaped castings here, where hulls over-report contact. A viewer showing
+    the source meshes would show a gun comfortably clear of something the planner was
+    certain it hit, which is worse than showing nothing.
+  - Statics are written placed in the world; moving links in their own frames, which is why
+    `_link_hulls` is handed an empty transform map for them -- its lookup raises, it falls
+    back to the identity, and the geometry stays where the link's frame puts it. Each node
+    then carries one baked transform per link, read from a single `set_state` rather than a
+    forward-kinematics call per link.
+  - Node tool positions come from `_Node.pose`, which is `cell.pose_mm` and already in
+    manifest units; the edges go through `cell.fk`, which answers in metres, and divide the
+    scale out themselves. The two have to agree or the nodes float off their own edges.
+  - Edges are drawn along `_Node.chain`, the stations the steer validated, not as a line
+    between the two nodes. That line is a shortcut nothing checked and often has no inverse
+    kinematics at all, which is the shape this search exists to find.
+  - `--treeview-max-poses` caps how many nodes get a baked pose, a pose being most of the
+    file. Every node is still written and every edge still joins them, so the shape of the
+    search is whole; the capped ones are simply not clickable, and they are chosen evenly
+    rather than taking the first N, so what is clickable is spread over everything reached.
+  - **Written whatever the segment failed on.** A tree only exists where the band was on and
+    the clock left room, and a segment that failed at a locator never attempted a transit at
+    all. What lands there then is the cell, the straight chord between the endpoints with
+    its clearance, and the reason -- and where even the endpoints are missing, the cell and
+    the reason. A file that said nothing in those cases would be a puzzle, not a diagnostic.
+  - The data is a `.js` assigning a global rather than a `.json`: a page opened from
+    `file://` may not `fetch` a sibling, which is the one machine this is for, but a classic
+    `<script src>` to the same directory is allowed. Nothing is fetched and nothing served.
+  - `treeview.write` never raises. The caller is already handling a failure and must be left
+    to report it; a diagnostic that takes the run down with it is worse than none.
 - Order in `_finish` is densify → refine → split → verify, one sampling pass. It was
   sample → gate → densify → … while the gate stood: the fill follows the curve each move
   will really be flown along, which needs a model, and there was no model until the gate

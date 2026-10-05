@@ -29,7 +29,11 @@ a = Analysis(
     ["main.py"],
     pathex=[],
     binaries=[(p, "tesseract_robotics.libs") for p in dlls],
-    datas=[],
+    # The failure viewer is a .js asset inside the package, so it is not swept up with
+    # the modules.  Without it a frozen run writes a failed segment's data and then has
+    # no viewer to open it with -- weldpath.treeview looks beside its own __file__,
+    # which is this path inside the bundle.
+    datas=[("weldpath/treeview.js", "weldpath")],
     hiddenimports=collect_submodules("tesseract_robotics"),
     hookspath=[],
     runtime_hooks=["rthook_tesseract.py"],
