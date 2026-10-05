@@ -25,6 +25,20 @@ Static objects are written already placed in the world.  Moving links are writte
 own frames and placed per node from a baked transform, which is why ``_link_hulls`` is
 handed an empty transform map for them: its lookup fails and it falls back to the identity,
 leaving the geometry where the link's own frame puts it.
+
+**Every search the segment kept goes into the one file**, each as a pair of trees under a
+``solve`` index, and the viewer filters them the way it filters anything else.  A segment
+runs the tree many times -- successive seeds, once per gun opening, again in phase two,
+again per half of a detour -- and the questions worth asking are about the set: which
+opening got furthest, whether a second half failed where the first half had no trouble.
+One tree per file could not answer either, and writing a file per search would mean
+comparing them by opening two windows.
+
+The pose budget is therefore shared.  ``max_poses`` is a **total** over every tree in the
+file, apportioned by node count in :func:`_share`, not a limit each tree gets to itself: a
+baked pose costs a state load and a clearance query, which is a collision call, so a
+per-tree limit would have multiplied the slowest part of this by the number of searches
+kept and the file size with it.
 """
 from __future__ import annotations
 
@@ -36,7 +50,7 @@ import numpy as np
 
 from . import hullexport
 
-FORMAT = "weldpath-treeview/1"
+FORMAT = "weldpath-treeview/2"
 # The viewer ships as ``treeview.js`` inside the package and lands beside the data
 # under a name that says where it came from, the export directory being full of
 # other people's files.
@@ -141,6 +155,42 @@ def _bake(cell, man, q: np.ndarray, links: list[str]) -> dict:
     return pose
 
 
+def _share(counts: list[int], budget: int) -> list[int]:
+    """Split one pose ``budget`` over trees of ``counts`` nodes, biggest trees first served.
+
+    Proportional to node count, so a search that explored twice as far gets twice the
+    clickable nodes, and walked largest first so the rounding lands on the trees where one
+    pose either way matters least.  Every non-empty tree is guaranteed at least one, or a
+    file with more trees than budget would contain whole searches with nothing clickable in
+    them -- and a search with no pose at all is the one case where the viewer can draw the
+    shape but never answer "where was the robot here".  That floor is the one thing here
+    that can exceed the budget, and only where there are more non-empty trees than poses
+    asked for, by at most one per tree.
+
+    ``budget`` of 0 means no cap, which it also means at the flag, and comes back as 0 per
+    tree for :func:`_tree` to read the same way.
+    """
+    if budget <= 0:
+        return [0] * len(counts)
+    out = [0] * len(counts)
+    left = int(budget)
+    order = sorted(range(len(counts)), key=lambda i: -counts[i])
+    pool = sum(counts)
+    for n, i in enumerate(order):
+        if counts[i] <= 0:
+            continue
+        # One each is reserved for the trees still to come, so a tiny budget spreads over
+        # the searches rather than being spent entirely on the first one.
+        rest = sum(1 for j in order[n + 1:] if counts[j] > 0)
+        want = int(round(left * counts[i] / pool)) if pool else left
+        out[i] = max(1, min(want, max(1, left - rest)))
+        left -= out[i]
+        pool -= counts[i]
+        if left <= 0:
+            left = 0
+    return out
+
+
 def _tree(cell, man, tree, links: list[str], limit: int, log) -> dict:
     """One tree: its nodes with baked poses and clearance, and its edges' tool paths.
 
@@ -153,15 +203,15 @@ def _tree(cell, man, tree, links: list[str], limit: int, log) -> dict:
     Every node is still written, so the structure is whole and every edge still draws; the
     ones past the cap are simply not clickable, and the viewer says so.  Chosen uniformly
     rather than by taking the first N, so a capped tree still has poses spread over the
-    whole of what it explored instead of only near its root.
+    whole of what it explored instead of only near its root.  This tree's share of the
+    file's one budget, worked out by :func:`_share`; 0 is no cap.  What it reports is left
+    to the caller, which is the only place that knows how many trees there are.
     """
     nodes = list(tree.nodes)
     n = len(nodes)
     keep = set(range(n))
     if 0 < limit < n:
         keep = set(int(i) for i in np.linspace(0, n - 1, limit).round())
-        log(f"      treeview: {n} nodes, baking poses for {len(keep)} of them "
-            f"(--treeview-max-poses); the rest are drawn but not clickable")
 
     out_q, out_parent, out_clr, out_tcp, out_pose = [], [], [], [], []
     for i, node in enumerate(nodes):
@@ -230,9 +280,13 @@ def write_app(directory: str, log=print) -> str | None:
 
 
 def write(cell, man, directory: str, *, segment: str, failure: str,
-          qa, qb, kept=None, searches: int = 0, opening=None,
+          qa, qb, kept=None, searches: int = 0, dropped: int = 0, opening=None,
           max_poses: int = 0, chord_samples: int = 24, log=print) -> str | None:
     """Write one failed segment's viewer files.  Returns the HTML to open, or ``None``.
+
+    ``kept`` is every search :mod:`weldpath.treetrace` held, in the order it was offered;
+    ``searches`` and ``dropped`` are how many were offered and how many the limit turned
+    away, which is what lets the file say it is a sample rather than the whole of it.
 
     Never raises: a diagnostic that takes the run down with it is worse than no diagnostic.
     The caller is already handling a failure and must be left to report it.
@@ -250,6 +304,7 @@ def write(cell, man, directory: str, *, segment: str, failure: str,
             "failure": failure,
             "units": man.units,
             "searches": searches,
+            "dropped": dropped,
             "gun_opening_mm": None if opening is None else float(opening),
             "clearance": {
                 "margin": round(float(cell.obstacle_clearance / man.scale), 3),
@@ -258,6 +313,7 @@ def write(cell, man, directory: str, *, segment: str, failure: str,
             "links": {"all": links, "gun": sorted(gun),
                       "arm": [n for n in links if n not in gun]},
             "geometry": _geometry(cell, man, log),
+            "solves": [],
             "trees": [],
         }
         # Only where there are two endpoints to draw one between.  A segment that failed at
@@ -265,12 +321,29 @@ def write(cell, man, directory: str, *, segment: str, failure: str,
         # so this cannot be allowed to be the thing that stops it.
         if qa is not None and qb is not None:
             data["chord"] = _chord(cell, man, qa, qb, links, chord_samples)
-        if kept is not None:
-            label, start_tree, goal_tree = kept
-            data["tree_label"] = label
-            for name, tree in (("start", start_tree), ("goal", goal_tree)):
-                data["trees"].append(
-                    {"name": name, **_tree(cell, man, tree, links, max_poses, log)})
+        # Flattened to trees before the budget is split, so the apportionment is one call
+        # over the whole file rather than a budget handed down and divided twice.
+        flat = []
+        for s, search in enumerate(kept or []):
+            flat.append((s, "start", search.start))
+            flat.append((s, "goal", search.goal))
+        shares = _share([len(t.nodes) for _, _, t in flat], max_poses)
+        for s, search in enumerate(kept or []):
+            data["solves"].append({
+                "id": int(getattr(search, "order", s + 1)),
+                "label": str(search.label),
+                "nodes": int(len(search.start.nodes) + len(search.goal.nodes)),
+            })
+        for (s, name, tree), share in zip(flat, shares):
+            data["trees"].append({"solve": s, "name": name,
+                                  **_tree(cell, man, tree, links, share, log)})
+        baked = sum(sum(1 for p in t["pose"] if p is not None) for t in data["trees"])
+        if data["solves"]:
+            log(f"      treeview: {len(data['solves'])} search"
+                f"{'' if len(data['solves']) == 1 else 'es'} of {searches} offered"
+                + (f", {dropped} dropped by --treeview-searches" if dropped else "")
+                + f"; {baked} of {sum(t['count'] for t in data['trees'])} nodes have a "
+                f"baked pose (--treeview-max-poses)")
 
         stem = _safe(segment)
         body = json.dumps(data, separators=(",", ":"), allow_nan=False)
@@ -287,7 +360,8 @@ def write(cell, man, directory: str, *, segment: str, failure: str,
 
         size = os.path.getsize(js) / 1e6
         total = sum(t["count"] for t in data["trees"])
-        log(f"      treeview: wrote {total} nodes over {len(data['trees'])} trees "
+        log(f"      treeview: wrote {total} nodes over {len(data['trees'])} trees in "
+            f"{len(data['solves'])} search{'' if len(data['solves']) == 1 else 'es'} "
             f"({size:.1f} MB) -- open {html}")
         return html
     except Exception as exc:            # a diagnostic must not mask the failure it reports

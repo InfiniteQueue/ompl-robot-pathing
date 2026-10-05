@@ -205,6 +205,7 @@ class ToolpathPlanner:
                  opening_resolution_mm: float = 1.0,
                  export_dir: str | None = None,
                  treeview: bool = True, treeview_max_poses: int = 1500,
+                 treeview_searches: int = 12,
                  keep_unrefined: bool = False, log=print):
         self.cell = cell
         self.man = man
@@ -285,6 +286,7 @@ class ToolpathPlanner:
         # is on how many nodes get a baked robot pose, those being most of the file.
         self.treeview = bool(treeview)
         self.treeview_max_poses = max(0, int(treeview_max_poses))
+        self.treeview_searches = max(0, int(treeview_searches))
         self.keep_unrefined = keep_unrefined
         # None means "no separate weld rule", i.e. the cell's own clearance throughout.
         self.weld_clearance = (None if weld_clearance_mm is None
@@ -692,7 +694,7 @@ class ToolpathPlanner:
             self.log(f"  segment {a.name} -> {b.name} [{index + 1}/{len(pairs)}]")
             stagetrace.section(f"segment {a.name} -> {b.name} [{index + 1}/{len(pairs)}]")
             if self.treeview:
-                treetrace.start()
+                treetrace.start(self.treeview_searches)
             try:
                 if a.name not in anchors:
                     raise PlanningError(f"no reachable joint solution for '{a.name}'")
@@ -732,6 +734,7 @@ class ToolpathPlanner:
             segment=f"{a.name}--to--{b.name}", failure=failure,
             qa=anchors.get(a.name), qb=anchors.get(b.name),
             kept=treetrace.kept(), searches=treetrace.searches(),
+            dropped=treetrace.dropped(),
             opening=self.openings.get(b.name),
             max_poses=self.treeview_max_poses, log=self.log)
 

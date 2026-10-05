@@ -348,7 +348,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "opening it was found at (default: %(default)g)")
     #FALLBACK POSES
     #HOW MANY POSES A TRANSIT MAY BE OFFERED
-    p.add_argument("--fallback-poses", type=int, default=3, metavar="N",
+    p.add_argument("--fallback-poses", type=int, default=0, metavar="N",
                    help="how many fallback poses a transit that cannot be flown directly "
                         "may be offered, in preference order. One method of looking "
                         "contributes at most one pose and there are three methods, so 3 "
@@ -919,6 +919,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "a locator never placed, what lands there is the cell, the "
                         "straight chord between the endpoints and the reason "
                         "(default: %(default)s)")
+    p.add_argument("--treeview-searches", type=int, default=12, metavar="N",
+                   help="how many of a segment's Cartesian tree searches the failure "
+                        "view keeps. A segment runs the tree many times -- successive "
+                        "seeds, one per gun opening, again in phase two, again per half "
+                        "of a detour -- and they fail in different places, so which "
+                        "opening got furthest is a question about the set rather than "
+                        "about any one of them. All of them go in the one file and the "
+                        "viewer filters them per search. The limit is there for memory: "
+                        "a kept search's nodes stay alive until the segment ends, and "
+                        "every segment pays that whether or not it fails. Past the limit "
+                        "the smallest kept search makes way for a bigger one, so what is "
+                        "lost is the searches that died early -- raise it to see those. "
+                        "0 keeps every search offered (default: %(default)g)")
     p.add_argument("--treeview-max-poses", type=int, default=1500, metavar="N",
                    help="how many of a tree's nodes get the robot's pose baked into the "
                         "failure view. A pose is every moving link's position and "
@@ -1055,6 +1068,9 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.treeview_max_poses < 0:
         print("error: --treeview-max-poses cannot be negative", file=sys.stderr)
         return 2
+    if args.treeview_searches < 0:
+        print("error: --treeview-searches cannot be negative", file=sys.stderr)
+        return 2
     if args.phase_two_cartesian_runs < 0:
         print("error: --phase-two-cartesian-runs cannot be negative", file=sys.stderr)
         return 2
@@ -1182,6 +1198,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         opening_round_mm=args.gun_opening_round_mm,
         gun=gun, retune_openings=args.retune_gun_openings,
         treeview=args.treeview, treeview_max_poses=args.treeview_max_poses,
+        treeview_searches=args.treeview_searches,
         relocate=Relocation(min_attempts=args.polish_min_attempts,
                             min_mm=args.relocate_min_mm, max_mm=args.relocate_max_mm,
                             exponent=args.relocate_exponent),

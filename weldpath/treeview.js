@@ -83,7 +83,18 @@ canvas.dragging { cursor: grabbing; }
 label.row { display: flex; align-items: center; gap: 7px; padding: 2px 0;
   cursor: pointer; user-select: none; }
 label.row input { accent-color: #6aa9ff; margin: 0; }
+label.row.sub { padding-left: 17px; }
+label.row .n { color: #80868f; font-variant-numeric: tabular-nums; }
 .sw { width: 11px; height: 11px; border-radius: 2px; flex: 0 0 auto; }
+.solve { border-top: 1px solid #23262b; padding-top: 4px; margin-top: 4px; }
+.solve:first-of-type { border-top: 0; margin-top: 0; }
+.lbl { color: #8b929b; font-size: 11px; padding: 1px 0 2px 17px;
+  word-break: break-word; }
+.bar { display: flex; gap: 6px; margin: 4px 0 2px; }
+.bar button { flex: 1 1 0; background: #23262b; color: #c8ced6; cursor: pointer;
+  border: 1px solid #32363d; border-radius: 4px; padding: 3px 0; font: inherit;
+  font-size: 11px; }
+.bar button:hover { background: #2b2f36; }
 table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
 td { padding: 1px 0; vertical-align: top; }
 td.k { color: #8b929b; padding-right: 8px; white-space: nowrap; }
@@ -118,7 +129,7 @@ function fail(message) {
   ]));
 }
 
-if (!DATA || DATA.format !== 'weldpath-treeview/1') {
+if (!DATA || DATA.format !== 'weldpath-treeview/2') {
   fail('No data loaded. Open the <segment>.treeview.html file that was written beside ' +
        'this script, not this script itself.');
   return;
@@ -134,6 +145,24 @@ const C = {
   chord:  [0.55, 0.58, 0.62],
   pick:   [1.00, 0.30, 0.30],
 };
+
+/* One hue per solve, so several shown at once stay tellable apart, and within a solve the
+ * start tree is the brighter of the pair -- the same distinction the two-tree file made
+ * with two fixed colours, which cannot stretch to a dozen searches.  Golden-angle steps
+ * rather than an even split of the circle, because the number of solves is not known until
+ * the file is read and an even split would recolour every search when one more arrives. */
+function hsl(h, s, l) {
+  const f = n => {
+    const k = (n + h * 12) % 12;
+    return l - s * Math.min(l, 1 - l) * Math.max(-1, Math.min(k - 3, 9 - k, 1));
+  };
+  return [f(0), f(8), f(4)];
+}
+function solveColour(i, which) {
+  if (SOLVES.length === 1) return which === 'start' ? C.start : C.goal;
+  const h = ((0.137 + i * 0.381) % 1);
+  return which === 'start' ? hsl(h, 0.82, 0.68) : hsl(h, 0.55, 0.45);
+}
 
 /* Clearance to colour: red where the move is at the collision margin, green where the
  * query has run out of range and is reporting "nothing seen" rather than a distance.
@@ -261,13 +290,22 @@ const gunSet = new Set(DATA.links.gun || []);
  * position, a clearance and maybe a baked pose, plus polylines joining them.  The chord is
  * in the list because it is the one set that always exists -- a segment can fail with no
  * tree at all, and the file is written anyway. */
+const SOLVES = DATA.solves || [];
+/* The biggest search is the one shown first.  Every search is in the file and one click
+ * away, but a dozen overlapping trees on opening is a picture of nothing. */
+let biggest = 0;
+for (let i = 1; i < SOLVES.length; i++)
+  if ((SOLVES[i].nodes || 0) > (SOLVES[biggest].nodes || 0)) biggest = i;
+
 const sets = [];
 for (const t of (DATA.trees || [])) {
+  const s = t.solve || 0;
   sets.push({
     name: t.name === 'start' ? 'tree from the start' : 'tree from the goal',
-    key: t.name, colour: t.name === 'start' ? C.start : C.goal,
+    key: t.name, solve: s, colour: solveColour(s, t.name),
     count: t.count, tcp: t.tcp, clearance: t.clearance, pose: t.pose,
-    q: t.q, parent: t.parent, edges: t.edges, on: true,
+    q: t.q, parent: t.parent, edges: t.edges,
+    on: SOLVES.length <= 1 || s === biggest,
   });
 }
 if (DATA.chord) {
@@ -276,7 +314,7 @@ if (DATA.chord) {
   for (let i = 1; i < n; i++)
     edges.push({ a: i - 1, b: i, path: [DATA.chord.tcp[i - 1], DATA.chord.tcp[i]] });
   sets.push({
-    name: 'the straight chord', key: 'chord', colour: C.chord, count: n,
+    name: 'the straight chord', key: 'chord', solve: -1, colour: C.chord, count: n,
     tcp: DATA.chord.tcp, clearance: DATA.chord.clearance, pose: DATA.chord.pose,
     q: DATA.chord.q, parent: null, edges: edges, on: sets.length === 0,
   });
@@ -290,6 +328,7 @@ for (const s of sets) {
     cols[i * 3] = c[0]; cols[i * 3 + 1] = c[1]; cols[i * 3 + 2] = c[2];
   }
   s.pointBuf = buffer(pts); s.pointCol = buffer(cols);
+  s.pointColSet = buffer(nodeColours(s, true));
 
   let segs = 0;
   for (const e of s.edges) segs += Math.max(0, e.path.length - 1);
@@ -335,7 +374,7 @@ function eyePos() {
 
 // ------------------------------------------------------------------------------ the UI
 const opts = { statics: true, translucent: false, arm: true, gun: true,
-               edges: true, nodes: true, chordPose: true };
+               edges: true, nodes: true, chordPose: true, bySolve: false };
 let picked = null;          // {set, index}
 
 const panel = el('div', { id: 'panel' });
@@ -343,6 +382,20 @@ document.body.appendChild(panel);
 document.body.appendChild(el('div', { id: 'hint', text:
   'drag to orbit · wheel to zoom · right-drag or shift-drag to pan · ' +
   'click a node to put the robot there · R resets the view' }));
+
+/* Clearance is what the node colours are for, and it is the right default: it is the
+ * reading that explains a failure.  But with several searches shown at once every node is
+ * on the same ramp and nothing says which search it belongs to, so this repaints them in
+ * their set's colour instead.  Built once per set either way -- the cost is a second
+ * colour buffer, not a second draw. */
+function nodeColours(s, bySolve) {
+  const cols = new Float32Array(s.count * 3);
+  for (let i = 0; i < s.count; i++) {
+    const c = bySolve ? s.colour : heat(s.clearance[i]);
+    cols[i * 3] = c[0]; cols[i * 3 + 1] = c[1]; cols[i * 3 + 2] = c[2];
+  }
+  return cols;
+}
 
 function checkbox(label, key, colour) {
   const input = el('input', { type: 'checkbox' });
@@ -378,14 +431,59 @@ function buildPanel() {
   panel.appendChild(checkbox('nodes', 'nodes'));
 
   panel.appendChild(el('h2', { text: 'searches' }));
+  if (SOLVES.length > 1) {
+    const all = el('button', { text: 'show all' });
+    const none = el('button', { text: 'hide all' });
+    const set = v => () => {
+      for (const s of sets) if (s.solve >= 0) s.on = v;
+      buildPanel(); draw();
+    };
+    all.onclick = set(true);
+    none.onclick = set(false);
+    panel.appendChild(el('div', { class: 'bar' }, [all, none]));
+  }
+  /* Grouped by solve, with the pair's two trees under it.  Toggling the solve is the
+   * filter asked for; the two sub-rows stay because which of the pair got stuck is the
+   * question a pair of trees exists to answer. */
+  for (let i = 0; i < SOLVES.length; i++) {
+    const mine = sets.filter(s => s.solve === i);
+    if (!mine.length) continue;
+    const info = SOLVES[i];
+    const group = el('div', { class: 'solve' });
+    const head = el('input', { type: 'checkbox' });
+    head.checked = mine.some(s => s.on);
+    head.indeterminate = !mine.every(s => s.on) && head.checked;
+    head.onchange = () => {
+      for (const s of mine) s.on = head.checked;
+      buildPanel(); draw();
+    };
+    group.appendChild(el('label', { class: 'row' }, [
+      head,
+      el('span', { text: `search ${info.id}` }),
+      el('span', { class: 'n', text: `${info.nodes}` }),
+    ]));
+    if (info.label) group.appendChild(el('div', { class: 'lbl', text: info.label }));
+    for (const s of mine) {
+      const input = el('input', { type: 'checkbox' });
+      input.checked = s.on;
+      input.onchange = () => { s.on = input.checked; buildPanel(); draw(); };
+      const sw = el('span', { class: 'sw' });
+      sw.style.background = `rgb(${s.colour.map(v => Math.round(v * 255)).join(',')})`;
+      group.appendChild(el('label', { class: 'row sub' },
+        [input, sw, el('span', { text: s.key === 'start' ? 'from the start' : 'from the goal' }),
+         el('span', { class: 'n', text: `${s.count}` })]));
+    }
+    panel.appendChild(group);
+  }
   for (const s of sets) {
+    if (s.solve >= 0) continue;
     const input = el('input', { type: 'checkbox' });
     input.checked = s.on;
     input.onchange = () => { s.on = input.checked; draw(); };
     const sw = el('span', { class: 'sw' });
     sw.style.background = `rgb(${s.colour.map(v => Math.round(v * 255)).join(',')})`;
     panel.appendChild(el('label', { class: 'row' },
-      [input, sw, el('span', { text: `${s.name} (${s.count})` })]));
+      [input, sw, el('span', { text: s.name }), el('span', { class: 'n', text: `${s.count}` })]));
   }
   if (!sets.some(s => s.key !== 'chord'))
     panel.appendChild(el('p', { class: 'none', text:
@@ -394,6 +492,7 @@ function buildPanel() {
       'transit. The straight chord is shown instead.' }));
 
   panel.appendChild(el('h2', { text: 'clearance' }));
+  if (SOLVES.length > 1) panel.appendChild(checkbox('colour nodes by search', 'bySolve'));
   panel.appendChild(el('div', { id: 'ramp' }));
   panel.appendChild(el('div', { class: 'ends' }, [
     el('span', { text: `${DATA.clearance.margin} ${DATA.units} (margin)` }),
@@ -408,8 +507,10 @@ function buildPanel() {
   const info = [['units', DATA.units]];
   if (DATA.gun_opening_mm !== null && DATA.gun_opening_mm !== undefined)
     info.push(['gun opening', `${DATA.gun_opening_mm} ${DATA.units}`]);
-  if (DATA.searches) info.push(['tree searches', DATA.searches]);
-  if (DATA.tree_label) info.push(['biggest', DATA.tree_label]);
+  if (DATA.searches)
+    info.push(['tree searches', DATA.dropped
+      ? `${SOLVES.length} kept of ${DATA.searches}` : `${DATA.searches}`]);
+  if (DATA.dropped) info.push(['dropped', `${DATA.dropped} (--treeview-searches)`]);
   panel.appendChild(rows(info));
 }
 
@@ -422,12 +523,14 @@ function showPicked() {
   const { set, index } = picked;
   const clr = set.clearance[index];
   const baked = set.pose[index];
+  const mine = SOLVES[set.solve];
   const pairs = [
-    ['from', set.name],
+    ['from', mine ? `search ${mine.id}, ${set.name}` : set.name],
     ['index', `${index} of ${set.count - 1}`],
     ['clearance', clr === null || clr === undefined
       ? 'not measured' : `${clr} ${DATA.units}`],
   ];
+  if (mine && mine.label) pairs.push(['search', mine.label]);
   if (set.parent) pairs.push(['parent', set.parent[index] < 0 ? 'root' : set.parent[index]]);
   const p = set.tcp[index];
   pairs.push(['tool', `${p[0]}, ${p[1]}, ${p[2]}`]);
@@ -512,7 +615,8 @@ function draw() {
   for (const s of sets) {
     if (!s.on) continue;
     if (opts.edges && s.lineCount) drawFlat(gl.LINES, s.lineBuf, s.lineCol, s.lineCount, 1, 0.8);
-    if (opts.nodes) drawFlat(gl.POINTS, s.pointBuf, s.pointCol, s.count, 5 * dpr, 1);
+    if (opts.nodes) drawFlat(gl.POINTS, s.pointBuf,
+      opts.bySolve ? s.pointColSet : s.pointCol, s.count, 5 * dpr, 1);
   }
   if (picked) {
     const p = picked.set.tcp[picked.index];

@@ -496,12 +496,24 @@ tool speed cap.
 to search; none of them says why a particular transit could not be solved, and the log can
 only say that OMPL returned no solution. So when a segment fails, `--treeview` writes the
 search into the study directory, beside the manifest it was read from, as a page that opens
-on a double click — no server, no install, nothing fetched. It shows the cell as the planner collided against it, the biggest
-pair of Cartesian trees the segment built, each node coloured by how much clearance the
-robot had there, and the robot itself — arm and gun — wherever a node is clicked.
+on a double click — no server, no install, nothing fetched. It shows the cell as the planner collided against it, the
+Cartesian trees the segment built, each node coloured by how much clearance the robot had
+there, and the robot itself — arm and gun — wherever a node is clicked.
 
-The two trees grow towards each other from the start and the goal, so what the picture is
-for is the gap between them: which one got how far, and where they stopped short of meeting.
+**Every search goes into the one file.** A segment runs the tree many times — successive
+seeds until the solve budget is spent, once per gun opening, again in phase two, again per
+half of a detour — and they fail in different places. Which opening got furthest, and
+whether a second half failed where the first half had no trouble, are questions about the
+set rather than about any one search, so the viewer lists them all and filters per search,
+each in its own colour, with the biggest shown on opening. `--treeview-searches` bounds how
+many are held; it is a memory limit, since a kept search's nodes stay alive until the
+segment ends and every segment pays that whether or not it fails. Past it the smallest kept
+search makes way for a bigger one, so what is lost is the searches that died early — the
+file says how many were dropped, and raising the limit is how to see them.
+
+The two trees of each search grow towards each other from the start and the goal, so what
+the picture is for is the gap between them: which one got how far, and where they stopped
+short of meeting.
 The geometry drawn is the convex decomposition the collision check actually used rather than
 the source meshes, because those differ — a viewer showing the pretty meshes would show the
 gun comfortably clear of something the planner was certain it had hit.
@@ -1244,7 +1256,8 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--gun-opening-weight` | 1.5 | what a second counts as with the gun at full travel, against 1x shut; multiplies a route's whole penalised cost, so candidates found at different openings compete on it. 1 switches it off |
 | `--retune-gun-openings` | 4 | openings each finished leg is re-priced at, after every other pass, validated along the whole leg and never re-planned. 0 leaves it at the opening it was found at |
 | `--treeview` | on | write a failed segment's search into the study directory as a page that can be opened and looked at |
-| `--treeview-max-poses` | 1500 | how many of a tree's nodes get the robot's pose baked in, those being most of the file's size |
+| `--treeview-searches` | 12 | how many of a segment's tree searches the view keeps, all of them filterable separately in the viewer. A memory limit; past it the smallest kept search makes way. 0 keeps every one |
+| `--treeview-max-poses` | 1500 | how many nodes get the robot's pose baked in, those being most of the file's size. A total over every tree in the file, split between them by node count |
 | `--fallback-poses` | 3 | fallback poses a transit may be offered, which is also how many of the three ways of looking are run. 0 looks for none, so a transit with no direct route fails rather than detouring |
 | `--fallback-distance-mm` | 100 | room a fallback pose must leave around the robot and gun |
 | `--no-shortcut` | off | skip shortcutting and polishing |

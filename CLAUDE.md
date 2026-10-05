@@ -481,9 +481,9 @@ the way, so the joint values in between are whatever that line demands.
     than the step is re-derived by `plan_linear`, which need not reproduce the chain the
     tree validated.
   - `--unrefined-output` writes every transit as one `PTP` phase regardless.
-- **A segment that fails leaves a viewer behind.** `treetrace` keeps the biggest pair of
-  Cartesian trees a segment built -- most nodes over both, offered by `plan_cartesian` at
-  each of its two exits -- and `ToolpathPlanner.run` hands them to `treeview` from the
+- **A segment that fails leaves a viewer behind.** `treetrace` keeps the pairs of
+  Cartesian trees a segment built -- offered by `plan_cartesian` at each of its two exits --
+  and `ToolpathPlanner.run` hands them to `treeview` from the
   `except` that records the failure. Three files land in the **study directory** --
   `Manifest.directory`, the one the manifest was read from: the viewer
   (`weldpath-treeview.js`, shared), one segment's data, and a stub page that pulls both in.
@@ -496,9 +496,25 @@ the way, so the joint values in between are whatever that line demands.
     the search offers its trees without knowing whether anyone is listening. It reads
     nothing and touches no disk -- a segment that succeeds must not pay for a diagnostic it
     will never write -- so all of the work is `treeview`'s, done once, after the failure.
-  - **Biggest is most nodes and both trees are kept.** The two grow towards each other and
+  - **Both trees of a pair are kept.** The two grow towards each other and
     the thing worth looking at is the gap between them: which got how far, and where they
     stopped short. The deeper branch of one tree would hide exactly that.
+  - **Every search goes in the one file, and the viewer filters them per solve.** A segment
+    runs the tree many times -- successive seeds until the solve budget is spent, once per
+    gun opening, again in phase two, again per half of a detour -- and they fail in
+    different places. Which opening got furthest, and whether a second half failed where
+    the first half had no trouble, are questions about the *set*; the single biggest tree
+    answered neither, and a file per search would mean comparing them in two windows. Each
+    search is a `solve` carrying the label `plan_cartesian` was given -- run number and gun
+    opening -- and the viewer groups the filters under it, colours each one its own hue,
+    and names the search in the readout when a node is picked.
+  - `--treeview-searches` (12) bounds how many are held, and it is a **memory** bound
+    rather than a file one: a kept search's nodes stay alive until the segment ends, and
+    every segment pays that whether or not it fails. Past the limit the *smallest* kept
+    search makes way for a bigger one. What is lost is therefore the searches that died
+    early -- and those are informative, a tree of four nodes saying the endpoint is boxed
+    in at that opening -- so the file records how many were offered and how many were
+    dropped, and raising the limit is how to see them. 0 keeps everything offered.
   - **The geometry written is the geometry the planner collided against** --
     `hullexport._link_hulls`, the convex decomposition, not the source meshes. They differ,
     badly on the C-shaped castings here, where hulls over-report contact. A viewer showing
@@ -519,6 +535,12 @@ the way, so the joint values in between are whatever that line demands.
     file. Every node is still written and every edge still joins them, so the shape of the
     search is whole; the capped ones are simply not clickable, and they are chosen evenly
     rather than taking the first N, so what is clickable is spread over everything reached.
+    It is a **total over every tree in the file**, apportioned by node count in
+    `treeview._share`, not a limit each tree gets to itself: a baked pose costs a state
+    load and a clearance query, which is a collision call, so per-tree it would have
+    multiplied the slowest part of this by the number of searches kept. Every non-empty
+    tree is guaranteed one, which is the only thing here that can exceed the budget and
+    only where there are more trees than poses asked for.
   - **Written whatever the segment failed on.** A tree only exists where the band was on and
     the clock left room, and a segment that failed at a locator never attempted a transit at
     all. What lands there then is the cell, the straight chord between the endpoints with
