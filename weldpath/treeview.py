@@ -1,7 +1,9 @@
 """Write a failed segment's Cartesian trees out as something that can be looked at.
 
 Called only when a segment has failed, from :meth:`weldpath.toolpath.ToolpathPlanner.run`,
-with whatever :mod:`weldpath.treetrace` kept.  Three files land in the export directory:
+with whatever :mod:`weldpath.treetrace` kept.  Three files land in the study directory --
+the one the manifest was read from, which is the one directory this program is always
+given:
 
 * ``weldpath-treeview.js``   -- the viewer, written once and shared
 * ``<segment>.treedata.js``  -- one segment's trees, geometry and poses

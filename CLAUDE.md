@@ -474,9 +474,14 @@ the way, so the joint values in between are whatever that line demands.
 - **A segment that fails leaves a viewer behind.** `treetrace` keeps the biggest pair of
   Cartesian trees a segment built -- most nodes over both, offered by `plan_cartesian` at
   each of its two exits -- and `ToolpathPlanner.run` hands them to `treeview` from the
-  `except` that records the failure. Three files land in the export directory: the viewer
+  `except` that records the failure. Three files land in the **study directory** --
+  `Manifest.directory`, the one the manifest was read from: the viewer
   (`weldpath-treeview.js`, shared), one segment's data, and a stub page that pulls both in.
   `--treeview` turns it off.
+  - Not `export_dir`. That is set only when `--export-collision-geometry` is passed, so a
+    view hung off it is one that never appears on an ordinary run -- which is what the
+    first cut of this did, logging "no --export-dir" and writing nothing. The study
+    directory is the one directory the program is always given.
   - `treetrace` mirrors `stagetrace`: off until `start`, every call a no-op while it is, so
     the search offers its trees without knowing whether anyone is listening. It reads
     nothing and touches no disk -- a segment that succeeds must not pay for a diagnostic it

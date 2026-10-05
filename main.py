@@ -892,8 +892,9 @@ def build_parser() -> argparse.ArgumentParser:
     #WHAT A FAILED SEGMENT LEAVES BEHIND TO LOOK AT
     p.add_argument("--treeview", type=boolean, nargs="?", const=True, default=True,
                    metavar="BOOL",
-                   help="write a failed segment's search into the export directory as "
-                        "something that can be opened and looked at: the cell as the "
+                   help="write a failed segment's search into the study directory, "
+                        "beside the manifest it was read from, as something that can be "
+                        "opened and looked at: the cell as the "
                         "planner collided against it, the biggest pair of Cartesian trees "
                         "the segment built, and the robot wherever a node is clicked. "
                         "Three files per failure -- a page, its data, and the viewer "

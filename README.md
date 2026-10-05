@@ -495,8 +495,8 @@ tool speed cap.
 **A segment that fails leaves something to look at.** Every budget above decides how hard
 to search; none of them says why a particular transit could not be solved, and the log can
 only say that OMPL returned no solution. So when a segment fails, `--treeview` writes the
-search into the export directory as a page that opens on a double click — no server, no
-install, nothing fetched. It shows the cell as the planner collided against it, the biggest
+search into the study directory, beside the manifest it was read from, as a page that opens
+on a double click — no server, no install, nothing fetched. It shows the cell as the planner collided against it, the biggest
 pair of Cartesian trees the segment built, each node coloured by how much clearance the
 robot had there, and the robot itself — arm and gun — wherever a node is clicked.
 
@@ -1234,7 +1234,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--gun-opening-round-mm` | 5 | multiple that openings found by bisection are rounded to |
 | `--gun-opening-weight` | 1.5 | what a second counts as with the gun at full travel, against 1x shut; multiplies a route's whole penalised cost, so candidates found at different openings compete on it. 1 switches it off |
 | `--retune-gun-openings` | 4 | openings each finished leg is re-priced at, after every other pass, validated along the whole leg and never re-planned. 0 leaves it at the opening it was found at |
-| `--treeview` | on | write a failed segment's search into the export directory as a page that can be opened and looked at |
+| `--treeview` | on | write a failed segment's search into the study directory as a page that can be opened and looked at |
 | `--treeview-max-poses` | 1500 | how many of a tree's nodes get the robot's pose baked in, those being most of the file's size |
 | `--fallback-distance-mm` | 100 | room a fallback pose must leave around the robot and gun |
 | `--no-shortcut` | off | skip shortcutting and polishing |

@@ -715,18 +715,18 @@ class ToolpathPlanner:
         be missing: a segment can fail because a locator never placed, and then there is no
         transit and no tree, only the cell and the reason.  ``treeview`` writes what exists.
 
-        Held to the export directory, there being nowhere else the operator is already
-        looking, and every file it writes is named in the log so nothing lands there
-        silently.
+        Written to the study directory -- ``Manifest.directory``, the one the manifest was
+        read from -- because that is where the operator already is, and because it is the
+        one directory this program is always given.  ``export_dir`` is not it: that is set
+        only when ``--export-collision-geometry`` is passed, so hanging this off it meant
+        the view silently did not appear on any ordinary run.  Every file is named in the
+        log, so nothing lands there silently.
         """
         if not self.treeview:
             return
-        if not self.export_dir:
-            self.log("      no --export-dir, so there is nowhere to write the failure view")
-            return
         from . import treeview
         treeview.write(
-            self.cell, self.man, self.export_dir,
+            self.cell, self.man, self.man.directory,
             segment=f"{a.name}--to--{b.name}", failure=failure,
             qa=anchors.get(a.name), qb=anchors.get(b.name),
             kept=treetrace.kept(), searches=treetrace.searches(),
