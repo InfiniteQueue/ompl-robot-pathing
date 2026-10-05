@@ -880,6 +880,15 @@ over at the next pose, which charged for the easy half once per opening per pose
 of the worst case was those repeats. What committing costs is coverage: a second half that
 reaches at no opening now ends the transit rather than falling through to another pose.
 
+`--fallback-poses` caps how many poses a transit is offered. There are three ways of
+looking and each contributes at most one pose, so 3 is every pose there is; the cap is
+applied while the search runs rather than to the list it produces, because each method
+solves inverse kinematics at every step it takes until the arm runs out of reach, and a cap
+that only hid the pose afterwards would save none of that time. Because a reached pose
+closes the others off, what the count really bounds is a transit where pose after pose
+cannot be reached. 0 looks for none at all, and a transit with no direct route then fails
+rather than detouring.
+
 **The departure opening leads because it is already in force.** Using it costs no gun
 change at the start of the move, and it is the state the robot was proved to stand at the
 departing locator in. The arrival opening is still tried second. The order used to put a
@@ -1236,6 +1245,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--retune-gun-openings` | 4 | openings each finished leg is re-priced at, after every other pass, validated along the whole leg and never re-planned. 0 leaves it at the opening it was found at |
 | `--treeview` | on | write a failed segment's search into the study directory as a page that can be opened and looked at |
 | `--treeview-max-poses` | 1500 | how many of a tree's nodes get the robot's pose baked in, those being most of the file's size |
+| `--fallback-poses` | 3 | fallback poses a transit may be offered, which is also how many of the three ways of looking are run. 0 looks for none, so a transit with no direct route fails rather than detouring |
 | `--fallback-distance-mm` | 100 | room a fallback pose must leave around the robot and gun |
 | `--no-shortcut` | off | skip shortcutting and polishing |
 | `--shortcut-seconds` | 20 | time budget for shortcutting each transit |

@@ -6,6 +6,13 @@ Every method that succeeds contributes one pose, so the transit gets a list in p
 order rather than a single answer -- the planner tries them in turn, and a method that
 found somewhere unhelpful costs one more attempt rather than the whole transit.
 
+``max_poses`` stops that walk once it holds that many.  The cap is applied *here* rather
+than by slicing the list the planner gets, because a method costs real time whether or not
+its pose is ever used -- it solves inverse kinematics at every step it takes -- and a cap
+that only hid the pose afterwards would save none of it.  So this is a limit on how hard
+the detour is looked for as well as on how many detours are attempted.  0 asks for no
+poses at all, which leaves a transit that cannot be flown directly to fail directly.
+
 This is per transit, not per run.  Both ends of the move enter every method and the
 validity rule, so a pose found for one transit says nothing about the next; the previous
 scheme, which took the first via in the study and used it everywhere, was cheap precisely
@@ -34,23 +41,36 @@ from .validity import NO_IK, Validator
 class FallbackFinder:
     """Builds fallback poses for one cell, on demand, transit by transit."""
 
-    def __init__(self, cell, man, *, fallback_mm: float, step_mm: float, log=print):
+    def __init__(self, cell, man, *, fallback_mm: float, step_mm: float,
+                 max_poses: int = len(methods.METHODS), log=print):
         self.cell = cell
         self.man = man
         self.fallback_mm = float(fallback_mm)
         self.step_mm = float(step_mm)
+        self.max_poses = max(0, int(max_poses))
         self.log = log
 
     def announce(self) -> None:
         """Say what the search will do, once, before any transit needs it."""
-        self.log(f"  fallback poses: keeping {self.fallback_mm:g} mm off the parts, "
-                 f"stepping {self.step_mm:g} mm at a time until the arm runs out of "
-                 f"reach")
+        if not self.max_poses:
+            self.log("  fallback poses: none will be looked for, so a transit with no "
+                     "direct route fails rather than detouring")
+            return
+        self.log(f"  fallback poses: up to {self.max_poses} of "
+                 f"{len(methods.METHODS)} method"
+                 f"{'' if len(methods.METHODS) == 1 else 's'}, keeping "
+                 f"{self.fallback_mm:g} mm off the parts, stepping {self.step_mm:g} mm "
+                 f"at a time until the arm runs out of reach")
         self.log(f"  a neutral pose is {neutral.describe()}")
 
     def poses(self, qa: np.ndarray, qb: np.ndarray,
               pose_a: np.ndarray, pose_b: np.ndarray) -> list[np.ndarray]:
         """Fallback poses for the transit from ``qa`` to ``qb``, most preferred first."""
+        if not self.max_poses:
+            # Nothing is searched and nothing is logged per transit.  The count was
+            # announced once at the start of the run, and repeating it on every transit
+            # that fails directly would say the same thing dozens of times.
+            return []
         ctx = methods.Context(cell=self.cell, man=self.man,
                               qa=np.asarray(qa, dtype=float),
                               qb=np.asarray(qb, dtype=float),
@@ -59,8 +79,18 @@ class FallbackFinder:
                               step_mm=self.step_mm)
         validator = Validator(self.cell, qa, qb, self.fallback_mm)
         out: list[np.ndarray] = []
-        for method in methods.METHODS:
-            out.extend(self._run(method, ctx, validator))
+        for n, method in enumerate(methods.METHODS):
+            if len(out) >= self.max_poses:
+                left = len(methods.METHODS) - n
+                self.log(f"      {len(out)} fallback pose"
+                         f"{'' if len(out) == 1 else 's'} is the limit, so "
+                         f"{left} further method{'' if left == 1 else 's'} "
+                         f"{'was' if left == 1 else 'were'} not searched")
+                break
+            # Sliced as well as broken out of: a method returns one pose today, and a
+            # count enforced only by the loop guard would quietly stop meaning anything
+            # the day one returns two.
+            out.extend(self._run(method, ctx, validator)[:self.max_poses - len(out)])
         if not out:
             self.log("      no fallback pose was found by any method; this transit will "
                      "be attempted directly or not at all")

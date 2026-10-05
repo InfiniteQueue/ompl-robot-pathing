@@ -190,6 +190,7 @@ class ToolpathPlanner:
                  opening_round_mm: float = 5.0,
                  gun: GunPreference | None = None, retune_openings: int = 0,
                  fallback_mm: float = 100.0, fallback_step_mm: float = 40.0,
+                 fallback_poses: int = 3,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
                  continuous_check: bool = False,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
@@ -308,7 +309,8 @@ class ToolpathPlanner:
         # Poses to route a difficult transit through are searched for per transit and only
         # when one is needed; see weldpath.fallback and _fallback_for.
         self.fallback = FallbackFinder(cell, man, fallback_mm=fallback_mm,
-                                       step_mm=fallback_step_mm, log=self.log)
+                                       step_mm=fallback_step_mm,
+                                       max_poses=fallback_poses, log=self.log)
 
     def _fallback_for(self, a: Locator, b: Locator, qa: np.ndarray, qb: np.ndarray):
         """A callable giving this transit its fallback poses, run only if it is asked.

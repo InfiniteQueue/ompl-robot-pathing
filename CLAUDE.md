@@ -289,6 +289,16 @@ the way, so the joint values in between are whatever that line demands.
     being the diagnosis for why no other was tried.
   - A pose never reached at any opening commits to nothing and the next pose is still tried.
     Only a pose actually *reached* closes the others off.
+  - **`--fallback-poses` (3) is how many poses a transit may be offered, and it is enforced
+    in `FallbackFinder.poses` rather than by slicing the list the planner gets.** A method
+    costs real time whether or not its pose is used -- it solves inverse kinematics at every
+    step it takes, until the arm runs out of reach -- so a cap read at the planner would
+    save none of it. `METHODS` has three entries and each contributes at most one pose, so
+    3 is every pose there is and anything above it is the same number. Since committing
+    means a reached pose closes the others off, what this bounds is the transit where pose
+    after pose cannot be reached at all; 0 looks for none, and a transit with no direct
+    route then fails instead of detouring. The skipped methods are named in the log, a cap
+    that quietly searched less being indistinguishable from a cell that offered less.
   - A `via` inside the joint 5 stop band cannot change the gun -- the robot stands still
     there and nothing downstream moves an endpoint -- so the second half is offered
     `lead_open` and nothing else. The old code skipped such a pose in the split tier

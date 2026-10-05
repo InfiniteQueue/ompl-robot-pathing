@@ -251,7 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "them fails, wasting the inverse kinematics already spent on the "
                         "stations before it (default: %(default)g)")
     #HOW FAR OUTSIDE THE ENDPOINTS IT LOOKS
-    p.add_argument("--cartesian-margin-mm", type=float, default=200.0, metavar="MM",
+    p.add_argument("--cartesian-margin-mm", type=float, default=400.0, metavar="MM",
                    help="how far outside the box spanned by the two endpoints the tree "
                         "samples for a way round. A detour has to leave the straight line "
                         "to be worth finding, but one that leaves it by more than the "
@@ -347,6 +347,21 @@ def build_parser() -> argparse.ArgumentParser:
                         "already-reduced leg per opening. 0 leaves each leg at the "
                         "opening it was found at (default: %(default)g)")
     #FALLBACK POSES
+    #HOW MANY POSES A TRANSIT MAY BE OFFERED
+    p.add_argument("--fallback-poses", type=int, default=3, metavar="N",
+                   help="how many fallback poses a transit that cannot be flown directly "
+                        "may be offered, in preference order. One method of looking "
+                        "contributes at most one pose and there are three methods, so 3 "
+                        "is every pose there is and anything higher is the same as 3. "
+                        "The count bounds the search as well as the planning: a method "
+                        "solves inverse kinematics at every step it takes, and once this "
+                        "many poses are in hand the remaining methods are not run. A "
+                        "pose costs a detour only if it is actually reached -- the first "
+                        "one that is settles the route and the rest are never tried -- so "
+                        "what this really bounds is a transit where pose after pose "
+                        "cannot be reached at all. 0 looks for none, and a transit with "
+                        "no direct route then fails rather than detouring "
+                        "(default: %(default)g)")
     #HOW FAR A FALLBACK POSE STAYS OFF THE PARTS
     p.add_argument("--fallback-distance-mm", type=float, default=100.0, metavar="MM",
                    help="how much room a fallback pose has to leave between every part of "
@@ -1034,6 +1049,9 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.retune_gun_openings < 0:
         print("error: --retune-gun-openings cannot be negative", file=sys.stderr)
         return 2
+    if args.fallback_poses < 0:
+        print("error: --fallback-poses cannot be negative", file=sys.stderr)
+        return 2
     if args.treeview_max_poses < 0:
         print("error: --treeview-max-poses cannot be negative", file=sys.stderr)
         return 2
@@ -1158,6 +1176,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         segment_seconds=args.segment_minutes * 60.0,
         fallback_mm=args.fallback_distance_mm,
         fallback_step_mm=args.fallback_step_mm,
+        fallback_poses=args.fallback_poses,
         main_openings=args.min_gun_openings,
         extra_openings=args.extra_gun_openings,
         opening_round_mm=args.gun_opening_round_mm,
