@@ -343,6 +343,33 @@ the way, so the joint values in between are whatever that line demands.
     search. Without it the gun changes as the robot starts moving instead of while it
     stands still at the weld. `_arrive_opening` reads `self.openings` for the same reason:
     the declared arrival is a pose the robot may never have been shown to reach.
+- **`--gun-opening-round-mm` (5) is the grid every opening the program *chooses* lands
+  on, and it covers more than the bisections.** `gun_opening_max` is
+  `2 * arm * sin(limit / 2)` -- 164.158939 mm on this cell -- so the widest opening is
+  never a round number, and neither is its half. Both were offered raw by
+  `_opening_stream` and by `toolpath._locator_openings`, and both reached shipped
+  waypoints as `gun_opening_mm`, which is a number nobody can set the gun to. The rounding
+  used to be applied to the bisections alone.
+  - `planning.opening_cap` rounds the widest **down**, because that one is a joint limit
+    and rounding it up names an opening the gun cannot reach -- which the endpoint screen
+    would then reject for what looks like a geometric reason. What it costs is the last
+    few millimetres of travel, 160 mm against 164.16, and `0` is how to decline the trade.
+  - `planning.snap_opening` is everything else: to nearest, then clamped to the cap. The
+    clamp has to be against the *cap* and not the raw widest, that being the other way an
+    unroundable number got out -- a bisection rounding past the limit came back as the
+    limit itself.
+  - **A weld's declared opening is never rounded.** It is process data from the study, and
+    snapping it would plan the weld at an opening nobody asked for. `named` passes through
+    `_opening_stream` untouched, and `_locator_openings` returns a weld's declared value
+    as it stands.
+  - `_search_opening`'s sweep is snapped **and re-solved** at the snapped value, never
+    merely relabelled: its grid is `widest` divided into cells and halved down to the
+    resolution, so its answer is never round, and the state and clearance beside it were
+    measured at the exact value. A snap that does not place the robot keeps the exact
+    value and says so -- a real opening that works beats a tidy one that does not.
+  - `cell._waypoint_openings` still spans the raw travel. It measures the clearance spread
+    for the allowed-collision relaxation and never ships a value, and measuring the wider
+    figure is the conservative side of that question.
 - **The opening is priced as well as searched over.** `penalty.GunPreference` is a flat
   multiplier on a route's penalised cost for the opening it is to be flown at: 1x shut,
   `--gun-opening-weight` (1.5) at full travel, linear between. Without it nothing in the

@@ -1252,7 +1252,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--phase-two-cartesian-seconds` | 30 | how long one of those searches may run |
 | `--min-gun-openings` | 5 | gun openings phase one deals its runs round, the cheapest solution of the set shipping |
 | `--extra-gun-openings` | 3 | further openings held back for phase two to walk |
-| `--gun-opening-round-mm` | 5 | multiple that openings found by bisection are rounded to |
+| `--gun-opening-round-mm` | 5 | multiple that every opening the program chooses is rounded to, the widest rounding down since it is a joint limit. A weld's declared opening is never rounded. 0 rounds nothing |
 | `--gun-opening-weight` | 1.5 | what a second counts as with the gun at full travel, against 1x shut; multiplies a route's whole penalised cost, so candidates found at different openings compete on it. 1 switches it off |
 | `--retune-gun-openings` | 4 | openings each finished leg is re-priced at, after every other pass, validated along the whole leg and never re-planned. 0 leaves it at the opening it was found at |
 | `--treeview` | on | write a failed segment's search into the study directory as a page that can be opened and looked at |

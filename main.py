@@ -251,7 +251,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "them fails, wasting the inverse kinematics already spent on the "
                         "stations before it (default: %(default)g)")
     #HOW FAR OUTSIDE THE ENDPOINTS IT LOOKS
-    p.add_argument("--cartesian-margin-mm", type=float, default=400.0, metavar="MM",
+    p.add_argument("--cartesian-margin-mm", type=float, default=200.0, metavar="MM",
                    help="how far outside the box spanned by the two endpoints the tree "
                         "samples for a way round. A detour has to leave the straight line "
                         "to be worth finding, but one that leaves it by more than the "
@@ -306,11 +306,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "leaves phase two nothing to do on a cell that has a gun "
                         "(default: %(default)g)")
     p.add_argument("--gun-opening-round-mm", type=float, default=5.0, metavar="MM",
-                   help="multiple that bisected gun openings are rounded to, so "
-                        "that the program commands round figures. An opening that rounds "
-                        "onto one already being tried is dropped, so a coarse setting "
-                        "over a narrow range yields fewer openings than asked for. 0 "
-                        "rounds nothing (default: %(default)g)")
+                   help="multiple that every gun opening the program chooses is "
+                        "rounded to, so that it commands round figures -- the bisections, "
+                        "the half-open candidate, and the widest, which is a joint limit "
+                        "through 2*arm*sin(limit/2) and so is never round on its own. The "
+                        "widest rounds *down*, a limit being a limit, which gives up the "
+                        "last few millimetres of the gun's travel; everything else rounds "
+                        "to nearest. A weld's declared opening is process data and is "
+                        "never rounded. An opening that rounds onto one already being "
+                        "tried is dropped, so a coarse setting over a narrow range yields "
+                        "fewer openings than asked for. 0 rounds nothing "
+                        "(default: %(default)g)")
     #WHAT A WIDE GUN COSTS A ROUTE
     p.add_argument("--gun-opening-weight", type=float, default=1.5, metavar="X",
                    help="what a second counts as when it is flown with the gun at full "

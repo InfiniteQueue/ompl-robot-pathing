@@ -26,7 +26,7 @@ from .cartesian import CartesianBudget
 from .fallback import FallbackFinder
 from .penalty import GunPreference
 from .planning import (LIN, PTP, Deadline, LinearZone, OmplBudget, PlanningError,
-                       Relocation, unique_openings,
+                       Relocation, opening_cap, snap_opening, unique_openings,
                        plan_freespace,
                        validate)
 
@@ -386,17 +386,24 @@ class ToolpathPlanner:
         An ordinary via carries no such requirement -- it declares nothing and is planned
         closed by default -- so if the tip fouls something there, opening or closing it is
         a legitimate way through and is tried straight away.
+
+        The two it invents are on the ``--gun-opening-round-mm`` grid.  They were the raw
+        joint limit and half of it, and a via placed at either shipped that number in its
+        waypoints -- 164.158939 mm and 82.079469 mm on this cell, neither of them something
+        anybody can set the gun to.
         """
         if not self.cell.gun_joint_name:
             return [0.0]
         if loc.is_weld:
             return [] if loc.gun_opening_arrive is None else [float(loc.gun_opening_arrive)]
         widest = self.man.gun_opening_max
+        cap = opening_cap(widest, self.opening_round_mm)
         # Deduped for the same reason a transit's list is: a gun with no travel to speak of
         # collapses all three of these onto zero, and solving the same pose three times
         # over means three identical failures, three diagnoses and three geometry exports
         # before the locator is given up on.
-        return unique_openings([0.0, widest, widest / 2.0], widest)
+        return unique_openings(
+            [0.0, cap, snap_opening(cap / 2.0, self.opening_round_mm, widest)], cap)
 
     def _diagnose(self, loc: Locator, seed: np.ndarray, tag: str = "",
                   opening: float = 0.0) -> str:
@@ -597,13 +604,29 @@ class ToolpathPlanner:
         found = _scan_for_clear(0.0, widest, scan=self.opening_scan_mm,
                                 resolution=self.opening_resolution_mm, measure=measure)
         if found.best is not None:
+            best, state = found.best, found.samples[found.best][0]
+            # The sweep's grid is `widest` divided into cells and then halved down to the
+            # resolution, so what it returns is never a round number.  Snapped onto the
+            # flag's grid -- and *re-solved* there, never merely relabelled: the state and
+            # the clearance were measured at `best`, and returning a different opening
+            # beside them would be claiming a pose nothing checked.  A snap that does not
+            # place the robot keeps the exact value, which is a real opening that works
+            # over a tidy one that does not.
+            snapped = snap_opening(best, self.opening_round_mm, widest)
+            if abs(snapped - best) > 1e-9:
+                at_snap, _ = measure(snapped)
+                if at_snap is not None:
+                    best, state = snapped, at_snap
+                else:
+                    self.log(f"      '{loc.name}' does not place at {snapped:g} mm, so "
+                             f"the opening is kept at the {best:g} mm the sweep found")
             why = ("declares no gun opening" if declared is None else
                    f"cannot be placed at the {declared:g} mm the study asks for")
             # Flagged where it overrides the study, plain where it fills in a blank.
             mark = "" if declared is None else "! "
             self.log(f"    {mark}'{loc.name}' {why}; clear at {found.describe()} mm "
-                     f"({found.tried} tried), reaching it at {found.best:g} mm")
-            return found.samples[found.best][0], found.best, ""
+                     f"({found.tried} tried), reaching it at {best:g} mm")
+            return state, best, ""
 
         if not (self.stand_off_search and loc.pose_world_import is not None):
             return None, 0.0, (f"; and no opening between 0 and {widest:g} mm places it "

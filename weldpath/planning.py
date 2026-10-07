@@ -2032,6 +2032,39 @@ def _effort_note(reduced: OmplBudget, full: OmplBudget) -> str:
 OPENING_TOL_MM = 1e-6
 
 
+def opening_cap(widest: float, round_mm: float) -> float:
+    """The widest opening on the grid: ``widest`` rounded **down** to a multiple.
+
+    Down rather than to nearest because this one is a joint limit.  ``gun_opening_max`` is
+    ``2 * arm * sin(limit / 2)``, so it is almost never a round number -- 164.158939 mm on
+    the cell here -- and rounding it up would name an opening the gun cannot reach, which
+    the endpoint screen would then reject for a reason that looks like geometry.
+
+    What it costs is the last few millimetres of the gun's travel: nothing can be planned
+    at 164.16 mm once 160 is the widest offered.  That is the trade the flag is, and
+    ``--gun-opening-round-mm 0`` is how to decline it.  The value ships in the waypoints
+    as process data -- somebody sets the gun to it -- so a number nobody can dial in is
+    worse than four millimetres of swing.
+    """
+    if round_mm <= 0.0 or widest <= 0.0:
+        return float(widest)
+    return float(max(0.0, (widest // round_mm) * round_mm))
+
+
+def snap_opening(value: float, round_mm: float, widest: float) -> float:
+    """One opening of the program's own choosing, put on the grid and kept in range.
+
+    For the program's choices only.  A weld's declared opening is process data from the
+    study and passes through untouched: rounding it would silently plan a weld at an
+    opening nobody asked for, which is the opposite of what this flag is for.
+    """
+    cap = opening_cap(widest, round_mm)
+    value = float(value)
+    if round_mm > 0.0:
+        value = round(value / round_mm) * round_mm
+    return float(min(max(value, 0.0), cap))
+
+
 def unique_openings(values: list[float], limit: float | None = None) -> list[float]:
     """``values`` in order, without repeats, optionally clamped to ``0 .. limit``.
 
@@ -2113,22 +2146,29 @@ def _opening_stream(named: list[float] | None, widest: float, round_mm: float,
     twice, whichever way it was turned down.  Rounding to ``round_mm`` keeps the values
     sayable on the shop floor, 45 mm rather than 43.7 mm, at the cost of the split being
     slightly off centre.
+
+    **Everything this chooses is rounded, not only the bisections.**  ``widest`` is a joint
+    limit through ``2 * arm * sin(limit / 2)`` and so is never round -- 164.158939 mm here,
+    with 82.079469 mm for its half -- and both were yielded raw, which put both numbers
+    into shipped waypoints where nobody could set the gun to either.  ``named`` is the one
+    thing still passed through untouched, those being the study's own openings.
     """
-    for value in [*(named or []), 0.0, widest, widest / 2.0]:
+    cap = opening_cap(widest, round_mm)
+    for value in [*(named or []), 0.0, cap, snap_opening(cap / 2.0, round_mm, widest)]:
         yield float(value)
     floor = round_mm if round_mm > 0.0 else OPENING_FLOOR_MM
     while True:
         # Closed and widest bound the search whether or not either was kept, so the
         # bisections cover the gun's whole travel even where the named openings cluster.
-        known = sorted({0.0, float(widest), *tried})
+        known = sorted({0.0, float(cap), *tried})
         gaps = sorted(zip(known, known[1:]), key=lambda g: g[1] - g[0], reverse=True)
         for lo, hi in gaps:
             if hi - lo < 2.0 * floor:
                 return                      # the widest gap left is narrower than a step
-            mid = (lo + hi) / 2.0
-            if round_mm > 0.0:
-                mid = round(mid / round_mm) * round_mm
-            mid = float(min(max(mid, 0.0), widest))
+            # Snapped and clamped against the *rounded* cap.  Clamping to the raw widest
+            # was the other way an unroundable number got out: a bisection rounded past
+            # the limit came back as the limit itself.
+            mid = snap_opening((lo + hi) / 2.0, round_mm, widest)
             if any(abs(mid - seen) < OPENING_TOL_MM for seen in tried):
                 continue                    # rounded onto a neighbour: try a wider gap
             yield mid
