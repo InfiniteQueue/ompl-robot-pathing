@@ -354,7 +354,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "opening it was found at (default: %(default)g)")
     #FALLBACK POSES
     #HOW MANY POSES A TRANSIT MAY BE OFFERED
-    p.add_argument("--fallback-poses", type=int, default=0, metavar="N",
+    p.add_argument("--fallback-poses", type=int, default=2, metavar="N",
                    help="how many fallback poses a transit that cannot be flown directly "
                         "may be offered, in preference order. One method of looking "
                         "contributes at most one pose and there are three methods, so 3 "
