@@ -51,12 +51,12 @@ The generated directories are safe to delete; they are rebuilt on the next run.
    is solved whole. A direct joint move is taken where one is clear; otherwise two
    searches run and the cheaper of everything they find ships -- OMPL, keeping the best of
    several runs, and a Cartesian-space tree whose edges are straight tool moves (only
-   while the near-panel band is on). Where that finds nothing the fallbacks follow in
-   turn: longer OMPL runs, the same again through a fallback pose searched for that
-   transit, and finally two legs with the gun changing between them. The gun opening is chosen by the search rather than ahead of it: phase
+   while the near-panel band is on). Where that finds nothing, the transit is retried as
+   a detour: `w1 -> f1 -> f2 -> w2`, through one fallback pose per end, searched for that
+   transit. The gun opening is chosen by the search rather than ahead of it: phase
    one's runs are dealt round several openings and the cheapest solution of the whole set
-   ships, with a reserve of further openings held back for phase two. All of them are
-   tried directly before any fallback pose is. Each run is made with the gun tip where it
+   ships, with a reserve of further openings held back from them for the detour. All of
+   them are tried directly before any fallback pose is. Each run is made with the gun tip where it
    would hold it. The route is then improved
    under a **time** metric — the same bang-bang joint dynamics the output is scheduled with,
    penalised for running close to the parts — by cutting detours, dropping waypoints that
@@ -487,21 +487,34 @@ From start to finish:
    the whole route, and the planner moves on to its next gun opening or fallback pose;
    nothing is relabelled or re-planned to rescue it.
 
-A route through a fallback pose is labelled once, over the joined route. A transit split for
-a gun change is labelled per leg, under that leg's own opening. The final per-phase
+A detour whose legs share one gun opening is labelled once, over the joined route. Legs at
+different openings are labelled separately, each under its own opening. The final per-phase
 validation checks each phase under its label, and `output.Timing` holds `LIN` moves to the
 tool speed cap.
 
 **A segment that fails leaves something to look at.** Every budget above decides how hard
 to search; none of them says why a particular transit could not be solved, and the log can
 only say that OMPL returned no solution. So when a segment fails, `--treeview` writes the
-search into the export directory as a page that opens on a double click — no server, no
-install, nothing fetched. It shows the cell as the planner collided against it, the biggest
-pair of Cartesian trees the segment built, each node coloured by how much clearance the
-robot had there, and the robot itself — arm and gun — wherever a node is clicked.
+search into the study directory, beside the manifest it was read from, as a page that opens
+on a double click — no server, no install, nothing fetched. It shows the cell as the planner collided against it, the
+Cartesian trees the segment built, each node coloured by how much clearance the robot had
+there, and the robot itself — arm and gun — wherever a node is clicked.
 
-The two trees grow towards each other from the start and the goal, so what the picture is
-for is the gap between them: which one got how far, and where they stopped short of meeting.
+**Every search goes into the one file.** A segment runs the tree many times — successive
+seeds until the solve budget is spent, once per gun opening, and again per leg of a detour,
+where the two extractions have no other solver — and they fail in different places. Which
+opening got furthest, and whether a traverse failed where the extractions had no trouble,
+are questions about the
+set rather than about any one search, so the viewer lists them all and filters per search,
+each in its own colour, with the biggest shown on opening. `--treeview-searches` bounds how
+many are held; it is a memory limit, since a kept search's nodes stay alive until the
+segment ends and every segment pays that whether or not it fails. Past it the smallest kept
+search makes way for a bigger one, so what is lost is the searches that died early — the
+file says how many were dropped, and raising the limit is how to see them.
+
+The two trees of each search grow towards each other from the start and the goal, so what
+the picture is for is the gap between them: which one got how far, and where they stopped
+short of meeting.
 The geometry drawn is the convex decomposition the collision check actually used rather than
 the source meshes, because those differ — a viewer showing the pretty meshes would show the
 gun comfortably clear of something the planner was certain it had hit.
@@ -511,10 +524,10 @@ the segment failed at a locator and never attempted a transit — what lands the
 the straight chord between the two endpoints with its clearance along it, and the reason.
 
 **One segment's search is bounded by the clock as well as by its budgets.** Every other
-budget bounds a part of the search — runs, seconds per run, gun openings, fallback poses —
+budget bounds a part of the search — runs, seconds per run, gun openings, detour legs —
 and they multiply: a transit that fails everywhere spends its phase-one runs at each
-opening, then the Cartesian searches, then phase two, then one detour's two halves over
-the openings its second half can be flown at.
+opening, then the Cartesian searches, then the detour's three legs over every opening each
+of them can be flown at.
 Each of those numbers is defensible on its own and their product is hours, on a segment
 that may simply have no route. `--segment-minutes` (60) is the figure that bounds it:
 past it nothing further is started, whatever routes are already in hand are still ranked,
@@ -569,8 +582,8 @@ draw the search into the gap; the tree steers along the tool's own line and stay
 that corridor. A phase one that solved is therefore no evidence that the tree had nothing
 better, and running only one of them leaves the cheaper route uncosted. What it costs is the
 budgets below on every transit rather than only on the ones nothing else could reach; the
-segment clock is what bounds that. The tree is still never run for the two halves of a route
-through a fallback pose. Its route is dense: states about `--check-step-mm` of tool travel apart, each gap a straight
+segment clock is what bounds that. It runs for every leg of a detour as well, and on the
+two legs out of the locators it is the only solver there is. Its route is dense: states about `--check-step-mm` of tool travel apart, each gap a straight
 tool move, plus one stationary joint move where its two trees meet. Like phase one, it
 searches more than once: new seeds until one solves within `--cartesian-solve-seconds`,
 then more until `--cartesian-min-seconds` has passed, and only the cheapest route of
@@ -808,7 +821,7 @@ changed collision state with the gun — **in both directions**: some are blocke
 clear wide open, others the reverse. So a destination can be unreachable at the opening the
 robot arrives with, and the transit planner plans over several of them. `--min-gun-openings`
 (5) make up the rotation phase one deals its runs round; `--extra-gun-openings` (3) more
-are held in reserve for phase two. Both are drawn in preference order — the opening the
+are held back from it, for the detour to walk leg by leg. Both are drawn in preference order — the opening the
 robot departs with, the one it has to arrive holding, then closed, widest and half open,
 then bisections of the widest range nothing has been tried in yet, rounded to
 `--gun-opening-round-mm` — and an opening that repeats one already offered, or that puts a
@@ -860,25 +873,61 @@ had to spend was gone.
 **Phase two looks somewhere new rather than looking harder.** It walks the reserve, one
 opening per run: phase one has already had its runs at everything in the rotation, and a
 longer search where three short ones just failed is the narrower of the two bets on offer.
-`--phase-two-cartesian-runs` Cartesian searches of `--phase-two-cartesian-seconds` each are
-spread evenly through those runs rather than queued behind them, since either kind ends the
-phase by solving and queueing one behind the other would let the ordering decide which kind
-ever got a turn.
-
 Changing the gun is a real operation on the machine, so a single opening for the whole
-transit is always preferred; only when none works is the move split into two legs with the
-gun changing at the intermediate pose, where the robot is stationary anyway. Each half of a
-detour is planned at one opening, the gun not changing partway through a move.
+transit is always preferred; only when none works does the gun change, and then only at a
+pose the robot is stationary at. Each leg is planned at one opening, the gun not changing
+partway through a move.
 
-**A detour commits to its pose and to the half that reached it.** The first opening that
-carries the route to a fallback pose settles the detour: that half is kept, no other pose is
-tried, and the only question left — the gun — is asked of the second half alone, which is
-the only part still looking for a route. The opening the first half flies at is tried first,
-so the answer looked for first is still one leg with no gun change in it. The planner used
-to work the other way round, solving both halves at each opening in turn and then starting
-over at the next pose, which charged for the easy half once per opening per pose; nearly all
-of the worst case was those repeats. What committing costs is coverage: a second half that
-reaches at no opening now ends the transit rather than falling through to another pose.
+**A transit with no direct route is retried as `w1 -> f1 -> f2 -> w2`.** `f1` is the start
+locator's own fallback pose and `f2` the end locator's, each a place to stand just clear of
+the pocket that end sits in — so the route is two extractions with a traverse between them,
+and it is what runs where a second, longer OMPL phase used to. That phase asked the same
+planner the same question again, from a new seed at a gun opening it had not reached; but a
+transit that has beaten the straight move, every phase-one run and the Cartesian tree is not
+one waiting for a longer look at the same space. It is one whose two ends cannot see each
+other, and the answer to that is to stop asking for one move. Nothing was given up by the
+swap: the openings that phase would have walked are walked here per leg.
+
+**Each leg gets the solver that suits it.** The leg between a locator and that locator's own
+fallback goes to the Cartesian tree alone. The tree steers along the tool's own straight
+line, which is the shape a pull-back out of a pocket has; OMPL samples joint space uniformly
+with nothing drawing it into the gap beside the fixture, so there it is both the slower
+solver and the one likelier to come back swinging the gun across the panel. The leg between
+the two poses runs through open air and gets everything a direct transit gets — the straight
+chord, phase one over the openings, and the tree ranked against it.
+
+**The extractions are settled first, and a solved leg is never re-solved.** They are the
+constrained legs, so a failure there points at one pose rather than at the detour as a
+whole, and settling them first means the traverse is offered openings an extraction has
+already been shown to fly at. Each leg then walks the openings led by those its neighbours
+hold, so no gun change is introduced where none is needed, and the first that carries it
+settles it. Consecutive legs at one opening are joined and refined as one route — the corner
+at the pose between them is exactly the kind the refinement passes exist to cut — so a
+detour the gun never changes on ships as one leg, not three. What the commitment costs is
+coverage: a leg that flies at no opening ends the transit rather than sending the search
+back to re-derive a pose, and the failure names the leg and how many of the three were in
+hand. A fallback pose inside the joint 5 stop band cannot change the gun, so the legs either
+side of it are locked to one opening between them; two such poses lock the whole detour to
+one.
+
+**Each pose is looked for in two places, both starting at its own locator.** First out along
+that locator's retreat axis — the direction pointing into the gun's own bulk, which is the
+way out of the pocket rather than deeper into it — and, where that finds nothing, out from
+the same locator towards where its nearest neutral pose puts the tool. Both step outward
+`--fallback-step-mm` at a time, so the first candidate that is reachable, collision free and
+`--fallback-distance-mm` clear of the parts is the nearest one that works. The arrangement
+before this walked a single list — retreat from the start, retreat from the end, then a line
+out of the midpoint — and offered the results as interchangeable candidates for one via,
+which made the end locator's extraction the proposed remedy for a start locator that could
+not be backed out. They were never alternatives.
+
+`--fallback-poses` is how many of the two ends get a pose. A transit has two ends and each
+has one fallback, so 2 is every pose there is and anything higher is read as 2; the cap is
+applied while the search runs rather than to the list it produces, because each walk solves
+inverse kinematics at every step it takes until the arm runs out of reach, and a cap that
+only hid the pose afterwards would save none of that time. 1 asks for the start end's alone,
+which still leaves one leg reaching all the way into the end locator's pocket. 0 looks for
+none at all, and a transit with no direct route then fails rather than detouring.
 
 **The departure opening leads because it is already in force.** Using it costs no gun
 change at the start of the move, and it is the state the robot was proved to stand at the
@@ -1223,19 +1272,19 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--cartesian-solve-seconds` | 120 | Cartesian tree time to find a first route, spent on every transit the band is on for; 0 disables. `--cartesian-seconds` still works |
 | `--cartesian-min-seconds` | 120 | least time the tree spends once solved, re-solving from new seeds and keeping the cheapest route |
 | `--cartesian-recut` | true | cut a Cartesian-tree route where it leaves the band and replan the parts outside it with phases one and two |
-| `--phase-two-max-runs` | 8 | further OMPL runs, stopping at the first solution |
-| `--phase-two-solve-seconds` | 45 | how long one of those runs may search |
+| `--phase-two-max-runs` | 2 | OMPL runs for a gap the recut has to join, stopping at the first solution. No longer a stage of a transit |
+| `--phase-two-solve-seconds` | 240 | how long one of those runs may search |
 | `--segment-minutes` | 60 | wall clock for one segment's search; past it the segment is reported as failed and the run moves on. 0 removes the limit |
 | `--direct-clearance-mm` | 0 | room the straight joint move has to keep to be taken without searching; under it the next gun opening is tried and then the searches. 0 asks nothing beyond the collision check |
-| `--phase-two-cartesian-runs` | 2 | Cartesian searches spread evenly through phase two, at its own gun openings |
-| `--phase-two-cartesian-seconds` | 30 | how long one of those searches may run |
 | `--min-gun-openings` | 5 | gun openings phase one deals its runs round, the cheapest solution of the set shipping |
-| `--extra-gun-openings` | 3 | further openings held back for phase two to walk |
-| `--gun-opening-round-mm` | 5 | multiple that openings found by bisection are rounded to |
+| `--extra-gun-openings` | 3 | further openings held back from the direct transit, for the detour to walk leg by leg |
+| `--gun-opening-round-mm` | 5 | multiple that every opening the program chooses is rounded to, the widest rounding down since it is a joint limit. A weld's declared opening is never rounded. 0 rounds nothing |
 | `--gun-opening-weight` | 1.5 | what a second counts as with the gun at full travel, against 1x shut; multiplies a route's whole penalised cost, so candidates found at different openings compete on it. 1 switches it off |
 | `--retune-gun-openings` | 4 | openings each finished leg is re-priced at, after every other pass, validated along the whole leg and never re-planned. 0 leaves it at the opening it was found at |
-| `--treeview` | on | write a failed segment's search into the export directory as a page that can be opened and looked at |
-| `--treeview-max-poses` | 1500 | how many of a tree's nodes get the robot's pose baked in, those being most of the file's size |
+| `--treeview` | on | write a failed segment's search into the study directory as a page that can be opened and looked at |
+| `--treeview-searches` | 12 | how many of a segment's tree searches the view keeps, all of them filterable separately in the viewer. A memory limit; past it the smallest kept search makes way. 0 keeps every one |
+| `--treeview-max-poses` | 1500 | how many nodes get the robot's pose baked in, those being most of the file's size. A total over every tree in the file, split between them by node count |
+| `--fallback-poses` | 2 | how many of a transit's two ends get a fallback pose of their own, the detour being `w1 -> f1 -> f2 -> w2`. 2 is every pose there is; 0 looks for none, so a transit with no direct route fails rather than detouring |
 | `--fallback-distance-mm` | 100 | room a fallback pose must leave around the robot and gun |
 | `--no-shortcut` | off | skip shortcutting and polishing |
 | `--shortcut-seconds` | 20 | time budget for shortcutting each transit |
@@ -1288,8 +1337,9 @@ Exit code is 0 when every segment planned, 1 otherwise.
 ## Notes and limitations
 
 * Freespace planning is randomised, so a marginal segment can take a different number of
-  attempts between runs. Fallback poses searched per transit make this much less likely,
-  but a cell with tighter clearances may need `--phase-two-max-runs` raised.
+  attempts between runs. A fallback pose per end, searched per transit, makes this much
+  less likely; a cell with tighter clearances may need `--phase-one-runs` or
+  `--cartesian-solve-seconds` raised, and `--segment-minutes` with them.
 * The Python OMPL bindings do not expose the planner's time budget, so difficulty is
   managed by making collision checks cheaper rather than by planning for longer.
 * Convex decomposition overstates penetration where a hull is a poor fit — on the sample

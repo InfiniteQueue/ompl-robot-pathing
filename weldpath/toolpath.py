@@ -26,7 +26,7 @@ from .cartesian import CartesianBudget
 from .fallback import FallbackFinder
 from .penalty import GunPreference
 from .planning import (LIN, PTP, Deadline, LinearZone, OmplBudget, PlanningError,
-                       Relocation, unique_openings,
+                       Relocation, opening_cap, snap_opening, unique_openings,
                        plan_freespace,
                        validate)
 
@@ -190,6 +190,7 @@ class ToolpathPlanner:
                  opening_round_mm: float = 5.0,
                  gun: GunPreference | None = None, retune_openings: int = 0,
                  fallback_mm: float = 100.0, fallback_step_mm: float = 40.0,
+                 fallback_poses: int = 2,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
                  continuous_check: bool = False,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
@@ -204,6 +205,7 @@ class ToolpathPlanner:
                  opening_resolution_mm: float = 1.0,
                  export_dir: str | None = None,
                  treeview: bool = True, treeview_max_poses: int = 1500,
+                 treeview_searches: int = 12,
                  keep_unrefined: bool = False, log=print):
         self.cell = cell
         self.man = man
@@ -284,6 +286,7 @@ class ToolpathPlanner:
         # is on how many nodes get a baked robot pose, those being most of the file.
         self.treeview = bool(treeview)
         self.treeview_max_poses = max(0, int(treeview_max_poses))
+        self.treeview_searches = max(0, int(treeview_searches))
         self.keep_unrefined = keep_unrefined
         # None means "no separate weld rule", i.e. the cell's own clearance throughout.
         self.weld_clearance = (None if weld_clearance_mm is None
@@ -308,23 +311,29 @@ class ToolpathPlanner:
         # Poses to route a difficult transit through are searched for per transit and only
         # when one is needed; see weldpath.fallback and _fallback_for.
         self.fallback = FallbackFinder(cell, man, fallback_mm=fallback_mm,
-                                       step_mm=fallback_step_mm, log=self.log)
+                                       step_mm=fallback_step_mm,
+                                       max_poses=fallback_poses, log=self.log)
 
     def _fallback_for(self, a: Locator, b: Locator, qa: np.ndarray, qb: np.ndarray):
-        """A callable giving this transit its fallback poses, run only if it is asked.
+        """A callable giving this transit one fallback pose per end, run only if asked.
 
         Handed to ``plan_freespace`` rather than a list because the search costs real time
-        -- three methods, each solving inverse kinematics at every step it takes -- and
-        most transits solve at the first gun opening and never reach for a detour.  The
-        planner calls this once, after every opening has failed directly.
+        -- each end walks out of its locator solving inverse kinematics at every step it
+        takes -- and most transits solve at the first gun opening and never reach for a
+        detour.  The planner calls this once, after every opening has failed directly.
+
+        What comes back is in route order: the start locator's own fallback, then the end
+        locator's.  The planner reads each for its configuration and for which end it
+        belongs to, that being what tells an extraction from a traverse, and knows nothing
+        else about how either was found.
 
         This replaces taking the study's first via and routing everything through it.  That
         was one pose for the whole run, chosen without reference to either end of the move
         it was rescuing or to how much room there was around it; it was only ever a guess
         that a pose the path already visited would be a clear one.
         """
-        def find() -> list[np.ndarray]:
-            return self.fallback.poses(qa, qb, a.pose_world, b.pose_world)
+        def find() -> list:
+            return self.fallback.pair(qa, qb, a.pose_world, b.pose_world)
         return find
 
     def _clearance_for(self, *locators: Locator):
@@ -382,17 +391,24 @@ class ToolpathPlanner:
         An ordinary via carries no such requirement -- it declares nothing and is planned
         closed by default -- so if the tip fouls something there, opening or closing it is
         a legitimate way through and is tried straight away.
+
+        The two it invents are on the ``--gun-opening-round-mm`` grid.  They were the raw
+        joint limit and half of it, and a via placed at either shipped that number in its
+        waypoints -- 164.158939 mm and 82.079469 mm on this cell, neither of them something
+        anybody can set the gun to.
         """
         if not self.cell.gun_joint_name:
             return [0.0]
         if loc.is_weld:
             return [] if loc.gun_opening_arrive is None else [float(loc.gun_opening_arrive)]
         widest = self.man.gun_opening_max
+        cap = opening_cap(widest, self.opening_round_mm)
         # Deduped for the same reason a transit's list is: a gun with no travel to speak of
         # collapses all three of these onto zero, and solving the same pose three times
         # over means three identical failures, three diagnoses and three geometry exports
         # before the locator is given up on.
-        return unique_openings([0.0, widest, widest / 2.0], widest)
+        return unique_openings(
+            [0.0, cap, snap_opening(cap / 2.0, self.opening_round_mm, widest)], cap)
 
     def _diagnose(self, loc: Locator, seed: np.ndarray, tag: str = "",
                   opening: float = 0.0) -> str:
@@ -593,13 +609,29 @@ class ToolpathPlanner:
         found = _scan_for_clear(0.0, widest, scan=self.opening_scan_mm,
                                 resolution=self.opening_resolution_mm, measure=measure)
         if found.best is not None:
+            best, state = found.best, found.samples[found.best][0]
+            # The sweep's grid is `widest` divided into cells and then halved down to the
+            # resolution, so what it returns is never a round number.  Snapped onto the
+            # flag's grid -- and *re-solved* there, never merely relabelled: the state and
+            # the clearance were measured at `best`, and returning a different opening
+            # beside them would be claiming a pose nothing checked.  A snap that does not
+            # place the robot keeps the exact value, which is a real opening that works
+            # over a tidy one that does not.
+            snapped = snap_opening(best, self.opening_round_mm, widest)
+            if abs(snapped - best) > 1e-9:
+                at_snap, _ = measure(snapped)
+                if at_snap is not None:
+                    best, state = snapped, at_snap
+                else:
+                    self.log(f"      '{loc.name}' does not place at {snapped:g} mm, so "
+                             f"the opening is kept at the {best:g} mm the sweep found")
             why = ("declares no gun opening" if declared is None else
                    f"cannot be placed at the {declared:g} mm the study asks for")
             # Flagged where it overrides the study, plain where it fills in a blank.
             mark = "" if declared is None else "! "
             self.log(f"    {mark}'{loc.name}' {why}; clear at {found.describe()} mm "
-                     f"({found.tried} tried), reaching it at {found.best:g} mm")
-            return found.samples[found.best][0], found.best, ""
+                     f"({found.tried} tried), reaching it at {best:g} mm")
+            return state, best, ""
 
         if not (self.stand_off_search and loc.pose_world_import is not None):
             return None, 0.0, (f"; and no opening between 0 and {widest:g} mm places it "
@@ -690,7 +722,7 @@ class ToolpathPlanner:
             self.log(f"  segment {a.name} -> {b.name} [{index + 1}/{len(pairs)}]")
             stagetrace.section(f"segment {a.name} -> {b.name} [{index + 1}/{len(pairs)}]")
             if self.treeview:
-                treetrace.start()
+                treetrace.start(self.treeview_searches)
             try:
                 if a.name not in anchors:
                     raise PlanningError(f"no reachable joint solution for '{a.name}'")
@@ -715,21 +747,22 @@ class ToolpathPlanner:
         be missing: a segment can fail because a locator never placed, and then there is no
         transit and no tree, only the cell and the reason.  ``treeview`` writes what exists.
 
-        Held to the export directory, there being nowhere else the operator is already
-        looking, and every file it writes is named in the log so nothing lands there
-        silently.
+        Written to the study directory -- ``Manifest.directory``, the one the manifest was
+        read from -- because that is where the operator already is, and because it is the
+        one directory this program is always given.  ``export_dir`` is not it: that is set
+        only when ``--export-collision-geometry`` is passed, so hanging this off it meant
+        the view silently did not appear on any ordinary run.  Every file is named in the
+        log, so nothing lands there silently.
         """
         if not self.treeview:
             return
-        if not self.export_dir:
-            self.log("      no --export-dir, so there is nowhere to write the failure view")
-            return
         from . import treeview
         treeview.write(
-            self.cell, self.man, self.export_dir,
+            self.cell, self.man, self.man.directory,
             segment=f"{a.name}--to--{b.name}", failure=failure,
             qa=anchors.get(a.name), qb=anchors.get(b.name),
             kept=treetrace.kept(), searches=treetrace.searches(),
+            dropped=treetrace.dropped(),
             opening=self.openings.get(b.name),
             max_poses=self.treeview_max_poses, log=self.log)
 
@@ -788,7 +821,7 @@ class ToolpathPlanner:
             segment_length=self.segment_length,
             continuous_check=self.continuous_check,
             check_step=self.check_step,
-            fallback_via=self._fallback_for(a, b, transit_start, transit_end),
+            fallback_find=self._fallback_for(a, b, transit_start, transit_end),
             fallback_runs=self.fallback_runs, relocate=self.relocate,
             deadline=deadline,
             shortcut_seconds=self.shortcut_seconds,

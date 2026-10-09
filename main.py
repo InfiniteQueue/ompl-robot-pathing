@@ -145,7 +145,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="how long the planner may spend searching for one segment's route "
                         "before giving up on it and moving to the next. Every other "
                         "budget here bounds a part of that search -- runs, seconds per "
-                        "run, gun openings, fallback poses -- and they multiply, so a "
+                        "run, gun openings, detour legs -- and they multiply, so a "
                         "segment that simply has no route can cost hours before the last "
                         "of them is exhausted. Past this nothing further is started; "
                         "whatever routes are already in hand are still ranked, refined "
@@ -182,41 +182,25 @@ def build_parser() -> argparse.ArgumentParser:
                    help="how long one phase-one run may search before giving up. Every "
                         "run costs this long in the worst case, so it multiplies with "
                         "--phase-one-runs (default: %(default)g)")
-    #PHASE TWO: FIND ANY ROUTE AT ALL
+    #PHASE TWO: FIND ANY ROUTE AT ALL, WHERE A GAP STILL HAS TO BE JOINED
     p.add_argument("--phase-two-max-runs", type=int, default=2, metavar="N",
-                   help="most sampling-planner runs allowed in phase two, which is "
-                        "entered only when phase one found nothing at all. Phase two "
-                        "stops at the first solution rather than sampling for a better "
-                        "one; if it too comes back empty the transit is retried through "
-                        "the fallback poses, starting again from phase one (default: %(default)g)")
+                   help="most sampling-planner runs allowed in phase two, which stops at "
+                        "the first solution rather than sampling for a better one. Phase "
+                        "two is no longer a stage of a transit: a transit that defeats "
+                        "the straight move, phase one and the Cartesian tree is retried "
+                        "as a detour through the fallback poses instead, that being a "
+                        "different question rather than a longer look at the same one. "
+                        "What this now bounds is the join inside --cartesian-recut, where "
+                        "a stretch of a Cartesian route is being replaced at one fixed "
+                        "gun opening and any route will do (default: %(default)g)")
     #PHASE TWO RUN TIME
     p.add_argument("--phase-two-solve-seconds", type=float, default=240.0,
                    metavar="SECONDS",
                    help="how long one phase-two run may search. Worth setting higher than "
-                        "--phase-one-solve-seconds: a transit that beat phase one is "
-                        "usually one where restarting wastes the tree built so far, so a "
-                        "longer single search helps where another short one does not "
-                        "(default: %(default)g)")
-    #PHASE TWO: CARTESIAN SEARCHES SPREAD THROUGH IT
-    p.add_argument("--phase-two-cartesian-runs", type=int, default=2, metavar="N",
-                   help="Cartesian tree searches made during phase two, spread evenly "
-                        "through its sampling runs rather than queued behind them. Each "
-                        "runs at the next gun opening of the --extra-gun-openings list, "
-                        "as phase two's own runs do. Either kind of search ends the phase "
-                        "by solving, so an order that ran one kind out first would let "
-                        "the ordering decide which kind ever got a turn rather than the "
-                        "clock. Like the searches between the phases these only run where "
-                        "--near-panel-mm is in force. 0 leaves phase two to the sampling "
-                        "planner alone (default: %(default)g)")
-    #PHASE TWO CARTESIAN RUN TIME
-    p.add_argument("--phase-two-cartesian-seconds", type=float, default=240.0,
-                   metavar="SECONDS",
-                   help="how long one of phase two's Cartesian searches may run. Shorter "
-                        "than --cartesian-solve-seconds on purpose: what is wanted by "
-                        "then is not a better route but any route, from a part of the "
-                        "gun's range nothing has tried yet, and phase two is where what "
-                        "the transit has left to spend is thinnest "
-                        "(default: %(default)g)")
+                        "--phase-one-solve-seconds: where this is reached, restarting the "
+                        "tree is usually the problem, so a longer single search helps "
+                        "where another short one does not. See --phase-two-max-runs for "
+                        "what still reaches it (default: %(default)g)")
     #CARTESIAN TREE, BETWEEN THE TWO PHASES
     p.add_argument("--cartesian-solve-seconds", "--cartesian-seconds", type=float,
                    default=120.0, metavar="SECONDS", dest="cartesian_solve_seconds",
@@ -293,24 +277,30 @@ def build_parser() -> argparse.ArgumentParser:
                         "puts either end of the transit in collision is skipped and does "
                         "not count, so this counts openings that can be planned at rather "
                         "than openings proposed (default: %(default)g)")
-    #HOW MANY MORE ARE HELD BACK FOR PHASE TWO
+    #HOW MANY MORE ARE HELD BACK FROM THE DIRECT SEARCH
     p.add_argument("--extra-gun-openings", type=int, default=3, metavar="N",
-                   help="further gun openings, beyond --min-gun-openings, held back for "
-                        "phase two. Phase one never runs at these: it has already had its "
-                        "runs at the others, and a longer search where three short ones "
-                        "just failed is the narrower of the two bets on offer, so phase "
-                        "two looks somewhere new instead. It walks this list one opening "
-                        "per run, and so do the Cartesian searches spread through it. "
-                        "Chosen and screened exactly as the others are, so one in "
-                        "collision at either end does not count towards the total. 0 "
-                        "leaves phase two nothing to do on a cell that has a gun "
+                   help="further gun openings, beyond --min-gun-openings, held back from "
+                        "the direct transit. Nothing searching the whole transit at once "
+                        "runs at these; what walks them is the detour through the "
+                        "fallback poses, which tries every opening on both lists leg by "
+                        "leg, and the gap join inside --cartesian-recut. Holding some "
+                        "back is what keeps a wider rotation from spreading phase one so "
+                        "thin that no opening gets enough runs to choose between routes. "
+                        "Chosen and screened exactly as the others are, so one that puts "
+                        "a pose in collision does not count towards the total "
                         "(default: %(default)g)")
     p.add_argument("--gun-opening-round-mm", type=float, default=5.0, metavar="MM",
-                   help="multiple that bisected gun openings are rounded to, so "
-                        "that the program commands round figures. An opening that rounds "
-                        "onto one already being tried is dropped, so a coarse setting "
-                        "over a narrow range yields fewer openings than asked for. 0 "
-                        "rounds nothing (default: %(default)g)")
+                   help="multiple that every gun opening the program chooses is "
+                        "rounded to, so that it commands round figures -- the bisections, "
+                        "the half-open candidate, and the widest, which is a joint limit "
+                        "through 2*arm*sin(limit/2) and so is never round on its own. The "
+                        "widest rounds *down*, a limit being a limit, which gives up the "
+                        "last few millimetres of the gun's travel; everything else rounds "
+                        "to nearest. A weld's declared opening is process data and is "
+                        "never rounded. An opening that rounds onto one already being "
+                        "tried is dropped, so a coarse setting over a narrow range yields "
+                        "fewer openings than asked for. 0 rounds nothing "
+                        "(default: %(default)g)")
     #WHAT A WIDE GUN COSTS A ROUTE
     p.add_argument("--gun-opening-weight", type=float, default=1.5, metavar="X",
                    help="what a second counts as when it is flown with the gun at full "
@@ -347,6 +337,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "already-reduced leg per opening. 0 leaves each leg at the "
                         "opening it was found at (default: %(default)g)")
     #FALLBACK POSES
+    #HOW MANY ENDS OF A TRANSIT GET ONE
+    p.add_argument("--fallback-poses", type=int, default=2, metavar="N",
+                   help="how many of a transit's two ends get a fallback pose of their "
+                        "own, for a transit that cannot be flown directly. At 2, the "
+                        "default, the detour is w1 -> f1 -> f2 -> w2: f1 backs the start "
+                        "locator out of the pocket it sits in, f2 does the same for the "
+                        "end locator, and the leg between them crosses open air. A "
+                        "transit has two ends and each has one fallback, so 2 is every "
+                        "pose there is and anything higher is read as 2. At 1 only the "
+                        "start locator gets one and the detour is w1 -> f1 -> w2, which "
+                        "still asks one leg to reach all the way into the end locator's "
+                        "pocket. 0 looks for none, and a transit with no direct route "
+                        "then fails rather than detouring (default: %(default)g)")
     #HOW FAR A FALLBACK POSE STAYS OFF THE PARTS
     p.add_argument("--fallback-distance-mm", type=float, default=100.0, metavar="MM",
                    help="how much room a fallback pose has to leave between every part of "
@@ -363,15 +366,15 @@ def build_parser() -> argparse.ArgumentParser:
                         "same distance out (default: %(default)g)")
     #EFFORT ONCE THE PREFERRED ANSWER HAS FAILED
     p.add_argument("--fallback-runs", type=int, default=3, metavar="N",
-                   help="sampling-planner runs allowed per phase once the preferred gun "
-                        "opening has failed -- the retried openings, and the legs of a "
-                        "two-leg split through a fallback pose. Nearly the whole worst "
-                        "case sits in that tail, and it is where the full budget buys "
-                        "least: phase one's expense buys a choice between routes, and by "
-                        "then the question is whether there is a route at all. 0 spends "
-                        "the full --phase-one-runs and --phase-two-max-runs everywhere, "
-                        "which is roughly 35 minutes on a transit that ends up failing "
-                        "against about 8 at the default (default: %(default)g)")
+                   help="sampling-planner runs allowed per phase on a leg of the detour "
+                        "through the fallback poses. Nearly the whole worst case sits in "
+                        "that tail -- legs times gun openings -- and it is where the full "
+                        "budget buys least: phase one's expense buys a choice between "
+                        "routes, and by the time a transit is being broken into legs the "
+                        "question is whether there is a route at all. Only the leg "
+                        "between the two fallback poses spends these; the legs out of the "
+                        "locators go to the Cartesian tree alone. 0 spends the full "
+                        "--phase-one-runs on every leg (default: %(default)g)")
     #endregion
     #region ###OPTIMISATION###
 
@@ -892,8 +895,9 @@ def build_parser() -> argparse.ArgumentParser:
     #WHAT A FAILED SEGMENT LEAVES BEHIND TO LOOK AT
     p.add_argument("--treeview", type=boolean, nargs="?", const=True, default=True,
                    metavar="BOOL",
-                   help="write a failed segment's search into the export directory as "
-                        "something that can be opened and looked at: the cell as the "
+                   help="write a failed segment's search into the study directory, "
+                        "beside the manifest it was read from, as something that can be "
+                        "opened and looked at: the cell as the "
                         "planner collided against it, the biggest pair of Cartesian trees "
                         "the segment built, and the robot wherever a node is clicked. "
                         "Three files per failure -- a page, its data, and the viewer "
@@ -903,6 +907,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "a locator never placed, what lands there is the cell, the "
                         "straight chord between the endpoints and the reason "
                         "(default: %(default)s)")
+    p.add_argument("--treeview-searches", type=int, default=12, metavar="N",
+                   help="how many of a segment's Cartesian tree searches the failure "
+                        "view keeps. A segment runs the tree many times -- successive "
+                        "seeds, one per gun opening, again in phase two, again per half "
+                        "of a detour -- and they fail in different places, so which "
+                        "opening got furthest is a question about the set rather than "
+                        "about any one of them. All of them go in the one file and the "
+                        "viewer filters them per search. The limit is there for memory: "
+                        "a kept search's nodes stay alive until the segment ends, and "
+                        "every segment pays that whether or not it fails. Past the limit "
+                        "the smallest kept search makes way for a bigger one, so what is "
+                        "lost is the searches that died early -- raise it to see those. "
+                        "0 keeps every search offered (default: %(default)g)")
     p.add_argument("--treeview-max-poses", type=int, default=1500, metavar="N",
                    help="how many of a tree's nodes get the robot's pose baked into the "
                         "failure view. A pose is every moving link's position and "
@@ -1033,14 +1050,14 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.retune_gun_openings < 0:
         print("error: --retune-gun-openings cannot be negative", file=sys.stderr)
         return 2
+    if args.fallback_poses < 0:
+        print("error: --fallback-poses cannot be negative", file=sys.stderr)
+        return 2
     if args.treeview_max_poses < 0:
         print("error: --treeview-max-poses cannot be negative", file=sys.stderr)
         return 2
-    if args.phase_two_cartesian_runs < 0:
-        print("error: --phase-two-cartesian-runs cannot be negative", file=sys.stderr)
-        return 2
-    if args.phase_two_cartesian_seconds < 0.0:
-        print("error: --phase-two-cartesian-seconds cannot be negative", file=sys.stderr)
+    if args.treeview_searches < 0:
+        print("error: --treeview-searches cannot be negative", file=sys.stderr)
         return 2
     if args.direct_clearance_mm < 0.0:
         print("error: --direct-clearance-mm cannot be negative", file=sys.stderr)
@@ -1150,18 +1167,18 @@ def _run(args: argparse.Namespace, directory: str) -> int:
                                   extend_mm=args.cartesian_extend_mm,
                                   margin_mm=args.cartesian_margin_mm,
                                   tilt_deg=args.cartesian_tilt_deg,
-                                  recut=args.cartesian_recut,
-                                  phase_two_seconds=args.phase_two_cartesian_seconds,
-                                  phase_two_runs=args.phase_two_cartesian_runs),
+                                  recut=args.cartesian_recut),
         fallback_runs=args.fallback_runs,
         segment_seconds=args.segment_minutes * 60.0,
         fallback_mm=args.fallback_distance_mm,
         fallback_step_mm=args.fallback_step_mm,
+        fallback_poses=args.fallback_poses,
         main_openings=args.min_gun_openings,
         extra_openings=args.extra_gun_openings,
         opening_round_mm=args.gun_opening_round_mm,
         gun=gun, retune_openings=args.retune_gun_openings,
         treeview=args.treeview, treeview_max_poses=args.treeview_max_poses,
+        treeview_searches=args.treeview_searches,
         relocate=Relocation(min_attempts=args.polish_min_attempts,
                             min_mm=args.relocate_min_mm, max_mm=args.relocate_max_mm,
                             exponent=args.relocate_exponent),

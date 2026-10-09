@@ -1429,12 +1429,12 @@ class OmplBudget:
     """
     phase_one_runs: int = 5
     phase_one_seconds: float = DEFAULT_PLANNING_TIME
+    # Phase two is no longer a stage of a transit -- the detour through the fallback
+    # poses took its place.  These are what ``_recut_outside_band`` still spends: a gap
+    # inside a Cartesian route is a small join at one fixed opening, and "any route" with
+    # one longer search is exactly the right question to ask of it.
     phase_two_max_runs: int = 15
     phase_two_seconds: float = DEFAULT_PLANNING_TIME
-
-    @property
-    def worst_case_runs(self) -> int:
-        return max(self.phase_one_runs, 0) + max(self.phase_two_max_runs, 0)
 
     def capped(self, runs: int) -> "OmplBudget":
         """This budget with each phase held to at most ``runs`` attempts.
@@ -1729,7 +1729,7 @@ def _retune_opening(cell: Cell, runs: list[Run], opening: float | None, *,
 def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    ompl: OmplBudget | None = None, segment_length: float = 0.02,
                    check_step: float = 0.05, continuous_check: bool = False,
-                   fallback_via=None,
+                   fallback_find=None,
                    fallback_runs: int = 0,
                    shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
                    planning_time: float = DEFAULT_PLANNING_TIME,
@@ -1764,12 +1764,12 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     cheapest solution of the whole set, so the choice between openings is made on what
     each one produced rather than on the order they were offered in.
 
-    **A detour commits to its pose and to the half that reached it**, and then asks the gun
-    question of the second half alone -- one opening per attempt, since a half is one leg
-    or part of one and the gun does not change partway through a move.  Reaching the pose
-    is what settles it: that half is never re-solved, no further pose is tried, and the two
-    halves are free to disagree about the gun, in which case they ship as two legs changing
-    over at the pose.  They agree far more often than not, and that is one leg.
+    **A transit with no direct route is retried as a detour through both ends' fallback
+    poses** -- ``w1 -> f1 -> f2 -> w2`` -- which is what runs where phase two used to.
+    Each leg is planned on its own, by the solver that suits it and at the gun opening it
+    is found to fly at, and a leg once solved is never solved again: see ``_plan_detour``.
+    Consecutive legs sharing an opening come back as one leg of the output, so a detour the
+    gun never changes on is one leg and not three.
 
     ``record``, if given, is extended with each leg's route as the sampling planner
     returned it, one entry per returned leg and in the same order.  Failed attempts leave
@@ -1786,11 +1786,15 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     raises like any other failure -- the caller's loop records it and moves on to the next
     segment.
 
-    ``fallback_via`` is either the poses to detour through or a zero-argument callable
-    returning them.  The callable form exists because finding them is now a search of its
-    own -- see :mod:`weldpath.fallback` -- and most transits solve directly and never need
-    one.  It is called at most once, and only after the direct transit has failed at every
-    opening, so a transit that solves pays nothing for the search it did not use.
+    ``fallback_find`` is either the poses to detour through, in route order, or a
+    zero-argument callable returning them.  Each is read for a ``q`` -- the configuration
+    -- and an ``end``, the name of the end of the transit whose fallback it is, which is
+    how ``_plan_detour`` tells an extraction from a traverse; a bare array is accepted and
+    read as neither.  Nothing here knows how they were found, which is
+    :mod:`weldpath.fallback`'s business.  The callable form exists because finding them is
+    a search of its own and most transits solve directly and never need one: it is called
+    at most once, and only after the direct transit has failed at every opening, so a
+    transit that solves pays nothing for the search it did not use.
 
     ``gun`` weights the opening itself in every score, and ``retune_openings`` is how many
     further openings each finished leg is re-priced at before it is returned -- see
@@ -1863,148 +1867,331 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
 
     if deadline.ran_out(log, "this segment before looking for a fallback pose"):
         raise gave_up(last)
-    poses = list((fallback_via() if callable(fallback_via) else fallback_via) or [])
+    poses = list((fallback_find() if callable(fallback_find) else fallback_find) or [])
     if not poses:
         raise last
 
-    # Through a fallback pose, and the first half of one commits the detour.  Directness
-    # is still the outer question -- a detour costs two full solves against one, so none of
-    # this is started until the cheap answer has been exhausted everywhere -- but once
-    # ``qa -> via`` is in hand the pose is settled and that half is never solved again.
-    #
-    # What is left to decide is the gun, and it is decided on the second half alone, that
-    # being the only part still looking for a route.  The old order asked it the other way
-    # round: it pinned one opening, solved *both* halves at it, and on failure moved to the
-    # next opening and solved the first half over again -- then did the whole of that again
-    # at the next pose, and a third time in a split tier that re-solved both halves per
-    # ordered pair of openings.  A transit whose second half was the hard one paid for the
-    # easy half once per opening per pose, and nearly all of the worst case was those
-    # repeats.
-    #
-    # What committing costs is coverage: a second half that reaches at no opening now ends
-    # the transit, where before it fell through to the next pose.  That is the trade --
-    # the repeats were buying a second chance at a route whose first half had already been
-    # found, and charging for it on every transit that took the detour at all.
-    for v, via in enumerate(poses, 1):
-        log(f"      retrying via fallback pose {v}/{len(poses)}")
-        options = lists(("start", qa), ("fallback", via), ("goal", qb)).all
-        if options and options[0] is None:
-            # A cell with no gun joint: ``pinned(None)`` holds that None in both lists, so
-            # ``all`` offers the same nothing twice.  There is one thing to try here.
-            options = [None]
-        lead = lead_open = None
-        raw_lead: list = []
-        for opening in options:
-            if deadline.ran_out(log, f"this segment at fallback pose {v}/{len(poses)}"):
-                raise gave_up(last)
-            log(f"      reaching fallback pose {v}/{len(poses)}{_gun_note(opening)}"
-                f"{_effort_note(reduced, ompl)}")
-            attempt: list = []
+    # Through the fallback poses, one leg per consecutive pair: w1 -> f1 -> f2 -> w2.
+    # ``_plan_detour`` is where the shape of this is argued -- why the extractions and the
+    # traverse get different solvers, why the extractions are settled first, and what a
+    # leg commits to once it is solved.
+    ends = [str(getattr(p, "end", "")) for p in poses]
+    detour = lists(("start", qa),
+                   *((f"{e or 'intermediate'} fallback", getattr(p, "q", p))
+                     for e, p in zip(ends, poses)),
+                   ("goal", qb))
+    if not detour.all:
+        # Screened against the fallback poses as well as the two locators, so this is a
+        # stronger condition than the direct transit's and can fail where that passed.
+        raise gave_up(PlanningError(
+            "no gun opening leaves the transit's ends and its fallback poses clear"))
+    cfg = _LegSettings(ompl=reduced, segment_length=segment_length,
+                       check_step=check_step, continuous_check=continuous_check,
+                       direct_clearance=direct_clearance, zone=zone,
+                       cartesian=cartesian, relocate=relocate, gun=gun,
+                       deadline=deadline)
+    # Into a list of its own and handed on only once every leg is in hand, for the reason
+    # the direct attempt's is: the caller pairs raw routes with returned legs by position,
+    # and a detour that captured two legs and then failed would leave entries behind for
+    # legs that never shipped.
+    raw_legs: list = []
+    try:
+        out = _plan_detour(cell, qa, qb, poses=poses, openings=detour, cfg=cfg,
+                           shortcut_seconds=shortcut_seconds,
+                           polish_seconds=polish_seconds, log=log, record=raw_legs)
+    except PlanningError as exc:
+        raise gave_up(exc) from None
+    if record is not None:
+        record.extend(raw_legs)
+    return tuned(out)
+
+
+@dataclass(frozen=True)
+class _LegSettings:
+    """What every leg of a detour is planned under, apart from its own ends and its gun.
+
+    One object rather than a dozen arguments threaded through three functions.  Nothing
+    held here varies from leg to leg; what does is the pair of states, the gun opening,
+    and whether the leg is one the Cartesian tree owns.
+    """
+    ompl: OmplBudget
+    segment_length: float
+    check_step: float
+    continuous_check: bool
+    direct_clearance: float
+    zone: "LinearZone | None"
+    cartesian: "CartesianBudget | None"
+    relocate: "Relocation | None"
+    gun: "GunPreference | None"
+    deadline: Deadline
+
+
+def _same_opening(a: float | None, b: float | None) -> bool:
+    """Whether two openings are the same command.  ``None`` is a cell with no gun joint."""
+    if a is None or b is None:
+        return a is None and b is None
+    return abs(float(a) - float(b)) < OPENING_TOL_MM
+
+
+def _lead_with(values: list, leads: list) -> list:
+    """``values`` reordered so ``leads`` come first, each opening appearing once.
+
+    What this expresses is a preference for *not* changing the gun.  A leg flown at an
+    opening a neighbouring leg is already committed to leaves a phase boundary with
+    nothing happening at it, so those are tried before any opening that would add a gun
+    change to the route.
+    """
+    out: list = []
+    for value in [*leads, *values]:
+        if not any(_same_opening(value, seen) for seen in out):
+            out.append(value)
+    return out
+
+
+def _tree_leg(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, opening: float | None,
+              cfg: _LegSettings, what: str, log, record: list | None = None) -> list[Run]:
+    """One leg joined by the Cartesian tree alone, at one gun opening.
+
+    This is the leg between a locator and that locator's **own** fallback pose, which is
+    the extraction from the pocket the locator sits in.  The tree is the only solver asked
+    for it, on purpose: it steers along the tool's own straight line with orientations
+    drawn near the endpoints', which is the shape a pull-back out of a pocket has.  OMPL
+    samples the joint space uniformly and has nothing drawing it into the gap beside the
+    fixture, so on this leg in particular it is both the slower solver and the one more
+    likely to come back with a route that swings the gun across the panel on its way out.
+
+    ``min_seconds`` is dropped to nothing.  That budget buys a *choice* between routes,
+    and on this leg there is nothing to choose: it is short, its shape is forced by the
+    pocket, and what the detour needs from it is that it exists at all.  The saving is
+    worth having because this is paid per leg per gun opening tried.
+    """
+    if cfg.cartesian is None or not cfg.cartesian.enabled:
+        # Guarded rather than assumed: _plan_detour hands these legs to every solver when
+        # the tree is switched off, so reaching here would mean that decision was skipped.
+        raise PlanningError(f"the cartesian tree is switched off, so nothing can plan "
+                            f"{what}")
+    found = _cartesian_solutions(cell, qa, qb, replace(cfg.cartesian, min_seconds=0.0),
+                                 cfg.check_step, [opening], log,
+                                 deadline=cfg.deadline, zone=cfg.zone, gun=cfg.gun)
+    if not found:
+        raise PlanningError(f"the cartesian tree found no route for {what}")
+    best = _cheapest(found, log)
+    _capture(record, best.route)
+    with cell.gun_opening(opening):
+        # No refinement budget here.  A leg is refined once the whole detour is settled,
+        # grouped with whichever neighbours share its opening -- refining it now would
+        # spend the passes on a route the next leg may yet fail to continue.
+        return _finish(cell, best.route, zone=cfg.zone, relocate=cfg.relocate,
+                       shortcut_seconds=0.0, polish_seconds=0.0,
+                       check_step=cfg.check_step, log=log)
+
+
+def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
+                 openings: GunOpenings, cfg: _LegSettings,
+                 shortcut_seconds: float, polish_seconds: float, log,
+                 record: list | None = None
+                 ) -> list[tuple[list[Run], float | None]]:
+    """``w1 -> f1 -> f2 -> w2``: the transit routed through both ends' fallback poses.
+
+    **This is what runs where phase two used to.**  Phase two asked the same sampling
+    planner the same question again, longer and at a gun opening it had not reached; but a
+    transit that has already beaten the straight chord, every phase-one run and the
+    Cartesian tree is not one waiting for a longer look at the same space -- it is one
+    whose two ends cannot see each other.  Breaking it into three legs is a different
+    question, and the openings phase two would have walked are walked here per leg anyway.
+
+    **Each leg has its own solver.**  A locator to its own fallback goes to the Cartesian
+    tree alone -- see ``_tree_leg`` -- and the leg between the two fallbacks, which runs
+    through open air, gets everything ``_plan_direct`` has: the straight chord, phase one
+    dealt round the openings, and the tree ranked against them.  The two ends of the route
+    are extractions and the middle is a traverse, and those want different solvers.
+
+    **Each leg chooses its own gun opening, and a solved leg is never re-solved.**  The
+    legs out of the locators are settled first, both because they are the constrained ones
+    -- the tip has to clear the pocket -- and because a failure there is attributable to
+    one pose rather than to the detour as a whole.  Each leg then walks the openings in
+    turn, led by those its neighbours already hold so that no gun change is introduced
+    where one is not needed, and the first that carries it settles it.  Where neighbouring
+    legs end up at different openings the gun changes at the pose between them, which is a
+    pose the robot is stationary at.
+
+    **A fallback pose inside the joint 5 stop band cannot change the gun.**  The robot
+    stands still there and nothing downstream moves an endpoint, so the legs either side
+    of such a pose are locked to one opening between them; the first of them to be solved
+    chooses for both.  Two such poses lock the whole detour to a single opening.
+
+    Returns one ``(runs, opening)`` leg per gun state, consecutive legs sharing an opening
+    being joined and refined as one.
+    """
+    vias = [np.asarray(getattr(p, "q", p), dtype=float) for p in poses]
+    ends = [str(getattr(p, "end", "")) for p in poses]
+    points = [np.asarray(qa, dtype=float), *vias, np.asarray(qb, dtype=float)]
+    names = ["the start locator",
+             *(f"the {e or 'intermediate'} fallback pose" for e in ends),
+             "the end locator"]
+    n = len(points) - 1
+
+    # Which legs the tree owns.  A leg joins a locator to *its own* fallback only at the
+    # two ends of the route, and only where that end is the one the pose was found for: a
+    # start locator that could not be backed out leaves the end locator's pose in the
+    # first slot, and the leg into it is then a traverse like any other rather than an
+    # extraction.
+    tree = cfg.cartesian is not None and cfg.cartesian.enabled
+    own = [False] * n
+    if tree and ends and ends[0] == "start":
+        own[0] = True
+    if tree and ends and ends[-1] == "end":
+        own[-1] = True
+    if not tree:
+        log("      the cartesian tree is switched off, so the legs out of the locators "
+            "are planned with every solver, like the one between the poses")
+
+    options = list(openings.all)
+    if options and options[0] is None:
+        # A cell with no gun joint: ``pinned(None)`` holds that None in both lists, so
+        # ``all`` offers the same nothing twice.  There is one thing to try here.
+        options = [None]
+
+    # Legs locked to one gun state.  The via between leg i-1 and leg i is ``points[i]``,
+    # and a via inside the stop band is one the gun cannot change at, so those two legs
+    # share an opening whatever it turns out to be.
+    lock = [0] * n
+    for i in range(1, n):
+        frozen = cell.in_stop_band(points[i])
+        if frozen:
+            log(f"      {names[i]} holds joint 5 inside the stop band; the gun cannot "
+                f"change there, so the legs either side of it fly at one opening")
+        lock[i] = lock[i - 1] + (0 if frozen else 1)
+
+    solvers = ("the legs out of the locators by the cartesian tree alone" if any(own)
+               else "every leg with every solver")
+    log(f"      detour: {n} legs through {', '.join(names[1:-1])} over "
+        f"{_openings_note(options)}, {solvers}, at up to "
+        f"{cfg.ompl.phase_one_runs} sampling run"
+        f"{'' if cfg.ompl.phase_one_runs == 1 else 's'} per leg")
+
+    solved: list[list[Run] | None] = [None] * n
+    raws: list[list[np.ndarray]] = [[] for _ in range(n)]
+    chose: list[float | None] = [None] * n
+    locked: dict[int, float | None] = {}
+    committed: list = []
+    last: PlanningError | None = None
+
+    # Extractions first, then the traverse.  The order is the point: a leg out of a pocket
+    # is the one that fails, and settling it first means the opening the traverse is
+    # offered is one the extraction has already been shown to fly at.
+    for i in [k for k in range(n) if own[k]] + [k for k in range(n) if not own[k]]:
+        what = f"{names[i]} to {names[i + 1]}"
+        if lock[i] in locked:
+            allowed = [locked[lock[i]]]
+            log(f"      {what} is locked to the gun opening of the leg beside it")
+        else:
+            allowed = _lead_with(options, committed)
+        for opening in allowed:
+            if cfg.deadline.ran_out(log, f"this segment planning {what}"):
+                raise PlanningError(
+                    f"ran out of time planning {what}"
+                    + (f"; the last failure was: {last}" if last else ""))
+            log(f"      detour leg {i + 1}/{n}, {what}{_gun_note(opening)}")
+            got: list[np.ndarray] = []
             try:
-                with cell.gun_opening(opening):
-                    runs, _ = _plan_direct(cell, qa, via, ompl=reduced,
-                                           segment_length=segment_length,
-                                           check_step=check_step,
-                                           continuous_check=continuous_check,
-                                           shortcut_seconds=0.0, polish_seconds=0.0,
-                                           zone=zone, cartesian=cartesian,
-                                           direct_clearance=direct_clearance,
-                                           relocate=relocate,
-                                           openings=GunOpenings.pinned(opening),
-                                           gun=gun, deadline=deadline, log=log,
-                                           record=attempt)
+                if own[i]:
+                    runs = _tree_leg(cell, points[i], points[i + 1], opening=opening,
+                                     cfg=cfg, what=what, log=log, record=got)
+                else:
+                    with cell.gun_opening(opening):
+                        runs, _ = _plan_direct(
+                            cell, points[i], points[i + 1], ompl=cfg.ompl,
+                            segment_length=cfg.segment_length,
+                            check_step=cfg.check_step,
+                            continuous_check=cfg.continuous_check,
+                            shortcut_seconds=0.0, polish_seconds=0.0,
+                            zone=cfg.zone, cartesian=cfg.cartesian,
+                            direct_clearance=cfg.direct_clearance,
+                            relocate=cfg.relocate,
+                            openings=GunOpenings.pinned(opening),
+                            gun=cfg.gun, deadline=cfg.deadline, log=log, record=got)
             except PlanningError as exc:
-                log(f"      no route to fallback pose {v}/{len(poses)}"
-                    f"{_gun_note(opening)}: {exc}")
+                log(f"      no route for {what}{_gun_note(opening)}: {exc}")
                 last = exc
                 continue
-            lead, lead_open, raw_lead = runs, opening, attempt
+            solved[i], chose[i], raws[i] = runs, opening, (got[0] if got else [])
+            locked.setdefault(lock[i], opening)
+            if not any(_same_opening(opening, seen) for seen in committed):
+                # Appended rather than promoted: the first leg to commit is the one whose
+                # opening every later leg is offered first, and that is the extraction,
+                # which is the leg with the least room to be flexible about the gun.
+                committed.append(opening)
             break
-        if lead is None:
-            # Never reached at any opening, so nothing was committed to and the next pose
-            # is still open.  Only a pose actually *reached* closes the others off.
-            continue
+        if solved[i] is None:
+            # Nothing is re-solved and no other pose is tried.  What is already in hand
+            # was found at an opening that works for it, and discarding it to look again
+            # would be paying twice for the half of the detour that was never the problem
+            # -- which is the repeat this ordering exists to remove.  The leg that failed
+            # is named, that being the diagnosis.
+            raise PlanningError(
+                f"the detour reaches {sum(1 for r in solved if r is not None)} of its "
+                f"{n} legs, but no gun opening carries {what}"
+                + (f"; the last failure was: {last}" if last else ""))
 
-        # The gun is the only question left.  ``lead_open`` leads: a second half that flies
-        # at it is one leg with no gun change anywhere in it, which is both the cheaper
-        # answer and the one the old order looked for first.
-        others = ([] if lead_open is None else
-                  [o for o in options if abs(o - lead_open) >= OPENING_TOL_MM])
-        order = [lead_open] + others
-        if cell.in_stop_band(via):
-            # The robot stands still here while the gun changes, and nothing downstream
-            # moves an endpoint, so the gun cannot change at this pose at all: the one
-            # opening on offer for the way out is the one the way in is flown at.
-            log(f"      fallback pose {v}/{len(poses)} holds joint 5 inside the stop "
-                f"band; not changing the gun there")
-            order = [lead_open]
-        for tail_open in order:
-            if deadline.ran_out(log, f"this segment on the way out of fallback pose "
-                                     f"{v}/{len(poses)}"):
-                raise gave_up(last)
-            log(f"      leaving fallback pose {v}/{len(poses)}{_gun_note(tail_open)}")
-            raw_tail: list = []
-            try:
-                with cell.gun_opening(tail_open):
-                    tail, _ = _plan_direct(cell, via, qb, ompl=reduced,
-                                           segment_length=segment_length,
-                                           check_step=check_step,
-                                           continuous_check=continuous_check,
-                                           shortcut_seconds=0.0, polish_seconds=0.0,
-                                           zone=zone, cartesian=cartesian,
-                                           direct_clearance=direct_clearance,
-                                           relocate=relocate,
-                                           openings=GunOpenings.pinned(tail_open),
-                                           gun=gun, deadline=deadline, log=log,
-                                           record=raw_tail)
-            except PlanningError as exc:
-                log(f"      no route on from fallback pose {v}/{len(poses)}"
-                    f"{_gun_note(tail_open)}: {exc}")
-                last = exc
-                continue
+    return _join_detour(cell, solved, chose, raws, cfg=cfg,
+                        shortcut_seconds=shortcut_seconds,
+                        polish_seconds=polish_seconds, log=log, record=record)
 
-            if lead_open is None or abs(tail_open - lead_open) < OPENING_TOL_MM:
-                # One gun state throughout, so one leg.  Joined and refined whole rather
-                # than half by half: the detour through the pose is exactly the kind of
-                # corner these passes exist to cut, and the split that follows is a reading
-                # of the finished route, so a phase boundary lands at the pose only where
-                # the geometry puts one there.
-                if raw_lead and raw_tail:
-                    _capture(record, raw_lead[0] + raw_tail[0][1:])
-                joined = _flatten(lead) + _flatten(tail)[1:]
-                with cell.gun_opening(lead_open):
-                    whole = _finish(cell, joined, zone=zone, relocate=relocate,
-                                    shortcut_seconds=shortcut_seconds,
-                                    polish_seconds=polish_seconds,
-                                    check_step=check_step, log=log)
-                return tuned([(whole, lead_open)])
 
-            if record is not None:
-                record.extend(raw_lead + raw_tail)
-            log(f"      no single gun opening reaches; changing from {lead_open:g} mm to "
-                f"{tail_open:g} mm at fallback pose {v}/{len(poses)}")
-            # Each half refined with its own opening in force: every question these passes
-            # ask is a question about a cell with the tip in a particular place.
-            with cell.gun_opening(lead_open):
-                first = _refine_runs(cell, lead, zone=zone, relocate=relocate,
+def _join_detour(cell: Cell, solved: list, chose: list, raws: list, *,
+                 cfg: _LegSettings, shortcut_seconds: float, polish_seconds: float,
+                 log, record: list | None = None
+                 ) -> list[tuple[list[Run], float | None]]:
+    """The detour's legs grouped by gun opening, each group refined as one route.
+
+    Consecutive legs at one opening are one leg of the output, and they are refined
+    together rather than separately: the corner at the pose between them is exactly the
+    kind the shortcut and polish passes exist to cut, and the split that follows is a
+    reading of the finished route, so a phase boundary lands at a pose only where the
+    geometry puts one there.  Legs at different openings cannot be joined -- the gun
+    changes between them -- so each is refined with its own opening in force, every
+    question those passes ask being a question about a cell with the tip in a particular
+    place.
+    """
+    groups: list[tuple[list[int], float | None]] = []
+    for i, opening in enumerate(chose):
+        if groups and _same_opening(groups[-1][1], opening):
+            groups[-1][0].append(i)
+        else:
+            groups.append(([i], opening))
+    if log and len(groups) > 1:
+        log(f"      the detour needs {len(groups)} gun states, changing at "
+            f"{len(groups) - 1} of its poses: "
+            + ", ".join(f"{'the gun as it stands' if o is None else f'{o:g} mm'}"
+                        for _, o in groups))
+
+    out: list[tuple[list[Run], float | None]] = []
+    for legs, opening in groups:
+        runs: list[Run] = []
+        for i in legs:
+            # Joining assumes each leg begins where the one before it ended, which is the
+            # fallback pose both were planned to; flattening drops that state once on
+            # exactly that assumption.  It holds -- both legs were handed the pose -- but
+            # a leg that came back somewhere else would leave a move in the finished route
+            # that nothing has ever checked, and that is worth a line of arithmetic rather
+            # than a trust.
+            if runs and not np.allclose(runs[-1].states[-1], solved[i][0].states[0]):
+                raise PlanningError(
+                    "a leg of the detour does not begin where the leg before it ended, "
+                    "so the two cannot be joined")
+            runs.extend(solved[i])
+        raw: list[np.ndarray] = []
+        for k, i in enumerate(legs):
+            # Consecutive legs meet at a pose both hold, so the boundary is written once.
+            raw.extend(raws[i] if k == 0 else raws[i][1:])
+        _capture(record, raw)
+        with cell.gun_opening(opening):
+            out.append((_refine_runs(cell, runs, zone=cfg.zone, relocate=cfg.relocate,
                                      shortcut_seconds=shortcut_seconds,
                                      polish_seconds=polish_seconds,
-                                     check_step=check_step, log=log)
-            with cell.gun_opening(tail_open):
-                second = _refine_runs(cell, tail, zone=zone, relocate=relocate,
-                                      shortcut_seconds=shortcut_seconds,
-                                      polish_seconds=polish_seconds,
-                                      check_step=check_step, log=log)
-            return tuned([(first, lead_open), (second, tail_open)])
-
-        # The pose is committed and the way out of it has been tried at every opening it
-        # could be flown at.  Going on to another pose would discard a first half already
-        # in hand and solve it again, which is the repeat this ordering exists to remove.
-        raise gave_up(PlanningError(
-            f"reached fallback pose {v}/{len(poses)}{_gun_note(lead_open)} but no gun "
-            f"opening carries the route on from it; the last failure was: {last}"))
-
-    raise gave_up(last or PlanningError("freespace transit failed at every gun opening"))
+                                     check_step=cfg.check_step, log=log), opening))
+    return out
 
 
 def _gun_note(opening: float | None) -> str:
@@ -2017,19 +2204,44 @@ def _gun_note(opening: float | None) -> str:
     return "" if opening is None else f" with the gun at {opening:g} mm"
 
 
-def _effort_note(reduced: OmplBudget, full: OmplBudget) -> str:
-    """How the reduced budget differs, for the log line that announces a retry."""
-    if reduced is full:
-        return ""
-    return (f", at up to {reduced.phase_one_runs} run"
-            f"{'' if reduced.phase_one_runs == 1 else 's'} per phase")
-
-
 # Two openings closer together than this are the same command as far as the machine is
 # concerned: the gun is a mechanism with backlash, not a number.  Anything nearer is a
 # rounding artefact -- widest/2 landing on a declared opening, or a bisection rounding onto
 # its own neighbour -- and trying it twice buys a second identical failure at full price.
 OPENING_TOL_MM = 1e-6
+
+
+def opening_cap(widest: float, round_mm: float) -> float:
+    """The widest opening on the grid: ``widest`` rounded **down** to a multiple.
+
+    Down rather than to nearest because this one is a joint limit.  ``gun_opening_max`` is
+    ``2 * arm * sin(limit / 2)``, so it is almost never a round number -- 164.158939 mm on
+    the cell here -- and rounding it up would name an opening the gun cannot reach, which
+    the endpoint screen would then reject for a reason that looks like geometry.
+
+    What it costs is the last few millimetres of the gun's travel: nothing can be planned
+    at 164.16 mm once 160 is the widest offered.  That is the trade the flag is, and
+    ``--gun-opening-round-mm 0`` is how to decline it.  The value ships in the waypoints
+    as process data -- somebody sets the gun to it -- so a number nobody can dial in is
+    worse than four millimetres of swing.
+    """
+    if round_mm <= 0.0 or widest <= 0.0:
+        return float(widest)
+    return float(max(0.0, (widest // round_mm) * round_mm))
+
+
+def snap_opening(value: float, round_mm: float, widest: float) -> float:
+    """One opening of the program's own choosing, put on the grid and kept in range.
+
+    For the program's choices only.  A weld's declared opening is process data from the
+    study and passes through untouched: rounding it would silently plan a weld at an
+    opening nobody asked for, which is the opposite of what this flag is for.
+    """
+    cap = opening_cap(widest, round_mm)
+    value = float(value)
+    if round_mm > 0.0:
+        value = round(value / round_mm) * round_mm
+    return float(min(max(value, 0.0), cap))
 
 
 def unique_openings(values: list[float], limit: float | None = None) -> list[float]:
@@ -2113,22 +2325,29 @@ def _opening_stream(named: list[float] | None, widest: float, round_mm: float,
     twice, whichever way it was turned down.  Rounding to ``round_mm`` keeps the values
     sayable on the shop floor, 45 mm rather than 43.7 mm, at the cost of the split being
     slightly off centre.
+
+    **Everything this chooses is rounded, not only the bisections.**  ``widest`` is a joint
+    limit through ``2 * arm * sin(limit / 2)`` and so is never round -- 164.158939 mm here,
+    with 82.079469 mm for its half -- and both were yielded raw, which put both numbers
+    into shipped waypoints where nobody could set the gun to either.  ``named`` is the one
+    thing still passed through untouched, those being the study's own openings.
     """
-    for value in [*(named or []), 0.0, widest, widest / 2.0]:
+    cap = opening_cap(widest, round_mm)
+    for value in [*(named or []), 0.0, cap, snap_opening(cap / 2.0, round_mm, widest)]:
         yield float(value)
     floor = round_mm if round_mm > 0.0 else OPENING_FLOOR_MM
     while True:
         # Closed and widest bound the search whether or not either was kept, so the
         # bisections cover the gun's whole travel even where the named openings cluster.
-        known = sorted({0.0, float(widest), *tried})
+        known = sorted({0.0, float(cap), *tried})
         gaps = sorted(zip(known, known[1:]), key=lambda g: g[1] - g[0], reverse=True)
         for lo, hi in gaps:
             if hi - lo < 2.0 * floor:
                 return                      # the widest gap left is narrower than a step
-            mid = (lo + hi) / 2.0
-            if round_mm > 0.0:
-                mid = round(mid / round_mm) * round_mm
-            mid = float(min(max(mid, 0.0), widest))
+            # Snapped and clamped against the *rounded* cap.  Clamping to the raw widest
+            # was the other way an unroundable number got out: a bisection rounded past
+            # the limit came back as the limit itself.
+            mid = snap_opening((lo + hi) / 2.0, round_mm, widest)
             if any(abs(mid - seen) < OPENING_TOL_MM for seen in tried):
                 continue                    # rounded onto a neighbour: try a wider gap
             yield mid
@@ -2620,30 +2839,21 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
             candidates.append(best)
 
     if not candidates:
-        # Nothing to choose between at this point, so the goal changes from a good route to
-        # any route, and the first one that arrives ends the phase.
-        tree_run = None
-        if tree is not None and tree.phase_two_enabled:
-            def tree_run(opening, run):
-                """One short Cartesian search, for phase two to spread among its own."""
-                got = _cartesian_route(cell, qa, qb, tree,
-                                       seconds=deadline.clamp(tree.phase_two_seconds),
-                                       seed=tree.seed + PHASE_TWO_SEED_OFFSET + run,
-                                       opening=opening, check_step=check_step,
-                                       label=f"phase 2 cartesian run {run}", log=log,
-                                       zone=zone, gun=gun)
-                if got is not None and tree.recut:
-                    got = _recut_solution(cell, got, zone=zone, sampler=sampler,
-                                          check_step=check_step, gun=gun, log=log)
-                return got
-        candidates = sampler.phase_two(
-            qa, qb, cartesian_runs=tree.phase_two_runs if tree_run is not None else 0,
-            cartesian_run=tree_run)
-
-    if not candidates:
+        # **No phase two here.**  What used to follow -- longer sampling runs, and short
+        # Cartesian searches spread through them, at the gun openings phase one had not
+        # reached -- is now the detour through the two fallback poses, which
+        # ``plan_freespace`` runs when this raises.  The two were never alternatives of
+        # the same kind.  Phase two asked the same solver the same question again from a
+        # different seed at a different opening; a transit that has beaten the straight
+        # chord, every phase-one run and the tree is not one waiting for a longer look at
+        # the same space, it is one whose two ends cannot see each other.  And the
+        # openings phase two would have walked are walked by the detour per leg, so
+        # nothing that was on offer here has been given up -- see ``_plan_detour``.
         raise PlanningError(
-            f"freespace transit failed after {ompl.worst_case_runs} attempts: "
-            f"{sampler.message}")
+            f"freespace transit failed after {max(ompl.phase_one_runs, 0)} sampling run"
+            f"{'' if ompl.phase_one_runs == 1 else 's'}"
+            + (" and the cartesian tree" if tree is not None else "")
+            + (f": {sampler.message}" if sampler.message else ""))
 
     best = _cheapest(candidates, log)
     _capture(record, best.route)
@@ -2655,12 +2865,6 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     log(f"      reduced to {sum(len(r.states) for r in out)} points in "
         f"{len(out)} run{'' if len(out) == 1 else 's'}{_gun_note(best.opening)}")
     return out, best.opening
-
-
-# Phase two's Cartesian searches start from seeds nothing else uses, so a transit whose
-# earlier searches all failed does not spend phase two repeating them exactly.  They run at
-# other openings in any case; this makes them a different search of the cell as well.
-PHASE_TWO_SEED_OFFSET = 1000
 
 
 def _cartesian_route(cell: Cell, qa: np.ndarray, qb: np.ndarray, budget: "CartesianBudget",

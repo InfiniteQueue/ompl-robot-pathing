@@ -8,9 +8,9 @@ through it".
   :mod:`neutral`   what a neutral pose is; edit ``CONDITIONS`` and nothing else
   :mod:`retreat`   which way is "back" from a locator, from the gun's own bulk
   :mod:`validity`  whether a candidate point is somewhere the robot can be parked
-  :mod:`methods`   where to look, in order; append to ``METHODS`` to add a method
-  :mod:`finder`    walks the methods, times them, reports what it found
+  :mod:`methods`   where each end's fallback is looked for; edit ``ENDS``
+  :mod:`finder`    walks each end's methods, times them, reports what it found
 """
-from .finder import FallbackFinder
+from .finder import Fallback, FallbackFinder
 
-__all__ = ["FallbackFinder"]
+__all__ = ["Fallback", "FallbackFinder"]
