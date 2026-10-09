@@ -231,16 +231,17 @@ the way, so the joint values in between are whatever that line demands.
     not cancel where it is supposed to.
 - `Deadline` is the wall clock for one segment, `--segment-minutes` (60). Every other
   budget bounds a part of the search and they multiply -- runs x seconds x openings, plus
-  one detour's two halves -- so this is the only figure that bounds a segment with no route.
+  the detour's three legs -- so this is the only figure that bounds a segment with no route.
   The product used to carry fallback poses and pairs of openings at each pose as factors of
-  their own; committing the pose and its first half removed both. `ran_out` is asked where work is about to start rather than
+  their own; committing each leg to the opening that carried it removed both, and dropping
+  phase two removed a whole stage. `ran_out` is asked where work is about to start rather than
   interrupting it, since a run stopped halfway leaves nothing usable, and `clamp` cuts each
   per-run limit to the time left. What is already found is still ranked, refined and
   shipped; a segment with nothing raises, and `ToolpathPlanner.run` records the reason and
   goes on, which is what it already did with a segment that failed outright.
 - **The gun opening is a search variable, not a setting picked before the search.**
   `_opening_lists` builds two lists per leg: `main`, the rotation phase one and the
-  Cartesian tree deal their runs round, and `extra`, held back for phase two. Both are
+  Cartesian tree deal their runs round, and `extra`, held back from them. Both are
   drawn in preference order -- departure, arrival, closed, widest, half open, then
   bisections of the widest range nothing has been tried in yet -- and screened as they are
   built, so an opening that repeats one already offered, or that leaves a pose of the leg
@@ -252,60 +253,115 @@ the way, so the joint values in between are whatever that line demands.
     infer it from the order it asked in, and everything downstream -- `_finish`, the recut,
     the per-phase validation -- has to run at the opening its route was found at, the tip
     being part of the machine that has to fit through the gap.
-  - Phase two walks `extra`, one opening per run, and never repeats one phase one had runs
-    at: a longer search where the short ones just failed is the narrower of the two bets.
-    `CartesianBudget.phase_two_seconds` and `phase_two_runs` add short Cartesian searches,
-    spread through those runs by `_interleave`, which takes whichever kind's next turn falls
-    earliest as a fraction of its own count. The phase stops at the first solution either
-    kind finds, so queueing one kind behind the other would let the ordering decide which
-    kind ever ran.
-  - The rotation belongs to the direct transit alone. Each half of a detour is planned at
+  - **`extra` is not phase two's any more**, phase two having stopped being a stage of a
+    transit. What walks it is the detour, which tries `GunOpenings.all` -- both lists, in
+    preference order -- leg by leg, and `_recut_outside_band`'s gap join, which is pinned
+    to one opening and so reads neither list. Holding some back is still worth doing: it
+    is what keeps a wider rotation from spreading phase one so thin that no opening gets
+    enough runs to choose between routes with.
+  - The rotation belongs to the direct transit alone. Each leg of a detour is planned at
     one pinned opening -- the gun does not change partway through a move -- so those walk
-    `GunOpenings.pinned` one opening at a time, the old order, kept where it is still the
-    only one available. A cell with no gun joint gets `pinned(None)`, which is exactly what
-    it did before any of this.
-- **A detour commits to its pose and to the half that reached it.** The fallback tier used
-  to pin one opening, solve *both* halves at it, and on failure move to the next opening and
-  solve the first half over again -- then do the whole of that again at the next pose, and a
-  third time in a separate split tier that re-solved both halves per ordered pair of
-  openings. A transit whose second half was the hard one therefore paid for the easy half
-  once per opening per pose, and nearly all of the worst case was those repeats. Now the
-  first opening that reaches the pose settles it: that half is kept, no further pose is
-  tried, and the remaining question -- the gun -- is asked of the second half alone, which
-  is the only part still looking for a route.
-  - The two tiers are one loop. `_plan_via` is gone, having planned both halves at one
-    opening and joined them by taking `first[0].states`, which read only the *first* run of
-    each half and is why it had to plan them with no zone: with no zone there is exactly one
-    run. The join is `_flatten` now, so the halves carry the zone like anything else.
-  - `lead_open` leads the second half's list, so the answer looked for first is still one
-    leg with no gun change in it. That case is joined and refined whole, the detour through
-    the pose being exactly the kind of corner those passes cut; a second half that only
-    flies at a different opening ships as two legs refined separately, each with its own
-    opening in force.
-  - What committing costs is coverage: a second half that reaches at no opening now ends the
-    transit, where before it fell through to the next pose. The repeats were buying a second
-    chance at a route whose first half had already been found, and charging for it on every
-    transit that took the detour at all. The failure says which pose it was stuck at, that
-    being the diagnosis for why no other was tried.
-  - A pose never reached at any opening commits to nothing and the next pose is still tried.
-    Only a pose actually *reached* closes the others off.
-  - **`--fallback-poses` (3) is how many poses a transit may be offered, and it is enforced
-    in `FallbackFinder.poses` rather than by slicing the list the planner gets.** A method
-    costs real time whether or not its pose is used -- it solves inverse kinematics at every
-    step it takes, until the arm runs out of reach -- so a cap read at the planner would
-    save none of it. `METHODS` has three entries and each contributes at most one pose, so
-    3 is every pose there is and anything above it is the same number. Since committing
-    means a reached pose closes the others off, what this bounds is the transit where pose
-    after pose cannot be reached at all; 0 looks for none, and a transit with no direct
-    route then fails instead of detouring. The skipped methods are named in the log, a cap
-    that quietly searched less being indistinguishable from a cell that offered less.
-  - A `via` inside the joint 5 stop band cannot change the gun -- the robot stands still
-    there and nothing downstream moves an endpoint -- so the second half is offered
-    `lead_open` and nothing else. The old code skipped such a pose in the split tier
-    entirely, which is the same rule read from the other side.
+    `GunOpenings.pinned` one opening at a time. A cell with no gun joint gets
+    `pinned(None)`, which is exactly what it did before any of this.
+  - `_Sampler.phase_two` survives for one caller. The recut is joining a gap inside a
+    route that is already in hand, at an opening already settled, and "any route, with one
+    longer search" is exactly the right question there -- which is what phase two was,
+    and what it was the wrong question for was a whole transit.
+- **A transit with no direct route is retried as `w1 -> f1 -> f2 -> w2`, and that is what
+  runs where phase two used to.** `f1` is the start locator's own fallback pose and `f2` the
+  end locator's, each a place to stand just clear of the pocket that end sits in, so the
+  route is two extractions with a traverse between them. `_plan_detour` is the whole of it.
+  - **Why it replaced phase two rather than following it.** Phase two asked the same
+    sampling planner the same question again -- longer, from a new seed, at a gun opening
+    phase one had not reached. But a transit that has already beaten the straight chord,
+    every phase-one run and the Cartesian tree is not one waiting for a longer look at the
+    same space; it is one whose two ends cannot see each other, and the answer to that is
+    to stop asking for one move. Nothing on offer there was given up: the openings phase
+    two would have walked are walked here per leg, and a longer single search is still
+    what the recut gets for its gap joins.
+  - **Each leg gets the solver that suits it.** A locator to its *own* fallback goes to the
+    Cartesian tree alone, `_tree_leg`: the tree steers along the tool's own straight line
+    with orientations drawn near the endpoints', which is the shape a pull-back out of a
+    pocket has, where OMPL samples joint space uniformly with nothing drawing it into the
+    gap beside the fixture and is both slower here and likelier to come back swinging the
+    gun across the panel. The leg between the two poses runs through open air and gets
+    everything `_plan_direct` has -- chord, phase one, the tree ranked against it.
+    `min_seconds` is dropped to nothing on the extractions: that budget buys a *choice*
+    between routes and there is nothing to choose about getting out of a pocket, and it
+    is paid per leg per opening.
+  - **The extractions are settled before the traverse.** They are the constrained legs --
+    the tip has to clear the pocket -- so a failure there is attributable to one pose
+    rather than to the detour as a whole, and settling them first means the traverse is
+    offered openings an extraction has already been shown to fly at. The traverse has the
+    most solvers and the most room, so it is the leg most able to take what it is given.
+  - **Each leg commits to the opening that carried it, and a solved leg is never
+    re-solved.** A leg walks `GunOpenings.all` led by the openings its neighbours already
+    hold -- `_lead_with`, so no gun change is introduced where none is needed -- and the
+    first that carries it settles it. Consecutive legs at one opening are joined and
+    refined as one route by `_join_detour`, the corner at the pose between them being
+    exactly the kind the passes exist to cut; legs at different openings ship separately,
+    each refined with its own opening in force, and the gun changes at the pose between
+    them, where the robot is stationary. A detour the gun never changes on is one leg of
+    output, not three.
+  - What that commitment costs is coverage: a leg that flies at no opening ends the
+    transit rather than sending the search back to re-derive a pose. Re-deriving would be
+    paying twice for the parts of the detour that were never the problem, which is the
+    repeat this ordering exists to remove. The failure names the leg and says how many of
+    the three were in hand, that being the diagnosis.
+  - **A fallback pose inside the joint 5 stop band cannot change the gun** -- the robot
+    stands still there and nothing downstream moves an endpoint -- so the legs either side
+    of it are locked to one opening between them, and the first of them to be solved
+    chooses for both. Two such poses lock the whole detour to a single opening. Expressed
+    as an equivalence class over the legs rather than as a check against each neighbour,
+    which is what makes the both-locked case fall out instead of needing its own rule.
+  - **`--fallback-poses` (2) is how many of the two ends get a pose, and it is enforced in
+    `FallbackFinder.pair` rather than by slicing the list the planner gets.** A walk costs
+    real time whether or not its pose is used -- it solves inverse kinematics at every step
+    it takes, until the arm runs out of reach -- so a cap read at the planner would save
+    none of it. A transit has two ends and each has one fallback, so 2 is every pose there
+    is and anything above it is read as 2. 1 asks for the start end's alone and the detour
+    is then `w1 -> f1 -> w2`, which still asks one leg to reach all the way into the end
+    locator's pocket; 0 looks for none, and a transit with no direct route then fails
+    instead of detouring.
+  - An end that yields nothing contributes nothing, and the detour is attempted through
+    whatever came back. A leg is an extraction only where the pose at its end is the
+    fallback of the locator at its other end, so a start locator that could not be backed
+    out leaves the end locator's pose standing alone and the leg into it is a traverse
+    like any other. Two walks that arrive at the same configuration are kept once --
+    possible where both ends fall through to their neutral walks and the locators sit
+    almost on top of each other -- since a leg from a pose to itself is not a move.
+  - With `--cartesian-solve-seconds 0` there is no tree to give the extractions, so every
+    leg takes every solver and the log says so. The detour is not switched off by it.
   - A cell with no gun joint has `pinned(None)` in both lists, so `GunOpenings.all` offers
-    the same nothing twice. Collapsed to one entry here, or the first half would be solved
-    twice at nothing and the second half's list would subtract `None` from `None`.
+    the same nothing twice. Collapsed to one entry here, or every leg would be solved
+    twice at nothing.
+- **A fallback pose belongs to one end of the transit, and is looked for in two places.**
+  `weldpath.fallback.methods.ENDS` pairs each end with its own two methods, tried in order:
+  out along that locator's retreat axis -- the direction that points into the gun's bulk,
+  which is the way out of the pocket -- and, where that yields nothing, out from that same
+  locator towards where its own nearest neutral pose puts the tool. Both walk outward a
+  `--fallback-step-mm` step at a time from the locator itself, so the first candidate that
+  passes `validity` is the nearest one that works, which is what keeps a detour a detour.
+  - The arrangement before this walked three methods -- retreat from the start, retreat
+    from the end, then a line out of the *midpoint* towards neutral -- and handed the
+    planner whatever poses they produced as interchangeable candidates for a single via.
+    Two things were wrong with it. The poses were not alternatives: "retreat from the end
+    locator" is the end locator's extraction, and offering it as the remedy for a start
+    locator that could not be backed out answers a different question. And one via means
+    one leg out of each pocket, so the transit still had to get from the start locator's
+    pocket all the way into the end locator's in a single move -- the move that had just
+    failed directly.
+  - The secondary walk is per end for the same reason. A single line out of the midpoint
+    is the same line for both ends, and the nearest valid pose on it is usually the same
+    pose for both, which would leave the traverse with nothing to join. Each end projects
+    its own configuration onto the neutral set and walks from its own locator, so the two
+    lines cannot coincide unless the locators do.
+  - Each candidate keeps its locator's own orientation for the whole walk. What is being
+    searched is a line of *positions*; turning the tool as it goes would search a
+    different curve at every step, which is a harder thing to reason about when it fails.
+  - The package no longer imports the planner at all. It did, for the midpoint
+    interpolation; with the walks starting at the locators there is nothing to interpolate,
+    and `weldpath.fallback` is a leaf again -- which is what its own docstring claims.
   - `_Sampler._run` loads a pose through `cell.set_state` inside its own `gun_opening`
     block. OMPL reads the gun from the environment's current state and not from the program
     it is handed, and before this each run inherited whatever the last collision query had
@@ -479,12 +535,11 @@ the way, so the joint values in between are whatever that line demands.
   sampling having nothing drawing it into the corridor beside the panel that the tree
   steers along. What it costs is `--cartesian-solve-seconds` plus `--cartesian-min-seconds`
   on every transit rather than only on the ones nothing else reached, bounded by `Deadline`
-  alone. It runs for the halves of a detour too, which the old split tier already did and
-  the old `_plan_via` did not -- that claim was true of one tier and false of the other.
-  A half is a candidate for being shipped as its own leg, so it is searched and scored under
-  the band it will be flown in; and with a second half's failure now ending the transit, the
-  one solver that searches a space OMPL cannot is worth having there. What that costs is the
-  tree's budget per half per opening tried, against the repeats the commit removed.
+  alone. It runs for every leg of a detour too, and on the two extractions it is the *only*
+  solver -- see `_plan_detour`. A leg is a candidate for being shipped as its own leg of
+  the output, so it is searched and scored under the band it will be flown in. What that
+  costs is the tree's budget per leg per opening tried, which is why the extractions drop
+  `--cartesian-min-seconds` to nothing.
   - `_cartesian_solutions` runs it from successive seeds: until one solves or
     `--cartesian-solve-seconds` passes, then on until `--cartesian-min-seconds` has, both
     timed from the first run. Routes are ranked by `_path_cost`, as phase one's are, and
@@ -495,8 +550,9 @@ the way, so the joint values in between are whatever that line demands.
   - With `--cartesian-recut` (default on), `_recut_outside_band` then cuts the route
     where it leaves the band, before it becomes a candidate. The first and last state of
     each far stretch stay as waypoints just outside the band; every state between them is
-    dropped, and the gap is re-planned by `_Sampler` -- the same phase one and phase two
-    the transit gets -- or taken as the joint chord when that is already clear. A gap
+    dropped, and the gap is re-planned by `_Sampler` -- phase one, then phase two, which
+    is the one place phase two still runs -- or taken as the joint chord when that is
+    already clear. A gap
     that cannot be joined keeps its tree states. A route with no near state is left
     alone, since that query is the one phase one just failed.
   - Afterwards it is treated exactly like an OMPL route. With the recut off, joint motion
@@ -528,9 +584,10 @@ the way, so the joint values in between are whatever that line demands.
     stopped short. The deeper branch of one tree would hide exactly that.
   - **Every search goes in the one file, and the viewer filters them per solve.** A segment
     runs the tree many times -- successive seeds until the solve budget is spent, once per
-    gun opening, again in phase two, again per half of a detour -- and they fail in
-    different places. Which opening got furthest, and whether a second half failed where
-    the first half had no trouble, are questions about the *set*; the single biggest tree
+    gun opening, and again per leg of a detour, where the two extractions have no other
+    solver -- and they fail in different places. Which opening got furthest, and whether a
+    traverse failed where the extractions had no trouble, are questions about the *set*;
+    the single biggest tree
     answered neither, and a file per search would mean comparing them in two windows. Each
     search is a `solve` carrying the label `plan_cartesian` was given -- run number and gun
     opening -- and the viewer groups the filters under it, colours each one its own hue,

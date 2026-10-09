@@ -190,7 +190,7 @@ class ToolpathPlanner:
                  opening_round_mm: float = 5.0,
                  gun: GunPreference | None = None, retune_openings: int = 0,
                  fallback_mm: float = 100.0, fallback_step_mm: float = 40.0,
-                 fallback_poses: int = 3,
+                 fallback_poses: int = 2,
                  segment_length: float = 0.02, check_step_deg: float = 3.0,
                  continuous_check: bool = False,
                  shortcut_seconds: float = 2.0, polish_seconds: float = 5.0,
@@ -315,20 +315,25 @@ class ToolpathPlanner:
                                        max_poses=fallback_poses, log=self.log)
 
     def _fallback_for(self, a: Locator, b: Locator, qa: np.ndarray, qb: np.ndarray):
-        """A callable giving this transit its fallback poses, run only if it is asked.
+        """A callable giving this transit one fallback pose per end, run only if asked.
 
         Handed to ``plan_freespace`` rather than a list because the search costs real time
-        -- three methods, each solving inverse kinematics at every step it takes -- and
-        most transits solve at the first gun opening and never reach for a detour.  The
-        planner calls this once, after every opening has failed directly.
+        -- each end walks out of its locator solving inverse kinematics at every step it
+        takes -- and most transits solve at the first gun opening and never reach for a
+        detour.  The planner calls this once, after every opening has failed directly.
+
+        What comes back is in route order: the start locator's own fallback, then the end
+        locator's.  The planner reads each for its configuration and for which end it
+        belongs to, that being what tells an extraction from a traverse, and knows nothing
+        else about how either was found.
 
         This replaces taking the study's first via and routing everything through it.  That
         was one pose for the whole run, chosen without reference to either end of the move
         it was rescuing or to how much room there was around it; it was only ever a guess
         that a pose the path already visited would be a clear one.
         """
-        def find() -> list[np.ndarray]:
-            return self.fallback.poses(qa, qb, a.pose_world, b.pose_world)
+        def find() -> list:
+            return self.fallback.pair(qa, qb, a.pose_world, b.pose_world)
         return find
 
     def _clearance_for(self, *locators: Locator):
@@ -816,7 +821,7 @@ class ToolpathPlanner:
             segment_length=self.segment_length,
             continuous_check=self.continuous_check,
             check_step=self.check_step,
-            fallback_via=self._fallback_for(a, b, transit_start, transit_end),
+            fallback_find=self._fallback_for(a, b, transit_start, transit_end),
             fallback_runs=self.fallback_runs, relocate=self.relocate,
             deadline=deadline,
             shortcut_seconds=self.shortcut_seconds,
