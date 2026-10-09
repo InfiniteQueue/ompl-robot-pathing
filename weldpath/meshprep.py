@@ -522,6 +522,102 @@ def merge_far(V: np.ndarray, groups: list[tuple[np.ndarray, np.ndarray]],
     return V, near + [(np.unique(p), p) for p in pieces], len(far)
 
 
+def read_groups(path: str) -> tuple[np.ndarray, list[np.ndarray]]:
+    """Read a prepared OBJ back as its vertices and one triangle array per ``o`` group.
+
+    The inverse of :func:`_write_groups`, and the reason a re-cut needs no source mesh: the
+    prepared file holds each group's own triangles, which is what Tesseract builds a hull
+    from at load time.  The writer emits each group's vertices with a running offset and
+    indexes them globally, so reading every ``v`` line into one list keeps those indices
+    meaning what they meant.
+    """
+    V: list[list[float]] = []
+    groups: list[list[list[int]]] = []
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            if line.startswith("v "):
+                V.append([float(x) for x in line.split()[1:4]])
+            elif line.startswith("o "):
+                groups.append([])
+            elif line.startswith("f "):
+                if not groups:
+                    groups.append([])
+                # OBJ indices are 1-based, and a face may carry texture or normal fields.
+                groups[-1].append([int(p.split("/")[0]) - 1 for p in line.split()[1:4]])
+    return (np.array(V, dtype=float),
+            [np.array(g, dtype=np.int64).reshape(-1, 3) for g in groups])
+
+
+def recut_groups(src: str, dst: str, cells: dict[int, float],
+                 overlap: float = 0.0) -> dict:
+    """Re-cut named groups of a prepared OBJ on a finer grid, where they stand in it.
+
+    ``cells`` maps a group's index -- the index Tesseract reports as ``subshape_id``, which
+    is this file's own ``o`` order -- to the cell size to re-cut that group's triangles at.
+    Each named group is replaced in place by the pieces :func:`split_by_grid` makes of it;
+    every other group is copied through untouched.
+
+    This is what answers a hull that refuses a waypoint, and it is deliberately narrower
+    than re-running the decomposition.  A cell size is a property of a *link*, and a link is
+    thousands of hulls, so taking one down a step pays four times the hulls across all of
+    them: measured on one panel shell, 901 hulls at a 20 mm cell against 15508 at 5 mm.
+    What over-reported is one hull, and that hull's own triangles are in this file, so this
+    pays about four hulls to answer the one that was in the way.
+
+    The error runs the safe way, for the same reason the grid is sound to begin with: each
+    piece is hulled from triangles the original group also held, so the union of the pieces
+    is contained in the hull it replaces and every triangle is still inside one of them.  A
+    re-cut can therefore stop reporting a contact that was never there, and cannot stop
+    reporting one that is.
+
+    ``overlap`` defaults to 0 rather than to ``DEFAULT_OVERLAP``, which is a legacy of the
+    signature it was once fixed at.  Padding a cell inflates every hull it makes, and
+    inflation is the thing being answered here, so a default that padded would work against
+    the call.  Callers pass the run's own ``--hull-cell-overlap`` regardless.
+
+    Nothing records which shell a group came from, and nothing needs to: a contact names
+    the group it hit, and a re-cut acts on that group.  Where a second re-cut is wanted the
+    indices have moved, so it is taken against the file this one wrote rather than against
+    the original -- which is what chaining the output back in as the next ``src`` does.
+
+    Returns stats shaped as :func:`decompose_to_obj` returns them, so a caller reads the
+    two alike.
+    """
+    t0 = time.time()
+    V, groups = read_groups(src)
+    marks = {int(k): float(v) for k, v in (cells or {}).items() if float(v) > 0.0}
+
+    out: list[tuple[np.ndarray, np.ndarray]] = []
+    recut = added = 0
+    for i, tris in enumerate(groups):
+        cell = marks.get(i, 0.0)
+        if cell <= 0.0 or not len(tris):
+            out.append((np.unique(tris), tris))
+            continue
+        V, pieces = split_by_grid(V, tris, cell, overlap)
+        if len(pieces) < 2:
+            # Already inside the cell, or too coarsely tessellated to divide at it: the
+            # triangle budget in ``subdivide_to`` is a real floor, and this is what
+            # reaching it looks like from the outside.
+            out.append((np.unique(tris), tris))
+            continue
+        recut += 1
+        added += len(pieces) - 1
+        out.extend((np.unique(p), p) for p in pieces)
+
+    # Already in metres: this file is the prepared one, not a source mesh.
+    written = (np.concatenate([t for _, t in out]) if out
+               else np.zeros((0, 3), dtype=np.int64))
+    _write_groups(dst, V, written, out, 1.0, src)
+    return {
+        "groups_in": int(len(groups)),
+        "shells_kept": int(len(out)),
+        "groups_recut": int(recut),
+        "hulls_added": int(added),
+        "seconds": round(time.time() - t0, 2),
+    }
+
+
 def _write_groups(dst: str, V: np.ndarray, F: np.ndarray,
                   groups: list[tuple[np.ndarray, np.ndarray]], scale: float,
                   src: str) -> None:
@@ -572,6 +668,9 @@ def decompose_to_obj(src: str, dst: str, scale: float, dedupe: bool = True,
     piece is thicker than that, so no hull bridges a bend in the sheet.  Only the pieces
     inside the focus radius when a focus is given, since that is where the hulls are paid
     for; every piece when none is.
+
+    What a contact reports against this file is the ``o`` group's own index, which is
+    enough to act on without any record kept here -- see :func:`recut_groups`.
     """
     t0 = time.time()
     V, F = load_obj(src)

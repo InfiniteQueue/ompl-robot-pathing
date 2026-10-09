@@ -14,10 +14,12 @@ the closing itself.
 """
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
 
+from . import meshprep
 from . import stagetrace
 from . import treetrace
 from .cell import STOP_BAND_JOINT, Cell
@@ -30,6 +32,29 @@ from .planning import (LIN, PTP, Deadline, LinearZone, OmplBudget, PlanningError
                        plan_freespace,
                        validate)
 
+
+
+# How much of a blocking hull's own size the re-cut aims at.  Half, so one step divides
+# it about eight ways: a step that only shaved it would need many rebuilds to say anything,
+# and one much finer would pay for a cut well past the point the refusal is answered.  The
+# hull shrinks with every step, so this converges on its own and the floor is what stops it.
+RECUT_FRACTION = 0.5
+
+
+@dataclass(frozen=True)
+class _Blocked:
+    """A locator a hull refused: which pair, which hull on each side, how deep, where.
+
+    ``distance`` and ``q`` are in environment units, as the cell reports them.  The pose is
+    the one the diagnosis measured, which is a solution taken without the collision check:
+    the collision-free solve returned nothing, so there is no better pose to name.
+    """
+    locator: str
+    opening: float
+    pair: tuple[str, str]
+    hulls: tuple[int, int]
+    distance: float
+    q: np.ndarray
 
 
 @dataclass
@@ -206,6 +231,8 @@ class ToolpathPlanner:
                  export_dir: str | None = None,
                  treeview: bool = True, treeview_max_poses: int = 1500,
                  treeview_searches: int = 12,
+                 recut_hulls: bool = True, recut_attempts: int = 3,
+                 recut_floor_mm: float = 2.0,
                  keep_unrefined: bool = False, log=print):
         self.cell = cell
         self.man = man
@@ -276,8 +303,19 @@ class ToolpathPlanner:
                      # the query running out of range.
                      (self.direct_clearance_mm + NEAR_PANEL_HEADROOM_MM
                       if self.direct_clearance_mm > 0.0 else 0.0))
+        # Kept: a re-cut replaces the cell, and the new one has to be asked for the same
+        # reach.  See _adopt.
+        self._probe_mm = wanted
         if wanted > 0.0:
             cell.require_proximity(wanted, log=log)
+        # A hull that refuses an input waypoint is re-cut finer where it stands, where the
+        # raw CAD says it is over-reporting; see _recut_blocking_hulls.
+        self.recut_hulls = bool(recut_hulls)
+        self.recut_attempts = max(0, int(recut_attempts))
+        self.recut_floor_mm = max(0.0, float(recut_floor_mm))
+        self._recuts = 0
+        # Filled by _diagnose, read by the re-cut pass once every locator has been tried.
+        self.blocks: list[_Blocked] = []
         # Set when --export-collision-geometry is on: a pose that cannot be placed then
         # also writes the two links that blocked it, as they sat when it was rejected.
         self.export_dir = export_dir
@@ -310,9 +348,23 @@ class ToolpathPlanner:
         self.openings: dict[str, float] = {}
         # Poses to route a difficult transit through are searched for per transit and only
         # when one is needed; see weldpath.fallback and _fallback_for.
-        self.fallback = FallbackFinder(cell, man, fallback_mm=fallback_mm,
-                                       step_mm=fallback_step_mm,
-                                       max_poses=fallback_poses, log=self.log)
+        self._fallback_args = dict(fallback_mm=fallback_mm, step_mm=fallback_step_mm,
+                                   max_poses=fallback_poses)
+        self.fallback = FallbackFinder(cell, man, log=self.log, **self._fallback_args)
+
+    def _adopt(self, cell: Cell) -> None:
+        """Take a rebuilt cell in place of the current one.
+
+        Everything the planner asked of the old cell has to be asked again: the clearance
+        manager is built per cell, and the fallback finder holds one.  The cell's own
+        settings travel with it, ``build`` applying them itself rather than leaving them to
+        be assigned afterwards -- which is exactly what a rebuild would have dropped.
+        """
+        self.cell = cell
+        if self._probe_mm > 0.0:
+            cell.require_proximity(self._probe_mm, log=self.log)
+        self.fallback = FallbackFinder(cell, self.man, log=self.log,
+                                       **self._fallback_args)
 
     def _fallback_for(self, a: Locator, b: Locator, qa: np.ndarray, qb: np.ndarray):
         """A callable giving this transit one fallback pose per end, run only if asked.
@@ -431,7 +483,13 @@ class ToolpathPlanner:
         hits = self.cell.contacts(q)
         if not hits:
             return "reachable, but the pose reads as in collision"
-        (a, b), (worst, point) = min(hits.items(), key=lambda kv: kv[1][0])
+        (a, b), hit = min(hits.items(), key=lambda kv: kv[1].distance)
+        worst, point = hit.distance, hit.point
+        # Kept for the re-cut pass, which runs once every locator has been tried.  This is
+        # the one place the blocking pair, the hull within each link and the pose are all
+        # in hand at the same time.
+        self.blocks.append(_Blocked(loc.name, float(opening), (a, b), hit.hulls,
+                                    float(worst), np.array(q, dtype=float)))
         more = f" (+{len(hits) - 1} more)" if len(hits) > 1 else ""
         # Where the contact sits, said in the frame the reader is looking at: the TCP's
         # own axes are the ones the approach and the lead-in are defined along, so "40 mm
@@ -517,8 +575,12 @@ class ToolpathPlanner:
         detail = ("; ".join(problems)
                   or "it declares no gun opening and --weld-opening-search is off")
         hint = ("" if "reachable, but" not in detail else
-                ". Hulls over-report contact on concave parts: check the pair against the "
-                "raw geometry before trusting it, and see --hull-cell-mm")
+                (". Hulls over-report contact on concave parts; the blocking hull is "
+                 "measured against the raw geometry and re-cut finer once every locator "
+                 "has been tried" if self.recut_hulls else
+                 ". Hulls over-report contact on concave parts: check the pair against "
+                 "the raw geometry before trusting it, and see --recut-blocking-hulls "
+                 "and --hull-cell-mm"))
         raise PlanningError(f"cannot place the robot at locator '{loc.name}' -- "
                             f"{detail}{hint}")
 
@@ -705,14 +767,13 @@ class ToolpathPlanner:
         if len(locators) < 2:
             return []
 
-        anchors: dict[str, np.ndarray] = {}
-        seed = self.start_q
-        for loc in locators:
-            try:
-                anchors[loc.name], self.openings[loc.name] = self._solve_locator(loc, seed)
-                seed = anchors[loc.name]
-            except PlanningError as exc:
-                self.log(f"  ! {exc}")
+        anchors = self._place_locators()
+        for attempt in range(self.recut_attempts):
+            if len(anchors) == len(locators) or not self._recut_blocking_hulls():
+                break
+            self.log(f"  placing every locator again against the re-cut geometry "
+                     f"({attempt + 2} of {self.recut_attempts + 1} attempts)")
+            anchors = self._place_locators()
         self.fallback.announce()
 
         segments: list[Segment] = []
@@ -739,6 +800,184 @@ class ToolpathPlanner:
                 treetrace.stop()
             segments.append(seg)
         return segments
+
+    def _place_locators(self) -> dict[str, np.ndarray]:
+        """Solve every locator in manifest order, seeding each from the last that placed.
+
+        Run again whole after a hull has been re-cut, rather than retried for the locator
+        that failed.  A re-cut changes what the hulls read, and the pair margins the build
+        derives are shifted by exactly that reading -- measured at the start pose and at
+        every waypoint -- so a finer hull moves the margins as well as the geometry, and not
+        necessarily the same way for every pose.  A locator placed under the coarser hulls
+        is not guaranteed to place again, so the whole pass is the only honest report of the
+        geometry actually loaded.
+        """
+        anchors: dict[str, np.ndarray] = {}
+        self.blocks = []
+        seed = self.start_q
+        for loc in self.man.locators:
+            try:
+                anchors[loc.name], self.openings[loc.name] = self._solve_locator(loc, seed)
+                seed = anchors[loc.name]
+            except PlanningError as exc:
+                self.log(f"  ! {exc}")
+        return anchors
+
+    def _required_clearance(self, pair: tuple[str, str], locator: str) -> float:
+        """What the raw geometry has to leave between these two links, at this locator.
+
+        The same two figures the build holds a pair to: the obstacle clearance against the
+        panels and tooling, the self-collision margin between the robot's own links -- and
+        the weld clearance in place of the first where the locator is a weld, a gun that
+        cannot approach the panel it is welding being no use.
+        """
+        statics = {s.name for s in self.man.static_objects}
+        if any(name in statics for name in pair):
+            loc = next((l for l in self.man.locators if l.name == locator), None)
+            if self.weld_clearance is not None and loc is not None and loc.is_weld:
+                return self.weld_clearance
+            return self.cell.obstacle_clearance
+        return self.cell.margin
+
+    def _aim_recut(self, link: str, index: int, targets: dict) -> None:
+        """Note one hull to re-cut, at a cell drawn from its own size.
+
+        The cell comes from the hull rather than from the link's ``--<category>-cell-mm``:
+        what has to divide is this piece, the flag describes the whole link, and a piece
+        that was never refined may be far larger than the flag suggests.  A cell no smaller
+        than the piece cannot divide it at all, so :data:`RECUT_FRACTION` of its own
+        diagonal is the coarsest cut that is certain to say something.
+        """
+        if not self.cell.geometry.get(link):
+            # Asked here rather than left to the caller that opens the file: a link with
+            # no prepared geometry has no hull to divide, and the pass runs while a
+            # locator is already failing, which is the worst place to raise from.
+            self.log(f"      {link} has no prepared convex geometry, so there is nothing "
+                     f"to re-cut")
+            return
+        if index < 0:
+            # A link of one convex piece has no subshape to report, and comes back as -1.
+            # That is the case with most to gain -- one hull over a whole part claims every
+            # hollow in it -- so it is resolved rather than passed over.  Verified on a
+            # C-shaped bar: single-hull, the contact reports -1; re-cut, it reports the
+            # piece.
+            count = self.cell.hull_count(link)
+            if count != 1:
+                self.log(f"      the contact did not say which of {link}'s {count} hulls "
+                         f"it hit, so there is nothing to re-cut")
+                return
+            index = 0
+        extent = self.cell.hull_extent(link, index)
+        if extent is None:
+            self.log(f"      {link} has no prepared convex geometry holding a hull "
+                     f"{index}, so there is nothing to re-cut")
+            return
+        diagonal = float(np.linalg.norm(extent))
+        cell_mm = diagonal * RECUT_FRACTION
+        if cell_mm < self.recut_floor_mm:
+            self.log(f"      hull {index} of {link} is already {diagonal:.1f} mm across, "
+                     f"so a finer cut would be under the {self.recut_floor_mm:g} mm floor")
+            return
+        self.log(f"      re-cutting hull {index} of {link}, "
+                 f"{extent[0]:.1f} x {extent[1]:.1f} x {extent[2]:.1f} mm, at a "
+                 f"{cell_mm:.1f} mm cell")
+        targets.setdefault(link, {})[index] = cell_mm
+
+    def _recut_blocking_hulls(self) -> bool:
+        """Re-cut the hulls that refused a locator, where the raw CAD says they are wrong.
+
+        A locator is refused when the collision check rejects every pose that reaches it.
+        The check reads convex hulls, which claim every hollow they span, so the refusal may
+        be the approximation rather than the cell -- badly so on the C-shaped castings here,
+        where a hulled link has read 23.4 mm of penetration against 6.1 mm of real overlap.
+        The appeal is the raw concave CAD, and where that says the pair is clear the hull
+        that read otherwise is cut finer *where it stands* and the locator tried again.
+
+        Three things make that worth doing rather than telling the operator to lower a cell
+        size by hand.  The hull is named, not guessed at: a contact reports which convex
+        piece of each link it hit.  The piece's own triangles are in the prepared file, so
+        re-cutting it needs no decomposition and costs about four hulls, against four times
+        the hulls of the whole link -- 901 to 15508 on one panel shell, measured, for a cell
+        taken from 20 mm to 5. And the error runs the safe way: the pieces of a cut hull are
+        contained in it, so this can stop reporting a contact that was never there and
+        cannot stop reporting one that is.
+
+        Returns whether the geometry changed, which is what tells the caller there is any
+        point placing the locators again.  It does not change where a pair's margin is set:
+        the margins are re-derived by the rebuild, from what the new hulls read.
+
+        Nothing is re-cut on the strength of a hull reading alone.  A pair whose raw
+        geometry really is too close is the study being wrong, and no cell size answers it;
+        a pair that cannot be measured is not evidence either way.  Both are reported and
+        left standing, which is also what stops the pass walking a cell down to its floor
+        for a refusal it was never going to fix.
+        """
+        if not self.recut_hulls or not self.blocks:
+            return False
+        # The deepest reading per locator.  A locator refused at several gun openings is
+        # one problem, and the worst of those readings is the one with most to gain.
+        worst: dict[str, _Blocked] = {}
+        for b in self.blocks:
+            if b.locator not in worst or b.distance < worst[b.locator].distance:
+                worst[b.locator] = b
+
+        scale = self.man.scale
+        self.log(f"  {len(worst)} locator{'' if len(worst) == 1 else 's'} refused by a "
+                 f"hull; measuring each blocking pair against the raw concave meshes. "
+                 f"Every pair loads full-resolution CAD into a scene of its own")
+        targets: dict[str, dict[int, float]] = {}
+        for name, b in sorted(worst.items()):
+            a, c = b.pair
+            self.log(f"    '{name}' at {b.opening:g} mm: {a} <-> {c} reads "
+                     f"{b.distance / scale:+.1f} mm on the hulls")
+            true_d = self.cell.exact_distance(b.pair, b.q, log=self.log)
+            if true_d is None:
+                self.log(f"      the raw meshes could not be measured here, so nothing "
+                         f"says the hulls are wrong; the pair stands")
+                continue
+            needed = self._required_clearance(b.pair, name)
+            if true_d < needed:
+                self.log(f"      the raw geometry really is {true_d / scale:+.1f} mm "
+                         f"apart, short of the {needed / scale:+.1f} mm required, so this "
+                         f"is the study rather than the hulls; the pair stands")
+                continue
+            self.log(f"      the raw geometry is {true_d / scale:+.1f} mm apart, so the "
+                     f"hulls over-report by {(true_d - b.distance) / scale:.1f} mm")
+            for link, index in zip(b.pair, b.hulls):
+                # Both sides, because the measurement convicts the pair and not one of
+                # them: either hull may be the one claiming space it has no material in,
+                # and a piece costs about four hulls to cut.
+                self._aim_recut(link, index, targets)
+
+        if not targets:
+            return False
+        self._recuts += 1
+        swap: dict[str, str] = {}
+        for link, cells in sorted(targets.items()):
+            source = self.cell.geometry[link]
+            dst = os.path.join(os.path.dirname(source),
+                               f"{link}.recut{self._recuts}.obj").replace("\\", "/")
+            # Every hull of this link in one call: the indices are this file's own, and
+            # re-cutting one would shift the rest.
+            st = meshprep.recut_groups(
+                source, dst, {i: c * scale for i, c in cells.items()},
+                overlap=float(getattr(self.cell, "hull_overlap", 0.0) or 0.0))
+            if not st["groups_recut"]:
+                self.log(f"    {link}: nothing divided -- the hull is already as fine as "
+                         f"its own tessellation goes, which is a floor no cell size "
+                         f"reaches past")
+                continue
+            self.log(f"    {link}: {st['groups_recut']} hull"
+                     f"{'' if st['groups_recut'] == 1 else 's'} cut into "
+                     f"{st['groups_recut'] + st['hulls_added']}, taking the link from "
+                     f"{st['groups_in']} to {st['shells_kept']} hulls ({st['seconds']}s)")
+            swap[link] = dst
+        if not swap:
+            return False
+        self.log("  rebuilding the scene with the re-cut geometry; the broadphase is built "
+                 "again and every pair margin is re-derived from what the new hulls read")
+        self._adopt(self.cell.rebuild(swap))
+        return True
 
     def _write_failure_view(self, a: Locator, b: Locator, anchors, failure: str) -> None:
         """Write the failed segment's search out as something that can be looked at.
