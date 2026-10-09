@@ -1107,6 +1107,46 @@ Two consequences worth knowing:
 Subdivision stops at 400 000 triangles per shell, which degrades to a coarser result rather
 than a wrong one.
 
+### When a hull refuses a weld
+
+The gate above and the cell sizes below are guesses made before planning starts about
+which shells are worth refining. A waypoint the planner cannot reach is that guess being
+caught out, and the program now answers it directly rather than printing a hint.
+
+A locator fails when the collision check rejects every pose that reaches it. The check
+reads hulls, which claim every hollow they span, so the refusal may be the approximation
+and not the cell — on the castings here a hulled link has read 23.4 mm of penetration where
+the raw meshes read 6.1 mm of real overlap. So the blocking pair is re-measured against the
+raw concave CAD, and where that says the pair is clear, the hull that read otherwise is cut
+finer and every locator is placed again. `--recut-blocking-hulls false` switches it off.
+
+What makes this cheap is that the hull is *named*. A contact reports `subshape_id`, the
+index of the convex piece it hit within each link, and that piece's own triangles are in
+the prepared OBJ — they are what Tesseract builds the hull from. So the piece is re-cut
+where it stands in the file and every other group is copied through. Lowering a link's
+`--<category>-cell-mm` instead would refine thousands of hulls to fix one: measured on a
+panel shell, a 20 mm cell gives 901 hulls and a 5 mm cell 15508, against **+7 hulls** for
+re-cutting the single piece that was in the way.
+
+| what is re-cut | hulls before | hulls after |
+|---|---|---|
+| one blocking piece, a 21 mm box, at a 10 mm cell | 1 | 8 |
+| the same piece at 5 mm | 1 | 46 |
+| the same piece at 2 mm | 1 | 378 |
+| the whole shell it belongs to, 20 mm cell -> 5 mm | 901 | 15508 |
+
+The error runs the safe way. Each piece is hulled from triangles the original group also
+held, so the union of the pieces is contained in the hull it replaces and every triangle is
+still inside one of them: a re-cut can stop reporting a contact that was never there, and
+cannot stop reporting one that is.
+
+Nothing is re-cut on a hull reading alone. A pair whose raw geometry really is too close is
+the study being wrong and no cell size answers it; a pair that could not be measured is not
+evidence either way. Both are reported and left alone — which is also what stops the pass
+walking a hull down to `--recut-floor-mm` for a refusal it was never going to fix. Each
+attempt halves the offending piece again, up to `--recut-attempts`, and a piece already too
+coarsely tessellated to divide says so rather than being asked twice.
+
 ### Spending the refinement where it matters
 
 A shell is only refined at all if it fills less than `--hull-fill` of its bounding box.
@@ -1297,6 +1337,9 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--max-shells` | 1500 | cap convex shells per link |
 | `--hull-cell-mm` | 50 | refine badly-hulled shells into cells this size; 0 disables |
 | `--hull-fill` | 0.85 | bounding-box fill below which a shell is refined |
+| `--recut-blocking-hulls` | true | re-measure a hull that refuses a waypoint against the raw CAD and cut it finer if it over-reports |
+| `--recut-attempts` | 3 | how many times the locators may be placed again against re-cut geometry; 0 keeps the measurement and skips the retry |
+| `--recut-floor-mm` | 2 | stop re-cutting once half the hull's own diagonal is under this |
 | `--robot-cell-mm` | 0 | cell size for the arm's own links |
 | `--gun-cell-mm` | 60 | cell size for the gun body and moving tip |
 | `--tooling-cell-mm` | 30 | cell size for static objects the manifest calls tooling |

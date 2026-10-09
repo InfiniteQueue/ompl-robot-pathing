@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import contextlib
 import os
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -63,6 +64,19 @@ COUNTER_NAMES = ("state_loads", "clearance", "clearance_hits", "clearance_fused"
 # waypoints of a run stay resident, small enough that a long polish cannot exhaust memory
 # on candidates it drew once and threw away.
 CLEARANCE_CACHE_MAX = 250_000
+
+
+@dataclass(frozen=True)
+class Contact:
+    """One pair's worst contact: the distance, where it was measured, and the hulls.
+
+    ``distance`` is negative for penetration, in environment units.  ``hulls`` indexes each
+    link's prepared ``o`` groups in the order its pair key names the links, and is (-1, -1)
+    where the bindings would not say.
+    """
+    distance: float
+    point: np.ndarray
+    hulls: tuple[int, int] = (-1, -1)
 
 
 class Cell:
@@ -428,23 +442,101 @@ class Cell:
         return res.size() > 0
 
     def contact_pairs(self, q: np.ndarray) -> dict[tuple[str, str], float]:
-        return {pair: d for pair, (d, _) in self.contacts(q).items()}
+        return {pair: c.distance for pair, c in self.contacts(q).items()}
 
-    def contacts(self, q: np.ndarray) -> dict[tuple[str, str], tuple[float, np.ndarray]]:
-        """Worst contact per pair, with the world point where it was measured.
+    def contacts(self, q: np.ndarray) -> dict[tuple[str, str], Contact]:
+        """Worst contact per pair: how deep, where, and which hull on each side.
 
         The point is the midpoint of the contact's two nearest points, which for anything
         close enough to be worth reporting are within a millimetre or two of each other.
         It answers "where on the gun is this happening", which the distance alone does not.
+
+        ``hulls`` is read from ``subshape_id`` and is the pair of convex pieces that
+        actually touched -- the index of each link's own ``o`` group in the prepared OBJ,
+        in the order the key names the links.  ``shape_id`` is not it: a link is one
+        ``<collision>`` element here, so that is 0 for everything, and the decomposition
+        arrives as the subshapes of a single compound mesh.  Verified against a two-cube
+        scene: reversing the groups in the file reverses the indices reported.
+
+        It is what lets a hull that over-reports be re-cut rather than merely complained
+        about, since a prepared group can be cut finer where it stands --
+        :func:`weldpath.meshprep.recut_groups`.
         """
         self.set_state(q)
-        worst: dict[tuple[str, str], tuple[float, np.ndarray]] = {}
+        worst: dict[tuple[str, str], Contact] = {}
         for c in _contact_test(self._cm):
-            key = tuple(sorted((c.link_names[0], c.link_names[1])))
+            names = (c.link_names[0], c.link_names[1])
+            key = tuple(sorted(names))
             d = float(c.distance)
-            if key not in worst or d < worst[key][0]:
-                worst[key] = (d, _contact_point(c))
+            if key not in worst or d < worst[key].distance:
+                # Reported in the contact's own link order, returned in the key's.
+                flip = key[0] != names[0]
+                try:
+                    hulls = (int(c.subshape_id[1 if flip else 0]),
+                             int(c.subshape_id[0 if flip else 1]))
+                except Exception:       # straight out of SWIG; a distance still stands
+                    hulls = (-1, -1)
+                worst[key] = Contact(d, _contact_point(c), hulls)
         return worst
+
+    def exact_distance(self, pair: tuple[str, str], q: np.ndarray,
+                       log=print) -> float | None:
+        """What the raw concave meshes read between two links at this state.
+
+        The hulls are an approximation that only ever claims *more* space than the CAD it
+        was cut from, so a pair the hulls call a collision may be clear in reality -- badly
+        so on the C-shaped castings here.  This is the appeal against that reading, and it
+        is the same measurement the build already makes at the start pose and at every
+        input waypoint, asked of one pair on demand.
+
+        Returns the worst distance, negative for penetration, or None where nothing could
+        be measured -- which is not evidence either way and must not be read as clear.
+
+        Dear: it loads full-resolution CAD into a scene of its own.  Cached per pair and
+        state on the cell, so asking twice is free and a rebuilt scene inherits the answer.
+        """
+        a, b = sorted(pair)
+        got = _exact_contacts(self.man, self.geometry, self.out_dir, [(a, b)],
+                              self._state_values(q), self._state_names, log,
+                              cache=self.exact)
+        return got.get((a, b))
+
+    def hull_count(self, link: str) -> int:
+        """How many convex pieces a link's prepared geometry holds; 0 where it has none.
+
+        Asked when a contact reports no subshape at all, which is what a link of a single
+        piece does.
+        """
+        groups = self._prepared(link)
+        return 0 if groups is None else len(groups[1])
+
+    def _prepared(self, link: str):
+        """This link's prepared OBJ, read once and kept."""
+        from . import meshprep
+        path = self.geometry.get(link)
+        if not path:
+            return None
+        if getattr(self, "_groups_of", None) is None:
+            self._groups_of: dict[str, tuple] = {}
+        if path not in self._groups_of:
+            self._groups_of[path] = meshprep.read_groups(path)
+        return self._groups_of[path]
+
+    def hull_extent(self, link: str, index: int) -> np.ndarray | None:
+        """The bounding-box size of one prepared convex piece, in manifest units.
+
+        ``index`` is a hull index as :class:`Contact` reports it.  What it is for is sizing
+        a re-cut: a cell no smaller than the piece cannot divide it, so the piece's own
+        extent is where a finer cut has to start from.
+        """
+        got = self._prepared(link)
+        if got is None:
+            return None
+        V, groups = got
+        if not 0 <= index < len(groups) or not len(groups[index]):
+            return None
+        P = V[np.unique(groups[index])]
+        return (P.max(axis=0) - P.min(axis=0)) / self.man.scale
 
     def in_tcp_frame(self, q: np.ndarray, point_world: np.ndarray) -> np.ndarray:
         """A world point expressed in the TCP's own frame, in manifest units.
@@ -1110,9 +1202,19 @@ def _assert_scale(env: Environment, man: Manifest, name: str, rel_mesh: str) -> 
             f"extent {got} m against {want} m from the source mesh")
 
 
+def _exact_key(a: str, b: str, q: np.ndarray) -> tuple:
+    """Cache key for one pair measured at one state.
+
+    Rounded to a micro-unit, which is far below anything this is compared against and well
+    above the noise in a state that arrived from inverse kinematics.
+    """
+    return (a, b, np.round(np.asarray(q, dtype=float), 6).tobytes())
+
+
 def _exact_contacts(man: Manifest, collision: dict[str, str], out_dir: str,
                     pairs: list[tuple[str, str]], q: np.ndarray,
-                    joint_names: list[str], log=print) -> dict[tuple[str, str], float]:
+                    joint_names: list[str], log=print,
+                    cache: dict | None = None) -> dict[tuple[str, str], float]:
     """Measure ``pairs`` at joint state ``q`` against the raw concave meshes.
 
     One pair at a time, and each pair's scene holds only the two links involved.  Loading
@@ -1126,12 +1228,25 @@ def _exact_contacts(man: Manifest, collision: dict[str, str], out_dir: str,
     probe distance, so a smaller probe claims *less* clearance than a larger one -- which
     makes retrying at 50, 10 and 2 mm a safe escalation rather than a compromise.
 
+    ``cache`` carries measurements already taken, keyed by pair and state.  What it holds
+    stays true for the whole run however the *hulls* change: these are the raw meshes, and
+    re-cutting a convex piece does not move the CAD it was cut from.  So a scene rebuilt to
+    answer one over-reporting hull does not pay for this again, which is the slowest thing
+    the build does -- full-resolution CAD into a scene of its own, seconds to minutes a
+    pair.
+
     Returns the worst distance per pair, negative for penetration.  A pair absent from the
     result was not measurable: either nothing lay within the probe, or the measurement
     could not be made at all, and the caller decides what to do about that.
     """
     out: dict[tuple[str, str], float] = {}
     for i, (a, b) in enumerate(pairs, 1):
+        key = _exact_key(a, b, q)
+        if cache is not None and key in cache:
+            out[(a, b)] = cache[key]
+            log(f"    . {i}/{len(pairs)} {a} <-> {b} already measured here "
+                f"({cache[key] * 1000:+.1f} mm)")
+            continue
         log(f"    . {i}/{len(pairs)} measuring {a} <-> {b}")
         for probe in EXACT_PROBE_STEPS:
             try:
@@ -1143,6 +1258,8 @@ def _exact_contacts(man: Manifest, collision: dict[str, str], out_dir: str,
             # Measured cleanly but found nothing: the pair is clear by at least the probe
             # used, which is all that can honestly be claimed.
             out[(a, b)] = worst if worst is not None else probe
+            if cache is not None:
+                cache[key] = out[(a, b)]
             break
         else:
             log(f"  ! cannot re-measure {a} <-> {b} against the raw meshes at any probe "
@@ -1267,7 +1384,8 @@ def _waypoint_openings(man: Manifest, loc) -> list[float]:
 def _relax_at_waypoints(cell: Cell, man: Manifest, collision: dict[str, str], out_dir: str,
                         obstacle: set[tuple[str, str]], margin: float,
                         overrides: dict[tuple[str, str], float],
-                        disabled: list[tuple[str, str]], start: np.ndarray, log) -> None:
+                        disabled: list[tuple[str, str]], start: np.ndarray, log,
+                        cache: dict | None = None) -> None:
     """Measure the internal pairs that trip at each input waypoint, and loosen by what the
     hulls over-read there.
 
@@ -1325,7 +1443,8 @@ def _relax_at_waypoints(cell: Cell, man: Manifest, collision: dict[str, str], ou
                     f"{', '.join(f'{a} <-> {b}' for a, b in sorted(hits))} reads in "
                     f"contact; re-measuring against the raw concave meshes")
                 exact = _exact_contacts(man, collision, out_dir, sorted(hits),
-                                        cell._state_values(q), cell._state_names, log)
+                                        cell._state_values(q), cell._state_names, log,
+                                        cache=cache)
                 for (a, b), hull in sorted(hits.items(), key=lambda kv: kv[1]):
                     if (a, b) not in exact:
                         continue        # unmeasurable, already reported
@@ -1446,8 +1565,27 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
           panel_bend_mm: float = 0.0,
           obstacle_clearance_mm: float = 0.0, tcp_check_mm: float = 0.0,
           export_dir: str | None = None,
-          penalty=None, dynamics=None) -> Cell:
-    """Prepare geometry, emit URDF/SRDF, load the environment and generate the ACM."""
+          penalty=None, dynamics=None,
+          stop_time_weight: float = 1.0, stop_band_rad: float = 0.0,
+          geometry: dict[str, str] | None = None,
+          exact_cache: dict | None = None) -> Cell:
+    """Prepare geometry, emit URDF/SRDF, load the environment and generate the ACM.
+
+    ``geometry`` maps a link to an already-prepared collision OBJ to use in place of what
+    the decomposition resolves for it.  That is how a hull re-cut to answer a waypoint it
+    refused reaches the scene: the file is produced from the one already in hand, by
+    :func:`weldpath.meshprep.recut_groups`, and nothing about the decomposition changes.
+
+    ``exact_cache`` is carried across rebuilds, and ``stop_time_weight`` and
+    ``stop_band_rad`` are settings of the cell that used to be assigned to it by the
+    caller afterwards.  Both exist because the scene can now be rebuilt mid-run: a setting
+    applied after the fact is one a rebuild silently drops, which this code has already
+    been bitten by once -- see ``load`` below on ``tcp_check_mm``.
+    """
+    # Every parameter, read before anything else is bound, so a rebuild can be asked for
+    # with one of them changed and nothing else lost.
+    settings = {k: v for k, v in locals().items() if k not in ("man", "log")}
+    exact: dict = dict(exact_cache or {})
     collision = _resolve_collision_meshes(man, log, min_shell_mm, max_shells, hull_cell_mm,
                                           hull_fill, hull_per_category, weld_proximity_mm,
                                           tcp_proximity_mm, far_cell_mm, far_per_category,
@@ -1456,6 +1594,16 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
                                           enclosed_probe_mm,
                                           enclosed_voxel_mm, enclosed_keep_mm,
                                           enclosed_dump, panel_bend_mm=panel_bend_mm)
+    for link, path in (geometry or {}).items():
+        if link not in collision:
+            # A link with no mesh has nothing to stand in for, and naming one is a mistake
+            # worth hearing about rather than a no-op.
+            log(f"  ! no collision geometry for '{link}' to replace; ignoring the "
+                f"override")
+            continue
+        log(f"  geometry: '{link}' takes {os.path.basename(path)} in place of "
+            f"{os.path.basename(collision[link])}")
+        collision[link] = path
     velocity = {}
     if dynamics is not None:
         velocity = {n: float(v) for n, v in zip(man.robot_joint_names, dynamics.velocity)}
@@ -1479,6 +1627,21 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         cell.margin, cell.obstacle_clearance = margin, clearance
         cell.margin_overrides = overrides
         cell.tcp_check_mm = max(0.0, float(tcp_check_mm))
+        cell.stop_time_weight = float(stop_time_weight)
+        cell.stop_band_rad = float(stop_band_rad)
+        cell.out_dir = out_dir
+        cell.geometry = dict(collision)
+        # What the grid was cut with, for anything that cuts more of it later: padding a
+        # cell inflates every hull it makes, so a re-cut has to use the same figure rather
+        # than a default of its own.
+        cell.hull_overlap = float(hull_overlap or 0.0)
+        cell.exact = exact
+        # Asking for the same cell again with one link's geometry replaced.  Returns a new
+        # Cell: the environment owns its broadphase and there is no command in these
+        # bindings to swap a link's collision geometry under one.
+        cell.rebuild = lambda swap: build(
+            man, log=log, **{**settings, "geometry": {**(geometry or {}), **swap},
+                             "exact_cache": exact})
         return cell
 
     os.environ.setdefault("TESSERACT_RESOURCE_PATH", man.directory)
@@ -1523,16 +1686,17 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         # With the gun at the start opening, as the hulls were measured: a pair involving
         # the moving tip reads differently at every opening, and the exact scene left to
         # itself holds the gun joint at zero.
-        exact = _exact_contacts(man, collision, out_dir, sorted(always),
-                                cell._state_values(start), cell._state_names, log)
+        measured = _exact_contacts(man, collision, out_dir, sorted(always),
+                                   cell._state_values(start), cell._state_names, log,
+                                   cache=exact)
         fatal: list[tuple[str, str, float]] = []
         for (a, b), hull in sorted(always.items(), key=lambda kv: kv[1]):
-            if (a, b) not in exact:
+            if (a, b) not in measured:
                 # Unmeasurable, already reported. Inventing a distance here would either
                 # disable a real collision or hand the pair a margin nothing justifies, so
                 # the pair keeps its default and the start-state check has the final say.
                 continue
-            true_d = exact[(a, b)]
+            true_d = measured[(a, b)]
             base = clearance if (a, b) in obstacle else margin
             if true_d < 0.0:
                 # Real geometry genuinely interpenetrates: a modelling problem, not
@@ -1575,7 +1739,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
 
     # -- the same measurement at every input waypoint ----------------------------------
     _relax_at_waypoints(cell, man, collision, out_dir, obstacle, margin, overrides,
-                        disable, start, log)
+                        disable, start, log, cache=exact)
 
     if disable or overrides:
         pairs = pairs + [(a, b, "InContactAtStart") for (a, b) in disable]

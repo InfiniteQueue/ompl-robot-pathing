@@ -564,6 +564,71 @@ the way, so the joint values in between are whatever that line demands.
     than the step is re-derived by `plan_linear`, which need not reproduce the chain the
     tree validated.
   - `--unrefined-output` writes every transit as one `PTP` phase regardless.
+- **A hull that refuses an input waypoint is measured against the raw CAD, and re-cut
+  where the CAD says it is wrong.** `_solve_locator` fails a locator when the collision
+  check rejects every pose that reaches it, and the check reads convex hulls, which claim
+  every hollow they span. So the refusal may be the approximation rather than the cell.
+  `ToolpathPlanner._recut_blocking_hulls` is the appeal: it re-measures the blocking pair
+  against the raw concave meshes, and where those say the pair is clear it cuts the
+  offending hull finer and places every locator again.
+  - **The hull is named, not guessed at.** A `ContactResult` carries `subshape_id`, which
+    is the index of the convex piece each link was hit on -- that link's own `o` group in
+    the prepared OBJ, in file order. `shape_id` is *not* it and is 0 for everything here: a
+    link is one `<collision>` element, so the whole decomposition arrives as the subshapes
+    of one compound mesh. Verified against a two-cube scene, where reversing the groups in
+    the file reverses the indices reported. `Cell.contacts` returns it as
+    `Contact.hulls`, in the order its pair key names the links.
+  - **Only that hull is re-cut, not the link.** `meshprep.recut_groups` reads the prepared
+    OBJ back, re-cuts the named groups with `split_by_grid` where they stand in the file,
+    and copies every other group through. The piece's own triangles are in that file --
+    they are what Tesseract builds the hull from -- so this needs no source mesh and no
+    decomposition. A cell size is a property of a *link*, and a link is thousands of
+    hulls: lowering one costs about four times the hulls over all of them, measured at
+    901 -> 15508 on one panel shell between a 20 mm cell and a 5 mm one, against +7 for
+    re-cutting the one piece that was in the way. Every hull of a link goes in one call,
+    since the indices are that file's own and cutting one shifts the rest.
+  - **The error runs the safe way**, for the same reason the grid is sound to begin with:
+    each piece is hulled from triangles the original group also held, so the union of the
+    pieces is contained in the hull it replaces and every triangle is still inside one of
+    them. A re-cut can stop reporting a contact that was never there; it cannot stop
+    reporting one that is.
+  - **Nothing is re-cut on a hull reading alone.** A pair whose raw geometry really is too
+    close is the study being wrong, and no cell size answers it; a pair that could not be
+    measured is not evidence either way. Both are reported and left standing, which is
+    also what stops the pass walking a hull down to the floor for a refusal it was never
+    going to fix. The threshold is the one the build holds that pair to: the obstacle
+    clearance against the parts, the self-collision margin between the robot's own links,
+    `--weld-clearance-mm` in place of the first at a weld.
+  - **The cell comes from the hull, not from the link's flag.** What has to divide is this
+    piece; the flag describes the whole link, and a piece the fill gate never refined may
+    be far larger than the flag suggests. `RECUT_FRACTION` of the piece's own diagonal is
+    the coarsest cut certain to say anything -- a cell no smaller than the piece cannot
+    divide it at all. The piece shrinks at every step, so this converges on its own and
+    `--recut-floor-mm` is what stops it.
+  - **The whole anchor pass runs again, not just the locator that failed.** A re-cut
+    changes what the hulls read, and the pair margins the build derives are shifted by
+    exactly that reading -- measured at the start pose and at every waypoint -- so a finer
+    hull moves the margins as well as the geometry, and not necessarily the same way for
+    every pose. A locator placed under the coarser hulls is not guaranteed to place again.
+  - It runs **before any segment is planned**, every locator being solved up front, so no
+    route has been costed against the hulls that are about to change. That is also why the
+    rebuild is a whole new `Cell`: these bindings have no command to swap a link's
+    collision geometry under a loaded environment, and `AddLinkCommand` would mean building
+    `Link` geometry through SWIG. A scene load is about 9 s on a 5.5k-hull cell, paid once
+    per attempt.
+  - `build` takes `geometry`, a per-link stand-in for what the decomposition resolves, and
+    that is the only way re-cut geometry reaches a scene -- the decomposition itself is
+    untouched and its cache is never written over. `stop_time_weight` and `stop_band_rad`
+    became `build` parameters at the same time: they were assigned to the cell by `main`
+    afterwards, and a setting applied after the fact is one a rebuild silently drops, which
+    this code has already been bitten by once with `tcp_check_mm`.
+  - The raw measurements are cached per pair and state on the cell and carried across
+    rebuilds. They stay true however the hulls change -- they are the raw meshes, and
+    re-cutting a convex piece does not move the CAD it was cut from -- so a rebuild does
+    not pay again for the slowest thing the build does.
+  - `--recut-blocking-hulls false` leaves the whole pass out. `--recut-attempts 0` keeps
+    the measurement and its diagnosis and skips only the retry, which is the setting for
+    finding out *why* a waypoint is refused without spending hulls on it.
 - **A segment that fails leaves a viewer behind.** `treetrace` keeps the pairs of
   Cartesian trees a segment built -- offered by `plan_cartesian` at each of its two exits --
   and `ToolpathPlanner.run` hands them to `treeview` from the

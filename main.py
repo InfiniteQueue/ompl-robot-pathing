@@ -711,6 +711,33 @@ def build_parser() -> argparse.ArgumentParser:
                         "it did not survive being measured: see split_by_grid. What it "
                         "does buy is duplicate hulls, a flat face on a cell boundary "
                         "being claimed whole by both sides (default: %(default)g)")
+    #RE-CUT A HULL THAT REFUSES A WAYPOINT
+    p.add_argument("--recut-blocking-hulls", type=boolean, nargs="?", const=True,
+                   default=True, metavar="BOOL",
+                   help="where a hull refuses an input waypoint, measure the blocking pair "
+                        "against the raw concave meshes and, if the hulls are over-"
+                        "reporting, cut that one hull finer where it stands and try the "
+                        "waypoint again. A contact names the convex piece it hit, and that "
+                        "piece's own triangles are in the prepared file, so this costs "
+                        "about four hulls rather than the four times the hulls of the whole "
+                        "link that lowering its --<category>-cell-mm would. Nothing is cut "
+                        "on a hull reading alone: a pair whose raw geometry really is too "
+                        "close is the study being wrong, and is reported and left "
+                        "(default: %(default)s)")
+    p.add_argument("--recut-attempts", type=int, default=3, metavar="N",
+                   help="how many times the locators may be placed again against re-cut "
+                        "geometry. Each attempt re-measures the raw meshes for the pairs "
+                        "still blocking, cuts their hulls in half again and reloads the "
+                        "scene, so the cost is one scene load plus a contact test per "
+                        "attempt. 0 switches the retry off while leaving the measurement "
+                        "and its diagnosis in place (default: %(default)d)")
+    p.add_argument("--recut-floor-mm", type=float, default=2.0, metavar="MM",
+                   help="stop re-cutting a hull once half its own diagonal is under this. "
+                        "It bounds the hull count a refusal can cost, and below a few "
+                        "millimetres there is nothing left to win: a hull that small "
+                        "cannot be over-reporting by enough to refuse a pose that "
+                        "--obstacle-clearance-mm would otherwise accept (default: "
+                        "%(default)g)")
     #endregion
     #region ###CLEARANCE FROM THE PARTS###
     #CLEARANCE EVERYWHERE
@@ -1103,6 +1130,13 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         return {c: getattr(args, f"{c}_{option}")
                 for c in ("robot", "gun", "tooling", "panel")}
 
+    # Settled before the build rather than assigned to the cell afterwards: the scene
+    # can be rebuilt mid-run to answer a hull that refuses a waypoint, and a setting
+    # applied after the fact is one that rebuild would drop.
+    import math
+    stop_band_rad = (math.radians(args.j5_stop_band_deg)
+                     if args.j5_stop_band and args.j5_stop_band_deg > 0.0 else 0.0)
+
     if args.split_panel_bends and args.panel_bend_mm <= 0:
         print("error: --panel-bend-mm must be above 0; use --split-panel-bends false to "
               "switch bend splitting off", file=sys.stderr)
@@ -1132,20 +1166,17 @@ def _run(args: argparse.Namespace, directory: str) -> int:
                               tcp_check_mm=args.check_step_mm,
                               export_dir=(directory if args.export_collision_geometry
                                           else None),
-                              penalty=penalty, dynamics=dynamics)
+                              penalty=penalty, dynamics=dynamics,
+                              stop_time_weight=args.stop_time_weight,
+                              stop_band_rad=stop_band_rad)
     except RuntimeError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
 
-    cell.stop_time_weight = args.stop_time_weight
     if args.stop_time_weight != 1.0:
         log(f"route scoring charges stops at weight {args.stop_time_weight:g}: splitting a "
             f"short move in two scores {2 ** (args.stop_time_weight / 2):.3f}x the whole, "
             f"against 1.414x real; the exported timing is the real one")
-
-    if args.j5_stop_band and args.j5_stop_band_deg > 0.0:
-        import math
-        cell.stop_band_rad = math.radians(args.j5_stop_band_deg)
 
     if args.probe_point:
         # Instead of planning: this is asked when a specific pose is already known to be
@@ -1177,6 +1208,9 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         extra_openings=args.extra_gun_openings,
         opening_round_mm=args.gun_opening_round_mm,
         gun=gun, retune_openings=args.retune_gun_openings,
+        recut_hulls=args.recut_blocking_hulls,
+        recut_attempts=args.recut_attempts,
+        recut_floor_mm=args.recut_floor_mm,
         treeview=args.treeview, treeview_max_poses=args.treeview_max_poses,
         treeview_searches=args.treeview_searches,
         relocate=Relocation(min_attempts=args.polish_min_attempts,
