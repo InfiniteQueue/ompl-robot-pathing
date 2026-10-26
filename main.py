@@ -399,6 +399,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--shortcut-seconds", type=float, default=60.0, metavar="SECONDS",
                    help="time budget for shortcutting each freespace transit; longer "
                         "budgets keep shortening with diminishing returns (default: %(default)g)")
+    #DISABLE THE TOOL STAND-OFF TRIALS
+    p.add_argument("--no-tip-standoff", dest="tip_standoff", action="store_false",
+                   help="skip the pass that tries the finished route again with the gun "
+                        "opened wider and the tool backed off, before it is polished. "
+                        "Four trials: the gun 5 mm wider with the approach left alone, "
+                        "5 mm wider with half and then all of that taken out of the "
+                        "approach, and 10 mm wider with half of it -- which back the "
+                        "moving electrode off the panel, the fixed one off it, or both "
+                        "evenly. Every waypoint but the route's two ends moves, the whole "
+                        "route is re-checked and re-priced at the new opening, and the "
+                        "cheapest of the five answers ships. A route in open air has no "
+                        "clearance penalty to reduce, so it keeps what it was planned "
+                        "with; what the pass costs is four inverse-kinematics solves per "
+                        "waypoint and four validations of the route")
     #POLISH PASS TIME
     p.add_argument("--polish-seconds", type=float, default=240.0, metavar="SECONDS",
                    help="time budget for the final pass over each transit's emitted "
@@ -1221,6 +1235,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         extra_openings=args.extra_gun_openings,
         opening_round_mm=args.gun_opening_round_mm,
         gun=gun, retune_openings=args.retune_gun_openings,
+        stand_off=args.tip_standoff,
         recut_hulls=args.recut_blocking_hulls,
         recut_attempts=args.recut_attempts,
         recut_floor_mm=args.recut_floor_mm,

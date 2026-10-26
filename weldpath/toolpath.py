@@ -28,7 +28,7 @@ from .cartesian import CartesianBudget
 from .fallback import FallbackFinder
 from .penalty import GunPreference
 from .planning import (LIN, PTP, Deadline, LinearZone, OmplBudget, PlanningError,
-                       Relocation, opening_cap, snap_opening, unique_openings,
+                       Relocation, StandOff, opening_cap, snap_opening, unique_openings,
                        plan_freespace,
                        validate)
 
@@ -231,6 +231,7 @@ class ToolpathPlanner:
                  export_dir: str | None = None,
                  treeview: bool = True, treeview_max_poses: int = 1500,
                  treeview_searches: int = 12,
+                 stand_off: bool = True,
                  recut_hulls: bool = True, recut_attempts: int = 3,
                  recut_floor_mm: float = 2.0,
                  keep_unrefined: bool = False, log=print):
@@ -260,6 +261,11 @@ class ToolpathPlanner:
         # planning._retune_opening.
         self.gun = gun or GunPreference(1.0)
         self.retune_openings = max(0, int(retune_openings))
+        # The trials run before the route is polished, so they are the one pass that can
+        # change what a leg is flown at as well as where it goes.  The grid comes from the
+        # same flag every opening the program chooses lands on, this being one of them.
+        self.stand_off = StandOff(enabled=bool(stand_off),
+                                  round_mm=float(opening_round_mm))
         # How far the shortcut and polish passes displace a waypoint when they try
         # relocating one, and how the distance is drawn between those bounds.
         self.relocate = relocate or Relocation()
@@ -1071,7 +1077,8 @@ class ToolpathPlanner:
             main_openings=self.main_openings,
             extra_openings=self.extra_openings,
             opening_round_mm=self.opening_round_mm,
-            gun=self.gun, retune_openings=self.retune_openings,
+            gun=self.gun, stand_off=self.stand_off,
+            retune_openings=self.retune_openings,
             record=raw_legs, log=self.log)
         # What the robot leaves a weld holding is what the transit out of it was solved
         # at, which is only known now.  The declared value seeded that search and is a

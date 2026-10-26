@@ -836,9 +836,240 @@ def clear_stop_band(model: "MotionModel", path: list[np.ndarray],
     return pts
 
 
+# What the stand-off pass tries, as (how much wider the gun is opened, what share of that
+# increase is taken out of the tool's own approach).  A share of 0 spends the whole
+# increase on the moving electrode and leaves the fixed one where the panel had it; 1
+# spends all of it on the fixed electrode and leaves the moving one where it was; 0.5 opens
+# the gap symmetrically about the weld, which is usually what the geometry wants.
+#
+# Written as a share rather than as a distance so the two stay coherent once the opening is
+# put on the ``--gun-opening-round-mm`` grid: an increase that lands at 3 mm rather than 5
+# is still split evenly at 1.5 mm.  On the grid, where a declared opening normally sits,
+# the four read as +5/0, +5/2.5, +5/5 and +10/5 mm.
+STAND_OFF_TRIALS: tuple[tuple[float, float], ...] = (
+    (5.0, 0.0), (5.0, 0.5), (5.0, 1.0), (10.0, 0.5))
+
+# How far a waypoint's joints may travel for the few millimetres its tool is asked to.
+# Inverse kinematics is a local solve from the state itself, so a solution this far off it
+# is another arm or wrist branch rather than the same pose backed off, and installing one
+# would put a reconfiguration in the middle of a route that has already been checked.
+STAND_OFF_JUMP_RAD = 0.1
+
+
+@dataclass
+class StandOff:
+    """Settings for the pass that buys air around the tool with a wider gun.
+
+    Carried as an object rather than as loose arguments for the same reason ``gun`` and
+    ``relocate`` are: it rides through four functions untouched, and ``None`` is how a
+    caller declines the pass altogether.
+    """
+    enabled: bool = True
+    round_mm: float = 0.0
+    trials: tuple[tuple[float, float], ...] = STAND_OFF_TRIALS
+
+
+def _open_axis(man) -> np.ndarray | None:
+    """Unit vector in the TCP's own frame along which the moving electrode opens.
+
+    The gun joint and the TCP are both rigid to the flange, so this is a constant of the
+    gun rather than of the pose, and it is read off the manifest's captured state.  A
+    revolute gun swings its electrode about the joint axis, so the direction at the TCP is
+    the tangent there -- ``axis x (tcp - anchor)``, signed by whichever way the limits
+    allow travel -- and a prismatic one slides along the axis itself.
+
+    Derived rather than assumed so that a gun mounted another way needs no code change.
+    Measured on the supplied cell it comes out as the tool's own +z to within 1.2e-4, which
+    is the axis ``--weld-shift-mm`` already backs a weld off along; that agreement is worth
+    knowing but it is not something to rely on.
+
+    ``None`` where there is no gun joint, or where the TCP sits on the joint axis and so
+    has no tangent to open along, which leaves the caller to skip the pass rather than
+    retreat in a direction nothing chose.
+    """
+    j = man.gun_joint
+    if j is None:
+        return None
+    T = np.array(man.tcp_world_pose, dtype=float)
+    axis = j.unit_axis * j.open_sign
+    if j.is_prismatic:
+        world = axis
+    else:
+        world = np.cross(axis, T[:3, 3] - np.array(j.anchor_world, dtype=float))
+    norm = float(np.linalg.norm(world))
+    if norm <= 0.0:
+        return None
+    return T[:3, :3].T @ (world / norm)         # world -> tool frame
+
+
+def _retreat_path(cell: Cell, path: list[np.ndarray], mm: float, axis: np.ndarray
+                  ) -> tuple[list[np.ndarray], int]:
+    """``path`` with every waypoint but its two ends backed off ``mm`` along ``-axis``.
+
+    The ends do not move.  They are the locators the leg runs between, and one of them is
+    usually the weld itself: the pose it was placed at is the one the study asked for, and
+    the stand-off it already has is ``--weld-shift-mm``'s to give.
+
+    A waypoint whose retreated pose has no solution, or whose solution is further than
+    ``STAND_OFF_JUMP_RAD`` from the state it came from, keeps the state it had.  The
+    candidate is validated and priced as one whole path either way, so a route that is
+    mostly backed off is still a real route and worth scoring; dropping the trial over one
+    waypoint at a reach limit would throw away the air gained at the other forty.  Called
+    with the trial's own opening already in force, so the collision screen inside
+    ``solve_pose`` reads the tip where the trial puts it.
+    """
+    out = [np.asarray(path[0], dtype=float)]
+    held = 0
+    for state in path[1:-1]:
+        q = np.asarray(state, dtype=float)
+        T = cell.pose_mm(q)
+        T[:3, 3] -= mm * (T[:3, :3] @ axis)
+        got = cell.solve_pose(T, [q])
+        if got is None or float(np.max(np.abs(got - q))) > STAND_OFF_JUMP_RAD:
+            held += 1
+            out.append(q)
+            continue
+        out.append(got)
+    out.append(np.asarray(path[-1], dtype=float))
+    return out, held
+
+
+def _stand_off(cell: Cell, path: list[np.ndarray], *, opening: float | None,
+               settings: "StandOff | None", gun: "GunPreference | None",
+               zone: "LinearZone | None", check_step: float,
+               deadline: "Deadline | None" = None, log=print
+               ) -> tuple[list[np.ndarray], float | None]:
+    """Trade a wider gun and a little tool stand-off for air around the whole route.
+
+    Run after the route has been shortened and reduced and **before it is polished**,
+    which is the last pass that will reshape it.  A trial moves every interior waypoint at
+    once and changes the gun under all of them, so putting it here means polish judges the
+    route as it will really be flown rather than one the gun has since moved out from
+    under.  Nothing before this point is wasted either: the trials are offered the reduced
+    route, so they are not re-deciding cuts that are already settled.
+
+    Each trial opens the gun wider and takes some share of that increase out of the tool's
+    approach -- see ``STAND_OFF_TRIALS``.  The two halves are one movement of the gap: the
+    opening backs the moving electrode off the panel, and the retreat backs the fixed one
+    off, so a half share opens the gap about the weld and a full one leaves the moving
+    electrode where it already was.
+
+    **What decides between them is the number every other candidate in this program is
+    ranked on**: ``_path_cost`` with the gun's own weight applied.  So the air bought is
+    priced by the clearance penalty, the wider gun is charged by ``GunPreference``, and a
+    trial is kept only where the first outweighs the second.  That is also what makes the
+    pass self-limiting: a transit in open air has no clearance penalty to reduce, every
+    trial costs it the gun weight and nothing else, and the route it was planned with wins
+    by construction.
+
+    Measured against the defaults, the trade is worth making where a route really does run
+    close.  The clearance penalty is ``1 + 7 * ((100 - d) / 100) ** 5``, so a state at 5 mm
+    is charged 6.42x and the same state 2.5 mm further out 5.74x -- 11% off the time spent
+    there, against the 1.5% the gun weight adds for 5 mm of a 164 mm travel.
+
+    Returns the route to carry on with and the opening to fly it at.  The opening is part
+    of the answer: the retreat and the opening are one trade, and shipping the backed-off
+    route at the opening it was planned at would put the tip back where it started and
+    leave a route priced on a geometry it is not flown in.
+    """
+    if settings is None or not settings.enabled or opening is None:
+        return path, opening
+    if len(path) < 3 or not cell.gun_joint_name:
+        # Two points have no interior waypoint to retreat, and a cell with no gun joint has
+        # no opening to widen and no moving electrode to back away from.
+        return path, opening
+    axis = _open_axis(cell.man)
+    if axis is None:
+        return path, opening
+    if deadline is not None and deadline.expired:
+        # There is a valid route in hand and this only improves it, so it is dropped whole
+        # rather than clamped -- a trial that is not priced against the others proves
+        # nothing, and the pass has no budget of its own to cut.
+        log("      not standing the tool off: the segment clock has run out")
+        return path, opening
+
+    widest = float(cell.man.gun_opening_max)
+
+    def price(states: list[np.ndarray], value: float) -> float | None:
+        """This route flown at this opening: its cost, or ``None`` where it will not fly.
+
+        Checked move by move under the profile the band gives it at *that* opening, which
+        is the derivation ``_split_runs`` will make and ``_verify_runs`` will check.
+        Deriving is right here and wrong in ``_retune_opening``: no split has happened yet,
+        so there is nothing settled for a derived profile to contradict.
+
+        A fresh ``MotionModel`` per opening, and not the caller's.  Its near and reach
+        caches are keyed on the state alone, and the whole point of moving the gun is that
+        a state reads differently with the tip somewhere else -- the cell's own caches are
+        keyed on the gun value and need no such care, but this one would serve the answers
+        it learned at the opening before.
+        """
+        with cell.gun_opening(value):
+            model = MotionModel(cell, max_step=check_step, zone=zone)
+            for a, b in zip(states, states[1:]):
+                if model.blocked(a, b):
+                    return None
+            return _path_cost(cell, states, check_step, zone=zone,
+                              gun=gun, opening=value)[0]
+
+    t0 = time.time()
+    was = price(path, opening)
+    if was is None:
+        # The route was verified at this opening as it was built, so this should not
+        # happen.  Reported rather than raised: the route is the caller's to verify, and a
+        # trial installed over one that does not stand up would hide where the fault is.
+        log(f"      not standing the tool off: the route does not price at the "
+            f"{opening:g} mm it was planned at")
+        return path, opening
+
+    best, best_cost, won = path, was, None
+    tried, seen = 0, set()
+    for extra, share in settings.trials:
+        if deadline is not None and deadline.expired:
+            break
+        value = snap_opening(opening + extra, settings.round_mm, widest)
+        gained = value - opening
+        if gained <= OPENING_TOL_MM:
+            continue                    # the gun has no travel left to give
+        back = gained * float(share)
+        key = (round(value, 6), round(back, 6))
+        if key in seen:
+            continue                    # two trials the cap or the grid has made one
+        seen.add(key)
+        with cell.gun_opening(value):
+            states, held = ((path, 0) if back <= 0.0
+                            else _retreat_path(cell, path, back, axis))
+        cost = price(states, value)
+        tried += 1
+        if cost is None:
+            continue
+        if cost < best_cost:
+            best, best_cost, won = states, cost, (value, back, held)
+
+    note = (f"{tried} of {len(settings.trials)} trial"
+            f"{'' if len(settings.trials) == 1 else 's'} in {time.time() - t0:.1f}s")
+    if won is None:
+        log(f"      keeping the route and the gun as planned: nothing cheaper than "
+            f"{was:.2f} s over {note}")
+        return path, opening
+    value, back, held = won
+    # ``held`` is both refusals together -- no solution and a branch flip -- since what
+    # the reader needs is how much of the route really moved.
+    stuck = f", {held} of them left where they were" if held else ""
+    log(f"      standing the tool off: the gun at {value:g} mm rather than {opening:g}, "
+        f"the approach backed off {back:.2f} mm over {len(best) - 2} waypoints{stuck}; "
+        f"cost {best_cost:.2f} s against {was:.2f} s, over {note}")
+    return best, value
+
+
 def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: float,
             polish_seconds: float, relocate: "Relocation | None" = None,
-            anchors: list[int] | None = None, log=print) -> list[np.ndarray]:
+            anchors: list[int] | None = None,
+            opening: float | None = None, stand_off: "StandOff | None" = None,
+            gun: "GunPreference | None" = None,
+            check_step: float | None = None,
+            deadline: "Deadline | None" = None,
+            log=print) -> tuple[list[np.ndarray], float | None]:
     """The whole post-processing chain, in the order the three passes need to run.
 
     Shortcutting reshapes the route while it is still dense, reduction picks which of those
@@ -850,6 +1081,12 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     Such a leg is refined once a pair is settled on, by ``_refine_runs``, so the pass is
     deferred rather than skipped -- and it says so, since "0s, both spent in full" reads
     as a budget that was consumed.
+
+    ``_stand_off`` runs between reducing and polishing, and is the one pass here that can
+    change what the leg is *flown* at as well as where it goes, so the opening comes back
+    with the route.  It is gated on the polish budget rather than on its own switch alone:
+    a leg deferring its refinement is one that may yet be discarded, and the trials are
+    worth paying for once, on the leg that will ship.
     """
     if shortcut_seconds <= 0 and polish_seconds <= 0:
         log(f"      leaving {len(path)} points unrefined for now: no budget at this "
@@ -862,6 +1099,26 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     stagetrace.stage("shortcut", model, improved)
     reduced = simplify(model, improved)
     stagetrace.stage("simplify", model, reduced)
+    chosen = opening
+    if polish_seconds > 0:
+        reduced, chosen = _stand_off(
+            model.cell, reduced, opening=opening, settings=stand_off, gun=gun,
+            zone=model.zone,
+            check_step=model.max_step if check_step is None else check_step,
+            deadline=deadline, log=log)
+        if not _same_opening(chosen, opening):
+            # The gun stays where the trial put it for the rest of the refinement: polish,
+            # the stop-band clearing and the split all have to read the route as it will be
+            # flown.  Set rather than entered as a context, because what has to outlive
+            # this function is exactly the change -- the caller's own ``gun_opening`` block
+            # is what puts the leg's opening back when the leg is done with.
+            model.cell.set_gun_opening(chosen)
+            # And a new model for it.  The near and reach caches are keyed on the state
+            # alone, so the old one would answer the band's question with what it learned
+            # at the opening before -- which is the whole thing the gun has just moved.
+            model = MotionModel(model.cell, max_step=model.max_step, zone=model.zone,
+                                pinned=model.pinned)
+        stagetrace.stage("stand off", model, reduced)
     polished = polish(model, reduced, time_budget=polish_seconds, relocate=relocate,
                       log=log)
     stagetrace.stage("polish", model, polished)
@@ -871,7 +1128,7 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     if log and model.overreach_refusals:
         log(f"      {model.overreach_refusals} replacements refused for starting linear "
             f"motion beyond {model.zone.reach_mm:g} mm of clearance")
-    return cleared
+    return cleared, chosen
 
 
 def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.ndarray]:
@@ -1737,6 +1994,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    main_openings: int = 5, extra_openings: int = 0,
                    opening_round_mm: float = 0.0,
                    gun: "GunPreference | None" = None,
+                   stand_off: "StandOff | None" = None,
                    retune_openings: int = 0,
                    zone: LinearZone | None = None,
                    direct_clearance: float = 0.0,
@@ -1856,6 +2114,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                      zone=zone, direct_clearance=direct_clearance,
                                      cartesian=cartesian, relocate=relocate,
                                      openings=direct, gun=gun,
+                                     stand_off=stand_off,
                                      deadline=deadline, log=log,
                                      record=raw)
         if record is not None:
@@ -1889,7 +2148,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                        check_step=check_step, continuous_check=continuous_check,
                        direct_clearance=direct_clearance, zone=zone,
                        cartesian=cartesian, relocate=relocate, gun=gun,
-                       deadline=deadline)
+                       stand_off=stand_off, deadline=deadline)
     # Into a list of its own and handed on only once every leg is in hand, for the reason
     # the direct attempt's is: the caller pairs raw routes with returned legs by position,
     # and a detour that captured two legs and then failed would leave entries behind for
@@ -1923,6 +2182,7 @@ class _LegSettings:
     cartesian: "CartesianBudget | None"
     relocate: "Relocation | None"
     gun: "GunPreference | None"
+    stand_off: "StandOff | None"
     deadline: Deadline
 
 
@@ -1980,10 +2240,13 @@ def _tree_leg(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, opening: float | No
     with cell.gun_opening(opening):
         # No refinement budget here.  A leg is refined once the whole detour is settled,
         # grouped with whichever neighbours share its opening -- refining it now would
-        # spend the passes on a route the next leg may yet fail to continue.
-        return _finish(cell, best.route, zone=cfg.zone, relocate=cfg.relocate,
-                       shortcut_seconds=0.0, polish_seconds=0.0,
-                       check_step=cfg.check_step, log=log)
+        # spend the passes on a route the next leg may yet fail to continue.  The stand-off
+        # trials are part of that deferral and cannot fire without a polish budget, so the
+        # opening that comes back is the one handed in and the caller still owns it.
+        runs, _ = _finish(cell, best.route, zone=cfg.zone, relocate=cfg.relocate,
+                          shortcut_seconds=0.0, polish_seconds=0.0,
+                          check_step=cfg.check_step, log=log)
+        return runs
 
 
 def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
@@ -2187,10 +2450,17 @@ def _join_detour(cell: Cell, solved: list, chose: list, raws: list, *,
             raw.extend(raws[i] if k == 0 else raws[i][1:])
         _capture(record, raw)
         with cell.gun_opening(opening):
-            out.append((_refine_runs(cell, runs, zone=cfg.zone, relocate=cfg.relocate,
-                                     shortcut_seconds=shortcut_seconds,
-                                     polish_seconds=polish_seconds,
-                                     check_step=cfg.check_step, log=log), opening))
+            # The opening comes back from the refinement rather than being paired with it
+            # here: the stand-off trials run inside and may have traded this leg's opening
+            # for air around the tool.  A leg that changes hands is still one leg of
+            # output at one opening, and the gun still changes only at a pose the robot is
+            # standing still at.
+            out.append(_refine_runs(cell, runs, zone=cfg.zone, relocate=cfg.relocate,
+                                    shortcut_seconds=shortcut_seconds,
+                                    polish_seconds=polish_seconds,
+                                    check_step=cfg.check_step, opening=opening,
+                                    stand_off=cfg.stand_off, gun=cfg.gun,
+                                    deadline=cfg.deadline, log=log))
     return out
 
 
@@ -2709,6 +2979,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
                  relocate: "Relocation | None" = None,
                  openings: "GunOpenings | None" = None,
                  gun: "GunPreference | None" = None,
+                 stand_off: "StandOff | None" = None,
                  deadline: "Deadline | None" = None, log=print,
                  record: list | None = None) -> tuple[list[Run], float | None]:
     """A route from ``qa`` to ``qb``, and the gun opening it is to be flown at.
@@ -2757,22 +3028,24 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
             # the penalty says this one does, the same pass that stands other routes off
             # is given a chance to bow it away -- there is nothing for OMPL to do here,
             # but plenty for relocation.
-            stand_off = False
+            standing_off = False
             if cell.penalty is not None and cell.penalty.enabled and shortcut_seconds > 0:
                 raw = cell.move_time(qa, qb)
                 cost = cell.segment_cost(qa, qb, max_step=check_step, stops=True)
-                stand_off = cost > raw * 1.05
-                if stand_off:
+                standing_off = cost > raw * 1.05
+                if standing_off:
                     log(f"      direct move is clear but runs close to the parts (cost "
                         f"{cost:.2f} s against {raw:.2f} s unpenalised)"
                         f"{_gun_note(opening)}; standing it off")
             try:
                 # _finish fills the interior in, which a two-point path needs before
                 # relocation has anything to move.
-                runs = _finish(cell, [qa, qb], zone=zone, relocate=relocate,
-                               shortcut_seconds=shortcut_seconds if stand_off else 0.0,
-                               polish_seconds=polish_seconds if stand_off else 0.0,
-                               check_step=check_step, log=log)
+                runs, opening = _finish(
+                    cell, [qa, qb], zone=zone, relocate=relocate,
+                    shortcut_seconds=shortcut_seconds if standing_off else 0.0,
+                    polish_seconds=polish_seconds if standing_off else 0.0,
+                    check_step=check_step, opening=opening, stand_off=stand_off,
+                    gun=gun, deadline=deadline, log=log)
             except PlanningError as exc:
                 # Clear as a joint chord is not the same as flyable: with both ends in the
                 # band the move ships linear, and _finish verifies it along the tool's
@@ -2859,12 +3132,14 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     _capture(record, best.route)
     with cell.gun_opening(best.opening):
         # Shortcut before reducing: the dense path gives the cuts somewhere to land.
-        out = _finish(cell, best.route, zone=zone, relocate=relocate,
-                      shortcut_seconds=shortcut_seconds,
-                      polish_seconds=polish_seconds, check_step=check_step, log=log)
+        out, flown = _finish(cell, best.route, zone=zone, relocate=relocate,
+                             shortcut_seconds=shortcut_seconds,
+                             polish_seconds=polish_seconds, check_step=check_step,
+                             opening=best.opening, stand_off=stand_off, gun=gun,
+                             deadline=deadline, log=log)
     log(f"      reduced to {sum(len(r.states) for r in out)} points in "
-        f"{len(out)} run{'' if len(out) == 1 else 's'}{_gun_note(best.opening)}")
-    return out, best.opening
+        f"{len(out)} run{'' if len(out) == 1 else 's'}{_gun_note(flown)}")
+    return out, flown
 
 
 def _cartesian_route(cell: Cell, qa: np.ndarray, qb: np.ndarray, budget: "CartesianBudget",
@@ -3161,7 +3436,11 @@ def _flatten(runs: list[Run]) -> list[np.ndarray]:
 
 def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
                  shortcut_seconds: float, polish_seconds: float, check_step: float,
-                 relocate: "Relocation | None" = None, log=print) -> list[Run]:
+                 relocate: "Relocation | None" = None,
+                 opening: float | None = None, stand_off: "StandOff | None" = None,
+                 gun: "GunPreference | None" = None,
+                 deadline: "Deadline | None" = None,
+                 log=print) -> tuple[list[Run], float | None]:
     """Optimise an already-split route and split it again.
 
     Used where a leg was planned without a refinement budget and is being refined
@@ -3171,16 +3450,23 @@ def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
     """
     pts = _flatten(runs)
     if len(pts) < 2:
-        return runs
+        return runs, opening
     model = MotionModel(cell, max_step=check_step, zone=zone)
     stagetrace.route("refining a leg planned earlier without a budget")
     stagetrace.note(_trace_zone(zone))
     stagetrace.stage("input", model, pts)
-    refined = _refine(model, pts, shortcut_seconds=shortcut_seconds,
-                      polish_seconds=polish_seconds, relocate=relocate, log=log)
+    refined, chosen = _refine(model, pts, shortcut_seconds=shortcut_seconds,
+                              polish_seconds=polish_seconds, relocate=relocate,
+                              opening=opening, stand_off=stand_off, gun=gun,
+                              check_step=check_step, deadline=deadline, log=log)
+    if not _same_opening(chosen, opening):
+        # The stand-off moved the gun and left it there; the split and the verification
+        # have to read the leg at the opening it will be flown at, not the one it was
+        # planned at.  See ``_refine``.
+        model = MotionModel(cell, max_step=check_step, zone=zone)
     runs = _split_runs(model, refined)
     _traced_verify(model, runs, "refined leg", log=log)
-    return runs
+    return runs, chosen
 
 
 def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> None:
@@ -3209,7 +3495,11 @@ def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> Non
 
 def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
             shortcut_seconds: float, polish_seconds: float, check_step: float,
-            relocate: "Relocation | None" = None, log=print) -> list[Run]:
+            relocate: "Relocation | None" = None,
+            opening: float | None = None, stand_off: "StandOff | None" = None,
+            gun: "GunPreference | None" = None,
+            deadline: "Deadline | None" = None,
+            log=print) -> tuple[list[Run], float | None]:
     """Densify a freshly planned route, optimise it, then split it by motion type.
 
     The route arrives as the handful of states the sampling planner happened to stop at,
@@ -3225,6 +3515,11 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     Which profile governs a move is decided per move, from where its two ends sit, so the
     split at the end is a reading of the finished path rather than a decision imposed on
     it.
+
+    ``opening`` is the gun state the caller has in force, and it comes back because
+    ``_stand_off`` may have traded it for air around the tool -- see ``_refine``.  A caller
+    that passes none gets none back, which is a cell with no gun joint and a leg refined
+    with no budget alike.
     """
     before, t0 = getattr(cell, "counters", None), time.time()
     before = dict(before) if before is not None else None
@@ -3244,9 +3539,14 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
     stagetrace.note(_trace_zone(zone))
     stagetrace.stage("solver", model, path, sources=range(len(path)))
     stagetrace.stage("densify", model, dense, sources=anchors)
-    refined = _refine(model, dense, shortcut_seconds=shortcut_seconds,
-                      polish_seconds=polish_seconds, relocate=relocate,
-                      anchors=anchors, log=log)
+    refined, chosen = _refine(model, dense, shortcut_seconds=shortcut_seconds,
+                              polish_seconds=polish_seconds, relocate=relocate,
+                              anchors=anchors, opening=opening, stand_off=stand_off,
+                              gun=gun, check_step=check_step, deadline=deadline, log=log)
+    if not _same_opening(chosen, opening):
+        # See ``_refine``: the gun has moved and stayed moved, so the split and the
+        # verification need a model that has not already read the band at the old opening.
+        model = MotionModel(cell, max_step=check_step, zone=zone)
     runs = _split_runs(model, refined)
     _traced_verify(model, runs, "planned route", log=log)
     _report_work(cell, before, time.time() - t0, log)
@@ -3256,7 +3556,7 @@ def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
             moves = sum(len(r.states) - 1 for r in runs if r.motion == LIN)
             log(f"      {lin} linear runs over {moves} moves, "
                 f"{len(runs) - lin} joint runs, {len(refined)} waypoints")
-    return runs
+    return runs, chosen
 
 
 def _trace_zone(zone: "LinearZone | None") -> str:

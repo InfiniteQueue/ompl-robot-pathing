@@ -465,6 +465,46 @@ judge how many stops it needs. The two agree to one constant `v/a` per move in t
 trapezoidal regime, so cruise time is a genuine lower bound rather than a different
 currency.
 
+### Trading a wider gun for air around the tool
+
+The clearance a weld gun has to work with is the gap between its two electrodes, and there
+are two ways to widen it. Opening the gun backs the **moving** electrode off the panel.
+Backing the whole tool off moves the **fixed** one, which is where the TCP sits. Before the
+route is polished, `_stand_off` tries four combinations of the two over the whole route:
+
+| trial | the gun | the approach | what it buys |
+| --- | --- | --- | --- |
+| 1 | +5 mm | unchanged | 5 mm on the moving electrode's side |
+| 2 | +5 mm | 2.5 mm back | 2.5 mm on both sides |
+| 3 | +5 mm | 5 mm back | 5 mm on the fixed electrode's side |
+| 4 | +10 mm | 5 mm back | 5 mm on both sides |
+
+Every waypoint but the route's two ends moves — those are the locators the leg runs
+between, and one is usually the weld itself. The whole route is then re-checked and
+re-priced at the new opening, and the cheapest of the five answers is what carries on to
+the polish pass. `--no-tip-standoff` leaves the pass out.
+
+**What decides is the same cost every candidate route is ranked on**, which is why the pass
+does not need a threshold of its own. The air it buys is priced by the clearance penalty,
+and the wider gun is charged by `--gun-opening-weight`. At the defaults the clearance
+penalty is `1 + 7 * ((100 - d) / 100) ** 5`, so a state 5 mm off a panel is charged 6.42x
+and the same state 2.5 mm further out 5.74x — 11% off the time spent there, against the
+1.5% the gun weight adds for 5 mm of a 164 mm travel. A transit in open air has no
+clearance penalty to reduce, every trial costs it the gun weight alone, and it keeps the
+route it was planned with.
+
+Which direction "back" is comes off the gun joint rather than from a convention: the
+tangent the moving electrode travels along at the TCP, expressed in the TCP's own frame,
+where it is a constant of the gun. On the supplied cell that works out as the tool's own
+−z, the same axis `--weld-shift-mm` backs a weld off along.
+
+Two things follow from the opening being part of the answer. The route **ships at the
+opening the trial won at** — flying it at the one it was planned at would put the moving
+electrode back where it started. And a waypoint whose backed-off pose has no solution, or
+whose solution is a different arm or wrist branch, keeps the state it had: the trial is
+validated and priced as one whole route either way, so one waypoint at a reach limit does
+not throw away the air gained at the others.
+
 ### Polishing the emitted waypoints
 
 `--polish-seconds` runs a final pass over the waypoints that will actually be written. Both
@@ -1382,6 +1422,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--fallback-distance-mm` | 100 | room a fallback pose must leave around the robot and gun |
 | `--no-shortcut` | off | skip shortcutting and polishing |
 | `--shortcut-seconds` | 20 | time budget for shortcutting each transit |
+| `--no-tip-standoff` | off | skip the trials that open the gun wider and back the tool off before the route is polished |
 | `--polish-seconds` | 50 | time budget for the final pass over the emitted waypoints |
 | `--no-near-panel-linear` | off | every transit move `PTP`; also disables the Cartesian tree |
 | `--near-panel-mm` | 50 | clearance at or under which a waypoint is in the band, and the whole of what decides a move's profile |
