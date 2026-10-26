@@ -43,6 +43,55 @@ the way, so the joint values in between are whatever that line demands.
   motion** — its only move profile is `OMPLRealVectorMoveProfile`, whose state space is the
   joint vector, so every edge it produces is a joint-space straight line. There is no
   configuration that changes this.
+- **`--segment-length-rad` is OMPL's own collision resolution, and 0.025 settles a
+  question the code left open.** It is `longest_valid_segment_length`: one distance in
+  *joint* space, so how far it carries the tool depends on which joint moved. Measured at
+  the start pose, 0.01 rad carries it 20.8 mm on Path 1 and 20.2 mm on Path 6 at the worst
+  joint, which is **j3** on both, against 7.2 and 5.6 mm at j4 -- so a single figure is
+  either wasteful at the wrist or coarse at the arm, and it is coarse at the arm.
+  - **The value had drifted rather than been decided.** OMPL's own default is 0.005 rad,
+    which spends about a second of collision checking per tree edge here and exhausts the
+    budget before finding anything, so coarsening it is what makes the sampler usable at
+    all. The flag was 0.02 when `--ompl-continuous-check` was added, went to 0.01 during
+    cell testing, to 0.05 an hour later, and back to 0.01 when a bundle revert undid the
+    0.05 -- so 0.01 was where a revert left it, and the `#was 0.05` beside it was the
+    leftover. The module docstring's own target, "a few hundredths of a radian", never
+    included 0.01.
+  - **Measured: 80 solves over 10 real transits from Paths 1, 2 and 7**, OMPL alone with no
+    anchor pass, no detour and no refinement, endpoints taken from each study's own shipped
+    route. 2.5x coarser is a median **x0.58** per transit, geometric mean x0.68, and leaves
+    route quality alone -- 11.4 s of raw motion against 11.0 s, better on the median. 5x
+    coarser is a median x0.35 but costs 29% longer routes, which is the worse trade: the
+    refinement budget is fixed, so a worse starting route is not bought back.
+  - It also solved what the finer step could not. `73052-14-R_2t -> via136` timed out twice
+    at 30 s at 0.01 rad and solved in 3.45 s at 0.025. One transit, so not a rate -- but a
+    transit the sampler cannot crack is what sends the planner into the detour, which is
+    where a segment's hours go.
+  - **Every refusal comes from the tool-space bisection and none from the joint grid.** Of
+    those 80 solves, not one route OMPL returned was refused by a joint-space check at the
+    cell's own 3 deg grid; every refusal was `--check-step-mm`'s. The two tests disagree
+    because they measure *different quantities*, not because one is finer -- OMPL's joint
+    grid is already about 5x finer than the cell's. So coarsening `--check-step-mm` does not
+    compensate for coarsening this, and it is the only thing catching the step-overs.
+    `_route_fault` is what rejects, and the retries the caller already has are what make the
+    trade safe: a refused route costs its own solve time and nothing unsafe ships.
+  - **The refusal rate this costs is inside the one the cells already have.** Counted over
+    the shipped logs of nine studies, all at 0.01 rad: **47 refusals in 1017 sampler runs,
+    4.6%**, spread 0% to 14.8% by study -- Good 240R1 at 14.8%, Path 2 at 10.0%, Path 3 at
+    7.0%, Paths 1 and 4 at about 1.5%, Paths 5, 6 and 7 at 0. That spread is wider than
+    anything the resolution did, so which cell is being planned decides this more than which
+    step it is planned at, and the 5% measured at 0.025 is not distinguishable from the
+    status quo. `grep -c "not clear under this cell's own check"` on a run's log is the
+    whole measurement; nothing in the program counts it and nothing needs to.
+  - **The floor is absolute and geometric.** What grows with the step is the tool gap one
+    sub-step can hide -- about 21 mm at 0.01, 52 mm at 0.025, 104 mm at 0.05 -- and an
+    obstacle has a fixed thickness, so the safe step is set by the thinnest thing the gun
+    must clear and differs per cell. No time budget trades against it. There is no rule in
+    the code deriving it: ten transits on three studies does not support writing one.
+  - `--ompl-continuous-check` is the principled answer to the step-over and it is too slow.
+    Swept at 0.05 rad it solved 11 of 20 transits where the sampled check at 0.05 solved 20
+    of 20, at about 30 s expected per usable route against 6 s. Still off by default, and
+    now measured rather than staged.
 - `plan_linear` is not a planner. It interpolates the pose and runs IK at each step,
   seeding from the previous solution, and takes whatever comes back nearest. It is greedy
   and never backtracks, so it can report "no collision-free IK at 45%" for a line that is
@@ -700,6 +749,72 @@ the way, so the joint values in between are whatever that line demands.
     `<script src>` to the same directory is allowed. Nothing is fetched and nothing served.
   - `treeview.write` never raises. The caller is already handling a failure and must be left
     to report it; a diagnostic that takes the run down with it is worse than none.
+- **`_stand_off` is the one refinement pass that moves the gun as well as the route, and
+  it runs immediately before polishing.** The gap between the electrodes is the clearance
+  the tool has to work with, and there are two ways to widen it: open the gun, which backs
+  the *moving* electrode off the panel, and back the whole tool off, which moves the
+  *fixed* one. The pass tries four combinations of the two over the whole route and keeps
+  whichever is cheapest, or the route as planned where none of them is.
+  - **`STAND_OFF_TRIALS` is (how much wider, what share of that is taken out of the
+    approach)**: `+5/0`, `+5/½`, `+5/all`, `+10/½`. A share of 0 spends the increase
+    entirely on the moving electrode, 1 entirely on the fixed one, and ½ opens the gap
+    symmetrically about the weld. Written as a *share* rather than a distance so the pair
+    stays coherent once the opening is snapped to `--gun-opening-round-mm`: an increase
+    that lands at 3 mm rather than 5 is still split evenly at 1.5 mm. On the grid, where a
+    declared opening normally sits, they read as +5/0, +5/2.5, +5/5 and +10/5 mm.
+  - **Which way "back" is comes off the gun joint, not off a convention.** `_open_axis`
+    takes the tangent the moving electrode travels along at the TCP -- `axis x (tcp -
+    anchor)`, signed by the travel the limits allow -- and expresses it in the TCP's own
+    frame, where it is a constant of the gun. On the supplied cell that is the tool's own
+    +z to within 1.2e-4, the same axis `--weld-shift-mm` backs a weld off along. The
+    agreement is worth knowing and is not relied on.
+  - **What decides between the trials is `_path_cost` with the gun weight**, the number
+    every candidate route in the program is ranked on. So the air bought is priced by the
+    clearance penalty and the wider gun is charged by `GunPreference`, and that is what
+    makes the pass self-limiting: a transit in open air has no clearance penalty to
+    reduce, every trial costs it the gun weight alone, and the route it was planned with
+    wins. At the defaults the trade is worth making where a route really does run close --
+    the penalty is `1 + 7 * ((100 - d) / 100) ** 5`, so a state at 5 mm is charged 6.42x
+    and the same state 2.5 mm further out 5.74x, 11% off the time spent there against the
+    1.5% the gun weight adds for 5 mm of a 164 mm travel.
+  - **The ends do not move.** They are the locators the leg runs between, and one of them
+    is usually the weld itself: the pose it was placed at is the one the study asked for,
+    and the stand-off it already has is `--weld-shift-mm`'s to give.
+  - A waypoint whose retreated pose will not solve, or whose solution is further than
+    `STAND_OFF_JUMP_RAD` from the state it came from, **keeps the state it had**. Inverse
+    kinematics is a local solve, so a solution that far off is another arm or wrist branch
+    rather than the same pose backed off, and installing one would put a reconfiguration
+    in the middle of a route that has already been checked. The candidate is validated and
+    priced as one whole path either way, so a route that is mostly backed off is still a
+    real route; dropping the trial over one waypoint at a reach limit would throw away the
+    air gained at the other forty.
+  - **The opening it chooses is part of the answer and it ships.** The retreat and the
+    opening are one trade: flying the backed-off route at the opening it was planned at
+    would put the moving electrode back where it started and leave the route priced on a
+    geometry it is not flown in. So `_refine`, `_finish` and `_refine_runs` all return the
+    opening alongside the route, and the pass leaves the gun where the trial put it with
+    `set_gun_opening` -- the caller's own `gun_opening` block is what puts it back when the
+    leg is done with. Polish, the stop-band clearing, the split and the verification then
+    all read the route at the opening it will be flown at.
+  - **A fresh `MotionModel` for every opening.** Its `_near` and `_reach` caches are keyed
+    on the state alone, and the whole point of moving the gun is that a state reads
+    differently with the tip somewhere else. The cell's own caches are keyed on the gun
+    value and need no such care. This is why `_refine` rebuilds its model after a trial is
+    kept, and `_finish` and `_refine_runs` theirs again before the split.
+  - Each trial is checked move by move under the profile the band gives it **at that
+    opening**. Deriving is right here and wrong in `_retune_opening`: no split has happened
+    yet, so there is nothing settled for a derived profile to contradict.
+  - **Gated on the polish budget**, not on its own switch alone. A leg planned with no
+    budget may yet be discarded -- the detour's extractions, and the legs `_tree_leg`
+    returns -- so the trials are paid for once, on the leg that ships, where `_refine_runs`
+    picks them up with the rest of the deferred refinement.
+  - `_retune_opening` still runs afterwards and may move the opening again, on the
+    retreated route. That is sound and not a contradiction: it validates and prices the
+    whole leg at each opening it considers, so whatever it picks is a reading of the route
+    actually in hand. What it will not do is move the waypoints back.
+  - Dropped whole when the segment clock has run out, for the reason `_retune_opening` is:
+    there is a valid route in hand, this only improves it, and half the trials prove
+    nothing. `--no-tip-standoff` leaves the pass out.
 - Order in `_finish` is densify → refine → split → verify, one sampling pass. It was
   sample → gate → densify → … while the gate stood: the fill follows the curve each move
   will really be flown along, which needs a model, and there was no model until the gate
@@ -707,3 +822,7 @@ the way, so the joint values in between are whatever that line demands.
   chord for the gate and again along the real curves for the passes. With the band
   answering per move the model exists first and the profile-aware fill is the only fill.
   The split is a reading of the finished path, not a decision imposed before it.
+  Inside `refine` it is shortcut → simplify → stand-off → polish → stop band: the
+  stand-off trials come after the route has been reduced, so they are not re-deciding cuts
+  that are already settled, and before polish, so polish judges the route as it will be
+  flown rather than one the gun has since moved out from under.

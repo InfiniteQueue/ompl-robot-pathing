@@ -335,6 +335,60 @@ infinity and drop out of the ranking. Where a move the route really contains sti
 price, it is charged as a joint move: ranking installs nothing, and an unflyable route is
 supposed to die at verification, after the passes have had their chance at it.
 
+### The resolution the sampling planner checks at
+
+`--segment-length-rad` is OMPL's `longest_valid_segment_length`: one distance in **joint**
+space, so how far it carries the tool depends on which joint moved. At the start pose,
+0.01 rad carries it about 21 mm at the worst joint, which is j3, and 6 mm at the wrist.
+
+It is the one resolution worth coarsening, and the default moved from 0.01 to **0.025** on
+the strength of 80 solves over 10 real transits from Paths 1, 2 and 7 — OMPL alone, no
+anchor pass, no detour, no refinement, endpoints taken from each study's own shipped route:
+
+| step | median solve, paired per transit | route quality | routes refused |
+|---|---|---|---|
+| 0.01 rad | — | 11.0 s of motion | 0 of 20 measured |
+| 0.025 rad | **×0.58** | 11.4 s | 1 of 20 |
+| 0.05 rad | ×0.35 | 14.2 s | 3 of 20 |
+
+0.025 is free: 42% off the solve with route quality unchanged. 0.05 is quicker still but
+hands the refinement passes a route 29% longer, and their budget is fixed, so it is not
+bought back. One transit — `73052-14-R_2t -> via136` — timed out twice at 30 s at 0.01 and
+solved in 3.45 s at 0.025, which matters more than the averages: a transit the sampler
+cannot crack is what sends the planner into the detour.
+
+**What a coarser step costs is routes refused for stepping over something.** OMPL walks a
+joint-space grid; this program then re-checks the route and bisects wherever the tool moves
+more than `--check-step-mm`, so it sees gaps the sampler stepped across and refuses the
+route. Of all 80 solves, **not one** refusal came from a joint-space check — every one came
+from that tool-space bisection. The two measure different quantities, so coarsening
+`--check-step-mm` does not compensate; leave it where it is.
+
+That refusal rate is already non-zero and already varies more by cell than by resolution.
+Counted over nine studies' shipped logs, all at the old 0.01 rad:
+
+| study | refused | sampler runs | rate |
+|---|---|---|---|
+| Good 240R1 Spotweld | 19 | 128 | 14.8% |
+| Path 2 | 14 | 140 | 10.0% |
+| Path 3 | 7 | 100 | 7.0% |
+| Path 4 | 4 | 246 | 1.6% |
+| Path 1 | 2 | 143 | 1.4% |
+| Path 9 | 1 | 208 | 0.5% |
+| Paths 5, 6, 7 | 0 | 52 | 0% |
+| **total** | **47** | **1017** | **4.6%** |
+
+So the 5% measured at 0.025 is not distinguishable from what these cells already do. To
+read it on your own run: `grep -c "not clear under this cell's own check"` on
+`weldpath-log.txt`.
+
+The limit is geometric and no time budget trades against it: a sub-step hides about 21 mm
+of tool travel at 0.01 rad, 52 mm at 0.025 and 104 mm at 0.05, and an obstacle has a fixed
+thickness. The safe step is bounded by the thinnest thing the gun must clear, which is a
+property of the cell. `--ompl-continuous-check` sweeps each sub-step instead of sampling it
+and so has no gap to step over at all; measured, it solved 11 of 20 transits where the
+sampled check solved 20 of 20, so it stays off by default.
+
 ### Seeing what the refinement changed
 
 `--unrefined-output` writes a second file, `waypoints-unrefined.json`, holding each transit
@@ -410,6 +464,46 @@ unchanged by subdivision, so shortcutting judges the route's *shape* while the l
 judge how many stops it needs. The two agree to one constant `v/a` per move in the
 trapezoidal regime, so cruise time is a genuine lower bound rather than a different
 currency.
+
+### Trading a wider gun for air around the tool
+
+The clearance a weld gun has to work with is the gap between its two electrodes, and there
+are two ways to widen it. Opening the gun backs the **moving** electrode off the panel.
+Backing the whole tool off moves the **fixed** one, which is where the TCP sits. Before the
+route is polished, `_stand_off` tries four combinations of the two over the whole route:
+
+| trial | the gun | the approach | what it buys |
+| --- | --- | --- | --- |
+| 1 | +5 mm | unchanged | 5 mm on the moving electrode's side |
+| 2 | +5 mm | 2.5 mm back | 2.5 mm on both sides |
+| 3 | +5 mm | 5 mm back | 5 mm on the fixed electrode's side |
+| 4 | +10 mm | 5 mm back | 5 mm on both sides |
+
+Every waypoint but the route's two ends moves — those are the locators the leg runs
+between, and one is usually the weld itself. The whole route is then re-checked and
+re-priced at the new opening, and the cheapest of the five answers is what carries on to
+the polish pass. `--no-tip-standoff` leaves the pass out.
+
+**What decides is the same cost every candidate route is ranked on**, which is why the pass
+does not need a threshold of its own. The air it buys is priced by the clearance penalty,
+and the wider gun is charged by `--gun-opening-weight`. At the defaults the clearance
+penalty is `1 + 7 * ((100 - d) / 100) ** 5`, so a state 5 mm off a panel is charged 6.42x
+and the same state 2.5 mm further out 5.74x — 11% off the time spent there, against the
+1.5% the gun weight adds for 5 mm of a 164 mm travel. A transit in open air has no
+clearance penalty to reduce, every trial costs it the gun weight alone, and it keeps the
+route it was planned with.
+
+Which direction "back" is comes off the gun joint rather than from a convention: the
+tangent the moving electrode travels along at the TCP, expressed in the TCP's own frame,
+where it is a constant of the gun. On the supplied cell that works out as the tool's own
+−z, the same axis `--weld-shift-mm` backs a weld off along.
+
+Two things follow from the opening being part of the answer. The route **ships at the
+opening the trial won at** — flying it at the one it was planned at would put the moving
+electrode back where it started. And a waypoint whose backed-off pose has no solution, or
+whose solution is a different arm or wrist branch, keeps the state it had: the trial is
+validated and priced as one whole route either way, so one waypoint at a reach limit does
+not throw away the air gained at the others.
 
 ### Polishing the emitted waypoints
 
@@ -1306,7 +1400,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | --- | --- | --- |
 | `--check-step-deg` | 3 | collision checking resolution along a move, in joint space |
 | `--check-step-mm` | 7 | tool-space companion to it; also the station spacing along a linear move |
-| `--segment-length-rad` | 0.01 | collision resolution inside the sampling planner |
+| `--segment-length-rad` | 0.025 | collision resolution inside the sampling planner, as OMPL's `longest_valid_segment_length`; coarser is quicker and refuses more routes for stepping over something |
 | `--phase-one-runs` | 25 | OMPL runs per transit, keeping the cheapest that solves |
 | `--phase-one-solve-seconds` | 25 | how long one of those runs may search |
 | `--cartesian-solve-seconds` | 120 | Cartesian tree time to find a first route, spent on every transit the band is on for; 0 disables. `--cartesian-seconds` still works |
@@ -1328,6 +1422,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--fallback-distance-mm` | 100 | room a fallback pose must leave around the robot and gun |
 | `--no-shortcut` | off | skip shortcutting and polishing |
 | `--shortcut-seconds` | 20 | time budget for shortcutting each transit |
+| `--no-tip-standoff` | off | skip the trials that open the gun wider and back the tool off before the route is polished |
 | `--polish-seconds` | 50 | time budget for the final pass over the emitted waypoints |
 | `--no-near-panel-linear` | off | every transit move `PTP`; also disables the Cartesian tree |
 | `--near-panel-mm` | 50 | clearance at or under which a waypoint is in the band, and the whole of what decides a move's profile |

@@ -28,7 +28,7 @@ from .cartesian import CartesianBudget
 from .fallback import FallbackFinder
 from .penalty import GunPreference
 from .planning import (LIN, PTP, Deadline, LinearZone, OmplBudget, PlanningError,
-                       Relocation, opening_cap, snap_opening, unique_openings,
+                       Relocation, StandOff, opening_cap, snap_opening, unique_openings,
                        plan_freespace,
                        validate)
 
@@ -39,6 +39,19 @@ from .planning import (LIN, PTP, Deadline, LinearZone, OmplBudget, PlanningError
 # and one much finer would pay for a cut well past the point the refusal is answered.  The
 # hull shrinks with every step, so this converges on its own and the floor is what stops it.
 RECUT_FRACTION = 0.5
+
+
+def _took(seconds: float) -> str:
+    """An elapsed time, in the unit the reader is holding it against.
+
+    Seconds are what every other figure in this log is in -- the per-run limits, the
+    shortcut and polish budgets, each solve -- so they stay the number.  A segment is the
+    one thing here that routinely runs into minutes, and reading ``--segment-minutes``
+    against ``412.3s`` is arithmetic the log can do instead.
+    """
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    return f"{seconds:.1f}s ({seconds / 60:.1f} min)"
 
 
 @dataclass(frozen=True)
@@ -231,6 +244,7 @@ class ToolpathPlanner:
                  export_dir: str | None = None,
                  treeview: bool = True, treeview_max_poses: int = 1500,
                  treeview_searches: int = 12,
+                 stand_off: bool = True,
                  recut_hulls: bool = True, recut_attempts: int = 3,
                  recut_floor_mm: float = 2.0,
                  keep_unrefined: bool = False, log=print):
@@ -260,6 +274,11 @@ class ToolpathPlanner:
         # planning._retune_opening.
         self.gun = gun or GunPreference(1.0)
         self.retune_openings = max(0, int(retune_openings))
+        # The trials run before the route is polished, so they are the one pass that can
+        # change what a leg is flown at as well as where it goes.  The grid comes from the
+        # same flag every opening the program chooses lands on, this being one of them.
+        self.stand_off = StandOff(enabled=bool(stand_off),
+                                  round_mm=float(opening_round_mm))
         # How far the shortcut and polish passes displace a waypoint when they try
         # relocating one, and how the distance is drawn between those bounds.
         self.relocate = relocate or Relocation()
@@ -784,6 +803,13 @@ class ToolpathPlanner:
             stagetrace.section(f"segment {a.name} -> {b.name} [{index + 1}/{len(pairs)}]")
             if self.treeview:
                 treetrace.start(self.treeview_searches)
+            # One clock for the segment, which is both what the search may spend and
+            # what the segment took.  Started out here rather than inside _plan_pair so
+            # that everything the segment does counts against it -- placing the weld,
+            # searching for a fallback pose, the refinement -- and so that a segment that
+            # never reached a transit still reports a time.
+            deadline = Deadline(self.segment_seconds)
+            spent = 0.0
             try:
                 if a.name not in anchors:
                     raise PlanningError(f"no reachable joint solution for '{a.name}'")
@@ -791,13 +817,18 @@ class ToolpathPlanner:
                     raise PlanningError(f"no reachable joint solution for '{b.name}'")
                 with self._clearance_for(a, b):
                     seg.phases, seg.raw_phases = self._plan_pair(
-                        a, b, anchors, final=index == len(pairs) - 1)
+                        a, b, anchors, deadline, final=index == len(pairs) - 1)
+                spent = deadline.spent
             except PlanningError as exc:
+                # Read before the diagnostic view is written, that being a file write and
+                # not search: a figure including it would read as the budget overrun.
+                spent = deadline.spent
                 seg.error = str(exc)
                 self.log(f"    ! {exc}")
                 self._write_failure_view(a, b, anchors, str(exc))
             finally:
                 treetrace.stop()
+                self.log(f"    segment {a.name} -> {b.name} planned in {_took(spent)}")
             segments.append(seg)
         return segments
 
@@ -1024,16 +1055,18 @@ class ToolpathPlanner:
         """
         return [leave_open, arrive_open]
 
-    def _plan_pair(self, a: Locator, b: Locator, anchors, final: bool = False
+    def _plan_pair(self, a: Locator, b: Locator, anchors,
+                   deadline: Deadline | None = None, final: bool = False
                    ) -> tuple[list[Phase], list[Phase]]:
         # The path starts at the first locator, not at start_state. start_state seeds
         # inverse kinematics and sets the gun's initial opening; it never contributes a
         # waypoint of its own, and it is not what a difficult transit detours through --
         # see weldpath.fallback.
-        # Started here rather than at the transit, so that everything this segment does
-        # counts against it -- placing the weld, searching for a fallback pose, and the
-        # refinement -- even though the search loops are what actually read it.
-        deadline = Deadline(self.segment_seconds)
+        # The clock belongs to the segment and ``run`` owns it, so that what the search is
+        # held to and what the segment is reported as taking are one reading rather than
+        # two that nearly agree.  A caller with no clock of its own gets a fresh one, which
+        # is what this did for itself before.
+        deadline = deadline if deadline is not None else Deadline(self.segment_seconds)
         phases: list[Phase] = []
         qa, qb = anchors[a.name], anchors[b.name]
         transit_start, transit_end = qa, qb
@@ -1071,7 +1104,8 @@ class ToolpathPlanner:
             main_openings=self.main_openings,
             extra_openings=self.extra_openings,
             opening_round_mm=self.opening_round_mm,
-            gun=self.gun, retune_openings=self.retune_openings,
+            gun=self.gun, stand_off=self.stand_off,
+            retune_openings=self.retune_openings,
             record=raw_legs, log=self.log)
         # What the robot leaves a weld holding is what the transit out of it was solved
         # at, which is only known now.  The declared value seeded that search and is a
