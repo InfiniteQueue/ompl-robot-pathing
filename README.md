@@ -335,6 +335,60 @@ infinity and drop out of the ranking. Where a move the route really contains sti
 price, it is charged as a joint move: ranking installs nothing, and an unflyable route is
 supposed to die at verification, after the passes have had their chance at it.
 
+### The resolution the sampling planner checks at
+
+`--segment-length-rad` is OMPL's `longest_valid_segment_length`: one distance in **joint**
+space, so how far it carries the tool depends on which joint moved. At the start pose,
+0.01 rad carries it about 21 mm at the worst joint, which is j3, and 6 mm at the wrist.
+
+It is the one resolution worth coarsening, and the default moved from 0.01 to **0.025** on
+the strength of 80 solves over 10 real transits from Paths 1, 2 and 7 — OMPL alone, no
+anchor pass, no detour, no refinement, endpoints taken from each study's own shipped route:
+
+| step | median solve, paired per transit | route quality | routes refused |
+|---|---|---|---|
+| 0.01 rad | — | 11.0 s of motion | 0 of 20 measured |
+| 0.025 rad | **×0.58** | 11.4 s | 1 of 20 |
+| 0.05 rad | ×0.35 | 14.2 s | 3 of 20 |
+
+0.025 is free: 42% off the solve with route quality unchanged. 0.05 is quicker still but
+hands the refinement passes a route 29% longer, and their budget is fixed, so it is not
+bought back. One transit — `73052-14-R_2t -> via136` — timed out twice at 30 s at 0.01 and
+solved in 3.45 s at 0.025, which matters more than the averages: a transit the sampler
+cannot crack is what sends the planner into the detour.
+
+**What a coarser step costs is routes refused for stepping over something.** OMPL walks a
+joint-space grid; this program then re-checks the route and bisects wherever the tool moves
+more than `--check-step-mm`, so it sees gaps the sampler stepped across and refuses the
+route. Of all 80 solves, **not one** refusal came from a joint-space check — every one came
+from that tool-space bisection. The two measure different quantities, so coarsening
+`--check-step-mm` does not compensate; leave it where it is.
+
+That refusal rate is already non-zero and already varies more by cell than by resolution.
+Counted over nine studies' shipped logs, all at the old 0.01 rad:
+
+| study | refused | sampler runs | rate |
+|---|---|---|---|
+| Good 240R1 Spotweld | 19 | 128 | 14.8% |
+| Path 2 | 14 | 140 | 10.0% |
+| Path 3 | 7 | 100 | 7.0% |
+| Path 4 | 4 | 246 | 1.6% |
+| Path 1 | 2 | 143 | 1.4% |
+| Path 9 | 1 | 208 | 0.5% |
+| Paths 5, 6, 7 | 0 | 52 | 0% |
+| **total** | **47** | **1017** | **4.6%** |
+
+So the 5% measured at 0.025 is not distinguishable from what these cells already do. To
+read it on your own run: `grep -c "not clear under this cell's own check"` on
+`weldpath-log.txt`.
+
+The limit is geometric and no time budget trades against it: a sub-step hides about 21 mm
+of tool travel at 0.01 rad, 52 mm at 0.025 and 104 mm at 0.05, and an obstacle has a fixed
+thickness. The safe step is bounded by the thinnest thing the gun must clear, which is a
+property of the cell. `--ompl-continuous-check` sweeps each sub-step instead of sampling it
+and so has no gap to step over at all; measured, it solved 11 of 20 transits where the
+sampled check solved 20 of 20, so it stays off by default.
+
 ### Seeing what the refinement changed
 
 `--unrefined-output` writes a second file, `waypoints-unrefined.json`, holding each transit
@@ -1306,7 +1360,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | --- | --- | --- |
 | `--check-step-deg` | 3 | collision checking resolution along a move, in joint space |
 | `--check-step-mm` | 7 | tool-space companion to it; also the station spacing along a linear move |
-| `--segment-length-rad` | 0.01 | collision resolution inside the sampling planner |
+| `--segment-length-rad` | 0.025 | collision resolution inside the sampling planner, as OMPL's `longest_valid_segment_length`; coarser is quicker and refuses more routes for stepping over something |
 | `--phase-one-runs` | 25 | OMPL runs per transit, keeping the cheapest that solves |
 | `--phase-one-solve-seconds` | 25 | how long one of those runs may search |
 | `--cartesian-solve-seconds` | 120 | Cartesian tree time to find a first route, spent on every transit the band is on for; 0 disables. `--cartesian-seconds` still works |

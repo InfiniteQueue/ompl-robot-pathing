@@ -128,16 +128,29 @@ def build_parser() -> argparse.ArgumentParser:
                         "(LVS_CONTINUOUS rather than DISCRETE). The sampled check "
                         "is spaced by --segment-length-rad, a joint-space figure, "
                         "so how far it carries the tool depends on which joint "
-                        "moved -- about 71 mm at j1 against 16 mm at j6 -- and a "
-                        "move that steps over a fixture at the shoulder is then "
-                        "refused by this planner's own finer check. A sweep leaves "
-                        "no gap to step over, at a higher cost per test. Off by "
-                        "default: OMPL's budget is what limits a hard cell, so "
-                        "this can buy fewer solutions found for fewer rejected "
-                        "(default: %(default)s)")
-    p.add_argument("--segment-length-rad", type=float, default=0.01, #was 0.05
-                   help="collision checking resolution for the sampling planner "
-                        "(default: %(default)g)")
+                        "moved -- measured at the start pose, 0.025 rad carries it "
+                        "39-52 mm on the arm joints against 14-26 mm at the "
+                        "wrist -- "
+                        "and a move that steps over a fixture on an arm joint is "
+                        "then refused by this program's own finer check. A sweep "
+                        "leaves no gap to step over, at a higher cost per test. Off "
+                        "by default, and measured: swept at 0.05 rad it solved 11 of "
+                        "20 transits where the sampled check solved 20 of 20, so it "
+                        "does buy fewer solutions found for fewer refused, and on "
+                        "these cells that trade is a bad one (default: %(default)s)")
+    p.add_argument("--segment-length-rad", type=float, default=0.025, metavar="RAD",
+                   help="collision checking resolution inside the sampling planner, as "
+                        "OMPL's longest_valid_segment_length. Coarser is quicker per "
+                        "solve and likelier to return a route this program's own check "
+                        "then refuses for having stepped over something. Measured over 80 "
+                        "solves on 10 real transits, 0.025 against the 0.01 this used to "
+                        "be: a median 42%% off the solve, route quality unchanged, and one "
+                        "transit solved that 0.01 could not crack in 30 s. What rises with "
+                        "it is the tool gap one sub-step can hide -- about 21 mm at 0.01, "
+                        "52 mm at 0.025, 104 mm at 0.05 -- so the safe value is "
+                        "bounded by "
+                        "the thinnest obstacle the gun must clear and is a property of the "
+                        "cell, not of any time budget (default: %(default)g)")
 #endregion
     #region ###PATHFINDING###
     #WHEN TO GIVE UP ON ONE SEGMENT
