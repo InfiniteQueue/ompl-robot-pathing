@@ -549,6 +549,63 @@ the way, so the joint values in between are whatever that line demands.
   - Skipped when the segment clock has run out. There is already a valid answer and this
     only improves it, so it is dropped whole rather than clamped: half a pass proves
     nothing.
+- **The weld clearance relaxes the whole transit, and `--scoped-weld-clearance` is how
+  to confine it.** `_clearance_for` drops the obstacle margin to `--weld-clearance-mm` (0)
+  whenever *either* endpoint is a weld, and the block it wraps is `_plan_pair` -- the entire
+  transit, every search and every refinement pass. A transit runs weld to weld, so in a
+  spotweld study almost every one is planned with no obstacle margin from end to end, and a
+  stretch grazing a panel 800 mm from either weld is as legal as the weld itself. The
+  relaxation is needed -- the gun closes on the panel it welds, and `_relax_at_waypoints`
+  does not cover it, that pass excluding obstacle pairs and handling the robot's own
+  geometry only -- but its *scope* was never the intent.
+  - **Measured over ten studies' stage logs**, travel-weighted at the densify stage, each
+    move charged at the worse of its two endpoint clearances: of 265.7 m of tool travel,
+    **3.03 m runs under 5 mm** and 1.05 m of that under 2 mm. 1.98 m of it is within 75 mm
+    of a route end, which is the weld approach the relaxation exists for; **1.05 m is
+    further in than that**, and has no justification. It is concentrated rather than
+    spread -- `73063-23-R_2t -> 73063-15-R_2t`, which appears in both Path 4 and Path 9,
+    contributes 396 mm of it and runs under 5 mm for 64% of its length.
+  - **The same measurement says the clearance penalty is almost never in force**: 95.84%
+    of that travel is at or beyond 25 mm, where the stepped curve is exactly 1x. Any
+    reshaping of the penalty acts on the remaining 4.2%, which is why a margin and not a
+    price is what removes the low-clearance stretches.
+  - **The margin cannot vary per state.** `_set_obstacle_clearance` re-applies every pair
+    margin and rebuilds both contact managers, so it is a per-block setting and switching
+    it per move would cost more than the planning. So the permissive margin stays and
+    `Cell.weld_relaxation` takes the difference back: a state the margins cleared,
+    further than `--weld-clearance-radius-mm` from the gun's position at any weld on the
+    leg and reading under `--obstacle-clearance-mm`, is reported in collision after all.
+    The rule only ever *adds* collisions, so nothing illegal becomes legal under it.
+  - Hung off `Cell.in_collision`, which every collision question in the program arrives
+    at, so no caller has to know about it. Cost is one attribute test while the scope is
+    off; with it on, the distance test is free -- the state is loaded and the tool
+    position costs no kinematics -- and the clearance read is the fused, cached one and is
+    reached only away from the welds, which is where the answer is in doubt.
+  - **Centres come from the anchor states, not from `pose_world`**: where the robot is put
+    rather than what the study asked for, the two differing by `--weld-shift-mm`, which is
+    exactly the distance that matters here.
+  - **Locator placement is deliberately left unscoped.** Scoping needs the anchors and is
+    only installed where they are passed, which is the transit. Every pose a placement
+    tries is at the locator itself, so there is nothing for a radius to exclude, and a
+    weld that places today must not stop placing because of a flag about transits.
+  - **Measured on Path 1's `via114 -> 73050-01-R_2t`**, the same segment planned twice
+    with nothing but this flag between the runs. Sub-5 mm travel fell from 100 mm of
+    937 mm to **67 mm of 1043 mm**, and the travel it displaced turns up in the 10-25 mm
+    band, 64 mm becoming 147 mm. What it cost was **+22% of real motion** -- the route the
+    tree found after the recut went from 3.23 s to 3.95 s unpenalised, 115.00 s to
+    133.14 s penalised -- and 11% more tool travel. One segment and one sample of a
+    stochastic search, so the direction is the mechanism and the magnitudes are not tight.
+  - **It removed the narrow gun entirely on that transit.** Unscoped, the tree solved at
+    25 mm on its first run in 34.8 s and shipped there, that being the cheapest opening it
+    found. Scoped, 25 mm failed outright after the full 120 s and the route shipped at
+    80 mm. A nearly shut gun puts the tip closest to the panel, which is what the scope
+    forbids away from the weld, so confining the relaxation does not merely reshape a
+    route -- it can take an opening off the table.
+  - **What it can cost is feasibility, not just time.** `73063-23-R_2t -> 73063-15-R_2t`
+    runs under 5 mm for most of its length, so confining the relaxation does not make that
+    route expensive, it makes it illegal -- and there may be no 5 mm route between those
+    two welds at all. The outcome is then a detour or a failed segment. That segment is
+    not plannable by this build at any setting, so the case stands unmeasured.
 - **`--direct-clearance-mm` is a floor under the straight move, and under nothing else.**
   `_plan_direct` tries the direct joint chord at each opening before any search, and the
   only question asked of it was `segment_collides`. That is a yes-or-no at the collision

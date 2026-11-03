@@ -1481,6 +1481,8 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--shell-split-tcp-prox` | 175 | refine the gun only this far from the TCP; 0 refines everywhere |
 | `--obstacle-clearance-mm` | 5 | clear air to hold from panels and tooling; may be negative |
 | `--weld-clearance-mm` | 0 | clearance used instead on moves to or from a weld |
+| `--scoped-weld-clearance` | on | apply `--weld-clearance-mm` only near the weld itself, and `--obstacle-clearance-mm` over the rest of the transit. Off, a weld at either end relaxes the whole route. Measured on one Path 1 segment: sub-5 mm travel 100 mm -> 67 mm, at +22% real motion |
+| `--weld-clearance-radius-mm` | 50 | how far from the gun's position at a weld that relaxation reaches, when the scoping is on |
 | `--weld-shift-mm` | −5 | shift weld locators along their own z before planning |
 | `--no-weld-shift-search` | off | fail a blocked shifted weld rather than search shorter stand-offs |
 | `--weld-shift-scan-mm` | 0.5 | first scan spacing of that search; halved while nothing is clear |

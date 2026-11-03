@@ -58,7 +58,7 @@ STOP_BAND_JOINT = 4
 # environment, a clearance query adds a contact test over every convex piece within the
 # probe, and a collision test adds one at the planning margins.
 COUNTER_NAMES = ("state_loads", "clearance", "clearance_hits", "clearance_fused",
-                 "collision_tests", "fk", "tcp_hits")
+                 "collision_tests", "fk", "tcp_hits", "weld_scoped")
 
 # States a cell remembers a clearance for before starting again.  Large enough that the
 # waypoints of a run stay resident, small enough that a long polish cannot exhaust memory
@@ -107,6 +107,11 @@ class Cell:
         # more often than anything asks for a whole transform.
         self._tcp_cache: dict[tuple[float, bytes], np.ndarray] = {}
         self.counters = dict.fromkeys(COUNTER_NAMES, 0)
+        # Installed by weld_relaxation; None means the margins stand on their own, which
+        # is what they do everywhere except inside a scoped weld transit.
+        self._relax_points: np.ndarray | None = None
+        self._relax_radius = 0.0                # environment units, as the tool is read
+        self._relax_floor = 0.0                 # millimetres, as clearance is read
         self._state = None                      # keeps the SWIG state object alive
         self._revolute = [j.type == "revolute" for j in man.robot.joints
                           if j.type != "fixed"]
@@ -268,6 +273,57 @@ class Cell:
             yield
         finally:
             self._set_obstacle_clearance(previous)
+
+    @contextlib.contextmanager
+    def weld_relaxation(self, points, radius_mm: float, floor_mm: float):
+        """Confine the relaxed margin to within ``radius_mm`` of the given tool positions.
+
+        The margin is a property of the whole environment: changing it re-applies every
+        pair and rebuilds both contact managers, so it cannot be made to vary per state or
+        per move, which is what a weld needs.  So the permissive margin stays in place and
+        this takes the difference back where it was never wanted -- a state the margins
+        cleared, standing further than ``radius_mm`` from every one of ``points`` and
+        reading under ``floor_mm``, is reported in collision after all.
+
+        ``points`` are tool positions in environment units, ``radius_mm`` and ``floor_mm``
+        in manifest units.  The rule only ever *adds* collisions, so nothing illegal
+        becomes legal under it and no pose that placed can stop placing because of it.
+
+        What it does not do is relax anything the margins did not already relax: it is a
+        restriction on an existing permission, not a second one.
+        """
+        previous = (self._relax_points, self._relax_radius, self._relax_floor)
+        pts = np.asarray(list(points), dtype=float).reshape(-1, 3) if len(points) else None
+        self._relax_points = pts
+        self._relax_radius = float(radius_mm) * self.man.scale
+        self._relax_floor = float(floor_mm)
+        try:
+            yield
+        finally:
+            self._relax_points, self._relax_radius, self._relax_floor = previous
+
+    def _only_relaxation_clears(self, q: np.ndarray) -> bool:
+        """Whether a state the margins passed is clear only because a weld relaxed them.
+
+        Asked of states the contact test has just cleared, so the state is loaded, the
+        tool position costs no kinematics and the clearance read is the fused, cached one.
+        The distance test runs first because it is free and it is the common answer near a
+        weld; the clearance query is reached only away from the welds, which is where the
+        question is actually in doubt.
+
+        Off entirely until :meth:`weld_relaxation` installs a scope, which is one
+        attribute test on the hot path.
+        """
+        if self._relax_points is None:
+            return False
+        tcp = self._tcp_now()
+        gap = float(np.min(np.linalg.norm(self._relax_points - tcp, axis=1)))
+        if gap <= self._relax_radius:
+            return False            # the weld's own neighbourhood, which the relaxation is for
+        if self._clearance_here(q) >= self._relax_floor:
+            return False
+        self.counters["weld_scoped"] += 1
+        return True
 
     # -- gun opening ---------------------------------------------------------
     def set_gun_opening(self, opening_mm: float) -> None:
@@ -439,7 +495,11 @@ class Cell:
         self.set_state(q)
         res = ContactResultMap()
         self._cm.contactTest(res, ContactRequest(ContactTestType_FIRST))
-        return res.size() > 0
+        if res.size() > 0:
+            return True
+        # Every collision question in the program arrives here, which is why the scoped
+        # weld relaxation is applied at this one point rather than at each caller.
+        return self._only_relaxation_clears(q)
 
     def contact_pairs(self, q: np.ndarray) -> dict[tuple[str, str], float]:
         return {pair: c.distance for pair, c in self.contacts(q).items()}

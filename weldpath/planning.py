@@ -3522,10 +3522,14 @@ def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> Non
     # state load the collision check had already paid for, so without it the loads would
     # have been this much higher.
     share = f", {fused} of them off a walk already made" if fused else ""
+    # Only where the scope is on and actually refused something, that being a state the
+    # margins cleared and the weld radius did not cover.
+    scoped = (f"; {d['weld_scoped']} states refused by the scoped weld clearance"
+              if d.get("weld_scoped") else "")
     log(f"      work: {d['clearance']} clearance queries ({served:.0f}% of {asked} served "
         f"from cache{share}), {d['collision_tests']} collision tests, "
         f"{d['state_loads']} state loads, {d['fk']} forward kinematics, "
-        f"in {elapsed:.1f}s")
+        f"in {elapsed:.1f}s{scoped}")
 
 
 def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
