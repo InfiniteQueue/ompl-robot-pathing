@@ -486,10 +486,10 @@ the polish pass. `--no-tip-standoff` leaves the pass out.
 
 **What decides is the same cost every candidate route is ranked on**, which is why the pass
 does not need a threshold of its own. The air it buys is priced by the clearance penalty,
-and the wider gun is charged by `--gun-opening-weight`. At the defaults the clearance
-penalty is `1 + 7 * ((100 - d) / 100) ** 5`, so a state 5 mm off a panel is charged 6.42x
-and the same state 2.5 mm further out 5.74x — 11% off the time spent there, against the
-1.5% the gun weight adds for 5 mm of a 164 mm travel. A transit in open air has no
+and the wider gun is charged by `--gun-opening-weight`. At the defaults the curve in
+force is the stepped one, `1 + 11.129 × 0.7^(d/2) − 0.129`, so a state 5 mm off a panel is
+charged 5.43× and the same state 2.5 mm further out 3.79× — 30% off the time spent there,
+against the 1.5% the gun weight adds for 5 mm of a 164 mm travel. A transit in open air has no
 clearance penalty to reduce, every trial costs it the gun weight alone, and it keeps the
 route it was planned with.
 
@@ -530,8 +530,9 @@ random seed and same budgets:
 Roughly a third of the waypoints and a 45% shorter cycle. Note the third column: the routes
 run **closer to the parts** than they used to. That is the trade being made on purpose —
 standoff now competes against time instead of being free — and both figures stay far above
-the 10 mm the penalty peaks at. Raise `--clearance-penalty-multiplier` to buy the distance
-back at the cost of cycle time.
+the 25 mm at which the default penalty is spent. Raise `--stepped-penalty-multiplier` to buy
+the distance back at the cost of cycle time (or `--clearance-penalty-multiplier`, if you
+have switched to the power curve with `--stepped-penalty false`).
 
 Point counts are kept low on purpose: a transit is reduced to the fewest waypoints that
 still traverse it collision-free, so a large sweeping motion costs a handful of points
@@ -679,12 +680,21 @@ budgets below on every transit rather than only on the ones nothing else could r
 segment clock is what bounds that. It runs for every leg of a detour as well, and on the
 two legs out of the locators it is the only solver there is. Its route is dense: states about `--check-step-mm` of tool travel apart, each gap a straight
 tool move, plus one stationary joint move where its two trees meet. Like phase one, it
-searches more than once: new seeds until one solves within `--cartesian-solve-seconds`,
-then more until `--cartesian-min-seconds` has passed, and only the cheapest route of
-the set goes on. Those runs are dealt round the same gun openings phase one used, one
-opening each. The tree steers by where the tool can go and a tip 200 mm open sweeps a
-corridor a closed one never enters, so a search that failed is evidence about the opening
-it ran at and about no other.
+searches more than once, and **it does so per gun opening**. Each opening of the same
+rotation phase one used gets new seeds until one solves within
+`--cartesian-solve-seconds`, at which point that opening is given up; once it has solved,
+further seeds until `--cartesian-process-seconds` has passed since that first route.
+`--cartesian-gun-openings` openings are attempted, or all of them where the rotation is
+shorter. The cheapest route over every opening attempted is the one that goes on.
+
+Per opening because the tree steers by where the tool can go, and a tip 200 mm open sweeps
+a corridor a closed one never enters: a search that failed is evidence about the opening it
+ran at and about no other. The budgets therefore multiply — at the defaults a transit the
+tree cannot solve spends 3 x 120 s here before the detour is reached — which is what
+`--cartesian-gun-openings` is for. Set it to 1 for the old behaviour, where both figures
+were counted from the first search of the transit and so were one window shared by every
+opening: a single failing search spent the whole of it and the openings after it were never
+tried.
 
 With `--cartesian-recut` on (the default), the route is then cut wherever it leaves the
 band. Each stretch outside the band is bounded by its own first and last state, which
@@ -1094,20 +1104,43 @@ than off it, and wants revisiting.
 
 A collision check is a hard yes/no, so a move clearing a panel by half a millimetre is as
 legal as one clearing it by half a metre — and the shortest route almost always hugs the
-obstacle. The clearance penalty turns proximity into cost instead, applied to *time*: at
-`--clearance-penalty-max-mm` and beyond there is no penalty, and at
-`--clearance-penalty-min-mm` and below a second costs as much as
-`--clearance-penalty-multiplier` seconds in open air. Between them it follows `x²` on
-`[0, 1]`, stretched to fit, so cost climbs slowly at first and sharply as the gun closes in:
+obstacle. The clearance penalty turns proximity into cost instead, applied to *time*.
 
-| Clearance | 50 mm | 40 mm | 26.5 mm | 20 mm | 10 mm | ≤ 3 mm |
+**There are two curves and the stepped one is the default.** `--stepped-penalty` is on, and
+while it is, every `--clearance-penalty-*` option below is ignored — `--no-clearance-penalty`
+still turns all penalties off. The stepped curve is given as a rate rather than as a shape:
+`--stepped-penalty-multiplier` at touching, falling by `--stepped-penalty-step-factor` every
+`--stepped-penalty-step-mm` of extra clearance, reaching 1× at `--stepped-penalty-zero-mm`.
+At the defaults — 12× at touching, ×0.7 per 2 mm, spent at 25 mm:
+
+| Clearance | 25 mm | 20 mm | 15 mm | 10 mm | 5 mm | 2 mm | 0 mm |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Factor | 1.0× | 1.19× | 1.64× | 2.74× | 5.43× | 8.66× | 12× |
+
+Below zero clearance it continues as a straight line of the same gradient, 1.985× per mm,
+rather than letting the exponential turn a deep penetration into a number that swamps every
+other term. That region is the collision margins' business, not the penalty's.
+`--stepped-penalty-zero-mm` is also how far the proximity query has to see, so lowering it
+speeds planning up.
+
+With `--stepped-penalty false` the power curve runs instead: no penalty at
+`--clearance-penalty-max-mm` and beyond, a second at `--clearance-penalty-min-mm` and below
+costing as much as `--clearance-penalty-multiplier` seconds in open air, and
+`x` raised to `--clearance-penalty-exponent` on the span between them, stretched to fit. At its own
+defaults — 1× at 100 mm rising as `x⁵` to 8× at 0 mm:
+
+| Clearance | 100 mm | 50 mm | 25 mm | 10 mm | 5 mm | 0 mm |
 | --- | --- | --- | --- | --- | --- | --- |
-| Factor | 1.0× | 3.2× | 13.3× | 21.0× | 36.5× | 50× |
+| Factor | 1.0× | 1.22× | 2.66× | 5.13× | 6.42× | 8× |
 
-It saturates at the minimum rather than continuing to climb; without that the pass would
-spend its whole budget fighting over the last millimetre of a clearance already as bad as
-it is allowed to get. The penalty is a *preference*, not a safety mechanism — what the robot
-is forbidden to do is still set by `--obstacle-clearance-mm`. The two are complementary: a
+Both ends are fixed whatever the exponent is, so the peak does not move while the shape is
+tuned; the exponent only decides where along the span the curve can tell one clearance from
+another. Either curve saturates at its peak rather than continuing to climb; without that
+the pass would spend its whole budget fighting over the last millimetre of a clearance
+already as bad as it is allowed to get.
+
+The penalty is a *preference*, not a safety mechanism — what the robot is forbidden to do is
+still set by `--obstacle-clearance-mm`. The two are complementary: a
 hard clearance makes poses illegal and quickly makes a cell unplannable, whereas the penalty
 makes them expensive, which is the better tool for "prefer standoff".
 
@@ -1123,10 +1156,12 @@ a collision check, because only the 18 robot-against-cell pairs are ever conside
 is paid per sample, and scoring candidates roughly halves the number of shortcut attempts
 that fit in a budget. Raise `--shortcut-seconds` to compensate.
 
-`--clearance-penalty-cutoff-mm` truncates the shallow end of the curve so the query looks no
-further, leaving the rest of the shape unchanged. That necessarily introduces a
-discontinuity — with the defaults a 20 mm cutoff steps the factor straight from 1× to 21×
-at 20 mm — which is inherent to the request rather than a defect. On this cell it saved
+`--clearance-penalty-cutoff-mm` truncates the shallow end of the power curve so the query
+looks no further, leaving the rest of the shape unchanged. It does nothing under the default
+stepped curve, which is bounded by `--stepped-penalty-zero-mm` already. Truncating
+necessarily introduces a discontinuity — on the power curve at its defaults a 20 mm cutoff
+steps the factor straight from 1× to 3.29× at 20 mm — which is inherent to the request
+rather than a defect. On this cell it saved
 nothing measurable, since the query is already dominated by fixed overhead rather than by
 how many pairs fall inside the margin.
 
@@ -1403,8 +1438,9 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--segment-length-rad` | 0.025 | collision resolution inside the sampling planner, as OMPL's `longest_valid_segment_length`; coarser is quicker and refuses more routes for stepping over something |
 | `--phase-one-runs` | 25 | OMPL runs per transit, keeping the cheapest that solves |
 | `--phase-one-solve-seconds` | 25 | how long one of those runs may search |
-| `--cartesian-solve-seconds` | 120 | Cartesian tree time to find a first route, spent on every transit the band is on for; 0 disables. `--cartesian-seconds` still works |
-| `--cartesian-min-seconds` | 120 | least time the tree spends once solved, re-solving from new seeds and keeping the cheapest route |
+| `--cartesian-solve-seconds` | 120 | time at one gun opening before the tree gives that opening up as having no route, spent on every transit the band is on for; 0 disables the tree. `--cartesian-seconds` still works |
+| `--cartesian-process-seconds` | 40 | how long one opening is searched after its first route there, from new seeds, keeping the cheapest |
+| `--cartesian-gun-openings` | 3 | least gun openings the tree attempts per transit, capped by `--min-gun-openings`. Multiplies the two figures above |
 | `--cartesian-recut` | true | cut a Cartesian-tree route where it leaves the band and replan the parts outside it with phases one and two |
 | `--phase-two-max-runs` | 2 | OMPL runs for a gap the recut has to join, stopping at the first solution. No longer a stage of a transit |
 | `--phase-two-solve-seconds` | 240 | how long one of those runs may search |
@@ -1457,9 +1493,11 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--clearance-penalty-min-mm` | 0 | clearance at and below which the penalty peaks |
 | `--clearance-penalty-multiplier` | 8 | peak penalty factor |
 | `--clearance-penalty-cutoff-mm` | 0 | ignore clearances beyond this; 0 uses the maximum |
-| `--stepped-penalty` | on | use the stepped clearance penalty |
-| `--stepped-penalty-multiplier` | 7 | stepped penalty at zero clearance |
-| `--stepped-penalty-zero-mm` | 35 | clearance at which the stepped penalty reaches 1× |
+| `--stepped-penalty` | on | use the stepped clearance penalty instead of the power curve above, which ignores every `--clearance-penalty-*` option |
+| `--stepped-penalty-multiplier` | 12 | stepped penalty at zero clearance |
+| `--stepped-penalty-zero-mm` | 25 | clearance at which the stepped penalty reaches 1×; also how far the proximity query has to see |
+| `--stepped-penalty-step-mm` | 2 | how much extra clearance counts as one step of falloff |
+| `--stepped-penalty-step-factor` | 0.7 | what one step multiplies the penalty by |
 | `--joint-max-velocity` | 2π/3, J6 11π/9 | per-joint velocity limits, rad/s, comma separated |
 | `--joint-max-acceleration` | 2.5, J6 11 | per-joint acceleration limits, rad/s², comma separated |
 | `--linear-speed-mm-s` | 250 | tool speed cap on `LIN` moves |
