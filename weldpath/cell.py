@@ -21,6 +21,7 @@ Two things here are load-bearing and were established by measurement rather than
 """
 from __future__ import annotations
 
+import collections
 import contextlib
 import os
 from dataclasses import dataclass
@@ -49,6 +50,38 @@ from .scene import GROUP, TCP_LINK, SceneBuilder
 # until it ran out of floating point.
 MAX_TOOL_SUBDIVISION = 6
 
+
+def _scan_order(n: int, stride: int) -> list[int]:
+    """Grid indices to collision check, sparse ones first, each exactly once.
+
+    Returns every index of an ``n``-point grid: first those a ``stride`` apart, with the
+    last point included so the move's own end is among them, then the rest in order.  It
+    is a **permutation**, which is the whole of why this is sound -- the set of states
+    tested on a clear move is unchanged, so the move costs exactly what it used to, and a
+    state that collides in the sparse pass is a state of the same grid and so is a real
+    collision that the sequential walk would have reached later.
+
+    What it buys is the blocked move.  Most of what the refinement passes propose is
+    rejected -- measured on Path 1, 35 of 48 shortcut attempts and 52 of 60 polish
+    attempts -- and a candidate that cuts into a panel is blocked over a long stretch of
+    its length, which a sparse pass finds in about ``n / stride`` tests rather than walking
+    up to it one step at a time.
+
+    What it costs is the narrow blockage.  A single blocked state just past the start is
+    found by the sequential walk almost immediately and by this one only in the second
+    pass, so a blocked move can cost up to ``n / stride`` tests more than it would have.
+    The trade is therefore a bet on blockages being wide, which is why ``stride`` is a
+    flag and 1 -- the plain sequential walk -- is the default until it is measured on a
+    real cell.
+    """
+    if stride <= 1 or n <= 3:
+        return list(range(n))
+    sparse = list(range(0, n, stride))
+    if sparse[-1] != n - 1:
+        sparse.append(n - 1)
+    seen = set(sparse)
+    return sparse + [i for i in range(n) if i not in seen]
+
 # The joint the stop band applies to, as an index into the robot's joint vector: joint 5,
 # the wrist pitch.  See ``Cell.stop_band_rad``.
 STOP_BAND_JOINT = 4
@@ -58,7 +91,8 @@ STOP_BAND_JOINT = 4
 # environment, a clearance query adds a contact test over every convex piece within the
 # probe, and a collision test adds one at the planning margins.
 COUNTER_NAMES = ("state_loads", "clearance", "clearance_hits", "clearance_fused",
-                 "collision_tests", "fk", "tcp_hits", "weld_scoped")
+                 "collision_tests", "fk", "tcp_hits", "weld_scoped",
+                 "scan_blocked", "scan_blocked_early", "subdiv_blocked")
 
 # States a cell remembers a clearance for before starting again.  Large enough that the
 # waypoints of a run stay resident, small enough that a long polish cannot exhaust memory
@@ -136,6 +170,8 @@ class Cell:
         self._probe_mm = 0.0                    # how far that manager can actually see
         self._extra_probe_mm = 0.0              # asked for by something other than the penalty
         self.tcp_check_mm = 0.0                 # tool-space check resolution; 0 disables
+        self.coarse_stride = 1                  # collision grid test order; 1 is sequential
+        self.subdivide_coarsest_first = False   # tool-space subdivision order
         # No waypoint the robot stops at may hold joint 5 closer to zero than this, in
         # radians; 0 disables.  It constrains stops only -- a move may sweep through the
         # band on its way somewhere else, so nothing that samples or checks a move reads it.
@@ -660,37 +696,61 @@ class Cell:
         # and asking it would pay for a clearance query to learn that.
         want = (factors and self._pm is not None
                 and self.penalty is not None and self.penalty.enabled)
-        facs: list[float] | None = [] if want else None
+        facs: list[float] | None = [0.0] * n if want else None
         measure_tool = self.tcp_check_mm > 0.0
 
-        tools = []
-        for t in grid:
-            q = a + t * delta
+        # Addressed by index rather than appended, so the walk may visit the grid in any
+        # order and still hand the bisection and the pricing the same ordered lists.
+        tools: list = [None] * n
+        for i in _scan_order(n, self.coarse_stride):
+            q = a + grid[i] * delta
             if self.in_collision(q):
+                self.counters["scan_blocked"] += 1
+                if i % self.coarse_stride == 0 or i == n - 1:
+                    # Refused in the sparse pass, which is what the ordering is for.
+                    self.counters["scan_blocked_early"] += 1
                 return True, None
             if measure_tool:
-                tools.append(self._tcp_now())
+                tools[i] = self._tcp_now()
             if want:
-                facs.append(self.penalty.factor(self._clearance_here(q)))
+                facs[i] = self.penalty.factor(self._clearance_here(q))
         if not measure_tool:
             return False, ([1.0] * n if factors and not want else facs)
 
         tool_step = self.tcp_check_mm * self.man.scale
-        # Right to left, so the halves of a split are popped in the order they are flown.
-        stack = [(grid[k], grid[k + 1], tools[k], tools[k + 1], 0)
-                 for k in range(n - 2, -1, -1)]
-        while stack:
-            t0, t1, p0, p1, depth = stack.pop()
+        spans = [(grid[k], grid[k + 1], tools[k], tools[k + 1], 0) for k in range(n - 1)]
+        if self.subdivide_coarsest_first:
+            # Double the resolution over the whole move each pass: every interval's own
+            # midpoint before any interval's grandchild, which traversal order calls
+            # breadth first.  A candidate that cuts into a panel is blocked over whole
+            # intervals of its length and one of their midpoints lands inside it, where
+            # refining one stretch at a time proves the opening stretch clear to the floor
+            # first -- up to 2^MAX_TOOL_SUBDIVISION tests before the blocked interval is
+            # looked at at all.
+            queue = collections.deque(spans)
+            take = queue.popleft
+        else:
+            # Right to left, so the halves of a split are popped in the order they are
+            # flown -- which is what makes the depth-first walk follow the move.
+            queue = list(reversed(spans))
+            take = queue.pop
+        while queue:
+            t0, t1, p0, p1, depth = take()
             if depth >= MAX_TOOL_SUBDIVISION:
                 continue
             if float(np.linalg.norm(p1 - p0)) <= tool_step:
                 continue
             tm = 0.5 * (t0 + t1)
             if self.in_collision(a + tm * delta):
+                self.counters["subdiv_blocked"] += 1
                 return True, None
             pm = self._tcp_now()
-            stack.append((tm, t1, pm, p1, depth + 1))
-            stack.append((t0, tm, p0, pm, depth + 1))
+            left = (t0, tm, p0, pm, depth + 1)
+            right = (tm, t1, pm, p1, depth + 1)
+            # Appended in whichever order leaves the left half taken first, so both walks
+            # follow the move rather than running it backwards.
+            queue.extend((left, right) if self.subdivide_coarsest_first
+                         else (right, left))
         return False, ([1.0] * n if factors and not want else facs)
 
     def segment_clearance(self, a: np.ndarray, b: np.ndarray, max_step: float = 0.05,
@@ -1624,6 +1684,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
           enclosed_keep_mm: float = 0.0, enclosed_dump: bool = False,
           panel_bend_mm: float = 0.0,
           obstacle_clearance_mm: float = 0.0, tcp_check_mm: float = 0.0,
+          coarse_check_stride: int = 1, subdivide_coarsest_first: bool = False,
           export_dir: str | None = None,
           penalty=None, dynamics=None,
           stop_time_weight: float = 1.0, stop_band_rad: float = 0.0,
@@ -1687,6 +1748,8 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         cell.margin, cell.obstacle_clearance = margin, clearance
         cell.margin_overrides = overrides
         cell.tcp_check_mm = max(0.0, float(tcp_check_mm))
+        cell.coarse_stride = max(1, int(coarse_check_stride))
+        cell.subdivide_coarsest_first = bool(subdivide_coarsest_first)
         cell.stop_time_weight = float(stop_time_weight)
         cell.stop_band_rad = float(stop_band_rad)
         cell.out_dir = out_dir

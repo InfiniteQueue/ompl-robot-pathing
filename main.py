@@ -791,6 +791,37 @@ def build_parser() -> argparse.ArgumentParser:
                         "%(default)g)")
     #endregion
     #region ###CLEARANCE FROM THE PARTS###
+    #ORDER THE COLLISION GRID IS TESTED IN
+    p.add_argument("--coarse-check-stride", type=int, default=1, metavar="N",
+                   help="test every Nth point of a move's collision grid first, then the "
+                        "rest. It is a reordering and not a coarser check: the same states "
+                        "are tested, so a move that is clear costs exactly what it did and "
+                        "the resolution, the guarantee and the pricing are untouched. What "
+                        "it buys is the blocked move, which the refinement passes propose "
+                        "far more often than not -- a candidate cutting into a panel is "
+                        "blocked over a long stretch and the sparse pass finds it in about "
+                        "1/N of the tests. What it costs is a narrow blockage near the "
+                        "start of a move, found later than a sequential walk would find "
+                        "it, so a blocked move can cost up to 1/N more tests. 1 is the "
+                        "plain sequential walk (default: %(default)d)")
+    #ORDER THE TOOL-SPACE SUBDIVISION IS WALKED IN
+    p.add_argument("--subdivide-coarsest-first", type=boolean, nargs="?", const=True,
+                   default=False, metavar="BOOL",
+                   help="double the check resolution over the whole move each pass -- "
+                        "every interval of the tool-space subdivision gets its own "
+                        "midpoint tested before any interval's grandchild -- instead of "
+                        "refining one stretch to the floor before starting the next. "
+                        "Traversal order calls this breadth first. Like "
+                        "--coarse-check-stride it is a reordering and not a coarser "
+                        "check: the same midpoints are tested, so a move that is clear "
+                        "costs exactly what it did. What it buys is the blocked move, and "
+                        "this is the half with the evidence behind it, every refusal "
+                        "measured over 80 sampler solves having come from the subdivision "
+                        "and none from the joint grid. Depth first can spend 64 tests "
+                        "proving the opening stretch of a move clear before it looks at "
+                        "the interval that is blocked. Takes true/false (yes/no, on/off, "
+                        "1/0); passing the flag with no value means true "
+                        "(default: %(default)s)")
     #CLEARANCE EVERYWHERE
     p.add_argument("--obstacle-clearance-mm", type=float, default=5.0, metavar="MM",
                    help="how close the robot and gun may come to the panels and tooling "
@@ -1245,6 +1276,8 @@ def _run(args: argparse.Namespace, directory: str) -> int:
                                              else 0.0),
                               obstacle_clearance_mm=args.obstacle_clearance_mm,
                               tcp_check_mm=args.check_step_mm,
+                              coarse_check_stride=args.coarse_check_stride,
+                              subdivide_coarsest_first=args.subdivide_coarsest_first,
                               export_dir=(directory if args.export_collision_geometry
                                           else None),
                               penalty=penalty, dynamics=dynamics,
