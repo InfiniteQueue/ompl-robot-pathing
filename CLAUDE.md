@@ -70,9 +70,17 @@ the way, so the joint values in between are whatever that line demands.
   - **Every refusal comes from the tool-space bisection and none from the joint grid.** Of
     those 80 solves, not one route OMPL returned was refused by a joint-space check at the
     cell's own 3 deg grid; every refusal was `--check-step-mm`'s. The two tests disagree
-    because they measure *different quantities*, not because one is finer -- OMPL's joint
-    grid is already about 5x finer than the cell's. So coarsening `--check-step-mm` does not
-    compensate for coarsening this, and it is the only thing catching the step-overs.
+    because they measure *different quantities* rather than because one is finer: OMPL
+    bounds one distance over the whole joint vector in its own metric, while
+    `--check-step-deg` bounds the **largest single joint's** delta, so the figures are not
+    commensurable -- and taken at face value 0.025 rad against 3 deg (0.0524 rad) is only
+    about 2x anyway. So coarsening `--check-step-mm` does not compensate for coarsening
+    this, and it is the only thing catching the step-overs.
+    - This said "about 5x finer" until it was checked. That held at the old 0.01 rad, and
+      the commit that moved the default to 0.025 left the ratio behind -- the same drift
+      this bullet exists to record. What is several times finer is the *tool-space*
+      bisection, which is what `_route_fault` and `_verify_runs` say: 0.025 rad carries
+      the tool about 52 mm at j3 against the 7 mm `--check-step-mm` holds it to.
     `_route_fault` is what rejects, and the retries the caller already has are what make the
     trade safe: a refused route costs its own solve time and nothing unsafe ships.
   - **The refusal rate this costs is inside the one the cells already have.** Counted over
