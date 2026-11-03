@@ -848,7 +848,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "75 mm from either end of its transit. Turning this on can make a "
                         "transit that only had a route along a panel fail or detour "
                         "instead, which is the trade; measured on one Path 1 segment it "
-                        "cost 22% of the real motion to take a third off the sub-5 mm "
+                        "cost 22%% of the real motion to take a third off the sub-5 mm "
                         "travel. Takes true/false (yes/no, on/off, "
                         "1/0); passing the flag with no value means true "
                         "(default: %(default)s)")
