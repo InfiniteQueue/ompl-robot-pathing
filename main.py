@@ -214,32 +214,56 @@ def build_parser() -> argparse.ArgumentParser:
                         "tree is usually the problem, so a longer single search helps "
                         "where another short one does not. See --phase-two-max-runs for "
                         "what still reaches it (default: %(default)g)")
-    #CARTESIAN TREE, BETWEEN THE TWO PHASES
+    #CARTESIAN TREE: WHEN ONE GUN OPENING IS ABANDONED
     p.add_argument("--cartesian-solve-seconds", "--cartesian-seconds", type=float,
                    default=120.0, metavar="SECONDS", dest="cartesian_solve_seconds",
-                   help="how long the Cartesian tree may search a transit that phase one "
-                        "could not solve before it has found one route. Searches that "
-                        "give up early are restarted from a new seed until this is spent. "
-                        "It runs between the two phases and only where "
-                        "--near-panel-mm is in force, so a cell whose transits solve never "
-                        "reaches it. Unlike the sampling planner it searches the space the "
-                        "tool moves in: every edge it builds is a straight tool move, "
-                        "checked along the line the tool really takes. That makes it a "
-                        "specialist rather than a replacement -- every route it can find "
-                        "is also a joint-space route, so it searches strictly less than "
-                        "phase two does -- but it concentrates the search into the "
-                        "corridor beside the panel, which is where uniform joint sampling "
-                        "spends everything and finds nothing. 0 turns it off "
+                   help="how long the Cartesian tree searches at one gun opening before "
+                        "giving that opening up as having no route. Searches that end "
+                        "early are restarted from a new seed until this is spent, and a "
+                        "search that spends it whole is why an opening with no route "
+                        "usually costs exactly this. Per opening, not per transit: the "
+                        "tree steers by where the tool can go and a tip 200 mm open "
+                        "sweeps a corridor a closed one never enters, so a search that "
+                        "failed is evidence about the opening it ran at and about no "
+                        "other -- which is what the next opening is for, and how many of "
+                        "those there are is --cartesian-gun-openings. It runs alongside "
+                        "phase one on every transit --near-panel-mm is in force for, so a "
+                        "cell planned with no band never reaches it. Unlike the sampling "
+                        "planner it searches the space the tool moves in: every edge it "
+                        "builds is a straight tool move, checked along the line the tool "
+                        "really takes. That makes it a specialist rather than a "
+                        "replacement -- every route it can find is also a joint-space "
+                        "route, so it searches strictly less than phase two does -- but "
+                        "it concentrates the search into the corridor beside the panel, "
+                        "which is where uniform joint sampling spends everything and "
+                        "finds nothing. 0 turns the tree off (default: %(default)g)")
+    #CARTESIAN TREE: HOW LONG ONE OPENING IS WORKED ONCE IT HAS A ROUTE
+    p.add_argument("--cartesian-process-seconds", type=float, default=40.0,
+                   metavar="SECONDS",
+                   help="how long the Cartesian tree keeps searching at a gun opening "
+                        "after its first route there, timed from that route and not "
+                        "restarted by a second. Further searches run from new seeds, and "
+                        "the lowest-penalty route of the whole set -- over every opening "
+                        "attempted -- is the one that goes on to --cartesian-recut, as "
+                        "phase one keeps its best. A tree settles for whichever route its "
+                        "seed leads it to first, so searching again is the only way to "
+                        "have a choice at all. A search that fails inside this window "
+                        "spends the rest of it. 0 keeps the first route found at each "
+                        "opening and moves on (default: %(default)g)")
+    #CARTESIAN TREE: HOW MANY GUN OPENINGS IT MUST ATTEMPT
+    p.add_argument("--cartesian-gun-openings", type=int, default=3, metavar="N",
+                   help="least gun openings the Cartesian tree attempts per transit, "
+                        "taken in order from the same screened rotation phase one deals "
+                        "its runs round -- so --min-gun-openings is the most that can be "
+                        "read here and a larger value is read as all of them. Each "
+                        "opening gets its own --cartesian-solve-seconds and "
+                        "--cartesian-process-seconds, so this multiplies them: at the "
+                        "defaults a transit the tree cannot solve costs 3 x 120 s before "
+                        "the detour is reached, and one that solves at once about 3 x 40 "
+                        "s. 1 is what this did before it was a setting, where a transit "
+                        "whose first search failed never saw a second opening and one "
+                        "that solved saw however many fitted in the time left "
                         "(default: %(default)g)")
-    #CARTESIAN TREE: CHOOSE BETWEEN ROUTES
-    p.add_argument("--cartesian-min-seconds", type=float, default=120.0, metavar="SECONDS",
-                   help="least time the Cartesian tree spends on a transit once it has "
-                        "solved it. Further searches, each from a new seed, run until this "
-                        "much time has passed since the first began, and the "
-                        "lowest-penalty route of the set is kept, as phase one keeps its "
-                        "best. Only the kept route goes on to --cartesian-recut. A "
-                        "transit whose first route took longer than this keeps that route "
-                        "alone; 0 always does (default: %(default)g)")
     #HOW FAR ONE EXTEND REACHES
     p.add_argument("--cartesian-extend-mm", type=float, default=80.0, metavar="MM",
                    help="furthest one extend of the Cartesian tree drives the tool. Short "
@@ -1097,6 +1121,10 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.extra_gun_openings < 0:
         print("error: --extra-gun-openings cannot be negative", file=sys.stderr)
         return 2
+    if args.cartesian_gun_openings < 1:
+        print("error: --cartesian-gun-openings must be at least 1: the tree plans at one "
+              "gun opening or another", file=sys.stderr)
+        return 2
     if args.gun_opening_weight < 1.0:
         print("error: --gun-opening-weight must be at least 1: below 1 it would pay a "
               "route to hold the gun open", file=sys.stderr)
@@ -1221,7 +1249,8 @@ def _run(args: argparse.Namespace, directory: str) -> int:
                         phase_two_max_runs=args.phase_two_max_runs,
                         phase_two_seconds=args.phase_two_solve_seconds),
         cartesian=CartesianBudget(seconds=args.cartesian_solve_seconds,
-                                  min_seconds=args.cartesian_min_seconds,
+                                  process_seconds=args.cartesian_process_seconds,
+                                  gun_openings=args.cartesian_gun_openings,
                                   extend_mm=args.cartesian_extend_mm,
                                   margin_mm=args.cartesian_margin_mm,
                                   tilt_deg=args.cartesian_tilt_deg,

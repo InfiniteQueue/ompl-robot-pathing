@@ -335,9 +335,10 @@ the way, so the joint values in between are whatever that line demands.
     gap beside the fixture and is both slower here and likelier to come back swinging the
     gun across the panel. The leg between the two poses runs through open air and gets
     everything `_plan_direct` has -- chord, phase one, the tree ranked against it.
-    `min_seconds` is dropped to nothing on the extractions: that budget buys a *choice*
-    between routes and there is nothing to choose about getting out of a pocket, and it
-    is paid per leg per opening.
+    `process_seconds` is dropped to nothing on the extractions: that budget buys a
+    *choice* between routes and there is nothing to choose about getting out of a pocket,
+    and it is paid per leg per opening. `gun_openings` is left alone and does nothing
+    there, each leg being pinned to one opening already.
   - **The extractions are settled before the traverse.** They are the constrained legs --
     the tip has to clear the pocket -- so a failure there is attributable to one pose
     rather than to the detour as a whole, and settling them first means the traverse is
@@ -582,17 +583,40 @@ the way, so the joint values in between are whatever that line demands.
   nothing, which meant a transit phase one solved never had the tree's route costed at all;
   the two differ less in whether they solve than in what they return, uniform joint
   sampling having nothing drawing it into the corridor beside the panel that the tree
-  steers along. What it costs is `--cartesian-solve-seconds` plus `--cartesian-min-seconds`
-  on every transit rather than only on the ones nothing else reached, bounded by `Deadline`
-  alone. It runs for every leg of a detour too, and on the two extractions it is the *only*
+  steers along. What it costs is `--cartesian-gun-openings` times
+  `--cartesian-solve-seconds` plus `--cartesian-process-seconds` on every transit rather
+  than only on the ones nothing else reached, bounded by `Deadline` alone. It runs for every leg of a detour too, and on the two extractions it is the *only*
   solver -- see `_plan_detour`. A leg is a candidate for being shipped as its own leg of
   the output, so it is searched and scored under the band it will be flown in. What that
   costs is the tree's budget per leg per opening tried, which is why the extractions drop
-  `--cartesian-min-seconds` to nothing.
-  - `_cartesian_solutions` runs it from successive seeds: until one solves or
-    `--cartesian-solve-seconds` passes, then on until `--cartesian-min-seconds` has, both
-    timed from the first run. Routes are ranked by `_path_cost`, as phase one's are, and
-    only the cheapest is recut, since the recut runs the sampling phases per stretch.
+  `--cartesian-process-seconds` to nothing.
+  - **Its three budgets are per gun opening, and that is a change.**
+    `_cartesian_solutions` takes each opening of the rotation in turn: searches from
+    successive seeds until one solves or `--cartesian-solve-seconds` passes, at which point
+    that opening is given up; once it has solved, further searches until
+    `--cartesian-process-seconds` has passed *since that first route*, which is not
+    restarted by a second route or an opening that keeps solving would never be left.
+    `--cartesian-gun-openings` (3) openings are attempted, or all of them where the
+    rotation is shorter -- there is no inventing an opening, the rotation having already
+    been screened. Routes accumulate over every opening attempted, are ranked by
+    `_path_cost` as phase one's are, and only the cheapest is recut, since the recut runs
+    the sampling phases per stretch.
+    - **Both figures used to be counted from the first run of the transit**, which made
+      them one window shared by every opening, and the opening advanced only when a search
+      ended early. So a single failing search spent the whole window and no later opening
+      was ever reached: measured over the shipped logs of nine studies, 12 of the 30
+      direct-transit tree calls tried exactly one opening for this reason, each burning
+      120 s to do it. How many openings a transit saw was a consequence of how quickly the
+      first one solved rather than anything anyone set.
+    - A search that fails spends its whole window, so the floor on a hopeless transit is
+      the product: 3 x 120 s before the detour is reached, against 120 s before. That is
+      the price of the guarantee and `--cartesian-gun-openings 1` is how to decline it.
+      Inside the process window a failed search likewise spends the rest of it -- there is
+      no third figure capping one search, and the window is what contains it.
+    - The gun is why per opening is the right scope. The tree's every edge is a straight
+      move of the tool and a tip 200 mm open sweeps a corridor a closed one never enters,
+      so a search that failed is evidence about the opening it ran at and about no other.
+      `_route_fault` has no counterpart here: a failed search is a failed search.
   - It returns every station it validated, about `--check-step-mm` of tool travel apart,
     each gap swept as a joint chord — close enough that chord and line coincide — plus
     one stationary joint move where the two trees meet at the same pose.

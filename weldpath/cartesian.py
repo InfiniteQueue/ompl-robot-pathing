@@ -52,6 +52,15 @@ __all__ = ["CartesianBudget", "plan_cartesian"]
 class CartesianBudget:
     """How hard the tree searches, and how far it reaches at a time.
 
+    **The three time and count budgets are per gun opening, not per transit.**  The gun
+    is part of the shape being steered around -- a tip 200 mm open sweeps a corridor a
+    closed one never enters -- so a search that failed says something about the opening it
+    ran at and nothing about any other.  ``seconds`` is what one opening gets to produce a
+    first route before it is abandoned, ``process_seconds`` what that opening gets
+    afterwards to better it, and ``gun_openings`` how many openings are attempted at all.
+    They multiply: a transit the tree cannot solve costs ``gun_openings * seconds``, and
+    ``planning.Deadline`` is the only thing bounding the product.
+
     ``extend_mm`` is the one setting worth understanding before the others.  It is how far
     a single extend drives the tool, and it trades the two failure modes against each
     other: short extends explore reliably but grow the tree slowly and pay a
@@ -65,8 +74,9 @@ class CartesianBudget:
     what anyone wanted.  With this on, ``planning._recut_outside_band`` cuts the route
     where it leaves the band and gives what is outside back to the sampling planner.
     """
-    seconds: float = 20.0           # wall clock to find a first route
-    min_seconds: float = 20.0       # wall clock spent re-solving for a better one
+    seconds: float = 20.0           # wall clock before one gun opening is abandoned
+    process_seconds: float = 20.0   # wall clock on better routes, once one is found
+    gun_openings: int = 3           # least openings attempted, where that many exist
     max_iters: int = 4000           # sample budget, whichever runs out first
     extend_mm: float = 120.0        # furthest one extend drives the tool
     extend_deg: float = 25.0        # ...and furthest it turns the tool, whichever binds

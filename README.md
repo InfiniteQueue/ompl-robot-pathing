@@ -679,12 +679,21 @@ budgets below on every transit rather than only on the ones nothing else could r
 segment clock is what bounds that. It runs for every leg of a detour as well, and on the
 two legs out of the locators it is the only solver there is. Its route is dense: states about `--check-step-mm` of tool travel apart, each gap a straight
 tool move, plus one stationary joint move where its two trees meet. Like phase one, it
-searches more than once: new seeds until one solves within `--cartesian-solve-seconds`,
-then more until `--cartesian-min-seconds` has passed, and only the cheapest route of
-the set goes on. Those runs are dealt round the same gun openings phase one used, one
-opening each. The tree steers by where the tool can go and a tip 200 mm open sweeps a
-corridor a closed one never enters, so a search that failed is evidence about the opening
-it ran at and about no other.
+searches more than once, and **it does so per gun opening**. Each opening of the same
+rotation phase one used gets new seeds until one solves within
+`--cartesian-solve-seconds`, at which point that opening is given up; once it has solved,
+further seeds until `--cartesian-process-seconds` has passed since that first route.
+`--cartesian-gun-openings` openings are attempted, or all of them where the rotation is
+shorter. The cheapest route over every opening attempted is the one that goes on.
+
+Per opening because the tree steers by where the tool can go, and a tip 200 mm open sweeps
+a corridor a closed one never enters: a search that failed is evidence about the opening it
+ran at and about no other. The budgets therefore multiply — at the defaults a transit the
+tree cannot solve spends 3 x 120 s here before the detour is reached — which is what
+`--cartesian-gun-openings` is for. Set it to 1 for the old behaviour, where both figures
+were counted from the first search of the transit and so were one window shared by every
+opening: a single failing search spent the whole of it and the openings after it were never
+tried.
 
 With `--cartesian-recut` on (the default), the route is then cut wherever it leaves the
 band. Each stretch outside the band is bounded by its own first and last state, which
@@ -1403,8 +1412,9 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--segment-length-rad` | 0.025 | collision resolution inside the sampling planner, as OMPL's `longest_valid_segment_length`; coarser is quicker and refuses more routes for stepping over something |
 | `--phase-one-runs` | 25 | OMPL runs per transit, keeping the cheapest that solves |
 | `--phase-one-solve-seconds` | 25 | how long one of those runs may search |
-| `--cartesian-solve-seconds` | 120 | Cartesian tree time to find a first route, spent on every transit the band is on for; 0 disables. `--cartesian-seconds` still works |
-| `--cartesian-min-seconds` | 120 | least time the tree spends once solved, re-solving from new seeds and keeping the cheapest route |
+| `--cartesian-solve-seconds` | 120 | time at one gun opening before the tree gives that opening up as having no route, spent on every transit the band is on for; 0 disables the tree. `--cartesian-seconds` still works |
+| `--cartesian-process-seconds` | 40 | how long one opening is searched after its first route there, from new seeds, keeping the cheapest |
+| `--cartesian-gun-openings` | 3 | least gun openings the tree attempts per transit, capped by `--min-gun-openings`. Multiplies the two figures above |
 | `--cartesian-recut` | true | cut a Cartesian-tree route where it leaves the band and replan the parts outside it with phases one and two |
 | `--phase-two-max-runs` | 2 | OMPL runs for a gap the recut has to join, stopping at the first solution. No longer a stage of a transit |
 | `--phase-two-solve-seconds` | 240 | how long one of those runs may search |

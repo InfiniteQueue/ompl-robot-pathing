@@ -2220,17 +2220,20 @@ def _tree_leg(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, opening: float | No
     fixture, so on this leg in particular it is both the slower solver and the one more
     likely to come back with a route that swings the gun across the panel on its way out.
 
-    ``min_seconds`` is dropped to nothing.  That budget buys a *choice* between routes,
-    and on this leg there is nothing to choose: it is short, its shape is forced by the
-    pocket, and what the detour needs from it is that it exists at all.  The saving is
-    worth having because this is paid per leg per gun opening tried.
+    ``process_seconds`` is dropped to nothing.  That budget buys a *choice* between
+    routes, and on this leg there is nothing to choose: it is short, its shape is forced by
+    the pocket, and what the detour needs from it is that it exists at all.  The saving is
+    worth having because this is paid per leg per gun opening tried.  ``gun_openings`` is
+    moot here for the same reason it is not passed: this leg is pinned to one opening and
+    the detour is what walks the others, a leg at a time.
     """
     if cfg.cartesian is None or not cfg.cartesian.enabled:
         # Guarded rather than assumed: _plan_detour hands these legs to every solver when
         # the tree is switched off, so reaching here would mean that decision was skipped.
         raise PlanningError(f"the cartesian tree is switched off, so nothing can plan "
                             f"{what}")
-    found = _cartesian_solutions(cell, qa, qb, replace(cfg.cartesian, min_seconds=0.0),
+    found = _cartesian_solutions(cell, qa, qb,
+                                 replace(cfg.cartesian, process_seconds=0.0),
                                  cfg.check_step, [opening], log,
                                  deadline=cfg.deadline, zone=cfg.zone, gun=cfg.gun)
     if not found:
@@ -3088,9 +3091,11 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
         # never saw it, which meant the cheaper route of the two was never even costed.
         #
         # What that costs is the tree's full budget on every transit that reaches here
-        # rather than only on the ones nothing else could reach: --cartesian-solve-seconds
-        # until it solves and then --cartesian-min-seconds looking for better ones,
-        # whether or not a route is already in hand.  The segment clock is what bounds it.
+        # rather than only on the ones nothing else could reach, and that budget is per
+        # gun opening: --cartesian-solve-seconds at each until it solves there and then
+        # --cartesian-process-seconds looking for better ones, over
+        # --cartesian-gun-openings of them, whether or not a route is already in hand.
+        # The segment clock is what bounds the product.
         #
         # Still before phase two, which is unchanged in running only when nothing has been
         # found at all: every route the tree finds is also a joint-space route, so it
@@ -3202,44 +3207,71 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                          gun: "GunPreference | None" = None) -> list[_Solution]:
     """Cartesian-tree routes for one transit, each scored as phase one scores its own.
 
-    Searches run from successive seeds until one solves or ``budget.seconds`` has passed,
-    then carry on until ``budget.min_seconds`` has passed, both counted from the start of
-    the first.  A tree search, like RRTConnect, settles for whichever route its seed leads
-    it to first, so more of them is the only way to have a choice.  Each search is given
-    only the time left, so neither figure is overrun by more than the search in hand takes
-    to notice.
+    **The budgets are per gun opening.**  Each opening in turn is searched from
+    successive seeds until one solves or ``budget.seconds`` has passed, at which point that
+    opening is abandoned; once it has solved, further searches run until
+    ``budget.process_seconds`` has passed *since that first route*.
+    ``budget.gun_openings`` openings are attempted, taken in order from the same rotation
+    phase one deals its runs round, or every opening offered where fewer than that exist.
 
-    The runs are dealt round the same rotation phase one used, one opening each.  There is
-    no endpoint screen here any more: ``_opening_lists`` has already established that both
-    ends are clear at every opening in that rotation, which is the one failure no further
-    seed could change.
+    Per opening rather than per transit because a search that failed is evidence about the
+    opening it ran at and about no other.  Before this both figures were counted from the
+    first run of the transit, which made them one window shared by every opening: a single
+    failing search spent the whole of it and the openings after it were never reached, so
+    how many openings a transit saw fell out of how quickly the first one solved.  What it
+    costs is that the budgets now multiply by the opening count, which is what
+    ``gun_openings`` is for.
+
+    A tree search, like RRTConnect, settles for whichever route its seed leads it to first,
+    so more of them is the only way to have a choice.  Each search is given the time left
+    in whichever window the opening is in, so a search that fails inside the process window
+    consumes the rest of it, and no figure here is overrun by more than the search in hand
+    takes to notice.
+
+    Routes accumulate over every opening attempted and the caller ranks the whole set, so
+    the opening a route was found at is chosen on what it produced.  There is no endpoint
+    screen here: ``_opening_lists`` has already established that both ends are clear at
+    every opening in the rotation, which is the one failure no further seed could change.
 
     Called on every transit, not only on the ones phase one failed, so these budgets are
     now spent whether or not a route is already in hand -- see ``_plan_direct``.
     """
     rotation = list(rotation) or [None]
     deadline = deadline or Deadline()
-    log(f"      cartesian tree: up to {budget.seconds:g}s searching linear space for a "
-        f"solution, then until {budget.min_seconds:g}s for better ones, over "
-        f"{_openings_note(rotation)}")
-    start = time.time()
+    # A count above the openings offered is read as all of them.  There is no inventing an
+    # opening to attempt: the rotation has already been screened, and the ones left out of
+    # it are left out because they repeat another or leave a pose of the leg in collision.
+    wanted = max(1, min(int(budget.gun_openings), len(rotation)))
+    log(f"      cartesian tree: {_openings_note(rotation[:wanted])}, up to "
+        f"{budget.seconds:g}s on {'each' if wanted > 1 else 'it'} to find a route in "
+        f"linear space and {budget.process_seconds:g}s more on better ones")
     found: list[_Solution] = []
     run = 0
-    while True:
-        left = deadline.clamp(
-            start + (budget.min_seconds if found else budget.seconds) - time.time())
-        if left <= 0.0:
-            if deadline.expired:
-                deadline.ran_out(log, f"the cartesian tree after {run} runs")
-            return found
-        run += 1
-        got = _cartesian_route(cell, qa, qb, budget, seconds=left, zone=zone, gun=gun,
-                               seed=budget.seed + run - 1,
-                               opening=rotation[(run - 1) % len(rotation)],
-                               check_step=check_step,
-                               label=f"cartesian tree run {run}", log=log)
-        if got is not None:
-            found.append(got)
+    for opening in rotation[:wanted]:
+        began = time.time()
+        solved: float | None = None
+        while True:
+            left = deadline.clamp((began + budget.seconds if solved is None else
+                                   solved + budget.process_seconds) - time.time())
+            if left <= 0.0:
+                if deadline.expired:
+                    # The segment clock, not this opening's: there is no next opening to
+                    # move on to either.
+                    deadline.ran_out(log, f"the cartesian tree after {run} runs")
+                    return found
+                break
+            run += 1
+            got = _cartesian_route(cell, qa, qb, budget, seconds=left, zone=zone, gun=gun,
+                                   seed=budget.seed + run - 1, opening=opening,
+                                   check_step=check_step,
+                                   label=f"cartesian tree run {run}", log=log)
+            if got is not None:
+                found.append(got)
+                if solved is None:
+                    # Timed from the first route at this opening and not restarted by a
+                    # second, or an opening that keeps solving would never be left.
+                    solved = time.time()
+    return found
 
 
 def _far_stretches(near: list[bool]) -> list[tuple[int, int]]:
