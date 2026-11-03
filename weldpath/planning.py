@@ -963,9 +963,12 @@ def _stand_off(cell: Cell, path: list[np.ndarray], *, opening: float | None,
     by construction.
 
     Measured against the defaults, the trade is worth making where a route really does run
-    close.  The clearance penalty is ``1 + 7 * ((100 - d) / 100) ** 5``, so a state at 5 mm
-    is charged 6.42x and the same state 2.5 mm further out 5.74x -- 11% off the time spent
-    there, against the 1.5% the gun weight adds for 5 mm of a 164 mm travel.
+    close.  The curve in force is :class:`SteppedPenalty`, ``--stepped-penalty`` being on by
+    default, so a state at 5 mm is charged 5.43x and the same state 2.5 mm further out
+    3.79x -- 30% off the time spent there, against the 1.5% the gun weight adds for 5 mm of
+    a 164 mm travel.  Quoting the power curve here instead, as this said until it was
+    measured, understated the pass by nearly three times: that curve spreads its range over
+    100 mm where the stepped one spends all of it inside 25.
 
     Returns the route to carry on with and the opening to fly it at.  The opening is part
     of the answer: the retreat and the opening are one trade, and shipping the backed-off

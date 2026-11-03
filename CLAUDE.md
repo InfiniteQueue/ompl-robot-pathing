@@ -798,9 +798,17 @@ the way, so the joint values in between are whatever that line demands.
     makes the pass self-limiting: a transit in open air has no clearance penalty to
     reduce, every trial costs it the gun weight alone, and the route it was planned with
     wins. At the defaults the trade is worth making where a route really does run close --
-    the penalty is `1 + 7 * ((100 - d) / 100) ** 5`, so a state at 5 mm is charged 6.42x
-    and the same state 2.5 mm further out 5.74x, 11% off the time spent there against the
-    1.5% the gun weight adds for 5 mm of a 164 mm travel.
+    the curve in force is the **stepped** one, `1 + 11.129 * 0.7^(d/2) - 0.129`, so a
+    state at 5 mm is charged 5.43x and the same state 2.5 mm further out 3.79x, **30%**
+    off the time spent there against the 1.5% the gun weight adds for 5 mm of a 164 mm
+    travel.
+  - **Those figures used to be quoted off the power curve, which is not the default.**
+    `--stepped-penalty` defaults to on, and every `--clearance-penalty-*` flag is ignored
+    while it is, so `1 + 7 * ((100 - d) / 100) ** 5` -- 6.42x at 5 mm against 5.74x at
+    7.5 mm, 11% -- describes a curve the program does not run unless
+    `--stepped-penalty false` is passed. The conclusion held; the arithmetic understated
+    the pass by a factor of nearly three, the stepped curve spending its whole range
+    inside 25 mm where the power curve spreads it over 100.
   - **The ends do not move.** They are the locators the leg runs between, and one of them
     is usually the weld itself: the pose it was placed at is the one the study asked for,
     and the stand-off it already has is `--weld-shift-mm`'s to give.
