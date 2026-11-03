@@ -3526,10 +3526,19 @@ def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> Non
     # margins cleared and the weld radius did not cover.
     scoped = (f"; {d['weld_scoped']} states refused by the scoped weld clearance"
               if d.get("weld_scoped") else "")
+    # Which of the two resolutions a refused move was refused by.  Measured over 80
+    # sampler solves it was always the tool-space bisection and never the joint grid, and
+    # this counts that rather than repeating it -- it is also what says whether
+    # --coarse-check-stride or --subdivide-coarsest-first is the one worth turning on.
+    grid, sub = d.get("scan_blocked", 0), d.get("subdiv_blocked", 0)
+    early = d.get("scan_blocked_early", 0)
+    where = (f"; {grid} moves refused on the joint grid"
+             + (f" ({early} in its sparse pass)" if early else "")
+             + f" and {sub} by the tool-space subdivision" if grid or sub else "")
     log(f"      work: {d['clearance']} clearance queries ({served:.0f}% of {asked} served "
         f"from cache{share}), {d['collision_tests']} collision tests, "
         f"{d['state_loads']} state loads, {d['fk']} forward kinematics, "
-        f"in {elapsed:.1f}s{scoped}")
+        f"in {elapsed:.1f}s{scoped}{where}")
 
 
 def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
