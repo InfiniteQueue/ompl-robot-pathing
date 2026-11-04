@@ -740,8 +740,15 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
         over = time.time() - deadline
         held = (f", held past its {time_budget:g}s budget by {over:.1f}s to reach the "
                 f"{floor}-attempt floor" if over > 0.05 and floor else "")
-        log(f"      polish: dropped {dropped} and relocated {moved} waypoints from "
-            f"{tried} attempts, penalised time {before:.2f} -> {after:.2f} s "
+        # ``dropped`` counts waypoints and ``moved`` counts moves, so one noun cannot
+        # carry both: a point is deleted once and gone, while the index to relocate is
+        # drawn afresh every attempt and the same point is improved again and again.
+        # This read "relocated 20 waypoints" of a four-point route, which has two
+        # interior points to draw from.  Phrased as kept-from-attempts to match
+        # ``shortcut``, which counts the same way.
+        log(f"      polish: dropped {dropped} waypoints and kept {moved} "
+            f"relocations from {tried} attempts, penalised time "
+            f"{before:.2f} -> {after:.2f} s "
             f"({gain:.0f}% better), {len(pts)} points{held}")
     return pts
 
