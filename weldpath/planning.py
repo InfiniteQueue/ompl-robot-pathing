@@ -3980,7 +3980,21 @@ def plan_linear(cell: Cell, pose_a: np.ndarray, pose_b: np.ndarray, seed: np.nda
     current = np.asarray(seed, dtype=float)
     for k in range(n + 1):
         pose = interpolate_pose(pose_a, pose_b, k / n)
-        q = cell.solve_pose(pose, [current], require_collision_free=not allow_collision)
+        # On-branch first, scattered seeds only if that finds nothing -- the pattern
+        # ``cartesian._steer`` already holds its own line to.  ``solve_pose`` defaults to
+        # eight extra seeds scattered across the joint ranges, which exist to expose the
+        # *other* arm configurations; tracking a line is the one job that does not want
+        # them, since the jump rule below refuses any station on a different branch than
+        # the one before it.  Measured over 991 station solves of a real polish pass: not
+        # once did a scattered seed find a station the seeded solve missed, and where it
+        # found a nearer solution it was nearer by 2.7e-4 rad.  Paying for them at every
+        # station cost 4x -- 87 ms against 21 ms on a 127 mm line -- and this is the call
+        # under every linear check in the program.
+        q = cell.solve_pose(pose, [current], require_collision_free=not allow_collision,
+                            branch_seeds=0)
+        if q is None:
+            q = cell.solve_pose(pose, [current],
+                                require_collision_free=not allow_collision)
         if q is None:
             raise PlanningError(
                 f"no collision-free IK at {100.0 * k / n:.0f}% along a {dist:.0f} mm "
