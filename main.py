@@ -955,20 +955,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "turns all penalties off. Takes true/false (yes/no, on/off, 1/0); "
                         "passing the flag with no value means true (default: %(default)s)")
     #STRENGTH AT TOUCHING
-    p.add_argument("--stepped-penalty-multiplier", type=float, default=12.0, metavar="N", #was 7
+    p.add_argument("--stepped-penalty-multiplier", type=float, default=12.0, metavar="N", #try 200
                    help="penalty at zero clearance: a second spent touching costs as much "
                         "as N seconds in open space (default: %(default)g)")
     #WHERE THE PENALTY IS SPENT
-    p.add_argument("--stepped-penalty-zero-mm", type=float, default=25.0, metavar="MM", #was 100
+    p.add_argument("--stepped-penalty-zero-mm", type=float, default=25.0, metavar="MM", #try 10
                    help="clearance at which the penalty reaches 1x and stops mattering. "
                         "Also how far the proximity query has to see, so lowering it "
                         "speeds planning up (default: %(default)g)")
     #STEP LENGTH
-    p.add_argument("--stepped-penalty-step-mm", type=float, default=2, metavar="MM", #was 3
+    p.add_argument("--stepped-penalty-step-mm", type=float, default=2, metavar="MM", #try 2
                    help="how much extra clearance counts as one step of falloff "
                         "(default: %(default)g)")
     #STEP FACTOR
-    p.add_argument("--stepped-penalty-step-factor", type=float, default=0.7, metavar="F",
+    p.add_argument("--stepped-penalty-step-factor", type=float, default=0.7, metavar="F", #try 0.2
                    help="what one step multiplies the penalty by: 0.7 means each "
                         "--stepped-penalty-step-mm of extra clearance costs 70%% of what "
                         "the step before it did. Must be between 0 and 1; smaller falls "
