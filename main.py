@@ -180,6 +180,25 @@ def build_parser() -> argparse.ArgumentParser:
                         "--obstacle-clearance-mm it can never fire, since a move closer "
                         "than that is already a collision. 0 leaves the collision check "
                         "as the whole of the test (default: %(default)g)")
+    #HOW MANY CANDIDATE ROUTES MAY BE OFFERED TO THE FINISHING PASSES
+    p.add_argument("--finish-attempts", type=int, default=4, metavar="N",
+                   help="candidate routes a transit may offer to the finishing passes "
+                        "before it is given up on. Ranking picks which route to keep; "
+                        "this is what happens when the route that was picked cannot be "
+                        "reduced to one the robot may fly. Two passes refuse a route "
+                        "outright -- the stop-band clearing, where a waypoint holds joint "
+                        "5 inside the band and can be neither removed nor nudged out of "
+                        "it, and the final verification, where the finished path will not "
+                        "fly -- and both are properties of a route's shape rather than of "
+                        "the transit, so the next-cheapest candidate is worth offering. "
+                        "It used to be that the cheapest was the only route ever "
+                        "densified, and a refusal there discarded the whole transit with "
+                        "every other candidate unexamined. Bounded because where the only "
+                        "way between the two ends takes joint 5 through zero every "
+                        "candidate is refused the same way and each attempt costs a whole "
+                        "refinement; the first attempt keeps the full budget and a retry "
+                        "takes only the time the segment clock has left. 1 is the old "
+                        "behaviour (default: %(default)g)")
     #PHASE ONE: CHOOSE BETWEEN ROUTES
     p.add_argument("--phase-one-runs", type=int, default=20, metavar="N",
                    help="sampling-planner runs made per transit in phase one. Every one "
@@ -993,7 +1012,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="commanded tool speed cap on linear moves; the joint limits still "
                         "govern whenever they are slower (default: %(default)g)")
     #HOW MUCH A STOP COSTS THE OPTIMISER
-    p.add_argument("--stop-time-weight", type=float, default=0.6, metavar="W",
+    p.add_argument("--stop-time-weight", type=float, default=0.8, metavar="W",
                    help="how heavily a stop is charged in the time the planner scores "
                         "routes by, and nowhere else: the exported timing is the real "
                         "one. Every waypoint is a full stop, so deleting one nearly "
@@ -1201,6 +1220,11 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.direct_clearance_mm < 0.0:
         print("error: --direct-clearance-mm cannot be negative", file=sys.stderr)
         return 2
+    if args.finish_attempts < 1:
+        # Not "cannot be negative": 0 would mean a transit that searches and then finishes
+        # nothing, so the floor is the attempt the transit has always made.
+        print("error: --finish-attempts must be at least 1", file=sys.stderr)
+        return 2
     if args.weld_opening_scan_mm <= 0.0:
         print("error: --weld-opening-scan-mm must be above 0", file=sys.stderr)
         return 2
@@ -1342,6 +1366,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         linear_crossing_penalty_s=args.linear_crossing_penalty_s,
         linear_introduce_mm=args.linear_introduce_mm,
         direct_clearance_mm=args.direct_clearance_mm,
+        finish_attempts=args.finish_attempts,
         weld_clearance_mm=args.weld_clearance_mm,
         scoped_weld_clearance=args.scoped_weld_clearance,
         weld_clearance_radius_mm=args.weld_clearance_radius_mm,

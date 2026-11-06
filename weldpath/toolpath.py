@@ -28,7 +28,8 @@ from .manifest import Locator, Manifest
 from .cartesian import CartesianBudget
 from .fallback import FallbackFinder
 from .penalty import GunPreference
-from .planning import (LIN, PTP, Deadline, LinearZone, OmplBudget, PlanningError,
+from .planning import (DEFAULT_FINISH_ATTEMPTS, LIN, PTP, Deadline, LinearZone,
+                       OmplBudget, PlanningError,
                        Relocation, StandOff, opening_cap, snap_opening, unique_openings,
                        plan_freespace,
                        validate)
@@ -246,6 +247,7 @@ class ToolpathPlanner:
                  linear_crossing_penalty_s: float = 0.0,
                  linear_introduce_mm: float = 0.0,
                  direct_clearance_mm: float = 0.0,
+                 finish_attempts: int = DEFAULT_FINISH_ATTEMPTS,
                  weld_clearance_mm: float | None = None,
                  scoped_weld_clearance: bool = True,
                  weld_clearance_radius_mm: float = 50.0,
@@ -316,6 +318,10 @@ class ToolpathPlanner:
         # the one shape of route the searches would never have proposed.  0 leaves the
         # collision check as the whole of the test, which is what it was.
         self.direct_clearance_mm = max(0.0, float(direct_clearance_mm))
+        # How many candidate routes a transit may offer to the finishing passes before it
+        # is given up on.  At least one, that being the transit itself rather than a
+        # retry: 0 would mean a transit that searches and then finishes nothing.
+        self.finish_attempts = max(1, int(finish_attempts))
         # Every locator reports its measured clearance against the one it has to meet,
         # placed or not, so the query has to see past the larger threshold with room to
         # spare.  A probe that stops at the threshold can only ever answer "at least the
@@ -1167,6 +1173,7 @@ class ToolpathPlanner:
             polish_seconds=self.polish_seconds,
             zone=self.zone,
             direct_clearance=self.direct_clearance_mm,
+            finish_attempts=self.finish_attempts,
             openings=self._transit_openings(a, b, leave_open, arrive_open),
             main_openings=self.main_openings,
             extra_openings=self.extra_openings,

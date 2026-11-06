@@ -271,6 +271,29 @@ rather than raw time genuinely reorders them: the 2.88 s run is quicker unpenali
 2.62 s one (1.88 s against 2.15 s), and loses because it spends that time closer to the
 panels.
 
+**When the route that was picked cannot be finished.** Ranking says which route to keep;
+it cannot say whether that route survives being reduced to waypoints. Two of the finishing
+passes refuse a route outright — the stop-band clearing, where a waypoint ends up holding
+joint 5 inside the band and can be neither removed nor nudged out of it, and the final
+verification, where the finished path will not fly. Both are properties of that route's
+shape rather than of the transit, so the candidates are offered in cost order and the
+first that finishes is the one that ships, over at most `--finish-attempts` of them.
+
+It used to be that the cheapest was the only route ever densified, and a refusal there
+discarded the whole transit with every other candidate unexamined — on exactly the
+transits where the searches had found a choice. On one real segment, two phase-one routes
+were found at two different gun openings; the cheaper was refined for 366 s, lost to the
+stop band, and the transit fell through to the detour with the other route never looked
+at. That was 914 s of a 1777 s segment with nothing kept from any of it.
+
+A retry gets the full refinement budget, so the cost is up to `--finish-attempts` times
+what a transit used to spend after its search. The segment clock bounds it, asked before
+each retry rather than during one, and the first attempt keeps the budget it always had.
+The count is capped because the failure is not always the route's fault: where the only
+way between the two ends takes joint 5 through zero, every candidate is refused the same
+way, and chasing all of them would spend the segment proving it.
+`--finish-attempts 1` restores the old behaviour.
+
 ### How long each run may search
 
 `--ompl-seconds` caps a single solve. It matters independently of the run count: restarting
@@ -1449,6 +1472,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--segment-length-rad` | 0.025 | collision resolution inside the sampling planner, as OMPL's `longest_valid_segment_length`; coarser is quicker and refuses more routes for stepping over something |
 | `--phase-one-runs` | 25 | OMPL runs per transit, keeping the cheapest that solves |
 | `--phase-one-solve-seconds` | 25 | how long one of those runs may search |
+| `--finish-attempts` | 4 | candidate routes a transit may offer to the finishing passes before it is given up on, cheapest first. A route refused by the stop-band clearing or the final verification is refused for its own shape, so the next one is worth trying; 1 is the old behaviour |
 | `--cartesian-solve-seconds` | 120 | time at one gun opening before the tree gives that opening up as having no route, spent on every transit the band is on for; 0 disables the tree. `--cartesian-seconds` still works |
 | `--cartesian-process-seconds` | 40 | how long one opening is searched after its first route there, from new seeds, keeping the cheapest |
 | `--cartesian-gun-openings` | 3 | least gun openings the tree attempts per transit, capped by `--min-gun-openings`. Multiplies the two figures above |

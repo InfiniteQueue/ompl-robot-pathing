@@ -247,6 +247,43 @@ the way, so the joint values in between are whatever that line demands.
   - `_Sampler` carries the zone for scoring only. Nothing plans differently for it: OMPL
     cannot produce linear motion, so the zone says how the route it returns will be flown,
     not how it is searched for.
+- **Ranking picks which route to keep; `_finish_ranked` is what happens when the route it
+  picked cannot be finished.** `_finish` refuses a route outright in two places --
+  `clear_stop_band`, where a waypoint holds joint 5 inside the stop band and can be
+  neither removed nor nudged out of it, and `_verify_runs`, where the finished path will
+  not fly -- and both are properties of that route's *shape*, not of the transit. So the
+  candidates are tried in cost order and the first that finishes ships, over at most
+  `--finish-attempts` (4) of them.
+  - **Taking only the cheapest threw the rest away unexamined, and did so exactly where
+    the searches had found a choice.** Measured on Path 3: `73052-11-R_2t ->
+    73052-06-R_2t` solved twice in phase one, at 115 mm and at 140 mm, refined the cheaper
+    for 366 s, lost it to the stop band at waypoint 4 of 8, and went to the detour with
+    the 327.71 s route never densified -- 914 s of a 1777 s segment and nothing kept from
+    any of it.
+  - **A retry gets the full refinement budget**, so the honest cost is up to
+    `--finish-attempts` times what a transit used to spend after its search. What bounds
+    it is the segment clock, asked before each retry rather than during one, since a
+    refinement stopped halfway leaves nothing usable -- exactly as a search does. The
+    *first* attempt is untouched and takes the budget it always took: clamping that one
+    too would have a long segment start finishing its routes differently because of a flag
+    about retries. A retry clamps, which is the only thing the `first` argument to
+    `finish` is for.
+  - **Bounded rather than exhaustive, and that is the point of the cap.** Where the only
+    way between the two ends takes joint 5 through zero, every candidate is refused for the
+    same reason, and chasing all twenty of phase one's would spend the segment proving it.
+    `--finish-attempts 1` is the old behaviour; 0 is refused by the CLI, a transit that
+    searches and then finishes nothing being no transit.
+  - `record` is appended to only for the candidate that succeeds. Raw routes are paired
+    with returned legs by position, so an attempt that captured its route and was then
+    refused would leave an entry behind for a leg that never shipped -- the reason
+    `plan_freespace` and `_plan_detour` already keep their captures in local lists.
+  - **It covers `_tree_leg` too, where it is nearly free.** A detour's extraction defers
+    all refinement, so an attempt there is a densify, a reduction and the stop-band pass.
+    Worth having for a different reason than on a transit: that leg has no other solver,
+    and a route the stop band refuses ends the extraction and so the whole detour.
+  - The last refusal is what gets raised, not a summary of them. It names the waypoint and
+    the joint value, which is the diagnosis; how many were tried is already in the lines
+    above it.
 - The passes ask one question before checking or pricing anything: `MotionModel.refuses`,
   which is `demotes` or `overreaches`. The two guard the same thing from opposite sides --
   one stops a near-panel stretch being dissolved, the other stops one being grown outward.

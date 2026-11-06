@@ -1620,6 +1620,16 @@ def _make_program(cell: Cell, qa: np.ndarray, qb: np.ndarray) -> cl.CompositeIns
 # How long one OMPL solve may run.  Tesseract's own default, and what this used to be
 # stuck with; see _set_planning_time for why changing it is awkward.
 DEFAULT_PLANNING_TIME = 5.0
+# How many of a transit's candidate routes may be offered to ``_finish`` before the
+# transit is given up on -- see ``_finish_ranked``, which is where this is argued.  Here
+# rather than beside that function because ``plan_freespace`` reads it as a default, and a
+# default is evaluated where the ``def`` is.  Bounded rather than exhaustive because the
+# failure it exists for is not always a property of the route: where the only way between
+# the two ends takes joint 5 through zero, every candidate is refused for the same reason
+# and each attempt costs a whole refinement.  Four is enough to get past a route whose
+# shape happened to be unlucky and few enough that a forced crossing is found out inside
+# one segment clock.
+DEFAULT_FINISH_ATTEMPTS = 4
 # The rest of OMPLSolverConfig's documented defaults, used to recognise the struct.
 _SOLVER_SIGNATURE = (10, 0, 1)          # max_solutions, simplify, optimize
 _planning_time_warned = False
@@ -2021,6 +2031,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    retune_openings: int = 0,
                    zone: LinearZone | None = None,
                    direct_clearance: float = 0.0,
+                   finish_attempts: int = DEFAULT_FINISH_ATTEMPTS,
                    cartesian: "CartesianBudget | None" = None,
                    relocate: "Relocation | None" = None,
                    deadline: "Deadline | None" = None,
@@ -2138,6 +2149,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                      cartesian=cartesian, relocate=relocate,
                                      openings=direct, gun=gun,
                                      stand_off=stand_off,
+                                     finish_attempts=finish_attempts,
                                      deadline=deadline, log=log,
                                      record=raw)
         if record is not None:
@@ -2171,7 +2183,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                        check_step=check_step, continuous_check=continuous_check,
                        direct_clearance=direct_clearance, zone=zone,
                        cartesian=cartesian, relocate=relocate, gun=gun,
-                       stand_off=stand_off, deadline=deadline)
+                       stand_off=stand_off, finish_attempts=finish_attempts,
+                       deadline=deadline)
     # Into a list of its own and handed on only once every leg is in hand, for the reason
     # the direct attempt's is: the caller pairs raw routes with returned legs by position,
     # and a detour that captured two legs and then failed would leave entries behind for
@@ -2206,6 +2219,7 @@ class _LegSettings:
     relocate: "Relocation | None"
     gun: "GunPreference | None"
     stand_off: "StandOff | None"
+    finish_attempts: int
     deadline: Deadline
 
 
@@ -2261,18 +2275,27 @@ def _tree_leg(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, opening: float | No
                                  deadline=cfg.deadline, zone=cfg.zone, gun=cfg.gun)
     if not found:
         raise PlanningError(f"the cartesian tree found no route for {what}")
-    best = _cheapest(found, log)
-    _capture(record, best.route)
-    with cell.gun_opening(opening):
-        # No refinement budget here.  A leg is refined once the whole detour is settled,
-        # grouped with whichever neighbours share its opening -- refining it now would
-        # spend the passes on a route the next leg may yet fail to continue.  The stand-off
-        # trials are part of that deferral and cannot fire without a polish budget, so the
-        # opening that comes back is the one handed in and the caller still owns it.
-        runs, _ = _finish(cell, best.route, zone=cfg.zone, relocate=cfg.relocate,
-                          shortcut_seconds=0.0, polish_seconds=0.0,
-                          check_step=cfg.check_step, log=log)
-        return runs
+
+    def finish(cand: _Solution, _first: bool) -> tuple[list[Run], float | None]:
+        with cell.gun_opening(opening):
+            # No refinement budget here.  A leg is refined once the whole detour is
+            # settled, grouped with whichever neighbours share its opening -- refining it
+            # now would spend the passes on a route the next leg may yet fail to continue.
+            # The stand-off trials are part of that deferral and cannot fire without a
+            # polish budget, so the opening that comes back is the one handed in and the
+            # caller still owns it.  Nothing to clamp on a retry for the same reason.
+            return _finish(cell, cand.route, zone=cfg.zone, relocate=cfg.relocate,
+                           shortcut_seconds=0.0, polish_seconds=0.0,
+                           check_step=cfg.check_step, log=log)
+
+    # Offered the same ranked retry as a direct transit, and here it is nearly free: with
+    # no refinement budget an attempt is a densify, a reduction and the stop-band pass, so
+    # what a second one costs is not what it costs on a transit.  It is worth having for
+    # the same reason -- this leg has no other solver, and a route the stop band refuses is
+    # the end of an extraction and so of the whole detour.
+    runs, _ = _finish_ranked(found, attempts=cfg.finish_attempts, finish=finish,
+                             deadline=cfg.deadline, record=record, log=log)
+    return runs
 
 
 def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
@@ -2398,6 +2421,7 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
                             zone=cfg.zone, cartesian=cfg.cartesian,
                             direct_clearance=cfg.direct_clearance,
                             relocate=cfg.relocate,
+                            finish_attempts=cfg.finish_attempts,
                             openings=GunOpenings.pinned(opening),
                             gun=cfg.gun, deadline=cfg.deadline, log=log, record=got)
             except PlanningError as exc:
@@ -2810,6 +2834,78 @@ def _cheapest(candidates: list[_Solution], log) -> _Solution:
     return best
 
 
+def _finish_ranked(candidates: list[_Solution], *, attempts: int, finish,
+                   deadline: "Deadline | None" = None, record: list | None = None,
+                   log=print) -> tuple[list[Run], float | None]:
+    """The cheapest candidate route ``finish`` accepts, over at most ``attempts`` of them.
+
+    ``_finish`` can refuse a route outright, and both of its refusals are properties of
+    the route's shape rather than of the transit: ``clear_stop_band`` where a waypoint
+    holds joint 5 inside the stop band and can be neither removed nor nudged out of it,
+    and ``_verify_runs`` where the finished path will not fly.  So the next candidate is
+    worth offering -- a different homotopy class, often at a different gun opening, found
+    by a different seed or by the other search entirely.
+
+    Taking only the cheapest threw every other candidate away unexamined, and did so on
+    exactly the transits where the searches had found more than one to choose between.
+    Measured on Path 3: ``73052-11-R_2t -> 73052-06-R_2t`` solved twice in phase one, at
+    115 mm and at 140 mm, refined the cheaper of the two for 366 s, lost it to the stop
+    band at waypoint 4 of 8, and went to the detour with the 327.71 s route never
+    densified.  914 s of a 1777 s segment, and nothing kept from any of it.
+
+    **A retry gets the full refinement budget**, which is the honest cost of this: up to
+    ``attempts`` times what one transit used to spend after its search.  What bounds it is
+    the segment clock, asked before each retry rather than during one -- a refinement
+    stopped halfway leaves nothing usable, exactly as a search does.  The first attempt is
+    untouched and takes the budget it always took, so a transit whose cheapest route
+    finishes costs what it did.
+
+    The caller supplies ``finish`` because the two call sites finish differently: one has
+    the transit's own budgets and stand-off trials, the other is a detour leg deferring
+    all of that.  It is passed the candidate and whether this is the first attempt, the
+    latter being what lets a retry clamp its budgets to the clock while the first does not.
+
+    ``record`` is appended to only for the candidate that succeeds.  A raw route is paired
+    with a returned leg by position at the top of this module, so an attempt that captured
+    its route and was then refused would leave an entry behind for a leg that never
+    shipped -- the same reason ``plan_freespace`` keeps its own captures in a local list.
+    """
+    if not candidates:
+        # Not reachable from either caller -- both raise on an empty set before they get
+        # this far -- but guarded here rather than left to ``_cheapest``, whose ``min``
+        # would answer an empty set with a ``ValueError``.  That is not a planning failure
+        # and would not be caught as one anywhere up the stack.
+        raise PlanningError("no candidate route to finish")
+    best = _cheapest(candidates, log)
+    pool = sorted(candidates, key=lambda c: c.cost)[:max(int(attempts), 1)]
+    last: PlanningError | None = None
+    for n, cand in enumerate(pool, 1):
+        if n > 1:
+            if deadline is not None and deadline.ran_out(
+                    log, f"the next of {len(pool)} candidate routes"):
+                break
+            log(f"      offering candidate {n} of {len(pool)} instead: cost "
+                f"{cand.cost:.2f} s against {best.cost:.2f} s for the cheapest"
+                f"{_gun_note(cand.opening)}, from {cand.source}")
+        mine: list = []
+        _capture(mine, cand.route)
+        try:
+            out, flown = finish(cand, n == 1)
+        except PlanningError as exc:
+            last = exc
+            log(f"      that route cannot be finished: {exc}")
+            continue
+        if record is not None:
+            record.extend(mine)
+        return out, flown
+    if last is not None:
+        # The last refusal, not a summary of them: it names the waypoint and the joint
+        # value, which is the diagnosis, and the lines above have already said how many
+        # were tried.
+        raise last
+    raise PlanningError("no candidate route to finish")
+
+
 def _interleave(first: int, second: int) -> list[bool]:
     """``first`` of one kind and ``second`` of another, each kind evenly spread.
 
@@ -3006,6 +3102,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
                  openings: "GunOpenings | None" = None,
                  gun: "GunPreference | None" = None,
                  stand_off: "StandOff | None" = None,
+                 finish_attempts: int = DEFAULT_FINISH_ATTEMPTS,
                  deadline: "Deadline | None" = None, log=print,
                  record: list | None = None) -> tuple[list[Run], float | None]:
     """A route from ``qa`` to ``qb``, and the gun opening it is to be flown at.
@@ -3023,6 +3120,12 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     see ``_path_cost``.  It reaches the searched routes and not the straight move, which
     is taken at the first opening that clears it rather than being scored against
     anything; ``plan_freespace``'s retune is where that choice is revisited.
+
+    ``finish_attempts`` is how many of the candidate routes may be offered to ``_finish``
+    before the transit is given up on -- see ``_finish_ranked``.  Ranking picks the route;
+    this is what happens when the route that was picked cannot be reduced to one the
+    robot may fly.  1 is the old behaviour, where the cheapest candidate was the only one
+    ever densified.
     """
     openings = openings or GunOpenings.pinned(None)
     deadline = deadline or Deadline()
@@ -3156,15 +3259,23 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
             + (" and the cartesian tree" if tree is not None else "")
             + (f": {sampler.message}" if sampler.message else ""))
 
-    best = _cheapest(candidates, log)
-    _capture(record, best.route)
-    with cell.gun_opening(best.opening):
-        # Shortcut before reducing: the dense path gives the cuts somewhere to land.
-        out, flown = _finish(cell, best.route, zone=zone, relocate=relocate,
-                             shortcut_seconds=shortcut_seconds,
-                             polish_seconds=polish_seconds, check_step=check_step,
-                             opening=best.opening, stand_off=stand_off, gun=gun,
-                             deadline=deadline, log=log)
+    def finish(cand: _Solution, first: bool) -> tuple[list[Run], float | None]:
+        # A retry is work this transit did not used to do, so it takes only the time that
+        # is left; the first attempt keeps the budget it always had, or a long segment
+        # would start finishing its routes differently for a flag about retries.
+        with cell.gun_opening(cand.opening):
+            # Shortcut before reducing: the dense path gives the cuts somewhere to land.
+            return _finish(cell, cand.route, zone=zone, relocate=relocate,
+                           shortcut_seconds=(shortcut_seconds if first
+                                             else deadline.clamp(shortcut_seconds)),
+                           polish_seconds=(polish_seconds if first
+                                           else deadline.clamp(polish_seconds)),
+                           check_step=check_step,
+                           opening=cand.opening, stand_off=stand_off, gun=gun,
+                           deadline=deadline, log=log)
+
+    out, flown = _finish_ranked(candidates, attempts=finish_attempts, finish=finish,
+                                deadline=deadline, record=record, log=log)
     log(f"      reduced to {sum(len(r.states) for r in out)} points in "
         f"{len(out)} run{'' if len(out) == 1 else 's'}{_gun_note(flown)}")
     return out, flown
