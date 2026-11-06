@@ -921,6 +921,19 @@ the way, so the joint values in between are whatever that line demands.
     priced as one whole path either way, so a route that is mostly backed off is still a
     real route; dropping the trial over one waypoint at a reach limit would throw away the
     air gained at the other forty.
+  - **`_retreat_path` solves with `avoid_stop_band`, and until it did this was the one
+    pass that could move an existing waypoint into the joint 5 band.** Every point it
+    touches is a waypoint and a waypoint is a stop, which is exactly what the flag is for;
+    without it a band solution won on nearness like any other. Contrast the other two
+    passes: `polish` refuses such a relocation outright, and `shortcut` installs interior
+    states that are not anchors, which `simplify` then prefers not to keep. The reason the
+    flag is left off elsewhere -- a solve tracking a line, whose stations must stay on the
+    branch they started on -- does not apply, each waypoint here being retreated on its
+    own. It is a preference and not a guarantee, `solve_pose` still answering with a band
+    state where it finds nothing else, and it cannot cost a trial: a non-band solution
+    further from the seed trips `STAND_OFF_JUMP_RAD` and the waypoint keeps what it had,
+    the same fallback as a pose that will not solve. `clear_stop_band` is still the gate;
+    this stops feeding it work.
   - **The opening it chooses is part of the answer and it ships.** The retreat and the
     opening are one trade: flying the backed-off route at the opening it was planned at
     would put the moving electrode back where it started and leave the route priced on a

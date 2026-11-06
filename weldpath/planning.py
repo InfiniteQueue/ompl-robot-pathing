@@ -924,6 +924,19 @@ def _retreat_path(cell: Cell, path: list[np.ndarray], mm: float, axis: np.ndarra
     waypoint at a reach limit would throw away the air gained at the other forty.  Called
     with the trial's own opening already in force, so the collision screen inside
     ``solve_pose`` reads the tip where the trial puts it.
+
+    **Solved with ``avoid_stop_band``**, which is what that flag is for: every point this
+    touches is a waypoint, and a waypoint is a stop.  Without it a band solution won on
+    nearness like any other, so this was the one pass that could move an existing waypoint
+    *into* the band -- ``polish`` refuses such a relocation outright, and ``shortcut`` only
+    installs interior states ``simplify`` may decline to anchor.  The reason the flag is
+    left off elsewhere does not apply here: that is for a solve tracking a line, whose
+    stations have to stay on the branch they started on, where this retreats each waypoint
+    on its own.  It is a preference and not a guarantee -- ``solve_pose`` still returns a
+    band solution when it finds nothing else -- and it cannot make a trial fail: a
+    non-band solution further from the seed simply trips ``STAND_OFF_JUMP_RAD`` and the
+    waypoint keeps the state it had, which is the same fallback as a pose that will not
+    solve at all.  ``clear_stop_band`` remains the gate; this stops feeding it work.
     """
     out = [np.asarray(path[0], dtype=float)]
     held = 0
@@ -931,7 +944,7 @@ def _retreat_path(cell: Cell, path: list[np.ndarray], mm: float, axis: np.ndarra
         q = np.asarray(state, dtype=float)
         T = cell.pose_mm(q)
         T[:3, 3] -= mm * (T[:3, :3] @ axis)
-        got = cell.solve_pose(T, [q])
+        got = cell.solve_pose(T, [q], avoid_stop_band=True)
         if got is None or float(np.max(np.abs(got - q))) > STAND_OFF_JUMP_RAD:
             held += 1
             out.append(q)
