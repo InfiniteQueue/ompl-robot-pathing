@@ -499,7 +499,7 @@ class MotionModel:
         return self.cell.penalty is not None and self.cell.penalty.enabled
 
 
-def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
+def simplify(model: MotionModel, path: list[np.ndarray], log=None) -> list[np.ndarray]:
     """Reduce a path to the fewest waypoints that still traverse it without collision.
 
     From each kept waypoint, reach for the furthest later waypoint the robot can get to
@@ -521,6 +521,25 @@ def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
     are refused, which is what stops this pass, running last, from quietly undoing the
     standoff the shortcut pass just bought: the chord across a corner the robot took wide
     is quicker, collision free, and hard against the panel.
+
+    **A waypoint the robot may not stop at is paid to avoid.**  Reaching past a state in
+    the joint 5 stop band is a preference while there is anywhere further to reach, but
+    when nothing further qualifies the adjacent point used to be taken blind -- and a
+    waypoint left in the band is what ``clear_stop_band`` has to remove or nudge, and what
+    discards the whole route when it can do neither.  So the reach that was rejected purely
+    on *cost* is remembered as it is made, and where the forced point is in the band the
+    nearest of those is taken instead, dearer than the polyline though it is.  Nothing
+    unsafe is accepted this way: every such reach has already passed ``refuses`` and
+    ``check_and_cost``, which is what makes this a price rather than a risk, and the
+    nearest is chosen so the cheapest alternative wins by construction.
+
+    It costs no checking at all, the verdicts being the ones the downward walk already
+    paid for.  What it may cost is time on the route, so the premium is logged: a single
+    step of it overlaps with ``clear_stop_band``'s own removal, which accepts a cost
+    increase too, and the case this adds that nothing else has is the *multi-step* skip --
+    where the adjacent reach is refused or unpriceable rather than merely dear, so removal
+    downstream would fail as well.  The log line is what will say which of the two is
+    happening; nothing here assumes it.
     """
     if len(path) < 3:
         return [p.copy() for p in path]
@@ -545,12 +564,19 @@ def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
     out = [path[0]]
     i = 0
     last = len(path) - 1
+    paid = paid_for = 0
+    premium = 0.0
     while i < len(path) - 1:
         j = last
+        # Reaches that are legal and priceable and merely cost more than the polyline,
+        # recorded as the walk makes them, nearest ``last`` first.  Only read when the
+        # walk runs out on a state the robot may not stop at, and then they are the whole
+        # of what is on offer: a reach rejected for the band is the thing being avoided,
+        # and one rejected by ``refuses`` or by an unpriceable line is not legal at all.
+        dearer: list[tuple[int, float, float]] = []
         while j > i + 1:
-            # Not a stop the robot may make.  Only reached past, not forced: the adjacent
-            # point is still taken unchecked when nothing further works, and
-            # ``clear_stop_band`` deals with it afterwards.
+            # Not a stop the robot may make.  Reached past in preference to anything
+            # nearer; forced only when nothing legal is left, below.
             if j < last and model.cell.in_stop_band(path[j]):
                 j -= 1
                 continue
@@ -562,12 +588,31 @@ def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
             if chord is None:
                 j -= 1
                 continue
-            if chord > polyline_cost(i, j) + 1e-9:
+            # Once: ``polyline_cost`` sums ``move_time`` over the stretch, and that settles
+            # each move's profile, which reads the band -- cached per state on the cell, but
+            # there is no reason to ask twice.
+            plain = polyline_cost(i, j)
+            if chord > plain + 1e-9:
+                dearer.append((j, chord, plain))
                 j -= 1
                 continue
             break
+        if (j == i + 1 and j != last and dearer
+                and model.cell.in_stop_band(path[j])):
+            # The walk has run out on a state the robot may not stop at, so pay for the
+            # nearest reach past it.  ``dearer`` is filled from ``last`` downward, so its
+            # final entry is the nearest and therefore the cheapest alternative there is;
+            # the end of the path is exempt, being the locator the leg runs to.
+            j, chord, plain = dearer[-1]
+            paid += 1
+            paid_for += j - i - 1
+            premium += chord - plain
         out.append(path[j])
         i = j
+    if log and paid:
+        log(f"      simplify: paid {premium:.2f} s to reach past {paid_for} waypoint"
+            f"{'' if paid_for == 1 else 's'} the robot may not stop at, over {paid} "
+            f"reach{'' if paid == 1 else 'es'}")
     return out
 
 
@@ -1120,7 +1165,7 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     improved = shortcut(model, path, time_budget=shortcut_seconds, anchors=anchors,
                         log=log)
     stagetrace.stage("shortcut", model, improved)
-    reduced = simplify(model, improved)
+    reduced = simplify(model, improved, log=log)
     stagetrace.stage("simplify", model, reduced)
     chosen = opening
     if polish_seconds > 0:
@@ -1367,7 +1412,15 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
 
     while time.time() < deadline and len(dense) > 2:
         tried += 1
-        cuts += _try_cut(model, dense, fac, marks, rng, penalised, whole, span_cost)
+        # Half the attempts are aimed at a stop-band crossing while there is one to aim
+        # at, and the aim quietly stops costing anything once there is not -- ``_band_span``
+        # then finds nothing and the draw is the uniform one again.  Half rather than all
+        # because the pass has two jobs here and no reason to prefer either: a route whose
+        # band crossings are all forced would otherwise spend its whole budget proving it.
+        span = (_band_span(model.cell, dense, rng)
+                if rng.random() < BAND_CUT_SHARE else None)
+        cuts += _try_cut(model, dense, fac, marks, rng, penalised, whole, span_cost,
+                         span=span)
 
     if log:
         after = span_cost(0, len(dense) - 1)
@@ -1378,9 +1431,73 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
     return dense
 
 
+# What share of ``shortcut``'s attempts are aimed at a stop-band crossing rather than
+# drawn uniformly.  Half, because the pass has two jobs and nothing says which matters
+# more on a given route: the aim costs nothing once no crossing can be cut -- ``_band_span``
+# returns ``None`` and the draw is the uniform one -- so the share is only ever spent where
+# there is something to spend it on.
+BAND_CUT_SHARE = 0.5
+
+
+def _band_span(cell: Cell, dense: list[np.ndarray], rng) -> tuple[int, int] | None:
+    """A span of ``dense`` whose two ends straddle a joint 5 stop-band crossing, or ``None``.
+
+    A waypoint in the band is what ``clear_stop_band`` has to remove or nudge, and what
+    discards the route when it can do neither.  ``shortcut`` is the pass that can make the
+    band states *not exist*, by replacing the stretch holding them -- but it draws its
+    spans uniformly, so on a dense route of hundreds of states it almost never draws one.
+
+    **The ends have to sit on the same side of the band, and that is not a heuristic.**  A
+    joint move is ``a + t*(b - a)``, so joint 5 runs monotonically from one end to the
+    other: if both ends are outside the band on the same side, no state of the replacement
+    can be inside it, and the removal is guaranteed rather than hoped for.  Where the two
+    ends straddle zero the replacement must cross through, and the cut achieves nothing.
+    A linear move's stations come from inverse kinematics along the tool's line and are
+    not monotone in any joint, so there the guarantee does not hold and the ``_try_cut``
+    comparison is all there is -- which is why this aims the draw and decides nothing.
+
+    So returning ``None`` is itself the diagnosis of a forced crossing: where joint 5
+    crosses zero once and stays on the far side, no same-sided span straddles it, and no
+    cut of any kind can remove the band states.  That is the case ``--finish-attempts``
+    exists to stop the planner chasing.
+
+    The minimal span is returned -- out to the nearest state outside the band on each side
+    -- being both the likeliest to be collision free and the cheapest to check.  Width is
+    left to the uniform draw, which is still running on the other attempts.
+
+    Indices are read off ``dense`` as it stands, not cached: ``_try_cut`` splices the list,
+    which shifts every index past a kept cut.  It is a pure arithmetic test per state, so a
+    walk of the whole list is nothing beside the collision check an attempt is about to pay.
+    """
+    inside = [cell.in_stop_band(q) for q in dense]
+    band = [k for k, hit in enumerate(inside) if hit]
+    if not band:
+        return None
+    k = int(band[rng.integers(len(band))])
+    i = k - 1
+    while i >= 0 and inside[i]:
+        i -= 1
+    j = k + 1
+    while j < len(dense) and inside[j]:
+        j += 1
+    if i < 0 or j >= len(dense) or j - i < 2:
+        return None                     # the crossing runs off one end of the route
+    a = float(dense[i][STOP_BAND_JOINT])
+    b = float(dense[j][STOP_BAND_JOINT])
+    if (a >= 0.0) != (b >= 0.0):
+        return None                     # straddles zero: the crossing is forced
+    return i, j
+
+
 def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
-             span_cost) -> int:
+             span_cost, span: tuple[int, int] | None = None) -> int:
     """Replace dense[i..j] with the straight move between the ends, if that is cheaper.
+
+    ``span`` names the stretch to try instead of drawing one uniformly -- see
+    ``_band_span``, which aims some of the attempts at a stop-band crossing.  It changes
+    only which cut is *proposed*: the comparison below is the same cost test either way, so
+    an aimed cut that is dearer is rejected exactly as a drawn one would be.  This pass
+    therefore cannot be made to install a band removal that costs time, and does not try.
 
     The comparison is made over the whole region between the anchors either side of the
     cut, not over ``i..j`` alone.  Under the per-sub-step rule those outer stretches are
@@ -1398,7 +1515,7 @@ def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
     Where the waypoints go is ``simplify``'s decision, made on stop-to-stop time where an
     extra stop costs a pair of ramps; this pass may only reshape the route between them.
     """
-    i, j = sorted(rng.integers(0, len(dense), size=2))
+    i, j = span if span is not None else sorted(rng.integers(0, len(dense), size=2))
     if j - i < 2:
         return 0
     # How wide the comparison has to be.  Under the whole-move rule a cut that swallows an
