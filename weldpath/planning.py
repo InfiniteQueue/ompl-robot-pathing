@@ -3542,10 +3542,18 @@ def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> Non
     where = (f"; {grid} moves refused on the joint grid"
              + (f" ({early} in its sparse pass)" if early else "")
              + f" and {sub} by the tool-space subdivision" if grid or sub else "")
+    # Which probe the queries actually went to, each threshold having its own manager.
+    # The total alone cannot tell a 5 mm relaxation read on the search's own hot path from
+    # a 120 mm reach read in a pass, and the two differ about fourfold in cost -- so
+    # without this there is no way to say where a transit's clearance time went.
+    widths = sorted(((k.split(":", 1)[1], v) for k, v in d.items()
+                     if k.startswith("probe:") and v > 0), key=lambda kv: -kv[1])
+    byprobe = ("; by probe " + ", ".join(f"{n} at {w} mm" for w, n in widths)
+               if widths else "")
     log(f"      work: {d['clearance']} clearance queries ({served:.0f}% of {asked} served "
         f"from cache{share}), {d['collision_tests']} collision tests, "
         f"{d['state_loads']} state loads, {d['fk']} forward kinematics, "
-        f"in {elapsed:.1f}s{scoped}{where}")
+        f"in {elapsed:.1f}s{scoped}{where}{byprobe}")
 
 
 def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
@@ -3810,18 +3818,19 @@ def _chain_scan(cell: Cell, chain: list[np.ndarray], check_step: float,
 def _reads_near(cell: Cell, q: np.ndarray, near_mm: float) -> bool:
     """Whether ``q`` is within ``near_mm`` of the parts, as far as the clearance query knows.
 
-    ``clearance_mm`` returns the probe distance itself when nothing lies within the probe,
-    so a reading at the probe is "nothing seen", not a distance, and it has to be kept out
-    of an at-or-under test.  Compared as a distance it passed whenever the probe was no
-    wider than the band: ``ToolpathPlanner`` sized the two equal, every state of every leg
-    read as near, and nearly every move shipped linear.
+    A reading saturates at the probe that took it, so a reading at the probe is "nothing
+    seen" and not a distance, and it has to be kept out of an at-or-under test.  Compared
+    as a distance it passed whenever the probe was no wider than the band: every state of
+    every leg read as near, and nearly every move shipped linear.
 
-    The caller has to have sized the probe past ``near_mm`` -- ``ToolpathPlanner`` does --
-    or states clear by more than the probe and less than the band are missed.  The probe
-    only ever grows, so once it is past the band this answer no longer depends on it.
+    Both halves of that test, and the choice of a manager wide enough to make it, are
+    ``Cell.clearance_within``'s now.  They moved because the test needs the probe the
+    reading came off and this caller can no longer know it: each threshold gets a manager
+    sized to itself, so ``near_mm`` is decided by a ``near_mm`` probe rather than by the
+    widest one anything in the program asked for -- 81 ms a query against 180 at the
+    defaults, measured on Path 4's cell.  Nothing about the answer changed.
     """
-    reading = cell.clearance_mm(q)
-    return reading < cell.probe_mm and reading <= near_mm
+    return cell.clearance_within(q, near_mm)
 
 
 def _split_runs(model: "MotionModel", pts: list[np.ndarray]) -> list[Run]:

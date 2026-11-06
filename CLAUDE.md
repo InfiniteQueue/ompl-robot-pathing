@@ -160,15 +160,35 @@ the way, so the joint values in between are whatever that line demands.
     the curve each move will really be flown along, which needs a model, and the model
     could not exist until the gate had ruled -- so the route was densified once along the
     chord to answer the gate and again along the real curves afterwards. One pass now.
-  - "Near" is `_reads_near`: `clearance_mm(q) <= near_mm` **and** `< cell.probe_mm`.
-    `clearance_mm` returns the probe distance when nothing is in range, so a saturated
-    reading is "nothing seen", never a distance. `ToolpathPlanner` asks for a probe of
-    `near_mm + NEAR_PANEL_HEADROOM_MM` so the band is always measurable. Both halves are
-    needed. Before, the probe was `max(near_mm, obstacle clearance + 25)`, exactly
-    `near_mm` at the defaults, and the plain `<=` test put every state in range: logs
-    said 100% of every leg, and nearly every move shipped linear.
-    `fallback.validity.Validator` widening the shared probe mid-run used to change labels
-    too; with the probe already past the band it no longer can.
+  - "Near" is `Cell.clearance_within(q, near_mm)`: the reading at or under `near_mm`
+    **and** short of the probe that took it. A manager reports its own probe distance when
+    nothing is in range, so a saturated reading is "nothing seen", never a distance, and
+    both halves are needed. Before, the probe was `max(near_mm, obstacle clearance + 25)`,
+    exactly `near_mm` at the defaults, and the plain `<=` test put every state in range:
+    logs said 100% of every leg, and nearly every move shipped linear.
+  - **Every threshold has its own clearance manager, and that is why the test lives on the
+    cell rather than at the caller.** `Cell._probe_for` keeps one manager per threshold
+    asked of it, built on demand, sized to that threshold plus `PROBE_EPSILON_MM`, with
+    its own cache. So the band is decided by a 50 mm probe instead of by the widest probe
+    anything in the program asked for -- 81 ms a query against 180, measured on Path 4's
+    11688 shells. The test moved off `_reads_near` because it needs the probe the reading
+    came from and the caller can no longer know which manager answered; `_reads_near`
+    remains as a one-line delegation and the answer is unchanged.
+    - **The caches have to stay separate, and that is the whole reason for the structure.**
+      One state honestly reads 120.0 against one manager and 5.0 against another, so a
+      shared cache would hand the band test a reading saturated at 5 mm -- the same
+      confusion that once made every move linear, read from the other end.
+    - `clearance_within` is at-or-under; `clearance_under` is strictly under. They are not
+      interchangeable: the band counts a state exactly at `near_mm` as near, while the
+      scoped weld relaxation counts one exactly at its floor as clear. One method serving
+      both would have moved a boundary the relaxation pins deliberately.
+    - `fallback.validity.Validator` widening the shared probe mid-run used to change
+      labels too. It still cannot, and now for a structural reason rather than a numerical
+      one: the band reads a manager of its own that nothing else resizes.
+    - The widest threshold reuses the shared manager rather than cloning a twin, that
+      being the threshold which sized it. Reuse needs both halves of `width >=
+      self._probe_mm > key`: a manager narrower than the threshold would saturate inside
+      the range being asked about and answer no to every state beyond it.
   - A failed `_verify_runs` discards the route. Nothing re-plans or relabels a stretch
     whose profile cannot be flown.
 - `shortcut`, `simplify` and `polish` all go through `MotionModel`, so a move destined for
@@ -242,11 +262,19 @@ the way, so the joint values in between are whatever that line demands.
     linear wherever it runs, so a tighter limit would refuse the reshaping `demotes`
     deliberately allows and freeze every near-panel stretch. 0 switches the rule off, and
     `refuses` is then `demotes` exactly.
-  - Measured by `_reads_near` against the limit, so the probe has to see past it:
-    `ToolpathPlanner` asks for `max(near_mm, reach_mm) + NEAR_PANEL_HEADROOM_MM`, 145 mm at
-    the defaults against 75 mm before. Beyond the probe every state reads the same, so this
-    is deliberately a yes-or-no rather than a ranking of one overreach against another --
-    there is no measurement to rank with.
+  - Measured by `clearance_within` against the limit, on a manager sized to the limit.
+    `ToolpathPlanner` still asks for `max(near_mm, reach_mm) + NEAR_PANEL_HEADROOM_MM`,
+    but that headroom is now `PROBE_EPSILON_MM` and the figure is 120 mm -- against 145
+    before the headroom was looked at, and 75 before the limit existed. **The 25 mm bought
+    nothing.** What the width has to do is let a state standing exactly at the threshold
+    read its real distance instead of saturating, which any epsilon does; both callers
+    keep the comparison and throw the reading away. It cost the difference between a
+    145 mm probe and a 120 mm one, 180 ms a query against 153. Contrast
+    `CLEARANCE_REPORT_HEADROOM_MM`, still 25 mm, which widens a probe so the *number* in
+    a locator's report is informative and where the magnitude is the whole of the point.
+  - Beyond the probe every state reads the same, so this is deliberately a yes-or-no
+    rather than a ranking of one overreach against another -- there is no measurement to
+    rank with.
   - It gates the passes only. The initial split is untouched: the dense route's states sit
     one check step apart, so a move out of the band into it is short by construction, and
     the reach only appears once a pass lengthens a move.
@@ -589,6 +617,14 @@ the way, so the joint values in between are whatever that line demands.
     off; with it on, the distance test is free -- the state is loaded and the tool
     position costs no kinematics -- and the clearance read is the fused, cached one and is
     reached only away from the welds, which is where the answer is in doubt.
+  - **It is therefore the hottest clearance reader in the program, and it reads a manager
+    sized to its own floor.** Being on `in_collision` puts it on the path every search
+    walks: Path 1's traverse leg logged 1611 clearance queries against 1607 collision
+    tests, one apiece, and until each threshold had its own manager every one of them was
+    a 5 mm question asked of a 145 mm probe. `clearance_under` and not
+    `clearance_within`, the floor itself being clear rather than refused -- and the
+    strictly-under polarity needs no saturation guard, since a reading that saturates is
+    at or above the probe and so at or above the floor.
   - **Centres come from the anchor states, not from `pose_world`**: where the robot is put
     rather than what the study asked for, the two differing by `--weld-shift-mm`, which is
     exactly the distance that matters here.

@@ -99,6 +99,15 @@ COUNTER_NAMES = ("state_loads", "clearance", "clearance_hits", "clearance_fused"
 # on candidates it drew once and threw away.
 CLEARANCE_CACHE_MAX = 250_000
 
+# How far past a threshold a manager built to decide that threshold is probed.  A reading
+# saturates at its own probe, so a manager sized exactly at the threshold reports the
+# threshold both for a state standing at it and for one a metre out, and an at-or-under
+# test then reads as strictly-under at the boundary.  Any epsilon settles that; the
+# magnitude buys nothing, the reading being thrown away and only the comparison kept.
+# Contrast ``toolpath.CLEARANCE_REPORT_HEADROOM_MM``, which widens a probe so the *number*
+# is informative and where the magnitude is the whole of the point.
+PROBE_EPSILON_MM = 0.001
+
 
 @dataclass(frozen=True)
 class Contact:
@@ -137,16 +146,17 @@ class Cell:
         # ask it of the same states repeatedly.  Keyed by the gun opening as well as the
         # joint vector, since where the moving tip sits changes the answer.
         self._clearance_cache: dict[tuple[float, bytes], float] = {}
-        # A second, narrower clearance manager, for the one caller that does not need the
-        # wide one: the penalty.  See _build_penalty_probe.  None means there is nothing
-        # to gain from it and the factor reads go through the wide manager as they did.
-        self._nm = None
-        self._narrow_mm = 0.0
-        # Its own cache, and it has to be its own.  A narrow reading saturates at the
-        # narrow probe, so handing one to the band test would report a state 60 mm out as
-        # sitting at 25 -- which is exactly the confusion ``_reads_near`` exists to avoid,
-        # and which once made nearly every move ship linear.
-        self._penalty_cache: dict[tuple[float, bytes], float] = {}
+        # Clearance managers by the threshold they were built to decide, each with its
+        # own cache -- and the caches have to be separate.  A reading saturates at the
+        # probe that took it, so one state honestly reads 120.0 against one manager and
+        # 5.0 against another, and a cache shared between two widths would hand a caller
+        # a number measured against a question it did not ask.  That is the confusion
+        # :meth:`clearance_within` exists to remove, and it once made nearly every move
+        # ship linear.  ``_pm`` is registered here too, under the thresholds it decides.
+        self._probes: dict[float, tuple[object, dict, float]] = {}
+        # The threshold the penalty reads at, or None to read the wide manager.  See
+        # _build_penalty_probe.
+        self._penalty_probe_mm: float | None = None
         # The same trick for the tool's position, which the cost arithmetic asks for far
         # more often than anything asks for a whole transform.
         self._tcp_cache: dict[tuple[float, bytes], np.ndarray] = {}
@@ -366,7 +376,13 @@ class Cell:
         gap = float(np.min(np.linalg.norm(self._relax_points - tcp, axis=1)))
         if gap <= self._relax_radius:
             return False            # the weld's own neighbourhood, which the relaxation is for
-        if self._clearance_here(q) >= self._relax_floor:
+        # Asked of a 5 mm manager at the defaults rather than of the wide one.  The
+        # question is whether the state is clear by at least the floor, which saturation
+        # answers correctly -- a state beyond the probe reads the probe, which is at or
+        # past the floor, and is not refused -- so a manager sized to the floor decides
+        # it exactly.  This is the read that runs on the search's own hot path, every
+        # ``in_collision`` the solver makes arriving here.
+        if not self.clearance_under(q, self._relax_floor, loaded=True):
             return False
         self.counters["weld_scoped"] += 1
         return True
@@ -445,17 +461,34 @@ class Cell:
                     f"robot-to-part pair")
             self._build_proximity(self._extra_probe_mm, log=log)
 
+    def _clone_probe(self, probe_mm: float):
+        """A clone of the collision scene reporting robot-to-part pairs within ``probe_mm``.
+
+        The default margin is driven hugely negative so self-collision pairs stay silent
+        and the query cost is confined to the pairs a clearance question is about.
+
+        Cloning is free: measured on Path 4's cell, 11688 shells, the build took 0.00 s at
+        every width from 10 mm to 145.  What a manager costs is its broadphase's memory
+        and the width it is asked to sweep, not its construction -- which is why a probe
+        per threshold is affordable at all.
+        """
+        probe = probe_mm * self.man.scale
+        pm = self._cm.clone()
+        pm.setDefaultCollisionMargin(-1.0)
+        for a, b in _obstacle_margins(self.man):
+            pm.setCollisionMarginPair(a, b, probe)
+        pm.setActiveCollisionObjects(self.env.getActiveLinkNames())
+        return pm
+
     def _build_proximity(self, probe_mm: float, log=None) -> None:
         self._pm = None
         self._probe_mm = 0.0
+        # Every registered manager was cloned from the collision scene as it stood, with
+        # margins set then, so a rebuild invalidates all of them and not just the wide
+        # one.  They are rebuilt on demand; see _probe_for.
+        self._probes.clear()
         if probe_mm > 0.0:
-            probe = probe_mm * self.man.scale
-            pm = self._cm.clone()
-            pm.setDefaultCollisionMargin(-1.0)
-            for a, b in _obstacle_margins(self.man):
-                pm.setCollisionMarginPair(a, b, probe)
-            pm.setActiveCollisionObjects(self.env.getActiveLinkNames())
-            self._pm = pm
+            self._pm = self._clone_probe(probe_mm)
             self._probe_mm = float(probe_mm)
         # Readings taken against the old manager, at whatever probe it had, do not carry.
         self._clearance_cache.clear()
@@ -488,22 +521,19 @@ class Cell:
         threshold already at or past the wide probe, in which case the factor reads use
         the wide manager and its cache exactly as they did.
         """
-        self._nm = None
-        self._narrow_mm = 0.0
-        self._penalty_cache.clear()
+        self._penalty_probe_mm = None
         if self.penalty is None or not self.penalty.enabled:
             return
         probe_mm = float(self.penalty.probe_mm)
         if probe_mm <= 0.0 or probe_mm >= self._probe_mm:
             return
-        probe = probe_mm * self.man.scale
-        nm = self._cm.clone()
-        nm.setDefaultCollisionMargin(-1.0)
-        for a, b in _obstacle_margins(self.man):
-            nm.setCollisionMarginPair(a, b, probe)
-        nm.setActiveCollisionObjects(self.env.getActiveLinkNames())
-        self._nm = nm
-        self._narrow_mm = probe_mm
+        # Registered at exactly ``probe_mm`` with no epsilon, unlike every other threshold
+        # here.  The penalty returns 1.0 at and beyond its own threshold, so a reading
+        # that saturates there gives the factor the true distance would have given; the
+        # band and reach tests need the epsilon because their answer changes at the
+        # boundary, and this one does not.
+        self._probes[probe_mm] = (self._clone_probe(probe_mm), {}, probe_mm)
+        self._penalty_probe_mm = probe_mm
         if log:
             log(f"  and a second one that can see only {probe_mm:g} mm, for the clearance "
                 f"penalty, which reads 1x at and beyond that and is what every station of "
@@ -517,6 +547,88 @@ class Cell:
         and anything reporting a distance has to be able to say which of the two it has.
         """
         return self._probe_mm
+
+    def _probe_for(self, threshold_mm: float):
+        """The manager, cache and probe width for deciding ``threshold_mm``.
+
+        Built on first use and kept until the geometry changes.  Keyed on the threshold
+        rather than on the width, so the epsilon stays an implementation detail and two
+        callers asking the same question share one warm cache.
+
+        The wide manager is reused where it is already no wider than a dedicated one
+        would be *and* still wide enough to decide the threshold -- that being the case
+        for whichever threshold sized it in the first place.  Both halves are needed:
+        reusing a manager narrower than the threshold would saturate inside the range the
+        caller is asking about and answer no to every state beyond it.
+        """
+        if self._pm is None:
+            return None, None, 0.0
+        key = float(threshold_mm)
+        got = self._probes.get(key)
+        if got is None:
+            width = key + PROBE_EPSILON_MM
+            if width >= self._probe_mm > key:
+                got = (self._pm, self._clearance_cache, self._probe_mm)
+            else:
+                got = (self._clone_probe(width), {}, width)
+            self._probes[key] = got
+        return got
+
+    def clearance_within(self, q: np.ndarray, threshold_mm: float, *,
+                         loaded: bool = False) -> bool:
+        """Whether anything lies within ``threshold_mm`` of the robot or the gun.
+
+        The whole of the question the band test, the reach test and the scoped weld
+        relaxation ask, and it belongs here rather than at those callers because the
+        answer needs the probe the reading was taken at.  A reading saturates at its own
+        probe, so ``clearance_mm(q) <= threshold`` is sound only where the probe is known
+        to be wider; compared against the wrong probe it is how every state of every leg
+        once read as near and nearly every move shipped linear.
+
+        Each threshold gets a manager sized to it, so a 5 mm question costs a 5 mm query.
+        That matters because these are the frequent readers and they all used to read the
+        widest probe anything in the program asked for -- 145 mm at the defaults, since
+        ``--linear-introduce-mm`` is 120 and the reading had to be distinguishable from
+        the query running out of range.  Measured on Path 4's cell, 11688 shells, each
+        width averaged over the 45 states of one route: 180 ms a query at 145 mm, 153 at
+        120, 81 at 50, 59 at 10, 52 at 5.  An earlier sweep of the same cell read 252 ms
+        at 145 and the same 58 at 10, so the wide end of this moves about a quarter with
+        machine state while the narrow end does not.  What is stable is the ordering, and
+        that the floor is the shell sweep and the state load rather than the margin --
+        which is why a narrower probe stops paying off somewhere around 10 mm.
+
+        The relaxation is the one that gained most, being hung off :meth:`in_collision`
+        and so on the path every search walks.  Path 1's traverse leg logged 1611
+        clearance queries against 1607 collision tests -- one apiece, every one of them a
+        5 mm question asked of a 145 mm manager.
+        """
+        pm, cache, probe = self._probe_for(threshold_mm)
+        if pm is None:
+            return False
+        reading = self._clearance(q, loaded, pm=pm, cache=cache, probe=probe)
+        return reading < probe and reading <= threshold_mm
+
+    def clearance_under(self, q: np.ndarray, threshold_mm: float, *,
+                        loaded: bool = False) -> bool:
+        """Whether anything lies *strictly* under ``threshold_mm`` of the robot or the gun.
+
+        :meth:`clearance_within` read the other way, and the two are not interchangeable
+        at the boundary: the band is an at-or-under test, where a state exactly at
+        ``--near-panel-mm`` counts as near, and the scoped weld relaxation is a
+        strictly-under one, where a state exactly at the floor is clear and is not
+        refused.  One method serving both would have moved that boundary, and the
+        relaxation's is pinned deliberately -- it only ever *adds* collisions, so where it
+        stops adding them is part of the rule.
+
+        Needs no saturation guard, unlike its sibling.  A reading saturates at or above
+        the probe, the probe is at or above the threshold, so "nothing found" fails a
+        strictly-under test on its own.
+        """
+        pm, cache, probe = self._probe_for(threshold_mm)
+        if pm is None:
+            return False
+        return self._clearance(q, loaded, pm=pm, cache=cache,
+                               probe=probe) < threshold_mm
 
     def clearance_mm(self, q: np.ndarray) -> float:
         """Closest approach between the robot or gun and the static objects, in mm.
@@ -540,31 +652,41 @@ class Cell:
         """
         return self._clearance(q, loaded=True)
 
-    def _clearance(self, q: np.ndarray, loaded: bool, narrow: bool = False) -> float:
-        """The cache both clearance entry points share; ``loaded`` skips the state load.
+    def _clearance(self, q: np.ndarray, loaded: bool, *,
+                   pm=None, cache=None, probe=None) -> float:
+        """The cache every clearance read shares; ``loaded`` skips the state load.
 
-        ``narrow`` reads the penalty's own manager instead of the wide one, with its own
-        cache.  The two must never share one: a reading saturates at the probe that took
-        it, so the same state honestly reads 145.0 against one manager and 25.0 against
-        the other, and a caller comparing against the band would be told the wrong thing.
+        ``pm``/``cache``/``probe`` name a manager other than the wide one -- one built for
+        a single threshold, see :meth:`_probe_for`.  A cache must never be shared between
+        two widths: a reading saturates at the probe that took it, so one state honestly
+        reads 120.0 against one manager and 5.0 against another, and a caller handed the
+        wrong one is told something about a question it did not ask.
+
+        Counted per probe as well as in total, so a run says which widths its queries went
+        to.  Nothing else could: thresholds are registered by their callers, and the total
+        alone cannot tell a 5 mm relaxation read from a 120 mm reach read.
         """
-        pm = self._nm if narrow else self._pm
+        if pm is None:
+            pm, cache, probe = self._pm, self._clearance_cache, self._probe_mm
         if pm is None:
             return float("inf")
-        cache = self._penalty_cache if narrow else self._clearance_cache
         key = (self.gun_value, np.asarray(q, dtype=float).tobytes())
         hit = cache.get(key)
         if hit is not None:
             self.counters["clearance_hits"] += 1
             return hit
         self.counters["clearance"] += 1
+        tag = f"probe:{probe:g}"
+        self.counters[tag] = self.counters.get(tag, 0) + 1
         if loaded:
             self.counters["clearance_fused"] += 1
         else:
             # Deliberately not set_state: refreshing the planning manager's transforms
             # costs as much as the query itself and nothing here will ask it anything.
             self._load_state(q)
-        got = self._clearance_now(narrow=narrow)
+        pm.setCollisionObjectsTransform(self._state.link_transforms)
+        worst = min((float(c.distance) for c in _contact_test(pm)), default=None)
+        got = probe if worst is None else worst / self.man.scale
         if len(cache) >= CLEARANCE_CACHE_MAX:
             # Relocation candidates are drawn at random and never revisited, so the cache
             # grows with states that will never be asked for again.  Dropping the lot is
@@ -572,14 +694,6 @@ class Cell:
             cache.clear()
         cache[key] = got
         return got
-
-    def _clearance_now(self, narrow: bool = False) -> float:
-        """Clearance at the state already loaded.  Assumes ``_load_state`` has just run."""
-        pm = self._nm if narrow else self._pm
-        probe = self._narrow_mm if narrow else self._probe_mm
-        pm.setCollisionObjectsTransform(self._state.link_transforms)
-        worst = min((float(c.distance) for c in _contact_test(pm)), default=None)
-        return probe if worst is None else worst / self.man.scale
 
     def penalty_factor(self, q: np.ndarray) -> float:
         """Cost multiplier for standing where ``q`` puts the robot."""
@@ -592,14 +706,16 @@ class Cell:
     def _factor(self, q: np.ndarray, loaded: bool) -> float:
         """The penalty factor, read at the narrowest probe that can answer it.
 
-        ``_nm`` is that probe where one is worth building; where it is not -- see
-        :meth:`_build_penalty_probe` -- this falls back to the wide manager and behaves
-        exactly as it did before there were two.
+        ``_penalty_probe_mm`` is that probe where one is worth building; where it is not
+        -- see :meth:`_build_penalty_probe` -- this falls back to the wide manager and
+        behaves exactly as it did before there were two.
         """
         if self.penalty is None:
             return 1.0
-        if self._nm is not None:
-            return self.penalty.factor(self._clearance(q, loaded, narrow=True))
+        if self._penalty_probe_mm is not None:
+            pm, cache, probe = self._probe_for(self._penalty_probe_mm)
+            return self.penalty.factor(
+                self._clearance(q, loaded, pm=pm, cache=cache, probe=probe))
         if self._pm is None:
             return 1.0
         return self.penalty.factor(self._clearance(q, loaded))

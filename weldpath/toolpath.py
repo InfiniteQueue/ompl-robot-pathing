@@ -23,7 +23,7 @@ import numpy as np
 from . import meshprep
 from . import stagetrace
 from . import treetrace
-from .cell import STOP_BAND_JOINT, Cell
+from .cell import PROBE_EPSILON_MM, STOP_BAND_JOINT, Cell
 from .manifest import Locator, Manifest
 from .cartesian import CartesianBudget
 from .fallback import FallbackFinder
@@ -216,7 +216,16 @@ CLEARANCE_REPORT_HEADROOM_MM = 25.0
 # How far past --near-panel-mm the clearance query has to see.  A reading at the probe means
 # nothing was found within it, so a probe no wider than the band cannot tell a state inside
 # the band from one far outside it.
-NEAR_PANEL_HEADROOM_MM = 25.0
+#
+# An epsilon, and 25 mm until it was looked at.  What the width has to do is make a state
+# standing exactly at the threshold read its real distance instead of saturating, which
+# any epsilon does; the reading itself is thrown away by both callers, who keep only the
+# comparison.  25 mm therefore bought nothing and cost the difference between a 145 mm
+# probe and a 120 mm one, 180 ms a query against 153, measured on Path 4's cell.  It
+# must stay equal to ``PROBE_EPSILON_MM`` so that the manager this sizes and the one
+# ``--linear-introduce-mm``'s own threshold asks for are the same object rather than two
+# clones a thousandth of a millimetre apart.
+NEAR_PANEL_HEADROOM_MM = PROBE_EPSILON_MM
 
 
 class ToolpathPlanner:

@@ -715,12 +715,23 @@ long joint moves by cutting across them once both ends of a cut lie outside the 
 **How "near" is measured.** The clearance query only looks as far as its probe, and when it
 finds nothing within that it returns the probe distance itself. So a state counts as near
 only when its reading is at or under `--near-panel-mm` *and* short of the probe; a reading at
-the probe means nothing was found, not that something is exactly that far away. The probe
-is sized to `--near-panel-mm` plus 25 mm, so every state inside the band is measured
-properly. `--linear-introduce-mm` is read by the same test, so the probe is sized past
-whichever of the two is the wider — 145 mm at the defaults. It can grow further during a
-run — a fallback-pose search widens it to `--fallback-distance-mm` — but it never drops
-below the band, so that changes no label.
+the probe means nothing was found, not that something is exactly that far away.
+
+Each threshold the program tests against gets its own clearance manager, sized to that
+threshold and no wider. So the band is decided by a 50 mm probe, `--linear-introduce-mm` by
+a 120 mm one, the clearance penalty by one as wide as `--stepped-penalty-zero-mm`, and the
+scoped weld clearance's floor by a 5 mm one. That matters because a wider probe inflates
+every shell's bounds before the broadphase runs: measured on a 11688-shell cell, averaged
+over the 45 states of one route, one query costs 180 ms at 145 mm, 153 at 120, 81 at 50,
+59 at 10 and 52 at 5. The readings are the same ones
+the single shared probe gave — a manager reports its own probe when nothing is within it,
+so a state outside the threshold fails the comparison either way — and each manager keeps
+its own cache, because a reading only means anything beside the probe that took it.
+
+A probe is sized to its threshold plus a thousandth of a millimetre, which is enough to let
+a state standing exactly at the threshold read its real distance rather than saturate. The
+figure used to be 25 mm, which made the widest probe 145 mm instead of 120 and bought
+nothing: both callers keep the comparison and throw the distance away.
 
 Past the probe every state reads the same, which is why the introduce limit is a yes-or-no
 and not a ranking: a state 130 mm clear and one a metre clear are both simply out of
