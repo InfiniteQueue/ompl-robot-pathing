@@ -251,6 +251,8 @@ class ToolpathPlanner:
                  weld_clearance_mm: float | None = None,
                  scoped_weld_clearance: bool = True,
                  weld_clearance_radius_mm: float = 50.0,
+                 earned_weld_clearance: bool = True,
+                 weld_clearance_slack_mm: float = 1.0,
                  stand_off_search: bool = True, stand_off_scan_mm: float = 0.5,
                  stand_off_resolution_mm: float = 0.05,
                  opening_search: bool = True, opening_scan_mm: float = 10.0,
@@ -373,6 +375,11 @@ class ToolpathPlanner:
         # anywhere at the weld clearance, however far from the weld it is.
         self.scoped_weld_clearance = bool(scoped_weld_clearance)
         self.weld_clearance_radius_mm = max(0.0, float(weld_clearance_radius_mm))
+        # The weld clearance a transit is planned at is read off its own weld poses rather
+        # than taken flat, the shift having already bought air the margin never looked at.
+        # See _earned_weld_clearance; the slack is how far under the reading it sits.
+        self.earned_weld_clearance = bool(earned_weld_clearance)
+        self.weld_clearance_slack_mm = max(0.0, float(weld_clearance_slack_mm))
         # A weld blocked at its shifted pose searches the shorter stand-offs back towards the
         # imported one; see _search_stand_off.
         if stand_off_scan_mm <= 0.0 or stand_off_resolution_mm <= 0.0:
@@ -458,23 +465,109 @@ class ToolpathPlanner:
         tries is at the locator itself, so there is nothing there for a radius to exclude,
         and a weld that places today must not stop placing because of a flag about
         transits.
+
+        The margin itself is **earned from the poses** where the anchors are in hand --
+        see :meth:`_earned_weld_clearance`.  Placement still gets the declared figure
+        flat, there being nothing measured yet to derive one from.
         """
         welds = [l for l in locators if l.is_weld]
         if self.weld_clearance is None or not welds:
             return self.cell.clearance(self.cell.obstacle_clearance)
-        if not self.scoped_weld_clearance or anchors is None:
+        if anchors is None:
             return self.cell.clearance(self.weld_clearance)
+        margin = self._earned_weld_clearance(locators, welds, anchors)
+        if not self.scoped_weld_clearance:
+            return self.cell.clearance(margin)
         points = [self.cell.fk(anchors[l.name])[:3, 3] for l in welds if l.name in anchors]
         if not points:
-            return self.cell.clearance(self.weld_clearance)
+            return self.cell.clearance(margin)
         # Read before the permissive margin goes in, or the floor would be the weld's own.
-        return self._scoped_clearance(points, self.cell.obstacle_clearance / self.man.scale)
+        return self._scoped_clearance(points, self.cell.obstacle_clearance / self.man.scale,
+                                      margin)
+
+    def _earned_weld_clearance(self, locators, welds, anchors) -> float:
+        """The margin this leg's own weld poses have earned, in scene units.
+
+        ``--weld-shift-mm`` backs every weld locator off its panel before planning and the
+        imported pose is restored for export, so the pose the robot is actually placed at
+        has real air around it -- measured over ten studies' logs, 37 weld placements read
+        4.3 to 5.6 mm at the 5 mm shift, median 5.2.  **Nothing was reading that figure.**
+        The margin handed to the planners was ``--weld-clearance-mm`` flat, 0 mm by
+        default, and 0 only ever had to be loose enough for the weld pose itself to place.
+        So the searches were told the whole transit could graze a panel, explored a region
+        that wide, and had the result taken back afterwards by the scoped relaxation --
+        which lives on ``Cell.in_collision`` in Python, where the planners cannot see it.
+        One Path 3 segment refused 3698 states that way: every one is search effort spent
+        inside a region the cell was never going to accept.
+
+        This closes that gap from the generous side.  The margin becomes the tightest
+        reading at this leg's own weld poses, less ``--weld-clearance-slack-mm``, clamped
+        into ``[--weld-clearance-mm, --obstacle-clearance-mm]``.  Both halves of the clamp
+        matter: it can never be looser than the declared weld clearance, and never
+        stricter than an ordinary transit's margin, so this can only ever move the figure
+        *towards* the cell's own and never past it.
+
+        **Measured at the openings this leg will be flown at, and at every weld pose for
+        each of them.**  The gun is a state variable the anchor does not carry -- an anchor
+        is robot joints and the opening is applied over the top -- so the same pose reads
+        differently as the tip swings, and the leg holds one opening across *both* of its
+        ends at a time.  Taking each weld's reading at its own opening alone would set the
+        margin from a geometry the leg is never in.  The rest of the rotation is left out
+        deliberately: a wider opening that reads tighter at an endpoint is screened out of
+        the rotation by the endpoint check that already exists, which is the right answer
+        for it, where folding it in here would tighten every leg to its worst opening.
+
+        What it cannot do is make a guarantee.  The reading is at the endpoints, and a
+        transit's tight spot is often neither of them -- a weld's 5 mm is usually the
+        electrode against the panel it welds, while a pinch halfway along is the gun's
+        throat against tooling beside it.  A leg whose only route ran under this now fails
+        or detours instead, exactly as scoping already can.  The scoped relaxation is
+        therefore kept as it was, still restoring the cell's own floor beyond the radius:
+        what this narrows is the *disagreement*, from the whole 0-to-5 mm band down to
+        whatever the slack leaves.
+        """
+        flat = self.weld_clearance
+        if not self.earned_weld_clearance:
+            return flat
+        ceiling = self.cell.obstacle_clearance
+        if ceiling <= flat:
+            # The weld rule is already no looser than the cell's own, so there is nothing
+            # to earn and no band to narrow.
+            return flat
+        # The leg's own preferred openings, which is what ``_transit_openings`` offers
+        # first and what ``_plan_pair`` leaves the gun holding at either end.
+        openings = sorted({self._leave_opening(locators[0]),
+                           self._arrive_opening(locators[-1])})
+        worst: float | None = None
+        for loc in welds:
+            q = anchors.get(loc.name)
+            if q is None:
+                continue
+            for opening in openings:
+                with self.cell.gun_opening(opening):
+                    got = self.cell.clearance_mm(q)
+                if not np.isfinite(got):
+                    continue
+                worst = got if worst is None else min(worst, got)
+        if worst is None:
+            return flat
+        earned = (worst - self.weld_clearance_slack_mm) * self.man.scale
+        margin = min(ceiling, max(flat, earned))
+        if margin > flat:
+            shown = ", ".join(f"{o:g}" for o in openings)
+            capped = " (the cell's own)" if margin >= ceiling else ""
+            self.log(f"    planning this transit at {margin / self.man.scale:.1f} mm "
+                     f"rather than the {flat / self.man.scale:.1f} mm the weld rule "
+                     f"declares{capped}: the tightest weld pose reads {worst:.1f} mm with "
+                     f"the gun at {shown} mm, less {self.weld_clearance_slack_mm:g} mm of "
+                     f"slack")
+        return margin
 
     @contextlib.contextmanager
-    def _scoped_clearance(self, points: list, floor_mm: float):
+    def _scoped_clearance(self, points: list, floor_mm: float, margin: float):
         """The weld clearance in force, with the cell's own restored away from the welds."""
         with contextlib.ExitStack() as stack:
-            stack.enter_context(self.cell.clearance(self.weld_clearance))
+            stack.enter_context(self.cell.clearance(margin))
             stack.enter_context(self.cell.weld_relaxation(
                 points, self.weld_clearance_radius_mm, floor_mm))
             yield

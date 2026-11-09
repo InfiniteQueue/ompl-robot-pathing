@@ -631,6 +631,55 @@ the way, so the joint values in between are whatever that line demands.
   relaxation is needed -- the gun closes on the panel it welds, and `_relax_at_waypoints`
   does not cover it, that pass excluding obstacle pairs and handling the robot's own
   geometry only -- but its *scope* was never the intent.
+  - **The 0 was never measured against what the stand-off already bought, and
+    `--earned-weld-clearance` is what reads it.** `--weld-shift-mm` (-5) backs every weld
+    locator off its panel before planning and `pose_as_imported` restores the original for
+    export, so the pose the robot is placed at has real air around it and the shift is free
+    at the output. Nothing read that figure. The margin handed to the planners was the flag,
+    flat, and 0 only ever had to be loose enough for the weld pose itself to place -- so the
+    searches were told the whole transit could graze a panel, explored a region that wide,
+    and had the result taken back afterwards by the scoping, which lives on
+    `Cell.in_collision` in Python where OMPL cannot see it. `_earned_weld_clearance` makes
+    the margin the tightest reading at the leg's own weld poses less
+    `--weld-clearance-slack-mm` (1), clamped into `[--weld-clearance-mm,
+    --obstacle-clearance-mm]`.
+    - **Measured over ten studies' shipped logs: 37 weld placements read 4.3 to 5.6 mm**
+      at the 5 mm shift, median 5.2 -- so on most legs the margin moves from 0 to about
+      4 mm. The distribution is what makes the clamp the whole safety story rather than a
+      tidiness: Path 7 has a weld at **0.1 mm**, Path 1 one at 2.7 and Path 9 one at 3.2,
+      and each of those legs comes out at or near today's figure on its own. A weld with
+      nothing to spare earns nothing, which is correct -- there is no air there.
+    - **What this is worth is not the refusals, it is the search.** One Path 3 segment
+      refused 3698 states by the scoping. Every one is a state OMPL was told was legal and
+      spent time reaching, and the sampler keeps going back, since nothing it can see says
+      otherwise. `_route_fault`'s margin-class refusals are the visible tail of that.
+    - **The scoped relaxation is kept exactly as it was**, still restoring the cell's own
+      floor beyond the radius. What narrows is the *disagreement* between the two tests:
+      from the whole 0-to-5 mm band down to whatever the slack leaves. Setting the floor to
+      the earned margin instead would make the relaxation a no-op and impose about 4 mm
+      uniformly, including inside the radius -- which is where the gun has to get into the
+      pocket and where the approach legitimately runs tighter. The exemption is load
+      bearing.
+    - **Measured at the openings the leg will be flown at, and at every weld pose for each
+      of them.** An anchor is robot joints; the gun is a state variable applied over the
+      top, so the same pose reads differently as the tip swings, and the leg holds one
+      opening across *both* ends at a time -- taking each weld at its own opening alone
+      would set the margin from a geometry the leg is never in. The openings are the first
+      locator's `_leave_opening` and the last one's `_arrive_opening`, which is what
+      `_transit_openings` offers first. The rest of the rotation is deliberately left out:
+      a wider opening that reads tighter at an endpoint is screened out by the endpoint
+      check that already exists, which is the right answer for that opening, where folding
+      it in here would tighten every leg to its worst.
+    - **It is not a guarantee and must not be read as one.** The reading is at the
+      endpoints, and a transit's tight spot is often neither -- a weld's 5 mm is usually
+      the electrode against the panel it welds, while a pinch halfway along is the gun's
+      throat against tooling beside it. A leg whose only route ran under the earned figure
+      now fails or detours, exactly as scoping already can; the clamp bounds that at the
+      ordinary transit margin and nothing worse.
+    - Placement is untouched. `_clearance_for` is called with no anchors there, and there
+      is nothing measured to derive a margin from until a locator has been placed -- so a
+      weld that places today cannot stop placing because of a flag about transits, the same
+      rule the scoping already follows.
   - **Measured over ten studies' stage logs**, travel-weighted at the densify stage, each
     move charged at the worse of its two endpoint clearances: of 265.7 m of tool travel,
     **3.03 m runs under 5 mm** and 1.05 m of that under 2 mm. 1.98 m of it is within 75 mm

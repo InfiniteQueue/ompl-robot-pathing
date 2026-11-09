@@ -1134,6 +1134,65 @@ Note that `--weld-shift-mm` still backs the tool off along the locator's **z**. 
 the panel normal for these welds then the shift is sliding the tool along the surface rather
 than off it, and wants revisiting.
 
+### The clearance a weld pose has earned
+
+A transit with a weld at either end is planned at `--weld-clearance-mm`, 0 by default,
+because the gun has to be able to reach the panel it welds. But `--weld-shift-mm` has
+already backed that weld 5 mm off its panel before planning, and the imported pose is
+restored for export — so the pose the robot actually stands at has real air around it, and
+the shift costs nothing in the output. Nothing was reading that figure. The planners were
+told the whole transit could graze a panel, and `--scoped-weld-clearance` then took the
+difference back afterwards, in a check the planners cannot see.
+
+`--earned-weld-clearance` (on) closes that from the generous side. Each transit is planned
+at the tightest clearance its own weld poses actually have, less
+`--weld-clearance-slack-mm` (1), clamped into `[--weld-clearance-mm,
+--obstacle-clearance-mm]` — so it only ever moves the margin towards the cell's own and
+never past it. Measured over ten studies' shipped logs, 37 weld placements read:
+
+| study | welds | min | median | max |
+|---|---|---|---|---|
+| Path 1 | 2 | 2.7 | 5.6 | 5.6 |
+| Path 2 | 2 | 5.6 | 5.6 | 5.6 |
+| Path 3 | 3 | 4.5 | 5.6 | 5.6 |
+| Path 4 | 2 | 4.5 | 5.6 | 5.6 |
+| Path 5 | 3 | 4.5 | 5.6 | 5.6 |
+| Path 6 | 2 | 4.5 | 5.6 | 5.6 |
+| Path 7 | 4 | **0.1** | 5.4 | 5.5 |
+| Path 9 | 11 | 3.2 | 5.2 | 5.5 |
+| 260R2 Problem Path | 3 | 4.3 | 4.8 | 5.4 |
+| Good 240R1 Spotweld | 5 | 4.3 | 5.2 | 5.4 |
+
+So on most legs the margin moves from 0 mm to about 4 mm, and the clamp is what handles the
+rest: Path 7's weld at 0.1 mm earns nothing and its transits come out exactly as they do
+today, which is the right answer — there is no air there to plan with.
+
+What this buys is mostly search rather than refusals. One Path 3 segment had 3698 states
+refused by the scoping: every one is a state the sampler was told was legal, spent time
+reaching, and keeps going back to, because nothing it can see says otherwise. The refusals
+reported as `returned a route that is not clear under this cell's own check` are the visible
+tail of the same thing.
+
+The scoped relaxation is unchanged and still restores `--obstacle-clearance-mm` beyond
+`--weld-clearance-radius-mm`. What narrows is the disagreement between the two tests, from
+the whole 0-to-5 mm band down to whatever the slack leaves. Setting the relaxation's floor
+to the earned margin as well would make it a no-op, but would then impose ~4 mm *inside* the
+radius too — which is where the gun has to get into the pocket, and where the approach
+legitimately runs tighter. That exemption is doing necessary work.
+
+The reading is taken at the openings the leg is flown at, and at every weld pose for each of
+them: the gun is a state variable the anchor does not carry, so the same pose reads
+differently as the tip swings, and a leg holds one opening across both of its ends at a
+time. The rest of the gun rotation is left out deliberately — a wider opening that reads
+tighter at an endpoint is screened out by the endpoint check that already exists.
+
+It is not a guarantee. The reading is at the endpoints, and a transit's tight spot is often
+neither of them: a weld's 5 mm is usually the electrode against the panel it welds, while a
+pinch halfway along is the gun's throat against tooling beside it. A leg whose only route
+ran under the earned figure now fails or detours instead, exactly as the scoping already
+can. Locator placement is untouched, there being nothing measured to derive a margin from
+until a locator has been placed.
+
 ### Penalising low clearance
 
 A collision check is a hard yes/no, so a move clearing a panel by half a millimetre is as
@@ -1518,6 +1577,8 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--weld-clearance-mm` | 0 | clearance used instead on moves to or from a weld |
 | `--scoped-weld-clearance` | on | apply `--weld-clearance-mm` only near the weld itself, and `--obstacle-clearance-mm` over the rest of the transit. Off, a weld at either end relaxes the whole route. Measured on one Path 1 segment: sub-5 mm travel 100 mm -> 67 mm, at +22% real motion |
 | `--weld-clearance-radius-mm` | 50 | how far from the gun's position at a weld that relaxation reaches, when the scoping is on |
+| `--earned-weld-clearance` | on | plan each transit at the tightest clearance its own weld poses actually have rather than at `--weld-clearance-mm` flat, clamped into `[--weld-clearance-mm, --obstacle-clearance-mm]`. Measured over ten studies, 37 weld placements read 4.3–5.6 mm at the 5 mm shift; a weld with nothing to spare earns nothing |
+| `--weld-clearance-slack-mm` | 1 | how far under that reading the earned margin sits, so the leg's own endpoints are clear of it rather than exactly on it |
 | `--weld-shift-mm` | −5 | shift weld locators along their own z before planning |
 | `--no-weld-shift-search` | off | fail a blocked shifted weld rather than search shorter stand-offs |
 | `--weld-shift-scan-mm` | 0.5 | first scan spacing of that search; halved while nothing is clear |

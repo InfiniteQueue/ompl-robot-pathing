@@ -878,6 +878,33 @@ def build_parser() -> argparse.ArgumentParser:
                         "the pose the robot is actually placed at rather than the one the "
                         "study declared, the two differing by --weld-shift-mm. Ignored "
                         "while the scoping is off (default: %(default)g)")
+    #EARN THE WELD CLEARANCE OFF THE WELD POSES
+    p.add_argument("--earned-weld-clearance", type=boolean, nargs="?", const=True,
+                   default=True, metavar="BOOL",
+                   help="true plans each transit at the tightest clearance its own weld "
+                        "poses actually have, less --weld-clearance-slack-mm, instead of "
+                        "at --weld-clearance-mm flat. --weld-shift-mm has already backed "
+                        "every weld off its panel, and the pose the robot is placed at "
+                        "therefore has real air around it -- measured over ten studies' "
+                        "logs, 37 weld placements read 4.3 to 5.6 mm at the 5 mm shift, "
+                        "median 5.2 -- but nothing read that figure, so the searches were "
+                        "told the whole transit could graze a panel and had the result "
+                        "taken back afterwards by --scoped-weld-clearance, which the "
+                        "planners cannot see. Clamped into [--weld-clearance-mm, "
+                        "--obstacle-clearance-mm], so it only ever moves the margin "
+                        "towards the cell's own and never past it, and a weld that placed "
+                        "with nothing to spare leaves its transit exactly as it was. "
+                        "Takes true/false (yes/no, on/off, 1/0); passing the flag with no "
+                        "value means true (default: %(default)s)")
+    #HOW FAR UNDER THE READING THE EARNED MARGIN SITS
+    p.add_argument("--weld-clearance-slack-mm", type=float, default=1.0, metavar="MM",
+                   help="how far under the measured weld-pose clearance the earned margin "
+                        "sits. It is not a safety factor: the reading is taken at the "
+                        "endpoints at the openings the leg is flown at, and the margin has "
+                        "to leave those same poses clear of it rather than exactly on it. "
+                        "0 plans at the reading itself, which puts the leg's own endpoints "
+                        "on the boundary. Ignored while --earned-weld-clearance is off "
+                        "(default: %(default)g)")
     #BACK THE WELD OFF THE PANEL SURFACE
     p.add_argument("--weld-shift-mm", type=float, default=-5.0, metavar="MM",
                    help="move every weld locator this far along its own z axis before "
@@ -1370,6 +1397,8 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         weld_clearance_mm=args.weld_clearance_mm,
         scoped_weld_clearance=args.scoped_weld_clearance,
         weld_clearance_radius_mm=args.weld_clearance_radius_mm,
+        earned_weld_clearance=args.earned_weld_clearance,
+        weld_clearance_slack_mm=args.weld_clearance_slack_mm,
         stand_off_search=args.weld_shift_search,
         stand_off_scan_mm=args.weld_shift_scan_mm,
         stand_off_resolution_mm=args.weld_shift_resolution_mm,
