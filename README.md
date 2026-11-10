@@ -412,6 +412,97 @@ property of the cell. `--ompl-continuous-check` sweeps each sub-step instead of 
 and so has no gap to step over at all; measured, it solved 11 of 20 transits where the
 sampled check solved 20 of 20, so it stays off by default.
 
+That table predates `--scoped-weld-clearance` being on by default, and the scope added a
+third way for a route to be refused that has nothing to do with resolution. The planner is
+handed the weld clearance for the whole transit and cannot see the scope that takes it back
+away from the welds, so it returns routes that are legal to it and refused here at a
+sample, with nothing stepped over. Counted over seven studies run since: of 309 routes the
+sampler returned, **161 were refused, every one of them on the first or last move of its
+route** — where a route crosses a weld's radius — and none on a move between. The refusal
+now says which test made it:
+
+```
+... returned a route that is not clear under this cell's own check (move 0 -> 1 of 4
+points is blocked, by the scoped weld clearance: a state the planner's margin allows, too
+close to the parts this far from a weld)
+```
+
+or `in contact between two samples of the joint grid, where only the tool-space check
+looks` for a genuine step-over, or `in contact on the joint grid`. The first is answered by
+`--earned-weld-clearance`, the second by `--segment-length-rad`, and they are not
+interchangeable.
+
+### What a second of budget buys
+
+Every budget here is wall clock, so a run can only be made better two ways: by getting more
+out of a second, or by not spending one once there is nothing left to buy. Profiled on a
+5186-shell cell with the search budgets cut short, 513 s of a 681 s run was one call — the
+contact test over the collision scene — against 112 s inside the sampling planner and 2.5 s
+of inverse kinematics. Outside the sampler, that call is the whole of the question.
+
+**The contact test is remembered per state.** The passes re-ask it by construction: a
+station on a straight tool move is tested as the inverse kinematics' answer and again as an
+end of the gap either side of it, and a route is swept whole when it is found, again when
+it is scored, when it is densified and when it is verified. A third of all the questions
+asked were of a state already answered.
+
+**Outside a weld's radius, one test answers two questions.** There a state was asked for
+contact at the margins and then, if clear, whether anything was within the scope's floor —
+a second pass over the whole scene. One test against the same scene with every
+robot-to-part pair held to that floor answers both. It was checked against the two
+questions asked apart on 6000 states of a real cell, on every branch, with none differing.
+
+Measured as the same work done both ways — a tree search to its join from a fixed seed, the
+route swept, scored, densified, reduced, verified, stood off and retuned:
+
+| Stage | Before | After | |
+| --- | --- | --- | --- |
+| Tree search to a join | 39.3 s | 19.8 s | ×1.98 |
+| The route swept for faults | 4.6 s | 0.1 s | |
+| The route scored | 20.2 s | 11.4 s | ×1.78 |
+| Densify, reduce, split, verify | 41.6 s | 30.1 s | ×1.38 |
+| The four stand-off trials | 79.2 s | 25.3 s | ×3.12 |
+| The opening retuned | 30.5 s | 6.1 s | ×4.96 |
+| **All of it** | **215.2 s** | **92.8 s** | **×2.32** |
+
+The route, its cost, the reduced route, the stand-off's choice and the retuned opening came
+out identical both ways. Nothing here changes an answer.
+
+**It does not make a run 2.3× shorter**, and it is worth being clear why. The stages in
+that table are the ones with no budget. Everything else stops on a clock, so a faster test
+there buys more samples in the same time — a tree likelier to join inside its window, more
+cuts tried by `shortcut` — rather than a shorter wait. Over the shipped logs of ten studies
+more than half of the time is searches that return nothing, each spent to the last second
+of its window: phase-one runs that time out are 35% of it and Cartesian searches that fail
+19%. Those are set by `--phase-one-runs`, `--phase-one-solve-seconds` and
+`--cartesian-solve-seconds`, and shortening a run means shortening those.
+
+The work line under each refined route reports both:
+
+```
+work: 6483 clearance queries (...), 10567 collision tests (57% of 24296 served from
+cache), 7913 of them settling the weld scope as well, 24868 state loads, ...
+```
+
+**When a pass last gained anything.** `shortcut` and `polish` spend their budgets in full,
+and nothing used to say how much of a budget was still buying anything. Both now end their
+log line with it:
+
+```
+shortcut: 12 cuts kept from 27 attempts, ... (48% better), the last gain at attempt 22,
+17.4s in
+```
+
+and `weldpath-stages.txt` carries the whole curve as a `progress` note ahead of each stage,
+every kept attempt as `attempt@seconds=cost`. A pass whose last gain came 20 s into 240 is
+one whose budget is twelve times what it used. No rule stops a pass early on that evidence
+yet, there having been no curves to size one against; these are the curves.
+
+Two things the passes no longer ask twice: `shortcut` does not propose a span it has
+already refused on the route as it stands, and ends — saying so, and handing back the rest
+of its budget — once every span has been tried since the last cut; and `polish` asks
+whether a waypoint can be dropped once per three states rather than once per sweep.
+
 ### Seeing what the refinement changed
 
 `--unrefined-output` writes a second file, `waypoints-unrefined.json`, holding each transit

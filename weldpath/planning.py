@@ -705,8 +705,17 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
     costs = [model.cost(pts[i], pts[i + 1], fa=fac[i], fb=fac[i + 1], stops=True)
              for i in range(len(pts) - 1)]
     before = sum(costs)
-    deadline = time.time() + time_budget
+    started = time.time()
+    deadline = started + time_budget
     dropped = moved = tried = 0
+    progress: list[tuple[int, float, float]] = []
+    # Waypoints already shown not worth removing, by the three states the question is
+    # about.  A sweep follows every relocation that is kept and asks it of every interior
+    # point, but a relocation moves one point and so changes the answer for at most three
+    # of them -- the one moved and its neighbours.  The rest are the same three states,
+    # the same check along the same curve and the same comparison as last time, and each
+    # is a whole move swept end to end to be told so again.
+    keeps: set[tuple[bytes, bytes, bytes]] = set()
 
     def unfinished() -> bool:
         """Whether the pass may keep working: the floor outranks the clock."""
@@ -718,15 +727,18 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
         # Under the same rule as the sampling loop, so that a relocation accepted past
         # the deadline still gets the removal sweep the pass promises follows every one.
         while k < len(pts) - 1 and unfinished():
+            triple = (pts[k - 1].tobytes(), pts[k].tobytes(), pts[k + 1].tobytes())
+            if triple in keeps:
+                k += 1
+                continue
             if model.refuses(pts[k - 1], pts[k + 1], [pts[k]]):
+                keeps.add(triple)
                 k += 1
                 continue
             direct = model.check_and_cost(pts[k - 1], pts[k + 1], fa=fac[k - 1],
                                           fb=fac[k + 1], stops=True)
-            if direct is None:
-                k += 1
-                continue
-            if direct >= costs[k - 1] + costs[k] - 1e-9:
+            if direct is None or direct >= costs[k - 1] + costs[k] - 1e-9:
+                keeps.add(triple)
                 k += 1
                 continue
             del pts[k], fac[k]
@@ -736,6 +748,8 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
             # to a different neighbour and deserves its own test.
 
     drop_sweep()
+    if dropped:
+        progress.append((0, time.time() - started, sum(costs)))
     while unfinished() and len(pts) > 2:
         tried += 1
         k = int(rng.integers(1, len(pts) - 1))
@@ -778,7 +792,10 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
         costs[k - 1], costs[k] = first, second
         moved += 1
         drop_sweep()
+        progress.append((tried, time.time() - started, sum(costs)))
 
+    stagetrace.note(_progress_note("polish", before, progress, tried,
+                                   time.time() - started))
     if log:
         after = sum(costs)
         gain = 100.0 * (1.0 - after / before) if before > 0 else 0.0
@@ -794,7 +811,7 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
         log(f"      polish: dropped {dropped} waypoints and kept {moved} "
             f"relocations from {tried} attempts, penalised time "
             f"{before:.2f} -> {after:.2f} s "
-            f"({gain:.0f}% better), {len(pts)} points{held}")
+            f"({gain:.0f}% better), {len(pts)} points{_last_gain(progress)}{held}")
     return pts
 
 
@@ -1407,11 +1424,20 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
 
     rng = rng or np.random.default_rng(0)
     before = span_cost(0, len(dense) - 1)
-    deadline = time.time() + time_budget
+    started = time.time()
+    deadline = started + time_budget
     tried = cuts = 0
+    # Spans tried and refused since the route last changed.  A cut is a function of the
+    # route and its two ends and of nothing drawn -- the line is tracked from a fixed
+    # seed -- so a span that failed fails again, and re-drawing it buys nothing.  The
+    # draw was with replacement, so on a short route a pass spent its budget re-asking.
+    # Emptied whenever a cut is kept, since that moves the indices and every cost they
+    # stand for.
+    refused: set[tuple[int, int]] = set()
+    progress: list[tuple[int, float, float]] = []
+    exhausted = False
 
     while time.time() < deadline and len(dense) > 2:
-        tried += 1
         # Half the attempts are aimed at a stop-band crossing while there is one to aim
         # at, and the aim quietly stops costing anything once there is not -- ``_band_span``
         # then finds nothing and the draw is the uniform one again.  Half rather than all
@@ -1419,16 +1445,87 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
         # band crossings are all forced would otherwise spend its whole budget proving it.
         span = (_band_span(model.cell, dense, rng)
                 if rng.random() < BAND_CUT_SHARE else None)
-        cuts += _try_cut(model, dense, fac, marks, rng, penalised, whole, span_cost,
-                         span=span)
+        if span is None or span in refused:
+            span = _open_span(rng, len(dense), refused)
+            if span is None:
+                # Every span there is has been tried on the route as it stands.  The
+                # clock has nothing left to buy, so it is handed back rather than spent.
+                exhausted = True
+                break
+        tried += 1
+        if _try_cut(model, dense, fac, marks, rng, penalised, whole, span_cost,
+                    span=span):
+            cuts += 1
+            refused.clear()
+            progress.append((tried, time.time() - started,
+                             span_cost(0, len(dense) - 1)))
+        else:
+            refused.add(span)
 
+    spent = time.time() - started
+    stagetrace.note(_progress_note("shortcut", before, progress, tried, spent))
     if log:
         after = span_cost(0, len(dense) - 1)
         gain = 100.0 * (1.0 - after / before) if before > 0 else 0.0
         detail = "penalised cruise time" if penalised else "cruise time"
         log(f"      shortcut: {cuts} cuts kept from {tried} attempts, "
-            f"{detail} {before:.2f} -> {after:.2f} s ({gain:.0f}% better)")
+            f"{detail} {before:.2f} -> {after:.2f} s ({gain:.0f}% better)"
+            + _last_gain(progress)
+            + (f"; stopped {spent:.1f}s into its {time_budget:g}s, every span of the "
+               f"route having been tried since the last cut" if exhausted else ""))
     return dense
+
+
+def _open_span(rng, n: int, refused: set[tuple[int, int]]) -> tuple[int, int] | None:
+    """A span ``(i, j)`` of an ``n``-point route not yet refused, or ``None`` if none is left.
+
+    Uniform over the spans a cut could apply to, those with at least one point between
+    their ends, which is what drawing two indices and discarding the unusable pairs gave
+    before -- so nothing about which cuts are proposed changes, only that one already
+    refused is not proposed again.
+
+    Drawn by rejection while most spans are open, which is nearly always: a dense route
+    of 150 points has eleven thousand of them and a pass tries a few hundred.  Listed
+    outright once fewer than half are, so the last few are found without drawing for them.
+    """
+    total = (n - 1) * (n - 2) // 2
+    if len(refused) >= total:
+        return None
+    if 2 * len(refused) < total:
+        while True:
+            i, j = sorted(int(v) for v in rng.integers(0, n, size=2))
+            if j - i >= 2 and (i, j) not in refused:
+                return i, j
+    left = [(i, j) for i in range(n - 2) for j in range(i + 2, n)
+            if (i, j) not in refused]
+    return left[int(rng.integers(len(left)))]
+
+
+def _last_gain(progress: list[tuple[int, float, float]]) -> str:
+    """When a pass last improved its route, for the end of its log line.
+
+    The budgets are wall clock and both passes spend theirs in full, so the one figure a
+    log could not give was how much of a budget was still buying anything.  A pass whose
+    last gain came 20 s into 240 is saying its budget is twelve times what it used.
+    """
+    if not progress:
+        return ""
+    attempt, seconds, _cost = progress[-1]
+    return f", the last gain at attempt {attempt}, {seconds:.1f}s in"
+
+
+def _progress_note(name: str, before: float, progress: list[tuple[int, float, float]],
+                   tried: int, spent: float) -> str:
+    """Every gain of a pass as ``attempt@seconds=cost``, for the stage trace.
+
+    The stage trace records a route before and after each pass and nothing of how the
+    pass got from one to the other.  This is the whole of that in one line: which
+    attempts were kept, when, and what the route cost after each -- the convergence curve,
+    which is what a budget should be sized against and what no log carried.
+    """
+    steps = " ".join(f"{a}@{s:.1f}={c:.3f}" for a, s, c in progress) or "none"
+    return (f"{name} progress, {tried} attempts in {spent:.1f}s from {before:.3f}: "
+            f"{steps}")
 
 
 # What share of ``shortcut``'s attempts are aimed at a stop-band crossing rather than
@@ -2891,10 +2988,35 @@ def _route_fault(cell: Cell, path: list[np.ndarray], check_step: float) -> str |
     Rejecting it here costs one sweep and hands the failure to the retries the caller
     already has: another run of phase one, phase two, the Cartesian tree, or the next gun
     opening.  A run that solves into a blocked route has not solved.
+
+    **The refusal says which of three tests made it**, because they call for different
+    remedies and the message used to name only the move.  The scoped weld clearance is a
+    *margin* disagreement: the planner is handed the weld clearance for the whole transit
+    and cannot see the scope that takes it back away from the welds, so it returns routes
+    that are legal to it and refused here at a sample, with nothing stepped over.  The
+    tool-space subdivision is a *resolution* disagreement, a state the planner's own
+    joint-space step carried the tool across.  The joint grid is neither, the cell's grid
+    being the coarser of the two -- contact there is a state the planner should have seen.
+    Counted over the shipped logs of seven studies, every one of 161 refusals was on the
+    first or the last move of its route, which is where a route leaves a weld's radius and
+    the cell's own floor comes back: the signature of the first, not the second.
     """
+    counters = getattr(cell, "counters", None) or {}
     for k, (a, b) in enumerate(zip(path, path[1:])):
+        scoped = counters.get("weld_scoped", 0)
+        subdivided = counters.get("subdiv_blocked", 0)
         if cell.segment_collides(a, b, max_step=check_step):
-            return f"move {k} -> {k + 1} of {len(path)} points is blocked"
+            # The scan stops at the first state it refuses, so a scope refusal counted
+            # across this one move is that state and no other.
+            if counters.get("weld_scoped", 0) > scoped:
+                why = (", by the scoped weld clearance: a state the planner's margin "
+                       "allows, too close to the parts this far from a weld")
+            elif counters.get("subdiv_blocked", 0) > subdivided:
+                why = (", in contact between two samples of the joint grid, where only "
+                       "the tool-space check looks")
+            else:
+                why = ", in contact on the joint grid"
+            return f"move {k} -> {k + 1} of {len(path)} points is blocked{why}"
     return None
 
 
@@ -3791,8 +3913,19 @@ def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> Non
                      if k.startswith("probe:") and v > 0), key=lambda kv: -kv[1])
     byprobe = ("; by probe " + ", ".join(f"{n} at {w} mm" for w, n in widths)
                if widths else "")
+    # The contact test is remembered per state, as clearance is, and for a pass that is
+    # mostly re-asking: a station on a tracked line is tested as the inverse kinematics'
+    # answer and again as an end of the gap either side of it.
+    tests = d["collision_tests"]
+    wanted = tests + d.get("collision_hits", 0)
+    remembered = (f" ({100.0 * (wanted - tests) / wanted:.0f}% of {wanted} served from "
+                  f"cache)" if wanted > tests else "")
+    # Outside the weld scope one test on a manager held to the scope's floor answers the
+    # contact question and the floor question together, where each used to be its own.
+    if d.get("collision_fused"):
+        remembered += f", {d['collision_fused']} of them settling the weld scope as well"
     log(f"      work: {d['clearance']} clearance queries ({served:.0f}% of {asked} served "
-        f"from cache{share}), {d['collision_tests']} collision tests, "
+        f"from cache{share}), {tests} collision tests{remembered}, "
         f"{d['state_loads']} state loads, {d['fk']} forward kinematics, "
         f"in {elapsed:.1f}s{scoped}{where}{byprobe}")
 

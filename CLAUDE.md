@@ -83,6 +83,19 @@ the way, so the joint values in between are whatever that line demands.
       the tool about 52 mm at j3 against the 7 mm `--check-step-mm` holds it to.
     `_route_fault` is what rejects, and the retries the caller already has are what make the
     trade safe: a refused route costs its own solve time and nothing unsafe ships.
+    - **That measurement could not see the third cause, and the third cause is now the
+      common one.** The 80 solves drove OMPL directly, with no weld scope installed. A
+      real transit installs one, and the scope lives on `Cell.in_collision` where OMPL
+      cannot see it -- so a route that leaves a weld close to a panel is legal to the
+      planner and refused here at a *sample*, with nothing stepped over. Counted over the
+      shipped logs of seven studies run with the scope on by default: of 309 routes the
+      sampler returned, **161 were refused, and every one of the 161 on the first or the
+      last move of its route** -- where a route crosses a weld's radius and the cell's own
+      floor comes back -- and none on a move between. A step-over has no reason to prefer
+      the ends. `_route_fault` now names which of the three tests refused, by reading the
+      `weld_scoped` and `subdiv_blocked` counters across the move it stopped at, so this
+      is a reading in the next log rather than an inference from where the refusals fall.
+      `--earned-weld-clearance` is the remedy for it; `--segment-length-rad` is not.
   - **The refusal rate this costs is inside the one the cells already have.** Counted over
     the shipped logs of nine studies, all at 0.01 rad: **47 refusals in 1017 sampler runs,
     4.6%**, spread 0% to 14.8% by study -- Good 240R1 at 14.8%, Path 2 at 10.0%, Path 3 at
@@ -711,6 +724,12 @@ the way, so the joint values in between are whatever that line demands.
     `clearance_within`, the floor itself being clear rather than refused -- and the
     strictly-under polarity needs no saturation guard, since a reading that saturates is
     at or above the probe and so at or above the floor.
+    - **It is no longer one apiece.** That read was a second contact test over the whole
+      scene for every state the first had cleared -- 23844 of the 29358 clearance queries
+      one transit's refinement made -- and `Cell._floor_manager` answers both from one
+      test. See "where the time goes" below. The clearance manager at the floor is still
+      what decides the one case a single test cannot: a part standing between its pair's
+      margin and the floor.
   - **Centres come from the anchor states, not from `pose_world`**: where the robot is put
     rather than what the study asked for, the two differing by `--weld-shift-mm`, which is
     exactly the distance that matters here.
@@ -1047,6 +1066,126 @@ the way, so the joint values in between are whatever that line demands.
   - Dropped whole when the segment clock has run out, for the reason `_retune_opening` is:
     there is a valid route in hand, this only improves it, and half the trials prove
     nothing. `--no-tip-standoff` leaves the pass out.
+- **Where the time goes, and what stopped being asked twice.** Every budget in the planner
+  is wall clock, so there are only two levers: what a second buys, and whether a second is
+  spent after there is nothing left to buy. Profiled on a reduced-budget run of a
+  5186-shell cell, 681 s end to end: **513 s was `contactTest`**, 112 s was OMPL's own
+  solve, and inverse kinematics was 2.5 s -- 0.15 ms a call, 16 thousand of them. So the
+  program is a contact-test budget and nothing else on the Python side is worth touching
+  until that is.
+  - **The contact test is remembered per state.** `Cell.in_collision` keeps its verdict in
+    `_collision_cache`, keyed like every other cache on the cell by the gun and the joint
+    vector, and emptied where the margins move. Clearance and tool position were cached
+    for exactly this reason and the verdict under them was not. The callers re-ask it **by
+    construction**: counted by caller over that run, `_chain_scan` asked 11265 times and
+    99% were states `plan_linear` had tested a moment before as the inverse kinematics'
+    own answer; `cartesian._steer` 92%; `_checked` and the final `validate` 100%. A third
+    of all 59144 calls, and about half of the time, since the repeats are concentrated on
+    tracked lines beside the panels where a test is dearest.
+    - **Only the contact test is remembered; the weld scope is asked live.** The scope
+      depends on points, a radius and a floor this cache knows nothing about, and its own
+      clearance read is cached already. Keeping it out is what lets a scope be installed
+      and removed without anything being forgotten, and why the cache is emptied in one
+      place, `_set_obstacle_clearance`, rather than three.
+    - **A remembered clear state is still loaded.** `segment_scan` reads the tool position
+      and the clearance off the state `in_collision` leaves in the environment, so a hit
+      that skipped the load would have it reading whichever state was tested last. The
+      load is 0.13 ms against a test of 2 to 30. A remembered contact loads nothing, every
+      caller stopping there.
+    - **Keys are exact, and that leaves some on the table.** A chain re-derived from a
+      different seed lands within inverse-kinematics tolerance of the states it had
+      before and misses, so `solve_pose` hits only 26%. Rounding the key would catch them
+      and would make a verdict at a boundary depend on what had been asked earlier, which
+      is not a trade this takes.
+  - **Outside a weld's radius one test answers both questions.** There `in_collision`
+    asked for contact at the margins and then, of every state that cleared, whether
+    anything was within the scope's floor -- a second pass over the whole scene through a
+    clearance manager. `Cell._floor_manager` is the planning manager with no robot-to-part
+    pair held to less than the floor. A state it finds nothing at is clear on both counts.
+    A contact it finds is *read*: between two links of the robot, or with a part inside
+    that pair's own margin, it is the planning manager's contact too and the state is
+    blocked on the one test. Only a part standing **between its margin and the floor** is
+    asked the old way, since one test cannot tell the scope refusing from another pair
+    being in contact as well and the two are counted differently.
+    - Checked state for state against the two questions asked apart, on a real cell and
+      spelled out independently of the product: **6000 states, every branch populated --
+      3496 in contact, 2101 clear outside the radius, 395 inside it, 8 refused by the
+      scope -- and none differing.** Stubs could not have shown the thing it rests on,
+      which is that a clone of the planning manager carries the default margin, every
+      override and the allowed pairs.
+    - Clear states outside the radius went from 3.46 ms to 1.94; states in contact from
+      6.27 to 6.75, the price of reading the contact. That sample is 58% contact, which a
+      search is not: over the profiled run 90% of the states asked about were clear.
+    - Where the earned weld clearance comes out at the cell's own, the margins already
+      reach the floor and the planning manager *is* its own floor manager. No clone, and
+      the scope's question disappears -- before this it was still asked of every state and
+      could never have refused one.
+    - `_clear_of` records the floor a state was shown clear of, so a later hit does not
+      ask the clearance manager after all. It stores the floor rather than a flag, so a
+      scope with a higher floor asks again and one with a lower does not.
+  - **Measured as the same work done both ways**, every stage a fixed amount of work from
+    a fixed seed rather than a budget, the old `in_collision` restored for one side: a tree
+    search to its join, the route swept, scored, densified, reduced, verified, stood off
+    and retuned.
+
+    | stage | before | after | |
+    |---|---|---|---|
+    | tree search to a join | 39.3 s | 19.8 s | x1.98 |
+    | the route swept for faults | 4.6 s | 0.1 s | |
+    | the route scored | 20.2 s | 11.4 s | x1.78 |
+    | densify, reduce, split, verify | 41.6 s | 30.1 s | x1.38 |
+    | the four stand-off trials | 79.2 s | 25.3 s | x3.12 |
+    | the opening retuned | 30.5 s | 6.1 s | x4.96 |
+    | **all of it** | **215.2 s** | **92.8 s** | **x2.32** |
+
+    **The route, its cost, the reduced route, the stand-off's choice and the retuned
+    opening were identical**, which is the claim that matters: nothing here changes an
+    answer. The two timed passes cannot be compared that way, being wall clock by design;
+    given the same budget shortcut made 27 attempts where it had made 19, and polish
+    reached its 20-attempt floor in 31 s where it had needed 55.
+  - **What this does not do is shorten a run by 2.3x, and the reason is the architecture
+    rather than the measurement.** The stages that got faster are the unbudgeted ones.
+    Everything else stops on a clock, so a faster test there buys more samples in the same
+    time -- a tree likelier to join inside its window, more cuts tried -- and not a shorter
+    wait. Summed over the shipped logs of ten studies the stage times divide as: phase-one
+    runs that timed out 35%, Cartesian searches that failed 19%, `_finish` 22%, phase-one
+    runs that solved 9%, tree searches that solved 6%, refused routes 4%. **More than half
+    of a run is searches that return nothing**, each spent to the last second of its
+    window.
+    - **A give-up rule for phase one was replayed against those logs and not built.**
+      "An opening that has had P runs and never solved gets no more", applied to the 47
+      logged blocks with their real outcomes: P=2 would not have spent 9555 s of 23164 and
+      would have cost 3 blocks their only solution; P=3, 6645 s and 2 blocks. The sampler
+      is heavy-tailed -- two blocks solved first at their 18th and 22nd run -- so there is
+      no patience that is both worth having and free, and which side of that to take is
+      the operator's call -- and `--phase-one-solve-seconds` has only ever been raised, 8
+      to 15 to 25 to 30.
+  - **`shortcut` no longer proposes a span it has already refused, and stops when there is
+    none left.** A cut is a function of the route and its two ends and of nothing drawn --
+    the line is tracked from a fixed seed -- so a span refused on the route as it stands is
+    refused again. `refused` holds them and is emptied when a cut is kept, that moving the
+    indices and every cost they stand for; `_open_span` draws uniformly over what is left.
+    When every span has been tried since the last cut the pass ends and says so, handing
+    back the rest of its budget -- the one place a budget is now returned rather than
+    spent, and it is lossless. How often that happens is not known: it needs a short
+    dense route, a route of 150 points having eleven thousand spans and a pass trying a
+    few hundred, and the logs record the raw point count rather than the dense one. The
+    log line says when it does.
+  - **`polish` asks whether a waypoint can be dropped once per three states.** A removal
+    sweep follows every relocation that is kept and asked it of every interior waypoint,
+    each a whole move swept end to end. A relocation moves one point, so it changes that
+    question for three of them at most. `keeps` remembers the triples already answered.
+  - **Both passes now say when they last gained anything**, in the log line -- "the last
+    gain at attempt 22, 17.4s in" -- and as a `progress` note in the stage trace carrying
+    every kept attempt as `attempt@seconds=cost`. Both spend their budget in full, and
+    until this nothing recorded how much of it was still buying anything: over the
+    shipped logs of seven studies 11 of 29 polish passes gained 1% or less for their
+    240 s. **No stall rule
+    was added**, there being no convergence curve to size one against; that note is the
+    curve, and the next logs will have it for every leg.
+  - `_report_work` prints the hits beside the tests, and how many tests settled the weld
+    scope as well. Note that it still covers `_finish` alone -- its snapshot is taken
+    there -- so nothing counts the searches' own work.
 - Order in `_finish` is densify → refine → split → verify, one sampling pass. It was
   sample → gate → densify → … while the gate stood: the fill follows the curve each move
   will really be flown along, which needs a model, and there was no model until the gate
