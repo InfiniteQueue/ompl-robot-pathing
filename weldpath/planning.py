@@ -2989,29 +2989,29 @@ def _route_fault(cell: Cell, path: list[np.ndarray], check_step: float) -> str |
     already has: another run of phase one, phase two, the Cartesian tree, or the next gun
     opening.  A run that solves into a blocked route has not solved.
 
-    **The refusal says which of three tests made it**, because they call for different
-    remedies and the message used to name only the move.  The scoped weld clearance is a
-    *margin* disagreement: the planner is handed the weld clearance for the whole transit
-    and cannot see the scope that takes it back away from the welds, so it returns routes
-    that are legal to it and refused here at a sample, with nothing stepped over.  The
-    tool-space subdivision is a *resolution* disagreement, a state the planner's own
-    joint-space step carried the tool across.  The joint grid is neither, the cell's grid
-    being the coarser of the two -- contact there is a state the planner should have seen.
-    Counted over the shipped logs of seven studies, every one of 161 refusals was on the
-    first or the last move of its route, which is where a route leaves a weld's radius and
-    the cell's own floor comes back: the signature of the first, not the second.
+    **The refusal says which test made it**, because the two call for different remedies
+    and the message used to name only the move.  The tool-space subdivision is a
+    *resolution* disagreement, a state the planner's own joint-space step carried the tool
+    across, and is what ``--segment-length-rad`` and ``--check-step-mm`` trade against each
+    other.  The joint grid is neither, the cell's grid being the coarser of the two --
+    contact there is a state the planner should have seen, and is worth knowing about for
+    that reason.
+
+    There used to be a third, and it was the common one: a *margin* disagreement, where
+    the scoped weld clearance refused a state the planner's own margin allowed.  That was
+    not a resolution problem and no resolution answered it -- counted over the shipped
+    logs of seven studies, every one of 161 such refusals fell on the first or the last
+    move of its route, where a route crossed a weld's radius and the cell's own floor came
+    back, and a step-over has no reason to prefer the ends.  The scope is gone, so the
+    planner and this check now work to one margin and only resolution can separate them.
     """
     counters = getattr(cell, "counters", None) or {}
     for k, (a, b) in enumerate(zip(path, path[1:])):
-        scoped = counters.get("weld_scoped", 0)
         subdivided = counters.get("subdiv_blocked", 0)
         if cell.segment_collides(a, b, max_step=check_step):
-            # The scan stops at the first state it refuses, so a scope refusal counted
-            # across this one move is that state and no other.
-            if counters.get("weld_scoped", 0) > scoped:
-                why = (", by the scoped weld clearance: a state the planner's margin "
-                       "allows, too close to the parts this far from a weld")
-            elif counters.get("subdiv_blocked", 0) > subdivided:
+            # The scan stops at the first state it refuses, so a subdivision refusal
+            # counted across this one move is that state and no other.
+            if counters.get("subdiv_blocked", 0) > subdivided:
                 why = (", in contact between two samples of the joint grid, where only "
                        "the tool-space check looks")
             else:
@@ -3892,10 +3892,6 @@ def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> Non
     # state load the collision check had already paid for, so without it the loads would
     # have been this much higher.
     share = f", {fused} of them off a walk already made" if fused else ""
-    # Only where the scope is on and actually refused something, that being a state the
-    # margins cleared and the weld radius did not cover.
-    scoped = (f"; {d['weld_scoped']} states refused by the scoped weld clearance"
-              if d.get("weld_scoped") else "")
     # Which of the two resolutions a refused move was refused by.  Measured over 80
     # sampler solves it was always the tool-space bisection and never the joint grid, and
     # this counts that rather than repeating it -- it is also what says whether
@@ -3906,9 +3902,9 @@ def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> Non
              + (f" ({early} in its sparse pass)" if early else "")
              + f" and {sub} by the tool-space subdivision" if grid or sub else "")
     # Which probe the queries actually went to, each threshold having its own manager.
-    # The total alone cannot tell a 5 mm relaxation read on the search's own hot path from
-    # a 120 mm reach read in a pass, and the two differ about fourfold in cost -- so
-    # without this there is no way to say where a transit's clearance time went.
+    # The total alone cannot tell a 50 mm band read from a 120 mm reach read in a pass,
+    # and the two differ about twofold in cost -- so without this there is no way to say
+    # where a transit's clearance time went.
     widths = sorted(((k.split(":", 1)[1], v) for k, v in d.items()
                      if k.startswith("probe:") and v > 0), key=lambda kv: -kv[1])
     byprobe = ("; by probe " + ", ".join(f"{n} at {w} mm" for w, n in widths)
@@ -3920,14 +3916,10 @@ def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> Non
     wanted = tests + d.get("collision_hits", 0)
     remembered = (f" ({100.0 * (wanted - tests) / wanted:.0f}% of {wanted} served from "
                   f"cache)" if wanted > tests else "")
-    # Outside the weld scope one test on a manager held to the scope's floor answers the
-    # contact question and the floor question together, where each used to be its own.
-    if d.get("collision_fused"):
-        remembered += f", {d['collision_fused']} of them settling the weld scope as well"
     log(f"      work: {d['clearance']} clearance queries ({served:.0f}% of {asked} served "
         f"from cache{share}), {tests} collision tests{remembered}, "
         f"{d['state_loads']} state loads, {d['fk']} forward kinematics, "
-        f"in {elapsed:.1f}s{scoped}{where}{byprobe}")
+        f"in {elapsed:.1f}s{where}{byprobe}")
 
 
 def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",

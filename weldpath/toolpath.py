@@ -249,8 +249,6 @@ class ToolpathPlanner:
                  direct_clearance_mm: float = 0.0,
                  finish_attempts: int = DEFAULT_FINISH_ATTEMPTS,
                  weld_clearance_mm: float | None = None,
-                 scoped_weld_clearance: bool = True,
-                 weld_clearance_radius_mm: float = 50.0,
                  earned_weld_clearance: bool = True,
                  weld_clearance_slack_mm: float = 1.0,
                  stand_off_search: bool = True, stand_off_scan_mm: float = 0.5,
@@ -368,13 +366,6 @@ class ToolpathPlanner:
         # None means "no separate weld rule", i.e. the cell's own clearance throughout.
         self.weld_clearance = (None if weld_clearance_mm is None
                                else weld_clearance_mm * man.scale)
-        # Scoped, the weld clearance holds within this much of the weld's own tool
-        # position and the cell's ordinary clearance holds over the rest of the transit.
-        # Unscoped -- the default, and what this has always done -- it holds over the
-        # whole transit, so a route with a weld at either end may run against any panel
-        # anywhere at the weld clearance, however far from the weld it is.
-        self.scoped_weld_clearance = bool(scoped_weld_clearance)
-        self.weld_clearance_radius_mm = max(0.0, float(weld_clearance_radius_mm))
         # The weld clearance a transit is planned at is read off its own weld poses rather
         # than taken flat, the shift having already bought air the margin never looked at.
         # See _earned_weld_clearance; the slack is how far under the reading it sits.
@@ -447,43 +438,30 @@ class ToolpathPlanner:
         vias has no reason to be that permissive.
 
         **That permission is granted to the whole block, which for a transit is the whole
-        route.**  A transit runs weld to weld, so in a spotweld study almost every one of
-        them is planned with no obstacle margin at all from end to end, and a stretch
-        grazing a panel 800 mm from either weld is as legal as the weld itself.  Measured
-        over ten studies' stage logs, 3.03 m of tool travel runs under 5 mm and 1.05 m of
-        that is more than 75 mm from either end of its transit.
+        route**, and the margin is therefore the one number the planners, the refinement
+        passes and this cell's own sweep all work to.  It is **earned from the leg's own
+        weld poses** where the anchors are in hand -- see :meth:`_earned_weld_clearance`.
+        Placement still gets the declared figure flat, there being nothing measured yet to
+        derive one from.
 
-        With ``scoped_weld_clearance`` the permission is confined to within
-        ``weld_clearance_radius_mm`` of where the gun actually stands at each weld, and
-        the cell's ordinary clearance governs the rest of the route.  The centres are read
-        from the anchor states rather than from ``pose_world``, that being where the robot
-        is put rather than what the study asked for -- ``--weld-shift-mm`` stands a weld
-        off, so the two differ by exactly the distance that matters here.
-
-        Scoping needs the anchors and is therefore only in force where they are passed,
-        which is the transit.  Placing a locator is left alone deliberately: every pose it
-        tries is at the locator itself, so there is nothing there for a radius to exclude,
-        and a weld that places today must not stop placing because of a flag about
-        transits.
-
-        The margin itself is **earned from the poses** where the anchors are in hand --
-        see :meth:`_earned_weld_clearance`.  Placement still gets the declared figure
-        flat, there being nothing measured yet to derive one from.
+        There used to be a second rule over the top of it.  ``--scoped-weld-clearance``
+        confined the permission to within a radius of each weld and had
+        ``Cell.in_collision`` take it back beyond that, which meant the searches were
+        handed one margin and judged against another: a route legal to the planner was
+        refused here at a sample, with nothing stepped over.  Measured on Path 1's
+        ``via114 -> 73050-01-R_2t``, 3095 states and five whole routes were refused that
+        way in one segment, every refusal naming the scope.  What it was guarding against
+        is not what the routes do -- the leg that shipped reads 120 mm, 52.6 mm and then
+        2.7 mm at the weld itself, so the only near-panel point on it is the weld -- and
+        what does the guarding now is the margin, which the planners can see.
         """
         welds = [l for l in locators if l.is_weld]
         if self.weld_clearance is None or not welds:
             return self.cell.clearance(self.cell.obstacle_clearance)
         if anchors is None:
             return self.cell.clearance(self.weld_clearance)
-        margin = self._earned_weld_clearance(locators, welds, anchors)
-        if not self.scoped_weld_clearance:
-            return self.cell.clearance(margin)
-        points = [self.cell.fk(anchors[l.name])[:3, 3] for l in welds if l.name in anchors]
-        if not points:
-            return self.cell.clearance(margin)
-        # Read before the permissive margin goes in, or the floor would be the weld's own.
-        return self._scoped_clearance(points, self.cell.obstacle_clearance / self.man.scale,
-                                      margin)
+        return self.cell.clearance(
+            self._earned_weld_clearance(locators, welds, anchors))
 
     def _earned_weld_clearance(self, locators, welds, anchors) -> float:
         """The margin this leg's own weld poses have earned, in scene units.
@@ -498,7 +476,9 @@ class ToolpathPlanner:
         that wide, and had the result taken back afterwards by the scoped relaxation --
         which lives on ``Cell.in_collision`` in Python, where the planners cannot see it.
         One Path 3 segment refused 3698 states that way: every one is search effort spent
-        inside a region the cell was never going to accept.
+        inside a region the cell was never going to accept.  That rule is gone and this is
+        what stands in its place -- the planners are handed this margin and judged against
+        it, and nothing in Python refuses a state they were told was legal.
 
         This closes that gap from the generous side.  The margin becomes the tightest
         reading at this leg's own weld poses, less ``--weld-clearance-slack-mm``, clamped
@@ -517,14 +497,25 @@ class ToolpathPlanner:
         the rotation by the endpoint check that already exists, which is the right answer
         for it, where folding it in here would tighten every leg to its worst opening.
 
+        **An opening at which a weld pose reads through the part is skipped, and until it
+        was this derivation never once engaged.**  It is the same exclusion read from the
+        other end: ``_opening_lists`` screens such an opening out of the rotation, so the
+        leg is never flown at it, and a reading taken there measures penetration rather
+        than air.  Nothing guarded against it -- a penetration is a finite negative
+        number, so it won the minimum outright and the clamp pulled the margin back to the
+        declared floor.
+        Measured on Path 1's ``via114 -> 73050-01-R_2t``: ``via114`` is placed with the gun
+        shut, the weld pose is 6.4 mm *inside* ``Assy_ST200_RH`` at that opening and reads
+        +2.7 mm at its own 25 mm, so the leg earned 0 mm where it should have earned 1.7 --
+        and the log line below, which only prints when the margin beats the declared
+        figure, had never appeared in a run of any study.
+
         What it cannot do is make a guarantee.  The reading is at the endpoints, and a
         transit's tight spot is often neither of them -- a weld's 5 mm is usually the
         electrode against the panel it welds, while a pinch halfway along is the gun's
-        throat against tooling beside it.  A leg whose only route ran under this now fails
-        or detours instead, exactly as scoping already can.  The scoped relaxation is
-        therefore kept as it was, still restoring the cell's own floor beyond the radius:
-        what this narrows is the *disagreement*, from the whole 0-to-5 mm band down to
-        whatever the slack leaves.
+        throat against tooling beside it.  A leg whose only route ran under this fails or
+        detours instead.  What bounds that is the clamp: never stricter than an ordinary
+        transit's margin, which is what every leg with no weld on it already flies to.
         """
         flat = self.weld_clearance
         if not self.earned_weld_clearance:
@@ -539,6 +530,7 @@ class ToolpathPlanner:
         openings = sorted({self._leave_opening(locators[0]),
                            self._arrive_opening(locators[-1])})
         worst: float | None = None
+        read_at: list[float] = []
         for loc in welds:
             q = anchors.get(loc.name)
             if q is None:
@@ -546,31 +538,36 @@ class ToolpathPlanner:
             for opening in openings:
                 with self.cell.gun_opening(opening):
                     got = self.cell.clearance_mm(q)
-                if not np.isfinite(got):
+                # A reading at or under zero is the tip through the part: a geometry the
+                # leg cannot be flown in, and not a measurement of the air this pose has.
+                # Asked as a penetration rather than as ``in_collision`` on purpose -- a
+                # collision test answers against whatever margin happens to be in force,
+                # and at the cell's own 5 mm that would reject the weld's own opening too,
+                # which reads +2.7 mm on Path 1 and is exactly the figure wanted here.
+                if not np.isfinite(got) or got <= 0.0:
                     continue
+                if opening not in read_at:
+                    read_at.append(opening)
                 worst = got if worst is None else min(worst, got)
         if worst is None:
             return flat
         earned = (worst - self.weld_clearance_slack_mm) * self.man.scale
         margin = min(ceiling, max(flat, earned))
         if margin > flat:
-            shown = ", ".join(f"{o:g}" for o in openings)
+            # Only the openings that contributed a reading, the others having been
+            # skipped as penetrations -- naming one the leg cannot be flown at would
+            # misreport where the figure came from.
+            shown = ", ".join(f"{o:g}" for o in sorted(read_at))
+            skipped = len(openings) - len(read_at)
             capped = " (the cell's own)" if margin >= ceiling else ""
             self.log(f"    planning this transit at {margin / self.man.scale:.1f} mm "
                      f"rather than the {flat / self.man.scale:.1f} mm the weld rule "
                      f"declares{capped}: the tightest weld pose reads {worst:.1f} mm with "
                      f"the gun at {shown} mm, less {self.weld_clearance_slack_mm:g} mm of "
-                     f"slack")
+                     f"slack"
+                     + (f" ({skipped} opening{'' if skipped == 1 else 's'} skipped, the "
+                        f"tip through the part there)" if skipped else ""))
         return margin
-
-    @contextlib.contextmanager
-    def _scoped_clearance(self, points: list, floor_mm: float, margin: float):
-        """The weld clearance in force, with the cell's own restored away from the welds."""
-        with contextlib.ExitStack() as stack:
-            stack.enter_context(self.cell.clearance(margin))
-            stack.enter_context(self.cell.weld_relaxation(
-                points, self.weld_clearance_radius_mm, floor_mm))
-            yield
 
     def _report_clearance(self, loc: Locator, q: np.ndarray | None,
                           opening: float, placed: bool) -> None:
@@ -964,11 +961,6 @@ class ToolpathPlanner:
             # never reached a transit still reports a time.
             deadline = Deadline(self.segment_seconds)
             spent = 0.0
-            # Counted here rather than in planning._report_work, which a segment only
-            # reaches once it has a route to refine.  A refusal is most interesting on the
-            # segment that failed, so the figure has to survive the failure.
-            refused = (self.cell.counters.get("weld_scoped", 0)
-                       if self.scoped_weld_clearance else 0)
             try:
                 if a.name not in anchors:
                     raise PlanningError(f"no reachable joint solution for '{a.name}'")
@@ -987,14 +979,7 @@ class ToolpathPlanner:
                 self._write_failure_view(a, b, anchors, str(exc))
             finally:
                 treetrace.stop()
-                scoped = ((self.cell.counters.get("weld_scoped", 0) - refused)
-                          if self.scoped_weld_clearance else 0)
-                note = (f", {scoped} states refused by the scoped weld clearance"
-                        if scoped else
-                        ", the scoped weld clearance refused nothing"
-                        if self.scoped_weld_clearance else "")
-                self.log(f"    segment {a.name} -> {b.name} planned in "
-                         f"{_took(spent)}{note}")
+                self.log(f"    segment {a.name} -> {b.name} planned in {_took(spent)}")
             segments.append(seg)
         return segments
 

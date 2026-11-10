@@ -83,19 +83,18 @@ the way, so the joint values in between are whatever that line demands.
       the tool about 52 mm at j3 against the 7 mm `--check-step-mm` holds it to.
     `_route_fault` is what rejects, and the retries the caller already has are what make the
     trade safe: a refused route costs its own solve time and nothing unsafe ships.
-    - **That measurement could not see the third cause, and the third cause is now the
-      common one.** The 80 solves drove OMPL directly, with no weld scope installed. A
-      real transit installs one, and the scope lives on `Cell.in_collision` where OMPL
-      cannot see it -- so a route that leaves a weld close to a panel is legal to the
-      planner and refused here at a *sample*, with nothing stepped over. Counted over the
-      shipped logs of seven studies run with the scope on by default: of 309 routes the
-      sampler returned, **161 were refused, and every one of the 161 on the first or the
-      last move of its route** -- where a route crosses a weld's radius and the cell's own
-      floor comes back -- and none on a move between. A step-over has no reason to prefer
-      the ends. `_route_fault` now names which of the three tests refused, by reading the
-      `weld_scoped` and `subdiv_blocked` counters across the move it stopped at, so this
-      is a reading in the next log rather than an inference from where the refusals fall.
-      `--earned-weld-clearance` is the remedy for it; `--segment-length-rad` is not.
+    - **That measurement could not see the cause that mattered, and it has since been
+      removed rather than tuned.** The 80 solves drove OMPL directly, with no weld scope
+      installed, so they were structurally blind to the *margin* disagreement: the scope
+      lived on `Cell.in_collision` where OMPL cannot see it, and a route that left a weld
+      close to a panel was legal to the planner and refused here at a *sample*, with
+      nothing stepped over. Counted over the shipped logs of seven studies run with the
+      scope on: of 309 routes the sampler returned, **161 were refused, and every one of
+      the 161 on the first or the last move of its route** -- where a route crossed a
+      weld's radius and the cell's own floor came back -- and none on a move between. A
+      step-over has no reason to prefer the ends. The scope is gone and the margin is
+      earned instead, so `_route_fault` has two causes left and both are resolution; what
+      a refusal in the next log means is therefore narrower than what it used to.
   - **The refusal rate this costs is inside the one the cells already have.** Counted over
     the shipped logs of nine studies, all at 0.01 rad: **47 refusals in 1017 sampler runs,
     4.6%**, spread 0% to 14.8% by study -- Good 240R1 at 14.8%, Path 2 at 10.0%, Path 3 at
@@ -191,10 +190,11 @@ the way, so the joint values in between are whatever that line demands.
       One state honestly reads 120.0 against one manager and 5.0 against another, so a
       shared cache would hand the band test a reading saturated at 5 mm -- the same
       confusion that once made every move linear, read from the other end.
-    - `clearance_within` is at-or-under; `clearance_under` is strictly under. They are not
-      interchangeable: the band counts a state exactly at `near_mm` as near, while the
-      scoped weld relaxation counts one exactly at its floor as clear. One method serving
-      both would have moved a boundary the relaxation pins deliberately.
+    - `clearance_within` is at-or-under, and is the only polarity left. `clearance_under`
+      was strictly under, for the scoped weld relaxation, which counted a state exactly at
+      its floor as clear where the band counts one exactly at `near_mm` as near; the two
+      were deliberately not interchangeable. The relaxation was its only caller and both
+      are gone.
     - `fallback.validity.Validator` widening the shared probe mid-run used to change
       labels too. It still cannot, and now for a structural reason rather than a numerical
       one: the band reads a manager of its own that nothing else resizes.
@@ -635,126 +635,122 @@ the way, so the joint values in between are whatever that line demands.
   - Skipped when the segment clock has run out. There is already a valid answer and this
     only improves it, so it is dropped whole rather than clamped: half a pass proves
     nothing.
-- **The weld clearance relaxes the whole transit, and `--scoped-weld-clearance` is how
-  to confine it.** `_clearance_for` drops the obstacle margin to `--weld-clearance-mm` (0)
-  whenever *either* endpoint is a weld, and the block it wraps is `_plan_pair` -- the entire
-  transit, every search and every refinement pass. A transit runs weld to weld, so in a
-  spotweld study almost every one is planned with no obstacle margin from end to end, and a
-  stretch grazing a panel 800 mm from either weld is as legal as the weld itself. The
-  relaxation is needed -- the gun closes on the panel it welds, and `_relax_at_waypoints`
-  does not cover it, that pass excluding obstacle pairs and handling the robot's own
-  geometry only -- but its *scope* was never the intent.
-  - **The 0 was never measured against what the stand-off already bought, and
-    `--earned-weld-clearance` is what reads it.** `--weld-shift-mm` (-5) backs every weld
-    locator off its panel before planning and `pose_as_imported` restores the original for
-    export, so the pose the robot is placed at has real air around it and the shift is free
-    at the output. Nothing read that figure. The margin handed to the planners was the flag,
-    flat, and 0 only ever had to be loose enough for the weld pose itself to place -- so the
-    searches were told the whole transit could graze a panel, explored a region that wide,
-    and had the result taken back afterwards by the scoping, which lives on
-    `Cell.in_collision` in Python where OMPL cannot see it. `_earned_weld_clearance` makes
-    the margin the tightest reading at the leg's own weld poses less
-    `--weld-clearance-slack-mm` (1), clamped into `[--weld-clearance-mm,
-    --obstacle-clearance-mm]`.
+- **A transit with a weld at either end is planned at the clearance its own weld poses
+  have earned, and that is the only margin in force.** `_clearance_for` wraps the whole of
+  `_plan_pair` -- every search and every refinement pass -- so whatever margin it installs
+  is the one number the planners are handed, the passes work to, and the cell's own sweep
+  judges against. `_earned_weld_clearance` makes it the tightest reading at the leg's own
+  weld poses less `--weld-clearance-slack-mm` (1), clamped into `[--weld-clearance-mm`
+  (0)`, --obstacle-clearance-mm` (5)`]`.
+  - **Why it is not simply `--weld-clearance-mm`.** The gun closes on the panel it welds,
+    so a weld pose cannot be held to an ordinary transit's margin, and
+    `_relax_at_waypoints` does not cover it -- that pass excludes obstacle pairs and
+    handles the robot's own geometry only. But 0 only ever had to be loose enough for the
+    weld pose itself to place, and `--weld-shift-mm` (-5) has already backed every weld
+    locator off its panel, with `pose_as_imported` restoring the original for export, so
+    the pose the robot actually stands at has real air around it and the shift is free at
+    the output. **Nothing read that figure.** The searches were told the whole transit
+    could graze a panel and explored a region that wide.
     - **Measured over ten studies' shipped logs: 37 weld placements read 4.3 to 5.6 mm**
       at the 5 mm shift, median 5.2 -- so on most legs the margin moves from 0 to about
       4 mm. The distribution is what makes the clamp the whole safety story rather than a
       tidiness: Path 7 has a weld at **0.1 mm**, Path 1 one at 2.7 and Path 9 one at 3.2,
-      and each of those legs comes out at or near today's figure on its own. A weld with
-      nothing to spare earns nothing, which is correct -- there is no air there.
-    - **What this is worth is not the refusals, it is the search.** One Path 3 segment
-      refused 3698 states by the scoping. Every one is a state OMPL was told was legal and
-      spent time reaching, and the sampler keeps going back, since nothing it can see says
-      otherwise. `_route_fault`'s margin-class refusals are the visible tail of that.
-    - **The scoped relaxation is kept exactly as it was**, still restoring the cell's own
-      floor beyond the radius. What narrows is the *disagreement* between the two tests:
-      from the whole 0-to-5 mm band down to whatever the slack leaves. Setting the floor to
-      the earned margin instead would make the relaxation a no-op and impose about 4 mm
-      uniformly, including inside the radius -- which is where the gun has to get into the
-      pocket and where the approach legitimately runs tighter. The exemption is load
-      bearing.
-    - **Measured at the openings the leg will be flown at, and at every weld pose for each
-      of them.** An anchor is robot joints; the gun is a state variable applied over the
-      top, so the same pose reads differently as the tip swings, and the leg holds one
-      opening across *both* ends at a time -- taking each weld at its own opening alone
-      would set the margin from a geometry the leg is never in. The openings are the first
-      locator's `_leave_opening` and the last one's `_arrive_opening`, which is what
-      `_transit_openings` offers first. The rest of the rotation is deliberately left out:
-      a wider opening that reads tighter at an endpoint is screened out by the endpoint
-      check that already exists, which is the right answer for that opening, where folding
-      it in here would tighten every leg to its worst.
-    - **It is not a guarantee and must not be read as one.** The reading is at the
-      endpoints, and a transit's tight spot is often neither -- a weld's 5 mm is usually
-      the electrode against the panel it welds, while a pinch halfway along is the gun's
-      throat against tooling beside it. A leg whose only route ran under the earned figure
-      now fails or detours, exactly as scoping already can; the clamp bounds that at the
-      ordinary transit margin and nothing worse.
-    - Placement is untouched. `_clearance_for` is called with no anchors there, and there
-      is nothing measured to derive a margin from until a locator has been placed -- so a
-      weld that places today cannot stop placing because of a flag about transits, the same
-      rule the scoping already follows.
-  - **Measured over ten studies' stage logs**, travel-weighted at the densify stage, each
-    move charged at the worse of its two endpoint clearances: of 265.7 m of tool travel,
-    **3.03 m runs under 5 mm** and 1.05 m of that under 2 mm. 1.98 m of it is within 75 mm
-    of a route end, which is the weld approach the relaxation exists for; **1.05 m is
-    further in than that**, and has no justification. It is concentrated rather than
-    spread -- `73063-23-R_2t -> 73063-15-R_2t`, which appears in both Path 4 and Path 9,
-    contributes 396 mm of it and runs under 5 mm for 64% of its length.
+      and each of those legs comes out at or near the declared figure on its own. A weld
+      with nothing to spare earns nothing, which is correct -- there is no air there.
+  - **It had never once engaged, and the cause was the opening set.** The margin is read
+    at the openings the leg will be flown at: the first locator's `_leave_opening` and the
+    last one's `_arrive_opening`, each weld pose at each of them, minimum taken. An anchor
+    is robot joints and the gun is a state variable applied over the top, so the same pose
+    reads differently as the tip swings, and the leg holds one opening across *both* ends
+    at a time -- taking each weld at its own opening alone would set the margin from a
+    geometry the leg is never in. What nothing guarded against is an opening at which a
+    weld pose reads *through* the part: a penetration is a finite negative number, so it
+    won the minimum outright and the clamp pulled the margin back to the declared 0.
+    - **Measured on Path 1's `via114 -> 73050-01-R_2t`.** `via114` is placed with the gun
+      shut, so the openings consulted are 0 and 25 mm. At 0 mm the weld pose is 6.4 mm
+      inside `Assy_ST200_RH` -- the log says so on the next line, `_opening_lists` having
+      screened 0 mm out of the rotation for exactly that reason -- and at its own 25 mm it
+      reads +2.7 mm. So the leg earned 0 mm where it should have earned 1.7.
+    - **The log line only prints when the margin beats the declared figure, and it had
+      never appeared in a run of any study.** `grep -l "the weld rule declares"` over all
+      ten studies' logs was empty. A whole committed mechanism was inert and nothing said
+      so, which is the argument for the line reporting what it read rather than only what
+      it chose.
+    - Such an opening is now skipped, and the report names only the openings that
+      contributed plus how many were skipped. Asked as a **penetration** (`got <= 0.0`)
+      rather than as `in_collision`, deliberately: a collision test answers against
+      whatever margin happens to be in force, and at the cell's own 5 mm that would
+      reject the weld's own opening too -- Path 1's +2.7 mm being exactly the figure
+      wanted here.
+    - The rest of the rotation is still left out. A wider opening that reads tighter at an
+      endpoint is screened out of the rotation by the endpoint check that already exists,
+      which is the right answer for that opening, where folding it in here would tighten
+      every leg to its worst.
+  - **It is not a guarantee and must not be read as one.** The reading is at the
+    endpoints, and a transit's tight spot is often neither -- a weld's 5 mm is usually the
+    electrode against the panel it welds, while a pinch halfway along is the gun's throat
+    against tooling beside it. A leg whose only route ran under the earned figure fails or
+    detours. What bounds that is the clamp: never stricter than an ordinary transit's
+    margin, which is what every leg with no weld on it already flies to.
+  - Placement is untouched. `_clearance_for` is called with no anchors there and returns
+    the declared figure flat, there being nothing measured to derive a margin from until a
+    locator has been placed -- so a weld that places today cannot stop placing because of
+    a flag about transits.
+- **`--scoped-weld-clearance` is gone, and with it the last rule that refused a state the
+  planners were told was legal.** It confined the weld relaxation to within
+  `--weld-clearance-radius-mm` (50) of each weld and had `Cell.weld_relaxation` take the
+  difference back beyond that: a state the margins cleared, further than the radius from
+  every weld on the leg and reading under `--obstacle-clearance-mm`, was reported in
+  collision after all. It hung off `Cell.in_collision`, in Python, where OMPL cannot see
+  it -- `request.env = self.cell.env` carries the pair margins and nothing else, and there
+  is no Python state validator.
+  - **That asymmetry was the dominant cause of "returned a route that is not clear under
+    this cell's own check".** `_route_fault` names which test refused, and on Path 1's run
+    of 2026-11-10 -- the only shipped log on code carrying that message -- **all five
+    refused routes named the scope**, none the tool-space subdivision and none the joint
+    grid. The segment refused **3095 states** that way. Every one is a state OMPL was told
+    was legal and spent time reaching, and the sampler keeps going back, since nothing it
+    can see says otherwise.
+  - **What it was guarding against is not what the routes do.** The leg that shipped from
+    that same segment is three points, reading 120.0 mm, 52.6 mm and 2.7 mm, the last
+    being the weld itself; its penalty factors are 1.00, 1.00 and 23.58. So the only
+    near-panel point on the route is the weld, the whole of the 34x penalised-to-plain
+    ratio is that terminal pose, and polish's "1% better" over 282 attempts is a route
+    with nothing left to gain rather than a pass that could not move it.
+  - **What replaces it is a price plus a margin, and the price is steep.** The stepped
+    curve is the default and `--clearance-penalty-*` is ignored while it is: 200x at
+    touching, 40.75x at 2 mm, 8.90x at 4 mm, 1x at 10 mm. Near clearances are acceptable
+    where there is no other option and expensive where there is, which is what a
+    multiplier expresses and what a Python-side refusal cannot.
+  - **Measured over ten studies' stage logs** before the removal, travel-weighted at the
+    densify stage, each move charged at the worse of its two endpoint clearances: of
+    265.7 m of tool travel, **3.03 m ran under 5 mm** and 1.05 m of that under 2 mm.
+    1.98 m of it is within 75 mm of a route end, which is the weld approach the relaxation
+    exists for; **1.05 m is further in than that**. It is concentrated rather than spread
+    -- `73063-23-R_2t -> 73063-15-R_2t`, which appears in both Path 4 and Path 9,
+    contributes 396 mm of it and runs under 5 mm for 64% of its length. That is the
+    travel the earned margin is now meant to remove, and by a means the searches can see.
   - **The same measurement says the clearance penalty is almost never in force**: 95.84%
-    of that travel is at or beyond 25 mm, where the stepped curve is exactly 1x. Any
-    reshaping of the penalty acts on the remaining 4.2%, which is why a margin and not a
-    price is what removes the low-clearance stretches.
-  - **The margin cannot vary per state.** `_set_obstacle_clearance` re-applies every pair
-    margin and rebuilds both contact managers, so it is a per-block setting and switching
-    it per move would cost more than the planning. So the permissive margin stays and
-    `Cell.weld_relaxation` takes the difference back: a state the margins cleared,
-    further than `--weld-clearance-radius-mm` from the gun's position at any weld on the
-    leg and reading under `--obstacle-clearance-mm`, is reported in collision after all.
-    The rule only ever *adds* collisions, so nothing illegal becomes legal under it.
-  - Hung off `Cell.in_collision`, which every collision question in the program arrives
-    at, so no caller has to know about it. Cost is one attribute test while the scope is
-    off; with it on, the distance test is free -- the state is loaded and the tool
-    position costs no kinematics -- and the clearance read is the fused, cached one and is
-    reached only away from the welds, which is where the answer is in doubt.
-  - **It is therefore the hottest clearance reader in the program, and it reads a manager
-    sized to its own floor.** Being on `in_collision` puts it on the path every search
-    walks: Path 1's traverse leg logged 1611 clearance queries against 1607 collision
-    tests, one apiece, and until each threshold had its own manager every one of them was
-    a 5 mm question asked of a 145 mm probe. `clearance_under` and not
-    `clearance_within`, the floor itself being clear rather than refused -- and the
-    strictly-under polarity needs no saturation guard, since a reading that saturates is
-    at or above the probe and so at or above the floor.
-    - **It is no longer one apiece.** That read was a second contact test over the whole
-      scene for every state the first had cleared -- 23844 of the 29358 clearance queries
-      one transit's refinement made -- and `Cell._floor_manager` answers both from one
-      test. See "where the time goes" below. The clearance manager at the floor is still
-      what decides the one case a single test cannot: a part standing between its pair's
-      margin and the floor.
-  - **Centres come from the anchor states, not from `pose_world`**: where the robot is put
-    rather than what the study asked for, the two differing by `--weld-shift-mm`, which is
-    exactly the distance that matters here.
-  - **Locator placement is deliberately left unscoped.** Scoping needs the anchors and is
-    only installed where they are passed, which is the transit. Every pose a placement
-    tries is at the locator itself, so there is nothing for a radius to exclude, and a
-    weld that places today must not stop placing because of a flag about transits.
-  - **Measured on Path 1's `via114 -> 73050-01-R_2t`**, the same segment planned twice
-    with nothing but this flag between the runs. Sub-5 mm travel fell from 100 mm of
-    937 mm to **67 mm of 1043 mm**, and the travel it displaced turns up in the 10-25 mm
-    band, 64 mm becoming 147 mm. What it cost was **+22% of real motion** -- the route the
-    tree found after the recut went from 3.23 s to 3.95 s unpenalised, 115.00 s to
-    133.14 s penalised -- and 11% more tool travel. One segment and one sample of a
-    stochastic search, so the direction is the mechanism and the magnitudes are not tight.
-  - **It removed the narrow gun entirely on that transit.** Unscoped, the tree solved at
-    25 mm on its first run in 34.8 s and shipped there, that being the cheapest opening it
-    found. Scoped, 25 mm failed outright after the full 120 s and the route shipped at
-    80 mm. A nearly shut gun puts the tip closest to the panel, which is what the scope
-    forbids away from the weld, so confining the relaxation does not merely reshape a
-    route -- it can take an opening off the table.
-  - **What it can cost is feasibility, not just time.** `73063-23-R_2t -> 73063-15-R_2t`
-    runs under 5 mm for most of its length, so confining the relaxation does not make that
-    route expensive, it makes it illegal -- and there may be no 5 mm route between those
-    two welds at all. The outcome is then a detour or a failed segment. That segment is
-    not plannable by this build at any setting, so the case stands unmeasured.
+    of that travel is at or beyond 25 mm, where the stepped curve is exactly 1x. So the
+    penalty acts on the remaining 4.2%, and a margin rather than a price is what decides
+    the rest.
+  - **The margin still cannot vary per state**, which is why the scoped rule existed at
+    all. `_set_obstacle_clearance` re-applies every pair margin and rebuilds the contact
+    manager, so it is a per-block setting and switching it per move would cost more than
+    the planning. The earned margin is one figure for the leg, which is what fits that
+    constraint; the scope was the other way of fitting it, at the price of the planners
+    not being able to see it.
+  - **Most of `0928ac8` went with it.** `Cell._floor_manager` and `_planning_contact`
+    existed to answer the scope's floor question on the same contact test as the margins',
+    `_clear_of` to remember that it had been answered, and `clearance_under` had the scope
+    as its only caller. With one question left there is nothing to fuse, so all four are
+    gone, along with the `weld_scoped` and `collision_fused` counters. **The per-state
+    `_collision_cache` is independent and stays** -- it is the larger half of that commit
+    and the callers still re-ask by construction.
+  - What is left on `in_collision` is the contact test at the margins in force and nothing
+    else. A verdict reached there and a verdict reached inside the planner now differ only
+    in how finely the move between two states is sampled, never in what counts as clear --
+    so `_route_fault` has two causes rather than three, and both are resolution.
 - **`--direct-clearance-mm` is a floor under the straight move, and under nothing else.**
   `_plan_direct` tries the direct joint chord at each opening before any search, and the
   only question asked of it was `segment_collides`. That is a yes-or-no at the collision
@@ -1082,11 +1078,13 @@ the way, so the joint values in between are whatever that line demands.
     own answer; `cartesian._steer` 92%; `_checked` and the final `validate` 100%. A third
     of all 59144 calls, and about half of the time, since the repeats are concentrated on
     tracked lines beside the panels where a test is dearest.
-    - **Only the contact test is remembered; the weld scope is asked live.** The scope
-      depends on points, a radius and a floor this cache knows nothing about, and its own
-      clearance read is cached already. Keeping it out is what lets a scope be installed
-      and removed without anything being forgotten, and why the cache is emptied in one
-      place, `_set_obstacle_clearance`, rather than three.
+    - **The contact test is the whole of what is remembered, and now the whole of what
+      is asked.** While the scoped weld relaxation existed it was deliberately left out of
+      this cache -- it depended on points, a radius and a floor the cache knew nothing
+      about -- which is what let a scope be installed and removed without anything being
+      forgotten. With the scope gone the verdict depends on the margins and the gun alone,
+      so the cache is emptied in one place, `_set_obstacle_clearance`, and keyed on the
+      gun.
     - **A remembered clear state is still loaded.** `segment_scan` reads the tool position
       and the clearance off the state `in_collision` leaves in the environment, so a hit
       that skipped the load would have it reading whichever state was tested last. The
@@ -1097,32 +1095,25 @@ the way, so the joint values in between are whatever that line demands.
       before and misses, so `solve_pose` hits only 26%. Rounding the key would catch them
       and would make a verdict at a boundary depend on what had been asked earlier, which
       is not a trade this takes.
-  - **Outside a weld's radius one test answers both questions.** There `in_collision`
-    asked for contact at the margins and then, of every state that cleared, whether
-    anything was within the scope's floor -- a second pass over the whole scene through a
-    clearance manager. `Cell._floor_manager` is the planning manager with no robot-to-part
-    pair held to less than the floor. A state it finds nothing at is clear on both counts.
-    A contact it finds is *read*: between two links of the robot, or with a part inside
-    that pair's own margin, it is the planning manager's contact too and the state is
-    blocked on the one test. Only a part standing **between its margin and the floor** is
-    asked the old way, since one test cannot tell the scope refusing from another pair
-    being in contact as well and the two are counted differently.
-    - Checked state for state against the two questions asked apart, on a real cell and
-      spelled out independently of the product: **6000 states, every branch populated --
-      3496 in contact, 2101 clear outside the radius, 395 inside it, 8 refused by the
-      scope -- and none differing.** Stubs could not have shown the thing it rests on,
-      which is that a clone of the planning manager carries the default margin, every
-      override and the allowed pairs.
-    - Clear states outside the radius went from 3.46 ms to 1.94; states in contact from
-      6.27 to 6.75, the price of reading the contact. That sample is 58% contact, which a
-      search is not: over the profiled run 90% of the states asked about were clear.
-    - Where the earned weld clearance comes out at the cell's own, the margins already
-      reach the floor and the planning manager *is* its own floor manager. No clone, and
-      the scope's question disappears -- before this it was still asked of every state and
-      could never have refused one.
-    - `_clear_of` records the floor a state was shown clear of, so a later hit does not
-      ask the clearance manager after all. It stores the floor rather than a flag, so a
-      scope with a higher floor asks again and one with a lower does not.
+  - **The fused floor manager that used to stand here is gone, and so is the second
+    question it answered.** Outside a weld's radius `in_collision` asked for contact at
+    the margins and then, of every state that cleared, whether anything was within the
+    scope's floor -- a second pass over the whole scene through a clearance manager, 23844
+    of the 29358 clearance queries one transit's refinement made. `Cell._floor_manager`
+    was the planning manager with no robot-to-part pair held to less than the floor, so a
+    state it found nothing at was clear on both counts from one test, and a contact it
+    found was *read* to say which question it settled. It was checked state for state
+    against the two questions asked apart on a real cell -- **6000 states, every branch
+    populated, none differing** -- and it bought 3.46 ms to 1.94 on a clear state outside
+    the radius.
+    - **Removing the scope removed the question rather than the optimisation.** With one
+      question left there is nothing to fuse, so `_floor_manager`, `_planning_contact` and
+      `_clear_of` went with it. The saving they represented is still had, and for free:
+      the second contact test is not made faster, it is not made.
+    - This was already visible before the scope was removed. Where the earned weld
+      clearance came out at the cell's own, the margins already reached the floor, the
+      planning manager *was* its own floor manager, and the scope's question could never
+      have refused a state -- it was still asked of every one.
   - **Measured as the same work done both ways**, every stage a fixed amount of work from
     a fixed seed rather than a budget, the old `in_collision` restored for one side: a tree
     search to its join, the route swept, scored, densified, reduced, verified, stood off

@@ -91,8 +91,8 @@ STOP_BAND_JOINT = 4
 # environment, a clearance query adds a contact test over every convex piece within the
 # probe, and a collision test adds one at the planning margins.
 COUNTER_NAMES = ("state_loads", "clearance", "clearance_hits", "clearance_fused",
-                 "collision_tests", "collision_hits", "collision_fused",
-                 "fk", "tcp_hits", "weld_scoped",
+                 "collision_tests", "collision_hits",
+                 "fk", "tcp_hits",
                  "scan_blocked", "scan_blocked_early", "subdiv_blocked")
 
 # States a cell remembers a clearance for before starting again.  Large enough that the
@@ -165,21 +165,8 @@ class Cell:
         # every pass arrives at and which nothing remembered.  A verdict belongs to the
         # margins it was reached under as well as to the state, so this is emptied where
         # they change -- ``_set_obstacle_clearance`` -- rather than keyed on them.  The
-        # weld scope is deliberately not part of it.  See :meth:`in_collision`.
         self._collision_cache: dict[tuple[float, bytes], bool] = {}
-        # States known to have nothing within a floor, by the floor they were shown clear
-        # of, and the managers that showed it -- one per floor, held to the planning
-        # margins everywhere else.  Outside a weld's radius ``in_collision`` asks two
-        # things of a state, contact and the scope's floor, and one test on such a manager
-        # answers both.  See _floor_manager.  Both go when the margins do.
-        self._clear_of: dict[tuple[float, bytes], float] = {}
-        self._floor_cms: dict[float, object] = {}
         self.counters = dict.fromkeys(COUNTER_NAMES, 0)
-        # Installed by weld_relaxation; None means the margins stand on their own, which
-        # is what they do everywhere except inside a scoped weld transit.
-        self._relax_points: np.ndarray | None = None
-        self._relax_radius = 0.0                # environment units, as the tool is read
-        self._relax_floor = 0.0                 # millimetres, as clearance is read
         self._state = None                      # keeps the SWIG state object alive
         self._revolute = [j.type == "revolute" for j in man.robot.joints
                           if j.type != "fixed"]
@@ -322,11 +309,8 @@ class Cell:
         # the proximity manager is a clone of it, so that has to be rebuilt too.
         self._cm = self.env.getDiscreteContactManager()
         self._cm.setActiveCollisionObjects(self.env.getActiveLinkNames())
-        # Every remembered verdict was reached under the margins just replaced, and the
-        # floor managers are clones of the manager that has just been.
+        # Every remembered verdict was reached under the margins just replaced.
         self._collision_cache.clear()
-        self._clear_of.clear()
-        self._floor_cms.clear()
         self.attach_penalty(self.penalty)
         self._state = None
 
@@ -348,141 +332,6 @@ class Cell:
             yield
         finally:
             self._set_obstacle_clearance(previous)
-
-    @contextlib.contextmanager
-    def weld_relaxation(self, points, radius_mm: float, floor_mm: float):
-        """Confine the relaxed margin to within ``radius_mm`` of the given tool positions.
-
-        The margin is a property of the whole environment: changing it re-applies every
-        pair and rebuilds both contact managers, so it cannot be made to vary per state or
-        per move, which is what a weld needs.  So the permissive margin stays in place and
-        this takes the difference back where it was never wanted -- a state the margins
-        cleared, standing further than ``radius_mm`` from every one of ``points`` and
-        reading under ``floor_mm``, is reported in collision after all.
-
-        ``points`` are tool positions in environment units, ``radius_mm`` and ``floor_mm``
-        in manifest units.  The rule only ever *adds* collisions, so nothing illegal
-        becomes legal under it and no pose that placed can stop placing because of it.
-
-        What it does not do is relax anything the margins did not already relax: it is a
-        restriction on an existing permission, not a second one.
-        """
-        previous = (self._relax_points, self._relax_radius, self._relax_floor)
-        pts = np.asarray(list(points), dtype=float).reshape(-1, 3) if len(points) else None
-        self._relax_points = pts
-        self._relax_radius = float(radius_mm) * self.man.scale
-        self._relax_floor = float(floor_mm)
-        try:
-            yield
-        finally:
-            self._relax_points, self._relax_radius, self._relax_floor = previous
-
-    def _only_relaxation_clears(self, q: np.ndarray) -> bool:
-        """Whether a state the margins passed is clear only because a weld relaxed them.
-
-        Asked of states the contact test has just cleared, so the state is loaded, the
-        tool position costs no kinematics and the clearance read is the fused, cached one.
-        The distance test runs first because it is free and it is the common answer near a
-        weld; the clearance query is reached only away from the welds, which is where the
-        question is actually in doubt.
-
-        Off entirely until :meth:`weld_relaxation` installs a scope, which is one
-        attribute test on the hot path.
-        """
-        if not self._outside_scope():
-            return False            # no scope, or the weld's own neighbourhood
-        # Already answered, where the contact test that cleared this state was the fused
-        # one: it found nothing within the floor either.  See ``in_collision``.
-        key = (self.gun_value, np.asarray(q, dtype=float).tobytes())
-        if self._clear_of.get(key, 0.0) >= self._relax_floor:
-            return False
-        # Asked of a 5 mm manager at the defaults rather than of the wide one.  The
-        # question is whether the state is clear by at least the floor, which saturation
-        # answers correctly -- a state beyond the probe reads the probe, which is at or
-        # past the floor, and is not refused -- so a manager sized to the floor decides
-        # it exactly.  This is the read that runs on the search's own hot path, every
-        # ``in_collision`` the solver makes arriving here.
-        if not self.clearance_under(q, self._relax_floor, loaded=True):
-            return False
-        self.counters["weld_scoped"] += 1
-        return True
-
-    def _outside_scope(self) -> bool:
-        """Whether the loaded state is one the weld scope governs: beyond every radius.
-
-        False with no scope installed, which is one attribute test.  The tool position is
-        read off the state already in the environment and costs no kinematics.
-        """
-        if self._relax_points is None:
-            return False
-        tcp = self._tcp_now()
-        gap = float(np.min(np.linalg.norm(self._relax_points - tcp, axis=1)))
-        return gap > self._relax_radius
-
-    def _floor_manager(self):
-        """The planning manager with every robot-to-part pair held to at least the floor.
-
-        What makes one contact test answer both of the questions ``in_collision`` asks of
-        a state outside the scope.  Every pair keeps the margin the planning manager holds
-        it to, except that no robot-to-part pair is held to less than the scope's floor --
-        so a state this manager finds nothing at is clear at the planning margins, every
-        margin here being at least the one there, *and* has nothing within the floor,
-        which is the whole of what the scope refuses for.
-
-        Returns the manager and the margin the planning manager holds each robot-to-part
-        pair to, by sorted pair, which is what lets a contact found here be read as well --
-        see :meth:`_planning_contact`.
-
-        A pair with an override keeps it where that is the wider: an override is the
-        distance a pair is really held to, and narrowing it here would let this manager
-        clear a state the planning one refuses.  Built on first use and kept until the
-        margins move, like the clearance managers and for the same reason -- it is a clone
-        of the collision scene as it stood.
-        """
-        got = self._floor_cms.get(self._relax_floor)
-        if got is None:
-            floor = self._relax_floor * self.man.scale
-            held = self.margin_overrides
-            pairs = [(a, b, held.get((a, b), held.get((b, a), self.obstacle_clearance)))
-                     for a, b in _obstacle_margins(self.man)]
-            if all(at >= floor for _a, _b, at in pairs):
-                # Nothing to raise: the planning margins already hold every pair to the
-                # floor, which is the earned weld clearance having come out at the cell's
-                # own.  The planning manager is then its own floor manager, and a state
-                # it clears needs no second question at all.
-                manager = self._cm
-            else:
-                manager = self._cm.clone()
-                for a, b, at in pairs:
-                    manager.setCollisionMarginPair(a, b, max(at, floor))
-                manager.setActiveCollisionObjects(self.env.getActiveLinkNames())
-            got = (manager, {tuple(sorted((a, b))): at for a, b, at in pairs})
-            self._floor_cms[self._relax_floor] = got
-        return got
-
-    @staticmethod
-    def _planning_contact(res, planned: dict[tuple[str, str], float]) -> bool:
-        """Whether a contact the floor manager found is one the planning manager holds too.
-
-        The floor manager differs from the planning one only in holding robot-to-part
-        pairs to the floor where their own margin is less.  So a contact between any other
-        two links is the planning manager's contact as well, and one between a robot link
-        and a part is too wherever it reads inside that pair's own margin.  Either settles
-        the question on the one test: the state is in collision whatever else is true.
-
-        What is left is a robot-to-part pair standing between its margin and the floor.
-        One test cannot say whether that is the scope refusing a state the margins allow
-        or whether some other pair is in contact as well, and the two are counted
-        differently, so it is asked the old way -- a band a fraction of a millimetre wide
-        at the defaults, where the earned margin sits just under the cell's own.
-        """
-        found = ContactResultVector()
-        res.flattenCopyResults(found)
-        for c in found:
-            at = planned.get(tuple(sorted((c.link_names[0], c.link_names[1]))))
-            if at is None or float(c.distance) < at:
-                return True
-        return False
 
     # -- gun opening ---------------------------------------------------------
     def set_gun_opening(self, opening_mm: float) -> None:
@@ -675,9 +524,9 @@ class Cell:
                          loaded: bool = False) -> bool:
         """Whether anything lies within ``threshold_mm`` of the robot or the gun.
 
-        The whole of the question the band test, the reach test and the scoped weld
-        relaxation ask, and it belongs here rather than at those callers because the
-        answer needs the probe the reading was taken at.  A reading saturates at its own
+        The whole of the question the band test and the reach test ask, and it belongs
+        here rather than at those callers because the answer needs the probe the reading
+        was taken at.  A reading saturates at its own
         probe, so ``clearance_mm(q) <= threshold`` is sound only where the probe is known
         to be wider; compared against the wrong probe it is how every state of every leg
         once read as near and nearly every move shipped linear.
@@ -694,38 +543,18 @@ class Cell:
         that the floor is the shell sweep and the state load rather than the margin --
         which is why a narrower probe stops paying off somewhere around 10 mm.
 
-        The relaxation is the one that gained most, being hung off :meth:`in_collision`
-        and so on the path every search walks.  Path 1's traverse leg logged 1611
-        clearance queries against 1607 collision tests -- one apiece, every one of them a
-        5 mm question asked of a 145 mm manager.
+        The reader that gained most by this was the scoped weld relaxation, which was
+        hung off :meth:`in_collision` and so sat on the path every search walked -- Path
+        1's traverse leg logged 1611 clearance queries against 1607 collision tests, one
+        apiece, every one a 5 mm question asked of a 145 mm manager.  That reader is gone
+        and the per-threshold managers are kept: the band and the reach ask often enough
+        on their own, and the 5 mm manager still serves ``--direct-clearance-mm``.
         """
         pm, cache, probe = self._probe_for(threshold_mm)
         if pm is None:
             return False
         reading = self._clearance(q, loaded, pm=pm, cache=cache, probe=probe)
         return reading < probe and reading <= threshold_mm
-
-    def clearance_under(self, q: np.ndarray, threshold_mm: float, *,
-                        loaded: bool = False) -> bool:
-        """Whether anything lies *strictly* under ``threshold_mm`` of the robot or the gun.
-
-        :meth:`clearance_within` read the other way, and the two are not interchangeable
-        at the boundary: the band is an at-or-under test, where a state exactly at
-        ``--near-panel-mm`` counts as near, and the scoped weld relaxation is a
-        strictly-under one, where a state exactly at the floor is clear and is not
-        refused.  One method serving both would have moved that boundary, and the
-        relaxation's is pinned deliberately -- it only ever *adds* collisions, so where it
-        stops adding them is part of the rule.
-
-        Needs no saturation guard, unlike its sibling.  A reading saturates at or above
-        the probe, the probe is at or above the threshold, so "nothing found" fails a
-        strictly-under test on its own.
-        """
-        pm, cache, probe = self._probe_for(threshold_mm)
-        if pm is None:
-            return False
-        return self._clearance(q, loaded, pm=pm, cache=cache,
-                               probe=probe) < threshold_mm
 
     def clearance_mm(self, q: np.ndarray) -> float:
         """Closest approach between the robot or gun and the static objects, in mm.
@@ -761,7 +590,7 @@ class Cell:
 
         Counted per probe as well as in total, so a run says which widths its queries went
         to.  Nothing else could: thresholds are registered by their callers, and the total
-        alone cannot tell a 5 mm relaxation read from a 120 mm reach read.
+        alone cannot tell a 50 mm band read from a 120 mm reach read.
         """
         if pm is None:
             pm, cache, probe = self._pm, self._clearance_cache, self._probe_mm
@@ -830,7 +659,16 @@ class Cell:
         self._cm.setCollisionObjectsTransform(self._state.link_transforms)
 
     def in_collision(self, q: np.ndarray) -> bool:
-        """Whether ``q`` is in contact at the margins in force, or refused by the scope.
+        """Whether ``q`` is in contact at the margins in force.
+
+        **This is the whole of the collision question, and that is deliberate.**  The
+        margins the environment holds are what the sampling planner is handed and what it
+        validates its own route against, so a verdict reached here and a verdict reached
+        inside the planner differ only in how finely the move between two states is
+        sampled -- never in what counts as clear.  There used to be a second rule on top,
+        the scoped weld relaxation, which refused a state the margins allowed; it lived
+        here, in Python, where the planner could not see it, and it is gone.  See
+        ``ToolpathPlanner._earned_weld_clearance`` for what replaced it.
 
         **The contact test is remembered per state.**  It is where the time goes -- split
         statement by statement on a 5185-shell cell, 13.4 ms of a 13.5 ms call is
@@ -842,13 +680,9 @@ class Cell:
         again when it is verified.  Clearance and tool position were already cached for
         exactly this reason and the verdict under them was not.
 
-        Only the contact test is remembered, not the answer.  The scoped weld relaxation
-        is asked live every time: it depends on a scope this cache knows nothing about,
-        its own clearance read is cached already, and keeping it out of here is what lets
-        a scope be installed and removed without anything having to be forgotten.  What a
-        verdict does depend on is the margins and the gun -- the gun is in the key, as it
-        is for every cache on the cell, and ``_set_obstacle_clearance`` empties this when
-        the margins move.
+        What a verdict depends on is the margins and the gun -- the gun is in the key, as
+        it is for every cache on the cell, and ``_set_obstacle_clearance`` empties this
+        when the margins move.
 
         **A remembered clear state is still loaded.**  Callers read the tool's position
         and the clearance off the state this leaves in the environment --
@@ -856,18 +690,9 @@ class Cell:
         reading whichever state was tested last.  A load is about a hundredth of the test
         it replaces.  A remembered contact loads nothing: every caller stops there.
 
-        **Outside the weld scope, one test answers both questions.**  A state beyond every
-        weld's radius is asked for contact at the margins and then whether anything is
-        within the scope's floor, and those were two contact tests over the whole scene --
-        the second through a clearance manager, one query for every state the first had
-        cleared.  :meth:`_floor_manager` is the planning manager with no robot-to-part
-        pair held to less than the floor, so a state it finds nothing at is clear on both
-        counts from the one test.  A contact it finds is read: one the planning manager
-        holds as well is a collision on that same test, as it always was.  Only a part
-        standing between a pair's margin and the floor is asked the old way, so the answer
-        is the same in every case -- checked state for state against the two questions
-        asked apart, 6000 states of a real cell on every branch, none differing.
-        ``_clear_of`` is what keeps a later hit from asking the second question after all.
+        The fused floor manager that used to stand here went with the scope.  It existed
+        to answer the scope's own question on the same contact test as the margins', and
+        with one question left there is nothing to fuse.
         """
         key = (self.gun_value, np.asarray(q, dtype=float).tobytes())
         hit = self._collision_cache.get(key)
@@ -877,50 +702,19 @@ class Cell:
                 # Bounded for the reason the clearance cache is: candidates drawn once
                 # and thrown away would otherwise accumulate for the length of a run.
                 self._collision_cache.clear()
-                self._clear_of.clear()
-            if self._pm is not None and self._outside_scope():
-                # Outside the scope two things are asked of this state -- contact at the
-                # margins, then whether anything is within the scope's floor -- and each
-                # was a contact test of its own over the whole scene.  One test on a
-                # manager held to the floor answers both wherever it finds nothing, which
-                # is nearly everywhere: a transit spends its time in open air.  Counted on
-                # a real transit, 23844 of 29358 clearance queries were this second
-                # question, one for every state the first had just cleared.
-                self.counters["collision_tests"] += 1
-                fused, planned = self._floor_manager()
-                if fused is not self._cm:
-                    fused.setCollisionObjectsTransform(self._state.link_transforms)
-                res = ContactResultMap()
-                fused.contactTest(res, ContactRequest(ContactTestType_FIRST))
-                if res.size() == 0:
-                    self.counters["collision_fused"] += 1
-                    self._collision_cache[key] = False
-                    self._clear_of[key] = self._relax_floor
-                    return False
-                if fused is self._cm or self._planning_contact(res, planned):
-                    # A contact the planning manager holds as well -- its own verdict
-                    # where the margins already reach the floor, and otherwise one read
-                    # off what was found.  Blocked on the one test, as it always was.
-                    self.counters["collision_fused"] += 1
-                    self._collision_cache[key] = True
-                    return True
-                # A robot-to-part pair between its margin and the floor, which this test
-                # cannot tell from the scope refusing.  Asked separately below, as before.
             self.counters["collision_tests"] += 1
             res = ContactResultMap()
             self._cm.contactTest(res, ContactRequest(ContactTestType_FIRST))
             hit = res.size() > 0
             self._collision_cache[key] = hit
-            if hit:
-                return True
-        else:
-            self.counters["collision_hits"] += 1
-            if hit:
-                return True
+            return hit
+        self.counters["collision_hits"] += 1
+        if not hit:
+            # Callers read the tool position and the clearance off whatever state this
+            # leaves loaded, so a remembered clear state is still loaded.  A remembered
+            # contact loads nothing: every caller stops there.
             self._load_state(q)
-        # Every collision question in the program arrives here, which is why the scoped
-        # weld relaxation is applied at this one point rather than at each caller.
-        return self._only_relaxation_clears(q)
+        return hit
 
     def contact_pairs(self, q: np.ndarray) -> dict[tuple[str, str], float]:
         return {pair: c.distance for pair, c in self.contacts(q).items()}

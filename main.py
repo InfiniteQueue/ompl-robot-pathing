@@ -852,32 +852,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="obstacle clearance used instead of --obstacle-clearance-mm on "
                         "any move starting or ending at a weld locator, where the gun "
                         "has to reach the panel (default: %(default)g)")
-    #CONFINE THE WELD CLEARANCE TO THE WELD
-    p.add_argument("--scoped-weld-clearance", type=boolean, nargs="?", const=True,
-                   default=True, metavar="BOOL",
-                   help="true applies --weld-clearance-mm only within "
-                        "--weld-clearance-radius-mm of where the gun stands at each weld, "
-                        "and --obstacle-clearance-mm over the rest of the transit. "
-                        "Switched off, the weld clearance governs the whole "
-                        "transit: a transit runs weld to weld, so almost every one of "
-                        "them is planned with no obstacle margin from end to end, and a "
-                        "stretch grazing a panel far from either weld is then as legal as "
-                        "the weld itself. Measured over ten studies' stage logs, 3.03 m "
-                        "of tool travel runs under 5 mm and 1.05 m of that is more than "
-                        "75 mm from either end of its transit. Turning this on can make a "
-                        "transit that only had a route along a panel fail or detour "
-                        "instead, which is the trade; measured on one Path 1 segment it "
-                        "cost 22%% of the real motion to take a third off the sub-5 mm "
-                        "travel. Takes true/false (yes/no, on/off, "
-                        "1/0); passing the flag with no value means true "
-                        "(default: %(default)s)")
-    #HOW FAR THE WELD CLEARANCE REACHES
-    p.add_argument("--weld-clearance-radius-mm", type=float, default=50.0, metavar="MM",
-                   help="how far from the gun's position at a weld the weld clearance "
-                        "still applies, when --scoped-weld-clearance is on. Measured from "
-                        "the pose the robot is actually placed at rather than the one the "
-                        "study declared, the two differing by --weld-shift-mm. Ignored "
-                        "while the scoping is off (default: %(default)g)")
     #EARN THE WELD CLEARANCE OFF THE WELD POSES
     p.add_argument("--earned-weld-clearance", type=boolean, nargs="?", const=True,
                    default=True, metavar="BOOL",
@@ -888,9 +862,11 @@ def build_parser() -> argparse.ArgumentParser:
                         "therefore has real air around it -- measured over ten studies' "
                         "logs, 37 weld placements read 4.3 to 5.6 mm at the 5 mm shift, "
                         "median 5.2 -- but nothing read that figure, so the searches were "
-                        "told the whole transit could graze a panel and had the result "
-                        "taken back afterwards by --scoped-weld-clearance, which the "
-                        "planners cannot see. Clamped into [--weld-clearance-mm, "
+                        "told the whole transit could graze a panel. This is the only "
+                        "margin in force: the planners are handed it, the refinement "
+                        "passes work to it and the cell's own sweep judges against it, "
+                        "with nothing in Python refusing a state they were told was "
+                        "legal. Clamped into [--weld-clearance-mm, "
                         "--obstacle-clearance-mm], so it only ever moves the margin "
                         "towards the cell's own and never past it, and a weld that placed "
                         "with nothing to spare leaves its transit exactly as it was. "
@@ -1395,8 +1371,6 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         direct_clearance_mm=args.direct_clearance_mm,
         finish_attempts=args.finish_attempts,
         weld_clearance_mm=args.weld_clearance_mm,
-        scoped_weld_clearance=args.scoped_weld_clearance,
-        weld_clearance_radius_mm=args.weld_clearance_radius_mm,
         earned_weld_clearance=args.earned_weld_clearance,
         weld_clearance_slack_mm=args.weld_clearance_slack_mm,
         stand_off_search=args.weld_shift_search,
