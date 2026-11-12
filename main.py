@@ -302,6 +302,19 @@ def build_parser() -> argparse.ArgumentParser:
                         "share of samples landing within one extend of the locator falls "
                         "from 0.59%% to 0.36%% -- which is only worth paying where the "
                         "near region is already covered (default: %(default)g)")
+    #HOW FAR CLEAR OF THE FIXTURE THE SECOND, WIDER BOX STANDS
+    p.add_argument("--cartesian-wide-box-mm", type=float, default=300.0, metavar="MM",
+                   help="how far clear of the panels and tooling a second, wider sampling "
+                        "box stands, offered to the legs of a detour that back a locator "
+                        "out of its pocket -- the legs the tree is the only solver for. "
+                        "It is used only by a seed following a failure at the same gun "
+                        "opening, and it is unioned with the endpoint box rather than "
+                        "replacing it. The endpoint box is a hard wall on how far the tool "
+                        "may be put from the straight line between the two ends, which is "
+                        "the right guess almost always and, where it is wrong, is wrong by "
+                        "excluding the only way round; measured on one extraction leg it "
+                        "is 2.03 m3 against 9.12 m3 for this one. 0 leaves the second box "
+                        "out (default: %(default)g)")
     #HOW FAR THE TOOL MAY BE TURNED OFF THE DIRECT INTERPOLATION
     p.add_argument("--cartesian-tilt-deg", type=float, default=45.0, metavar="DEG",
                    help="how far off the interpolation between the two endpoint "
@@ -1210,6 +1223,15 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         print("error: --cartesian-gun-openings must be at least 1: the tree plans at one "
               "gun opening or another", file=sys.stderr)
         return 2
+    if args.cartesian_wide_box_mm < 0.0:
+        # Refused rather than read as 0.  A negative figure draws the box *inside* the
+        # fixture, which is either an inverted box or one holding nothing reachable, and
+        # the escalation would quietly treat it as switched off -- the same number meaning
+        # two things.
+        print("error: --cartesian-wide-box-mm cannot be negative: it is how far clear of "
+              "the panels and tooling the box stands, and 0 is how to leave it out",
+              file=sys.stderr)
+        return 2
     if args.gun_opening_weight < 1.0:
         print("error: --gun-opening-weight must be at least 1: below 1 it would pay a "
               "route to hold the gun open", file=sys.stderr)
@@ -1345,6 +1367,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
                                   gun_openings=args.cartesian_gun_openings,
                                   extend_mm=args.cartesian_extend_mm,
                                   margin_mm=args.cartesian_margin_mm,
+                                  wide_box_mm=args.cartesian_wide_box_mm,
                                   tilt_deg=args.cartesian_tilt_deg,
                                   recut=args.cartesian_recut),
         fallback_runs=args.fallback_runs,

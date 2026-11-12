@@ -813,6 +813,47 @@ class Cell:
         P = V[np.unique(groups[index])]
         return (P.max(axis=0) - P.min(axis=0)) / self.man.scale
 
+    def statics_bounds(self) -> tuple[np.ndarray, np.ndarray] | None:
+        """The box the panels and tooling occupy, in manifest units, or ``None``.
+
+        Read from the prepared hulls rather than the source meshes, so this is the extent
+        of the geometry the planner actually collides against -- the two differ, and on
+        the C-shaped castings here the hulls are the larger.  The statics are stored in
+        the capture frame, which is the world frame (see
+        ``SceneBuilder._compute_frames``), so no transform is involved and the answer is
+        directly comparable with :meth:`pose_mm`.
+
+        **Measured once and kept.**  It costs a pass over every static's prepared OBJ --
+        4.8 s on the cell this was built for, 128 MB of geometry -- which is why nothing
+        asks for it unless a search is about to use it.  It cannot change under a loaded
+        environment: a re-cut builds a whole new ``Cell``, and the error a re-cut makes
+        runs inward anyway, the pieces being contained in the hull they replace.
+
+        The moving links are left out because they move, and not because of where their
+        geometry is stored.  A link's mesh is in the frame it was captured in, same as a
+        static's, so its vertices read as perfectly ordinary cell positions -- measured on
+        one cell, the arm's span looks exactly like a seventh static.  What it is is the
+        arm at one pose out of all of them, which is no part of the fixture a detour has
+        to get round.
+        """
+        got = getattr(self, "_statics_box", False)
+        if got is not False:
+            return got
+        from . import meshprep
+        lo = np.full(3, np.inf)
+        hi = np.full(3, -np.inf)
+        for s in self.man.static_objects:
+            path = self.geometry.get(s.name)
+            if not path or not os.path.isfile(path):
+                continue
+            box = meshprep.obj_bounds(path)
+            if box is None:
+                continue
+            lo = np.minimum(lo, box[0] / self.man.scale)
+            hi = np.maximum(hi, box[1] / self.man.scale)
+        self._statics_box = None if not np.all(np.isfinite(lo)) else (lo, hi)
+        return self._statics_box
+
     def in_tcp_frame(self, q: np.ndarray, point_world: np.ndarray) -> np.ndarray:
         """A world point expressed in the TCP's own frame, in manifest units.
 

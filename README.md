@@ -1194,6 +1194,34 @@ give. On this leg it did not: the start tree's nodes sit a median 6.7 mm apart a
 tree's 26.7 mm, against an extend of 80 mm, so both had already covered their own regions far
 finer than one extend and samples landing there bought nothing.
 
+The box is a hard wall and not a preference, which is why that figure decides an extraction.
+A steer travels at most one extend from a node the tree already has, so every node it ever
+grows lies in the convex hull of the two endpoints and the box — and the box contains them,
+so the hull is the box. Nothing can walk the tool further out of a pocket than the margin
+allows, however long the search is given.
+
+So there is a **second box**, drawn round the panels and tooling rather than round the leg,
+each face `--cartesian-wide-box-mm` (300) clear of that geometry. Only the detour's
+extractions ask for it, and only a seed that follows a failure at the same gun opening gets
+it: an ordinary extraction comes out of its pocket on the first seed and pays nothing, and a
+failed seed is the only evidence there is that the near box is the wrong shape. It is
+unioned with the endpoint box rather than replacing it — a box round a fixture need not
+contain the leg's own ends, and a search whose samples never come near the place it has to
+reach is worse off than one with no extra room at all. The premise is that a long detour is
+sometimes the only way round and its shape cannot be guessed beforehand, which is exactly
+what a box drawn round the straight line forbids; measured on the failed leg, 2.03 m³ against
+9.12 m³, and on another cell the fixture box is 9.34 m³ with every locator inside it.
+
+Two things it is not. It is not a reach model — much of it lies beyond the arm — and that is
+affordable only because a sample is a direction and not a destination: the steer moves one
+extend from a node it already has, so a target the arm could never stand at costs one steer
+and no more than any other. And it is not free of dilution; it takes the share of samples
+landing within one extend of the locator from 0.10% to 0.026%. That is normally the whole
+argument against a wider box and it is not one here, the near region being saturated
+already. Measuring the fixture costs a pass over the statics' prepared hulls — 1.8 s on a
+7051-shell cell, 4.8 s on a 128 MB one — paid once per run and only where a seed has
+actually failed. `--cartesian-wide-box-mm 0` leaves the second box out.
+
 `--fallback-poses` is how many of the two ends get a pose. A transit has two ends and each
 has one fallback, so 2 is every pose there is and anything higher is read as 2; the cap is
 applied while the search runs rather than to the list it produces, because each walk solves
@@ -1697,6 +1725,8 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--cartesian-solve-seconds` | 120 | time at one gun opening before the tree gives that opening up as having no route, spent on every transit the band is on for; 0 disables the tree. `--cartesian-seconds` still works |
 | `--cartesian-process-seconds` | 40 | how long one opening is searched after its first route there, from new seeds, keeping the cheapest |
 | `--cartesian-gun-openings` | 3 | least gun openings the tree attempts per transit, capped by `--min-gun-openings`. Multiplies the two figures above |
+| `--cartesian-margin-mm` | 300 | how far outside the box its two endpoints span the tree samples. A hard wall on how far the tool may be put from the straight line, so on an extraction it bounds how deep a pocket can be backed out of |
+| `--cartesian-wide-box-mm` | 300 | how far clear of the panels and tooling a second, wider box stands, offered to a detour's extraction legs after a seed has failed and unioned with the box above. 0 leaves it out |
 | `--cartesian-recut` | true | cut a Cartesian-tree route where it leaves the band and replan the parts outside it with phases one and two |
 | `--phase-two-max-runs` | 2 | OMPL runs for a gap the recut has to join, stopping at the first solution. No longer a stage of a transit |
 | `--phase-two-solve-seconds` | 240 | how long one of those runs may search |

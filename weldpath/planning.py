@@ -2477,6 +2477,16 @@ def _tree_leg(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, opening: float | No
     worth having because this is paid per leg per gun opening tried.  ``gun_openings`` is
     moot here for the same reason it is not passed: this leg is pinned to one opening and
     the detour is what walks the others, a leg at a time.
+
+    **This is the one caller that asks for the wide sampling box**, and the reasoning is
+    the mirror of ``process_seconds``.  There is nothing to choose about getting out of a
+    pocket, but there is everything to lose by not getting out: a transit's tree search
+    failing costs a candidate, where this one failing at every opening ends the detour and
+    so the segment.  A long detour round the fixture is exactly what that case needs and
+    exactly what the endpoint box forbids, the box being a hard wall on where the tool may
+    be put -- so the leg with no fallback is the leg that should be allowed to look
+    further.  See ``_cartesian_solutions``, which escalates to it only after a seed has
+    failed, so a leg that comes out of its pocket at the first attempt pays nothing.
     """
     if cfg.cartesian is None or not cfg.cartesian.enabled:
         # Guarded rather than assumed: _plan_detour hands these legs to every solver when
@@ -2486,7 +2496,8 @@ def _tree_leg(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, opening: float | No
     found = _cartesian_solutions(cell, qa, qb,
                                  replace(cfg.cartesian, process_seconds=0.0),
                                  cfg.check_step, [opening], log,
-                                 deadline=cfg.deadline, zone=cfg.zone, gun=cfg.gun)
+                                 deadline=cfg.deadline, zone=cfg.zone, gun=cfg.gun,
+                                 wide_box_mm=cfg.cartesian.wide_box_mm)
     if not found:
         raise PlanningError(f"the cartesian tree found no route for {what}")
 
@@ -2807,11 +2818,15 @@ class GunOpenings:
     phase-one budget went to one opening, and the next was reached only once that one had
     failed outright, by which time most of what the transit had to spend was gone.
 
-    ``extra`` holds openings ``main`` does not, and is what phase two walks.  Phase one
-    has already had runs at everything in ``main``; what phase two adds is a longer search
-    per run, and spending it where three short ones just failed is the narrower of the two
-    bets available.  So it is spent somewhere new, and an empty ``extra`` -- the gun ran
-    out of distinct openings, or none were asked for -- means phase two has nothing to do.
+    ``extra`` holds openings ``main`` does not, and **it is the detour's, not phase
+    two's.**  It was phase two's while that was a stage of a transit: phase one had
+    already had runs at everything in ``main``, and a longer search was the narrower bet
+    spent somewhere new.  Phase two is no longer a stage -- ``_plan_detour`` runs where it
+    used to -- and what walks both lists now is the detour, an opening at a time per leg.
+    Holding some back is still worth doing for the reason it always was, which is that a
+    wider rotation spread thin leaves no opening enough phase-one runs to choose a route
+    with.  An empty ``extra`` -- the gun ran out of distinct openings, or none were asked
+    for -- costs the detour its widest choice and nothing else.
 
     Both lists hold only openings the leg's own poses are clear at; see ``_opening_lists``.
 
@@ -2963,8 +2978,14 @@ def _opening_lists(cell: Cell, named: list[float] | None,
     if log:
         note = ", ".join(f"{v:g}" for v in out.main) or "none"
         extra = ", ".join(f"{v:g}" for v in out.extra)
+        # Said "for phase two" until the reading of a log made the point: phase two has
+        # not been a stage of a transit since ``_plan_detour`` replaced it, so that line
+        # named a stage no run has, and the openings it describes are walked by the
+        # detour.  A log line is where a stale name does the most damage -- it is what a
+        # reader reasons about the program from.
         log(f"      gun openings: {note} mm for phase one"
-            + (f", then {extra} mm for phase two" if extra else ", none left for phase two")
+            + (f", then {extra} mm held back for the detour" if extra
+               else ", none held back for the detour")
             + (f" ({len(tried) - len(kept)} screened out)"
                if len(tried) > len(kept) else ""))
     return out
@@ -3572,12 +3593,44 @@ def _recut_solution(cell: Cell, best: _Solution, *, zone: "LinearZone",
     return _Solution(cost, plain, route, best.opening, best.source)
 
 
+def _wide_box(cell: Cell, clear_mm: float, log) -> tuple | None:
+    """The panels and tooling, inflated ``clear_mm`` on every face, or ``None``.
+
+    A sampling box for a search the endpoint box has already failed -- see
+    ``cartesian._sample``, which unions it with that box rather than replacing it.  What
+    it buys is room for a detour nobody could have predicted the shape of: the endpoint
+    box is drawn round the straight line between the two ends and is the right guess
+    almost always, and where it is wrong it is wrong by excluding the only way round.
+
+    Drawn round the fixture rather than taken as a looser margin because the fixture is
+    what a detour has to get round, and because that bounds it: the cell is a known size,
+    where a margin large enough to cover an unknown detour has no natural figure.  Note
+    what it does *not* do -- it is not a reach model, and much of this box is beyond the
+    arm.  That is affordable only because a sample is a direction and not a destination; a
+    steer moves ``extend_mm`` from a node it already has, so a target the arm could never
+    stand at still costs one steer and no more than any other.
+
+    ``None`` where the cell has no static geometry to measure, which is a cell with
+    nothing to detour round.
+    """
+    box = cell.statics_bounds()
+    if box is None:
+        return None
+    lo, hi = box[0] - float(clear_mm), box[1] + float(clear_mm)
+    if log:
+        log(f"      widening the sampling box to the panels and tooling "
+            f"{clear_mm:g} mm clear: {np.round(hi - lo, 0)} mm "
+            f"= {float(np.prod(hi - lo)) / 1e9:.2f} m^3")
+    return (lo, hi)
+
+
 def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                          budget: "CartesianBudget", check_step: float,
                          rotation: list, log,
                          deadline: "Deadline | None" = None,
                          zone: "LinearZone | None" = None,
-                         gun: "GunPreference | None" = None) -> list[_Solution]:
+                         gun: "GunPreference | None" = None,
+                         wide_box_mm: float = 0.0) -> list[_Solution]:
     """Cartesian-tree routes for one transit, each scored as phase one scores its own.
 
     **The budgets are per gun opening.**  Each opening in turn is searched from
@@ -3608,6 +3661,14 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
 
     Called on every transit, not only on the ones phase one failed, so these budgets are
     now spent whether or not a route is already in hand -- see ``_plan_direct``.
+
+    **``wide_box_mm`` turns the sampling box into two, and only the detour's extractions
+    ask for it.**  Where it is set, a seed that follows a failure at the same opening
+    samples the panels and tooling inflated by that figure as well as the endpoint box --
+    see ``_wide_box``.  It is an argument rather than read off the budget so that the
+    decision stays at the call site: a direct transit has other solvers and a route from
+    one of them to fall back on, while an extraction has neither, which is what makes a
+    wider search worth its dilution there and not here.
     """
     rotation = list(rotation) or [None]
     deadline = deadline or Deadline()
@@ -3620,9 +3681,11 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
         f"linear space and {budget.process_seconds:g}s more on better ones")
     found: list[_Solution] = []
     run = 0
+    wide: tuple | None = None
     for opening in rotation[:wanted]:
         began = time.time()
         solved: float | None = None
+        seeds = 0
         while True:
             left = deadline.clamp((began + budget.seconds if solved is None else
                                    solved + budget.process_seconds) - time.time())
@@ -3634,10 +3697,31 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                     return found
                 break
             run += 1
-            got = _cartesian_route(cell, qa, qb, budget, seconds=left, zone=zone, gun=gun,
+            seeds += 1
+            use = budget
+            if wide_box_mm > 0.0 and seeds > 1 and solved is None:
+                # The first seed at an opening gets the endpoint box, and only a seed
+                # following a failure gets the wide one.  Escalation rather than a setting
+                # because the two boxes are right in different cases and nothing can tell
+                # which case a leg is beforehand: the endpoint box is the tighter search
+                # and solves an ordinary extraction in a fraction of a second, while a
+                # pocket deeper than it is a leg it cannot solve at all however long it
+                # runs -- the box being a hard wall on where the tool may be put.  A
+                # failed seed is the evidence, and it is the only evidence there is.
+                #
+                # Not offered once the opening has solved.  The seeds after that are
+                # looking for a *better* route, and the box that produced one is not the
+                # thing to change about the search that found it.
+                if wide is None:
+                    wide = _wide_box(cell, wide_box_mm, log)
+                if wide is not None:
+                    use = replace(budget, box=wide)
+            got = _cartesian_route(cell, qa, qb, use, seconds=left, zone=zone, gun=gun,
                                    seed=budget.seed + run - 1, opening=opening,
                                    check_step=check_step,
-                                   label=f"cartesian tree run {run}", log=log)
+                                   label=f"cartesian tree run {run}"
+                                         + (" (wide box)" if use is not budget else ""),
+                                   log=log)
             if got is not None:
                 found.append(got)
                 if solved is None:

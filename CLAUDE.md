@@ -548,6 +548,67 @@ the way, so the joint values in between are whatever that line demands.
       own regions three to twelve times finer than one extend, and samples landing there
       were buying nothing. That is what makes the trade worth taking here and not in
       general: dilution costs nothing where the near region is saturated.
+    - **The box is a hard wall on where the tool may be put, not a preference about
+      detours**, which is what makes the margin the figure an extraction stands or falls
+      on. A steer travels at most `extend_mm` from a node the tree already holds, so every
+      node lies in the convex hull of the two endpoints and the box, and the box contains
+      them, so the hull *is* the box. No budget walks the tool further out than the margin
+      allows.
+  - **There is a second box, drawn round the panels and tooling, and only the detour's
+    extractions get it.** `--cartesian-wide-box-mm` (300) is how far clear of that
+    geometry each of its faces stands; `Cell.statics_bounds` measures the geometry and
+    `planning._wide_box` inflates it.
+    - **Round the fixture rather than as a looser margin, because the fixture is what a
+      detour has to get round and because it bounds the answer.** A margin large enough to
+      cover a detour nobody can predict the shape of has no natural figure; the cell has a
+      known size. Measured on Path 2's leg: the endpoint box at 300 mm is 2.03 m^3 and this
+      one is 9.12 m^3, both endpoints inside it. On another cell, 3.39 m^3 of statics
+      becoming 9.34 m^3, with every locator inside.
+    - **Unioned with the endpoint box, not substituted for it.** "A wider box" reads as a
+      replacement and that is wrong in the case that matters: a box round a fixture need
+      not contain the leg's own ends, and a search whose samples never come near the place
+      it has to reach is worse off than one given no extra room. A union can only add.
+    - **Escalated after a failure rather than set**, in `_cartesian_solutions`: the first
+      seed at an opening samples the endpoint box and only a seed following a failure gets
+      the wide one, and once that opening has solved it is not offered again -- the later
+      seeds there are looking for a *better* route, and the box that produced one is not
+      the thing to change. The two boxes are right in different cases and nothing can tell
+      which case a leg is beforehand, so a failed seed is the evidence, and it is the only
+      evidence there is. An extraction that comes out of its pocket at the first attempt
+      pays nothing, measuring included.
+    - **Only `_tree_leg` asks for it, and that is the mirror of why that leg has no
+      process budget.** There is nothing to choose about getting out of a pocket, and
+      everything to lose by not getting out: a transit's tree search failing costs a
+      candidate, where this one failing at every opening ends the detour and so the
+      segment. So the decision is an argument at the call site rather than a reading of
+      the budget -- a direct transit has other solvers and a route to fall back on, which
+      is what makes the dilution not worth paying there.
+    - **It is not a reach model**, and only 60.3% of it lies inside the arm's observed
+      reach shell against 85.8% for the endpoint box. That is affordable because a sample
+      is a *direction* and not a destination: the steer moves one extend from a node
+      already in hand, so a target the arm could never stand at costs one steer and no
+      more than any other. What the box changes is the distribution of directions and the
+      wall, not where a steer is attempted.
+    - Dilution is real and is not the objection -- the share of samples within one extend
+      of the locator goes from 0.10% to 0.026%, in a region already covered far finer than
+      one extend. The cost worth naming is the measurement: a pass over the statics'
+      prepared hulls, 1.8 s on a 7051-shell cell and 4.8 s on 128 MB of geometry, kept on
+      the cell and so paid once per run.
+    - `Cell.statics_bounds` reads the **prepared** hulls rather than the source meshes, so
+      the box is the extent of what the planner collides against; the two differ, and on
+      the C-shaped castings here the hulls are larger. The moving links are left out
+      because they move and not because of where their geometry sits -- a link's mesh is
+      in its capture frame exactly as a static's is, and on one cell the arm's span reads
+      like a seventh static. `meshprep.obj_bounds` is the scan, parsed per `o` block so
+      that each block's vertex region is one slice numpy can take in a single call: 4.8 s
+      against 14.4 s for the obvious loop over lines, and held against `read_groups`'
+      own answer by `recut_test`.
+    - **The log line that described `extra` as phase two's is fixed.** It said "then 20,
+      70, 120 mm for phase two", which named a stage no run has had since `_plan_detour`
+      replaced it, and reading it is what produced the belief that a phase two exists and
+      uses the fallback poses. The openings it describes are the detour's. A stale name in
+      a log line is the worst place for one: it is what a reader reasons about the program
+      from, and the docstring on `GunOpenings` had the same error.
   - The arrangement before this walked three methods -- retreat from the start, retreat
     from the end, then a line out of the *midpoint* towards neutral -- and handed the
     planner whatever poses they produced as interchangeable candidates for a single via.

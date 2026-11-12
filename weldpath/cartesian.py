@@ -68,6 +68,12 @@ class CartesianBudget:
     are refused whole the moment any station on them fails, wasting the inverse kinematics
     already spent on the stations before it.
 
+    ``wide_box_mm`` is not used unless a caller asks for it, and only one does: the
+    extraction legs of a detour, where the tree is the sole solver.  It is how far clear
+    of the panels and tooling the wider sampling box stands, and the box itself is drawn
+    round that geometry rather than round the leg's own two endpoints -- see
+    ``planning._cartesian_solutions``, which swaps it in once a seed has failed.
+
     ``recut`` is the one setting here that is not about the search.  The tree has to reach
     the far endpoint, so it returns straight tool moves over the whole transit including
     the part of it that runs nowhere near a panel, where a straight-line route was never
@@ -88,6 +94,8 @@ class CartesianBudget:
     branch_seeds: int = 8           # scattered seeds tried when the continuing one fails
     recut: bool = True              # re-plan the stretches outside the band with OMPL
     seed: int = 0
+    box: tuple | None = None        # a wider box to sample in as well; see ``_sample``
+    wide_box_mm: float = 300.0      # how far clear of the fixture that wider box stands
 
     @property
     def enabled(self) -> bool:
@@ -250,9 +258,27 @@ def _sample(rng: np.random.Generator, pa: np.ndarray, pb: np.ndarray,
     perturbed by at most ``tilt_deg``, because a tool that arrives at a weld square to the
     panel is square to it most of the way in, and sampling SO(3) freely would spend nearly
     the whole budget on orientations no route uses.
+
+    **The box is a hard wall on where the tool may be put, not merely on where samples
+    land.**  A steer travels at most ``extend_mm`` from an existing node towards the
+    sample, so every node of the tree lies in the convex hull of the two endpoints and
+    this box -- and the box contains them, so the hull is the box.  Nothing can walk the
+    tool further out of a pocket than ``margin_mm``, however long the search runs, which
+    is what makes that figure the setting an extraction stands or falls on rather than a
+    preference about detours.
+
+    ``budget.box`` is a second, wider box offered by the caller, and what is sampled is
+    the **union** of the two.  Replacing the endpoint box outright would be the obvious
+    reading of "a wider box", and it is wrong in one case that matters: a box drawn round
+    the fixture need not contain an endpoint, and a search whose samples never come near
+    the place it has to reach is worse off than one with no extra room at all.  A union
+    can only add.
     """
     lo = np.minimum(pa[:3, 3], pb[:3, 3]) - budget.margin_mm
     hi = np.maximum(pa[:3, 3], pb[:3, 3]) + budget.margin_mm
+    if budget.box is not None:
+        lo = np.minimum(lo, np.asarray(budget.box[0], dtype=float))
+        hi = np.maximum(hi, np.asarray(budget.box[1], dtype=float))
     out = interpolate_pose(pa, pb, float(rng.uniform(0.0, 1.0)))
     out[:3, 3] = rng.uniform(lo, hi)
     out[:3, :3] = out[:3, :3] @ _random_rotation(rng, np.radians(budget.tilt_deg))
