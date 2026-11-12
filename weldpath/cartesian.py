@@ -78,10 +78,10 @@ class CartesianBudget:
     process_seconds: float = 20.0   # wall clock on better routes, once one is found
     gun_openings: int = 3           # least openings attempted, where that many exist
     max_iters: int = 4000           # sample budget, whichever runs out first
-    extend_mm: float = 120.0        # furthest one extend drives the tool
+    extend_mm: float = 80.0         # furthest one extend drives the tool
     extend_deg: float = 25.0        # ...and furthest it turns the tool, whichever binds
-    margin_mm: float = 150.0        # how far outside the endpoints sampling may stray
-    tilt_deg: float = 30.0          # how far off the endpoint slerp an orientation is drawn
+    margin_mm: float = 300.0        # how far outside the endpoints sampling may stray
+    tilt_deg: float = 45.0          # how far off the endpoint slerp an orientation is drawn
     goal_bias: float = 0.10         # share of samples aimed at the far tree's root
     jump_rad: float = 0.50          # largest per-joint step allowed between two stations
     orient_weight_mm_per_rad: float = 200.0     # a radian of turn as this much tool travel

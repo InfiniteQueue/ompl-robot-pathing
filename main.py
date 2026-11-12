@@ -291,11 +291,17 @@ def build_parser() -> argparse.ArgumentParser:
                         "them fails, wasting the inverse kinematics already spent on the "
                         "stations before it (default: %(default)g)")
     #HOW FAR OUTSIDE THE ENDPOINTS IT LOOKS
-    p.add_argument("--cartesian-margin-mm", type=float, default=200.0, metavar="MM",
+    p.add_argument("--cartesian-margin-mm", type=float, default=300.0, metavar="MM",
                    help="how far outside the box spanned by the two endpoints the tree "
                         "samples for a way round. A detour has to leave the straight line "
-                        "to be worth finding, but one that leaves it by more than the "
-                        "fixture is deep is not a detour (default: %(default)g)")
+                        "to be worth finding, and what the figure really bounds is how "
+                        "far the tool may be backed out of a pocket: measured on one "
+                        "extraction leg, 200 mm let the box reach 267 mm from the weld "
+                        "along its own retreat axis and 300 mm reaches 371 mm. It costs "
+                        "volume -- the same leg's box goes from 1.18 to 2.03 m3, so the "
+                        "share of samples landing within one extend of the locator falls "
+                        "from 0.59%% to 0.36%% -- which is only worth paying where the "
+                        "near region is already covered (default: %(default)g)")
     #HOW FAR THE TOOL MAY BE TURNED OFF THE DIRECT INTERPOLATION
     p.add_argument("--cartesian-tilt-deg", type=float, default=45.0, metavar="DEG",
                    help="how far off the interpolation between the two endpoint "

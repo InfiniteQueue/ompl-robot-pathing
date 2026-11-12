@@ -1178,11 +1178,21 @@ is what now calls a direction exhausted; a step in contact resets that run, sinc
 starts inside a pocket and is expected to begin blocked.
 
 This matters beyond the pose itself, because the fallback decides where the Cartesian tree
-may look: the extraction's sampling box is the locator-to-fallback box inflated by 150 mm, so
-a fallback across the retreat axis leaves the search almost no room in the one direction that
-gets the gun out. On the failed leg only 23.7% of samples had any component along the retreat
-axis and 0.85% fell within one extend of the locator, and the tree rooted at the weld reached
-26–60 nodes against 794–1071 for the one in open air.
+may look: the extraction's sampling box is the locator-to-fallback box inflated by
+`--cartesian-margin-mm`, so a fallback across the retreat axis leaves the search almost no
+room in the one direction that gets the gun out. On the failed leg, at the 200 mm margin then
+in force, only 26.8% of samples had any component along the retreat axis and 0.18% fell
+within one extend of the locator, and the tree rooted at the weld reached 26–60 nodes against
+794–1071 for the one in open air.
+
+The margin is now 300 mm. What it really bounds is how far the tool may be backed out of a
+pocket: 200 mm let that box reach 266.6 mm from the weld along its own retreat axis, and 300
+reaches 370.9 mm, so a pocket deeper than the box is a leg no budget can solve. The cost is
+volume — 1.18 to 2.03 m³, taking the share of samples within one extend of the locator from
+0.18% to 0.10% — and that cost is only real where the near region still has something to
+give. On this leg it did not: the start tree's nodes sit a median 6.7 mm apart and the goal
+tree's 26.7 mm, against an extend of 80 mm, so both had already covered their own regions far
+finer than one extend and samples landing there bought nothing.
 
 `--fallback-poses` is how many of the two ends get a pose. A transit has two ends and each
 has one fallback, so 2 is every pose there is and anything higher is read as 2; the cap is

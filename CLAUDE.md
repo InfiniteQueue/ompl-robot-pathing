@@ -517,15 +517,37 @@ the way, so the joint values in between are whatever that line demands.
     line has nothing usable on it at all.
   - **Why this matters beyond the pose itself: it decides where the Cartesian tree may
     look.** `cartesian._sample` draws position uniformly from the box the leg's two
-    endpoints span, inflated by `margin_mm` (150), so the extraction's search volume is
+    endpoints span, inflated by `--cartesian-margin-mm` (300), so the extraction's
+    search volume is
     built around the locator-to-fallback line. With the fallback 106 deg off the retreat
-    axis that box was a 1.6 m corridor through open air: measured on Path 2's leg, only
-    **23.7%** of samples had any component along the retreat axis, **0.85%** fell within
-    one extend (120 mm) of the locator, and the median sample was **789 mm** away. The
-    start tree reached 26-60 nodes against the goal tree's 794-1071, and the leg failed at
-    all eight gun openings. Relaxing `margin_mm` would dilute that further; putting the
-    fallback back on the retreat axis is what aligns the box with the direction the gun
-    has to move.
+    axis that box was a 1.7 m corridor through open air: measured on Path 2's leg at the
+    200 mm margin then in force, only **26.8%** of samples had any component along the
+    retreat axis, **0.18%** fell within one extend (80 mm) of the locator, and the
+    median sample was **789 mm** away. The start tree reached 26-60 nodes against the goal tree's
+    794-1071, and the leg failed at all eight gun openings. Putting the fallback back on
+    the retreat axis is what aligns the box with the direction the gun has to move.
+    - **Those figures were first quoted off the dataclass defaults, which are not what a
+      run uses.** Every `CartesianBudget` field that has a flag had drifted from it:
+      `margin_mm` said 150 against `--cartesian-margin-mm` 200, `extend_mm` 120 against
+      `--cartesian-extend-mm` 80, `tilt_deg` 30 against `--cartesian-tilt-deg` 45. Three
+      for three, and the dead one is always the easier to find. The dataclass now carries
+      the command line's values and `tree_test` pins every such pair, which is the only
+      thing that stops this recurring -- it found the second and third as soon as it
+      existed.
+    - **What the margin really bounds is how far the tool may be backed out of a pocket**,
+      and on an extraction that is the whole question. At 200 mm the box reached 266.6 mm
+      from the weld along its own retreat axis; at 300 it reaches 370.9 mm. The start trees
+      got 44-163 mm along it, so they were not pressed against the 200 mm wall -- but a
+      pocket deeper than the box is a leg no budget can solve, which is the case for
+      raising it.
+    - **Dilution is the cost, and it is only a cost where the near region still has
+      something to give.** 200 -> 300 mm takes the box from 1.18 to 2.03 m^3 and the share
+      of samples within one extend of the locator from 0.59% to 0.36%. Measured on the
+      same leg, the start tree's nodes sit a median **6.7 mm** apart and the goal tree's
+      **26.7 mm**, against an extend of 80 mm -- so both trees had already covered their
+      own regions three to twelve times finer than one extend, and samples landing there
+      were buying nothing. That is what makes the trade worth taking here and not in
+      general: dilution costs nothing where the near region is saturated.
   - The arrangement before this walked three methods -- retreat from the start, retreat
     from the end, then a line out of the *midpoint* towards neutral -- and handed the
     planner whatever poses they produced as interchangeable candidates for a single via.
