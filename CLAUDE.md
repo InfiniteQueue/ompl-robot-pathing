@@ -453,7 +453,7 @@ the way, so the joint values in between are whatever that line demands.
   - **`--fallback-poses` (2) is how many of the two ends get a pose, and it is enforced in
     `FallbackFinder.pair` rather than by slicing the list the planner gets.** A walk costs
     real time whether or not its pose is used -- it solves inverse kinematics at every step
-    it takes, until the arm runs out of reach -- so a cap read at the planner would save
+    it takes, for as long as the line lasts -- so a cap read at the planner would save
     none of it. A transit has two ends and each has one fallback, so 2 is every pose there
     is and anything above it is read as 2. 1 asks for the start end's alone and the detour
     is then `w1 -> f1 -> w2`, which still asks one leg to reach all the way into the end
@@ -476,8 +476,56 @@ the way, so the joint values in between are whatever that line demands.
   out along that locator's retreat axis -- the direction that points into the gun's bulk,
   which is the way out of the pocket -- and, where that yields nothing, out from that same
   locator towards where its own nearest neutral pose puts the tool. Both walk outward a
-  `--fallback-step-mm` step at a time from the locator itself, so the first candidate that
-  passes `validity` is the nearest one that works, which is what keeps a detour a detour.
+  `--fallback-step-mm` step at a time from the locator itself.
+  - **A walk runs the whole line and keeps the airiest pose on it.** It stops early only
+    where a candidate reaches `--fallback-distance-mm`, which is good enough by
+    definition; otherwise it keeps stepping and returns the highest-clearance pose it
+    saw. So that figure is where a walk *may* stop, not what it demands.
+    - **Requiring it outright is what broke this, and the figure is absolute where the
+      thing it is asked of is not.** A weld pose sits a few millimetres off the panel, and
+      in a tight cell nothing within reach of the pocket is 100 mm clear of anything.
+      Measured on Path 2's `73078-11-R_3t`, over the 65 states the Cartesian tree had
+      already validated around that locator: the best clearance anywhere was **35.7 mm**
+      and **not one reached 100**. So every step of the retreat walk was refused as too
+      close, the method was abandoned, and the pose that shipped came from the *neutral*
+      walk -- 1438.6 mm away, **106.0 deg** off the retreat axis, with a **-397.5 mm**
+      component along it. The gun does come clear backing out; it does not come 100 mm
+      clear.
+    - A sub-bar candidate therefore comes back from `validity` carrying its solution.
+      `Verdict.valid` is "good enough to stop", `Verdict.usable` is "somewhere the robot
+      can be parked", and only no-IK and in-collision discard the `q`.
+    - The comparison is strictly greater, so a tie keeps the nearer pose, which is what
+      keeps a detour a detour.
+  - **A single missed inverse-kinematics solve no longer ends a walk.** It used to, on the
+    reasoning that everything further along the line was unreachable too. That holds for a
+    walk heading radially outward and **not** for a retreat axis, which runs nearly
+    tangential to the reach sphere: measured on the same locator, 440 mm along it moves
+    the tool from 2450 mm to 2441 mm from the shoulder, while tree nodes in that same cell
+    reach 2616 mm. The one miss that ended that walk said nothing about reach, and the
+    walk gave up one step short -- the *next* segment's start locator found 109 mm at
+    exactly 11 steps on its own retreat axis.
+    - `finder.IK_GIVE_UP_MM` (200) is the run of consecutive misses that does call a
+      direction exhausted. A **distance** rather than a step count, so it does not change
+      meaning with `--fallback-step-mm`; five steps at the default. No flag: there is one
+      cell's worth of evidence behind the number and a flag would imply more.
+    - A step in contact resets the run and does not end anything. The walk starts inside a
+      pocket, so the first candidates are expected to be blocked.
+  - **The retreat method now nearly always answers, so the neutral walk rarely runs.**
+    That is the intent -- the neutral walk is a different search, not a looser version of
+    the retreat -- but it means a retreat pose only a little clearer than the weld is
+    preferred to a neutral pose far out in open air. It is only reached where the retreat
+    line has nothing usable on it at all.
+  - **Why this matters beyond the pose itself: it decides where the Cartesian tree may
+    look.** `cartesian._sample` draws position uniformly from the box the leg's two
+    endpoints span, inflated by `margin_mm` (150), so the extraction's search volume is
+    built around the locator-to-fallback line. With the fallback 106 deg off the retreat
+    axis that box was a 1.6 m corridor through open air: measured on Path 2's leg, only
+    **23.7%** of samples had any component along the retreat axis, **0.85%** fell within
+    one extend (120 mm) of the locator, and the median sample was **789 mm** away. The
+    start tree reached 26-60 nodes against the goal tree's 794-1071, and the leg failed at
+    all eight gun openings. Relaxing `margin_mm` would dilute that further; putting the
+    fallback back on the retreat axis is what aligns the box with the direction the gun
+    has to move.
   - The arrangement before this walked three methods -- retreat from the start, retreat
     from the end, then a line out of the *midpoint* towards neutral -- and handed the
     planner whatever poses they produced as interchangeable candidates for a single via.

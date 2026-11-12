@@ -20,11 +20,12 @@ Each end has two methods, tried in order:
                  the locator has no usable axis at all, and it heads somewhere the arm is
                  known to be able to stand rather than in a direction read off the gun.
 
-Both walk outward from the locator a step at a time, so the first candidate that passes
-:mod:`weldpath.fallback.validity` is the nearest one that works -- which is what keeps a
-detour a detour.  A method decides *where* to look and nothing else; whether a candidate
-is any good is validity's question, and a method that answered it too would have to be
-rewritten every time the rule changed.
+Both walk outward from the locator a step at a time.  A method decides *where* to look
+and nothing else: whether a candidate is any good is :mod:`weldpath.fallback.validity`'s
+question, and how far along its line a walk goes before settling is
+:class:`~weldpath.fallback.finder.FallbackFinder`'s -- it runs the whole line and keeps the
+airiest pose on it, stopping early only where one reaches the distance asked for.  A method
+that answered either would have to be rewritten every time those rules changed.
 
 Adding a method means writing a generator and putting it in an ``End``.  Nothing else in
 the package needs to know it exists.

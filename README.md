@@ -1150,17 +1150,44 @@ one.
 that locator's retreat axis — the direction pointing into the gun's own bulk, which is the
 way out of the pocket rather than deeper into it — and, where that finds nothing, out from
 the same locator towards where its nearest neutral pose puts the tool. Both step outward
-`--fallback-step-mm` at a time, so the first candidate that is reachable, collision free and
-`--fallback-distance-mm` clear of the parts is the nearest one that works. The arrangement
-before this walked a single list — retreat from the start, retreat from the end, then a line
-out of the midpoint — and offered the results as interchangeable candidates for one via,
-which made the end locator's extraction the proposed remedy for a start locator that could
-not be backed out. They were never alternatives.
+`--fallback-step-mm` at a time. The arrangement before this walked a single list — retreat
+from the start, retreat from the end, then a line out of the midpoint — and offered the
+results as interchangeable candidates for one via, which made the end locator's extraction
+the proposed remedy for a start locator that could not be backed out. They were never
+alternatives.
+
+**A walk runs the whole line and keeps the airiest pose on it.** It stops early only where a
+candidate is reachable, collision free and `--fallback-distance-mm` clear, which is good
+enough by definition; otherwise it keeps stepping and returns the highest-clearance pose it
+found. That figure is where a walk may stop, not what it demands, and the difference is the
+whole of it: a weld pose sits a few millimetres off its panel, so in a tight cell nothing
+within reach of the pocket is 100 mm clear of anything. Measured on Path 2's
+`73078-11-R_3t`, across the 65 states the Cartesian tree had already validated around that
+locator, the best clearance anywhere was **35.7 mm** and not one reached 100 — so every step
+of the retreat walk was refused as too close and the pose that shipped came from the neutral
+walk instead, 1.44 m away and 106° off the retreat axis. The gun does come clear backing out
+of that weld; it does not come 100 mm clear.
+
+**A single missed inverse-kinematics solve no longer ends a walk either.** It used to, on
+the reasoning that everything further along the line was unreachable too — sound for a walk
+heading radially outward, and wrong for a retreat axis, which runs nearly tangential to the
+reach sphere. On that same locator, 440 mm along it moves the tool from 2450 mm to 2441 mm
+from the shoulder while tree nodes in the same cell reach 2616 mm, and the walk gave up one
+step short of where the next segment's locator found 109 mm. A run of misses totalling 200 mm
+is what now calls a direction exhausted; a step in contact resets that run, since a walk
+starts inside a pocket and is expected to begin blocked.
+
+This matters beyond the pose itself, because the fallback decides where the Cartesian tree
+may look: the extraction's sampling box is the locator-to-fallback box inflated by 150 mm, so
+a fallback across the retreat axis leaves the search almost no room in the one direction that
+gets the gun out. On the failed leg only 23.7% of samples had any component along the retreat
+axis and 0.85% fell within one extend of the locator, and the tree rooted at the weld reached
+26–60 nodes against 794–1071 for the one in open air.
 
 `--fallback-poses` is how many of the two ends get a pose. A transit has two ends and each
 has one fallback, so 2 is every pose there is and anything higher is read as 2; the cap is
 applied while the search runs rather than to the list it produces, because each walk solves
-inverse kinematics at every step it takes until the arm runs out of reach, and a cap that
+inverse kinematics at every step it takes for as long as its line lasts, and a cap that
 only hid the pose afterwards would save none of that time. 1 asks for the start end's alone,
 which still leaves one leg reaching all the way into the end locator's pocket. 0 looks for
 none at all, and a transit with no direct route then fails rather than detouring.
