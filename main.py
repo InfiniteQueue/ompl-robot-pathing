@@ -180,6 +180,25 @@ def build_parser() -> argparse.ArgumentParser:
                         "--obstacle-clearance-mm it can never fire, since a move closer "
                         "than that is already a collision. 0 leaves the collision check "
                         "as the whole of the test (default: %(default)g)")
+    #HOW MANY CANDIDATE ROUTES MAY BE OFFERED TO THE FINISHING PASSES
+    p.add_argument("--finish-attempts", type=int, default=4, metavar="N",
+                   help="candidate routes a transit may offer to the finishing passes "
+                        "before it is given up on. Ranking picks which route to keep; "
+                        "this is what happens when the route that was picked cannot be "
+                        "reduced to one the robot may fly. Two passes refuse a route "
+                        "outright -- the stop-band clearing, where a waypoint holds joint "
+                        "5 inside the band and can be neither removed nor nudged out of "
+                        "it, and the final verification, where the finished path will not "
+                        "fly -- and both are properties of a route's shape rather than of "
+                        "the transit, so the next-cheapest candidate is worth offering. "
+                        "It used to be that the cheapest was the only route ever "
+                        "densified, and a refusal there discarded the whole transit with "
+                        "every other candidate unexamined. Bounded because where the only "
+                        "way between the two ends takes joint 5 through zero every "
+                        "candidate is refused the same way and each attempt costs a whole "
+                        "refinement; the first attempt keeps the full budget and a retry "
+                        "takes only the time the segment clock has left. 1 is the old "
+                        "behaviour (default: %(default)g)")
     #PHASE ONE: CHOOSE BETWEEN ROUTES
     p.add_argument("--phase-one-runs", type=int, default=20, metavar="N",
                    help="sampling-planner runs made per transit in phase one. Every one "
@@ -791,6 +810,37 @@ def build_parser() -> argparse.ArgumentParser:
                         "%(default)g)")
     #endregion
     #region ###CLEARANCE FROM THE PARTS###
+    #ORDER THE COLLISION GRID IS TESTED IN
+    p.add_argument("--coarse-check-stride", type=int, default=1, metavar="N",
+                   help="test every Nth point of a move's collision grid first, then the "
+                        "rest. It is a reordering and not a coarser check: the same states "
+                        "are tested, so a move that is clear costs exactly what it did and "
+                        "the resolution, the guarantee and the pricing are untouched. What "
+                        "it buys is the blocked move, which the refinement passes propose "
+                        "far more often than not -- a candidate cutting into a panel is "
+                        "blocked over a long stretch and the sparse pass finds it in about "
+                        "1/N of the tests. What it costs is a narrow blockage near the "
+                        "start of a move, found later than a sequential walk would find "
+                        "it, so a blocked move can cost up to 1/N more tests. 1 is the "
+                        "plain sequential walk (default: %(default)d)")
+    #ORDER THE TOOL-SPACE SUBDIVISION IS WALKED IN
+    p.add_argument("--subdivide-coarsest-first", type=boolean, nargs="?", const=True,
+                   default=False, metavar="BOOL",
+                   help="double the check resolution over the whole move each pass -- "
+                        "every interval of the tool-space subdivision gets its own "
+                        "midpoint tested before any interval's grandchild -- instead of "
+                        "refining one stretch to the floor before starting the next. "
+                        "Traversal order calls this breadth first. Like "
+                        "--coarse-check-stride it is a reordering and not a coarser "
+                        "check: the same midpoints are tested, so a move that is clear "
+                        "costs exactly what it did. What it buys is the blocked move, and "
+                        "this is the half with the evidence behind it, every refusal "
+                        "measured over 80 sampler solves having come from the subdivision "
+                        "and none from the joint grid. Depth first can spend 64 tests "
+                        "proving the opening stretch of a move clear before it looks at "
+                        "the interval that is blocked. Takes true/false (yes/no, on/off, "
+                        "1/0); passing the flag with no value means true "
+                        "(default: %(default)s)")
     #CLEARANCE EVERYWHERE
     p.add_argument("--obstacle-clearance-mm", type=float, default=5.0, metavar="MM",
                    help="how close the robot and gun may come to the panels and tooling "
@@ -802,6 +852,35 @@ def build_parser() -> argparse.ArgumentParser:
                    help="obstacle clearance used instead of --obstacle-clearance-mm on "
                         "any move starting or ending at a weld locator, where the gun "
                         "has to reach the panel (default: %(default)g)")
+    #EARN THE WELD CLEARANCE OFF THE WELD POSES
+    p.add_argument("--earned-weld-clearance", type=boolean, nargs="?", const=True,
+                   default=True, metavar="BOOL",
+                   help="true plans each transit at the tightest clearance its own weld "
+                        "poses actually have, less --weld-clearance-slack-mm, instead of "
+                        "at --weld-clearance-mm flat. --weld-shift-mm has already backed "
+                        "every weld off its panel, and the pose the robot is placed at "
+                        "therefore has real air around it -- measured over ten studies' "
+                        "logs, 37 weld placements read 4.3 to 5.6 mm at the 5 mm shift, "
+                        "median 5.2 -- but nothing read that figure, so the searches were "
+                        "told the whole transit could graze a panel. This is the only "
+                        "margin in force: the planners are handed it, the refinement "
+                        "passes work to it and the cell's own sweep judges against it, "
+                        "with nothing in Python refusing a state they were told was "
+                        "legal. Clamped into [--weld-clearance-mm, "
+                        "--obstacle-clearance-mm], so it only ever moves the margin "
+                        "towards the cell's own and never past it, and a weld that placed "
+                        "with nothing to spare leaves its transit exactly as it was. "
+                        "Takes true/false (yes/no, on/off, 1/0); passing the flag with no "
+                        "value means true (default: %(default)s)")
+    #HOW FAR UNDER THE READING THE EARNED MARGIN SITS
+    p.add_argument("--weld-clearance-slack-mm", type=float, default=1.0, metavar="MM",
+                   help="how far under the measured weld-pose clearance the earned margin "
+                        "sits. It is not a safety factor: the reading is taken at the "
+                        "endpoints at the openings the leg is flown at, and the margin has "
+                        "to leave those same poses clear of it rather than exactly on it. "
+                        "0 plans at the reading itself, which puts the leg's own endpoints "
+                        "on the boundary. Ignored while --earned-weld-clearance is off "
+                        "(default: %(default)g)")
     #BACK THE WELD OFF THE PANEL SURFACE
     p.add_argument("--weld-shift-mm", type=float, default=-5.0, metavar="MM",
                    help="move every weld locator this far along its own z axis before "
@@ -898,22 +977,22 @@ def build_parser() -> argparse.ArgumentParser:
                         "turns all penalties off. Takes true/false (yes/no, on/off, 1/0); "
                         "passing the flag with no value means true (default: %(default)s)")
     #STRENGTH AT TOUCHING
-    p.add_argument("--stepped-penalty-multiplier", type=float, default=12.0, metavar="N", #was 7
+    p.add_argument("--stepped-penalty-multiplier", type=float, default=200.0, metavar="N", #try 200
                    help="penalty at zero clearance: a second spent touching costs as much "
                         "as N seconds in open space (default: %(default)g)")
     #WHERE THE PENALTY IS SPENT
-    p.add_argument("--stepped-penalty-zero-mm", type=float, default=25.0, metavar="MM", #was 100
+    p.add_argument("--stepped-penalty-zero-mm", type=float, default=10.0, metavar="MM", #try 10
                    help="clearance at which the penalty reaches 1x and stops mattering. "
                         "Also how far the proximity query has to see, so lowering it "
                         "speeds planning up (default: %(default)g)")
     #STEP LENGTH
-    p.add_argument("--stepped-penalty-step-mm", type=float, default=2, metavar="MM", #was 3
+    p.add_argument("--stepped-penalty-step-mm", type=float, default=2, metavar="MM", #try 2
                    help="how much extra clearance counts as one step of falloff "
                         "(default: %(default)g)")
     #STEP FACTOR
-    p.add_argument("--stepped-penalty-step-factor", type=float, default=0.7, metavar="F",
-                   help="what one step multiplies the penalty by: 0.7 means each "
-                        "--stepped-penalty-step-mm of extra clearance costs 70%% of what "
+    p.add_argument("--stepped-penalty-step-factor", type=float, default=0.2, metavar="F", #try 0.2
+                   help="what one step multiplies the penalty by: 0.2 means each "
+                        "--stepped-penalty-step-mm of extra clearance costs 20%% of what "
                         "the step before it did. Must be between 0 and 1; smaller falls "
                         "off faster and so concentrates the penalty near the part. Holds "
                         "of the curve's exponential term rather than of the multiplier "
@@ -936,7 +1015,7 @@ def build_parser() -> argparse.ArgumentParser:
                    help="commanded tool speed cap on linear moves; the joint limits still "
                         "govern whenever they are slower (default: %(default)g)")
     #HOW MUCH A STOP COSTS THE OPTIMISER
-    p.add_argument("--stop-time-weight", type=float, default=0.6, metavar="W",
+    p.add_argument("--stop-time-weight", type=float, default=0.8, metavar="W",
                    help="how heavily a stop is charged in the time the planner scores "
                         "routes by, and nowhere else: the exported timing is the real "
                         "one. Every waypoint is a full stop, so deleting one nearly "
@@ -1144,6 +1223,11 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.direct_clearance_mm < 0.0:
         print("error: --direct-clearance-mm cannot be negative", file=sys.stderr)
         return 2
+    if args.finish_attempts < 1:
+        # Not "cannot be negative": 0 would mean a transit that searches and then finishes
+        # nothing, so the floor is the attempt the transit has always made.
+        print("error: --finish-attempts must be at least 1", file=sys.stderr)
+        return 2
     if args.weld_opening_scan_mm <= 0.0:
         print("error: --weld-opening-scan-mm must be above 0", file=sys.stderr)
         return 2
@@ -1219,6 +1303,8 @@ def _run(args: argparse.Namespace, directory: str) -> int:
                                              else 0.0),
                               obstacle_clearance_mm=args.obstacle_clearance_mm,
                               tcp_check_mm=args.check_step_mm,
+                              coarse_check_stride=args.coarse_check_stride,
+                              subdivide_coarsest_first=args.subdivide_coarsest_first,
                               export_dir=(directory if args.export_collision_geometry
                                           else None),
                               penalty=penalty, dynamics=dynamics,
@@ -1283,7 +1369,10 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         linear_crossing_penalty_s=args.linear_crossing_penalty_s,
         linear_introduce_mm=args.linear_introduce_mm,
         direct_clearance_mm=args.direct_clearance_mm,
+        finish_attempts=args.finish_attempts,
         weld_clearance_mm=args.weld_clearance_mm,
+        earned_weld_clearance=args.earned_weld_clearance,
+        weld_clearance_slack_mm=args.weld_clearance_slack_mm,
         stand_off_search=args.weld_shift_search,
         stand_off_scan_mm=args.weld_shift_scan_mm,
         stand_off_resolution_mm=args.weld_shift_resolution_mm,

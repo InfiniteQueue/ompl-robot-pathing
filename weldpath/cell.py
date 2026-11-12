@@ -21,6 +21,7 @@ Two things here are load-bearing and were established by measurement rather than
 """
 from __future__ import annotations
 
+import collections
 import contextlib
 import os
 from dataclasses import dataclass
@@ -49,6 +50,38 @@ from .scene import GROUP, TCP_LINK, SceneBuilder
 # until it ran out of floating point.
 MAX_TOOL_SUBDIVISION = 6
 
+
+def _scan_order(n: int, stride: int) -> list[int]:
+    """Grid indices to collision check, sparse ones first, each exactly once.
+
+    Returns every index of an ``n``-point grid: first those a ``stride`` apart, with the
+    last point included so the move's own end is among them, then the rest in order.  It
+    is a **permutation**, which is the whole of why this is sound -- the set of states
+    tested on a clear move is unchanged, so the move costs exactly what it used to, and a
+    state that collides in the sparse pass is a state of the same grid and so is a real
+    collision that the sequential walk would have reached later.
+
+    What it buys is the blocked move.  Most of what the refinement passes propose is
+    rejected -- measured on Path 1, 35 of 48 shortcut attempts and 52 of 60 polish
+    attempts -- and a candidate that cuts into a panel is blocked over a long stretch of
+    its length, which a sparse pass finds in about ``n / stride`` tests rather than walking
+    up to it one step at a time.
+
+    What it costs is the narrow blockage.  A single blocked state just past the start is
+    found by the sequential walk almost immediately and by this one only in the second
+    pass, so a blocked move can cost up to ``n / stride`` tests more than it would have.
+    The trade is therefore a bet on blockages being wide, which is why ``stride`` is a
+    flag and 1 -- the plain sequential walk -- is the default until it is measured on a
+    real cell.
+    """
+    if stride <= 1 or n <= 3:
+        return list(range(n))
+    sparse = list(range(0, n, stride))
+    if sparse[-1] != n - 1:
+        sparse.append(n - 1)
+    seen = set(sparse)
+    return sparse + [i for i in range(n) if i not in seen]
+
 # The joint the stop band applies to, as an index into the robot's joint vector: joint 5,
 # the wrist pitch.  See ``Cell.stop_band_rad``.
 STOP_BAND_JOINT = 4
@@ -58,12 +91,23 @@ STOP_BAND_JOINT = 4
 # environment, a clearance query adds a contact test over every convex piece within the
 # probe, and a collision test adds one at the planning margins.
 COUNTER_NAMES = ("state_loads", "clearance", "clearance_hits", "clearance_fused",
-                 "collision_tests", "fk", "tcp_hits")
+                 "collision_tests", "collision_hits",
+                 "fk", "tcp_hits",
+                 "scan_blocked", "scan_blocked_early", "subdiv_blocked")
 
 # States a cell remembers a clearance for before starting again.  Large enough that the
 # waypoints of a run stay resident, small enough that a long polish cannot exhaust memory
 # on candidates it drew once and threw away.
 CLEARANCE_CACHE_MAX = 250_000
+
+# How far past a threshold a manager built to decide that threshold is probed.  A reading
+# saturates at its own probe, so a manager sized exactly at the threshold reports the
+# threshold both for a state standing at it and for one a metre out, and an at-or-under
+# test then reads as strictly-under at the boundary.  Any epsilon settles that; the
+# magnitude buys nothing, the reading being thrown away and only the comparison kept.
+# Contrast ``toolpath.CLEARANCE_REPORT_HEADROOM_MM``, which widens a probe so the *number*
+# is informative and where the magnitude is the whole of the point.
+PROBE_EPSILON_MM = 0.001
 
 
 @dataclass(frozen=True)
@@ -103,9 +147,25 @@ class Cell:
         # ask it of the same states repeatedly.  Keyed by the gun opening as well as the
         # joint vector, since where the moving tip sits changes the answer.
         self._clearance_cache: dict[tuple[float, bytes], float] = {}
+        # Clearance managers by the threshold they were built to decide, each with its
+        # own cache -- and the caches have to be separate.  A reading saturates at the
+        # probe that took it, so one state honestly reads 120.0 against one manager and
+        # 5.0 against another, and a cache shared between two widths would hand a caller
+        # a number measured against a question it did not ask.  That is the confusion
+        # :meth:`clearance_within` exists to remove, and it once made nearly every move
+        # ship linear.  ``_pm`` is registered here too, under the thresholds it decides.
+        self._probes: dict[float, tuple[object, dict, float]] = {}
+        # The threshold the penalty reads at, or None to read the wide manager.  See
+        # _build_penalty_probe.
+        self._penalty_probe_mm: float | None = None
         # The same trick for the tool's position, which the cost arithmetic asks for far
         # more often than anything asks for a whole transform.
         self._tcp_cache: dict[tuple[float, bytes], np.ndarray] = {}
+        # And for the contact test itself, which is the one question every search and
+        # every pass arrives at and which nothing remembered.  A verdict belongs to the
+        # margins it was reached under as well as to the state, so this is emptied where
+        # they change -- ``_set_obstacle_clearance`` -- rather than keyed on them.  The
+        self._collision_cache: dict[tuple[float, bytes], bool] = {}
         self.counters = dict.fromkeys(COUNTER_NAMES, 0)
         self._state = None                      # keeps the SWIG state object alive
         self._revolute = [j.type == "revolute" for j in man.robot.joints
@@ -131,6 +191,8 @@ class Cell:
         self._probe_mm = 0.0                    # how far that manager can actually see
         self._extra_probe_mm = 0.0              # asked for by something other than the penalty
         self.tcp_check_mm = 0.0                 # tool-space check resolution; 0 disables
+        self.coarse_stride = 1                  # collision grid test order; 1 is sequential
+        self.subdivide_coarsest_first = False   # tool-space subdivision order
         # No waypoint the robot stops at may hold joint 5 closer to zero than this, in
         # radians; 0 disables.  It constrains stops only -- a move may sweep through the
         # band on its way somewhere else, so nothing that samples or checks a move reads it.
@@ -247,6 +309,8 @@ class Cell:
         # the proximity manager is a clone of it, so that has to be rebuilt too.
         self._cm = self.env.getDiscreteContactManager()
         self._cm.setActiveCollisionObjects(self.env.getActiveLinkNames())
+        # Every remembered verdict was reached under the margins just replaced.
+        self._collision_cache.clear()
         self.attach_penalty(self.penalty)
         self._state = None
 
@@ -320,7 +384,7 @@ class Cell:
         if log and wanted > 0.0:
             log(f"  cloning the collision scene into a clearance manager that can see "
                 f"{wanted:g} mm")
-        self._build_proximity(wanted)
+        self._build_proximity(wanted, log=log)
 
     def require_proximity(self, probe_mm: float, log=None) -> None:
         """Make sure clearance can be measured out to ``probe_mm``, penalty or no penalty.
@@ -329,6 +393,11 @@ class Cell:
         a distance -- and it can be switched off entirely, which must not take the
         measurement with it.  This raises the probe if it has to and leaves it alone
         otherwise, so asking twice costs nothing.
+
+        Widening no longer drags the penalty's own reads out with it.  Those go through
+        the narrow manager :meth:`_build_penalty_probe` keeps, so a caller that needs to
+        see 145 mm because of ``--linear-introduce-mm`` no longer makes every per-station
+        factor read pay for the distance it asked for.
         """
         self._extra_probe_mm = max(self._extra_probe_mm, float(probe_mm))
         if self._extra_probe_mm > self._probe_mm:
@@ -336,23 +405,85 @@ class Cell:
                 log(f"  building a clearance manager that can see {self._extra_probe_mm:g} "
                     f"mm; it clones the collision scene and sets a margin on every "
                     f"robot-to-part pair")
-            self._build_proximity(self._extra_probe_mm)
+            self._build_proximity(self._extra_probe_mm, log=log)
 
-    def _build_proximity(self, probe_mm: float) -> None:
-        self._pm = None
-        self._probe_mm = 0.0
-        if probe_mm <= 0.0:
-            return
+    def _clone_probe(self, probe_mm: float):
+        """A clone of the collision scene reporting robot-to-part pairs within ``probe_mm``.
+
+        The default margin is driven hugely negative so self-collision pairs stay silent
+        and the query cost is confined to the pairs a clearance question is about.
+
+        Cloning is free: measured on Path 4's cell, 11688 shells, the build took 0.00 s at
+        every width from 10 mm to 145.  What a manager costs is its broadphase's memory
+        and the width it is asked to sweep, not its construction -- which is why a probe
+        per threshold is affordable at all.
+        """
         probe = probe_mm * self.man.scale
         pm = self._cm.clone()
         pm.setDefaultCollisionMargin(-1.0)
         for a, b in _obstacle_margins(self.man):
             pm.setCollisionMarginPair(a, b, probe)
         pm.setActiveCollisionObjects(self.env.getActiveLinkNames())
-        self._pm = pm
-        self._probe_mm = float(probe_mm)
+        return pm
+
+    def _build_proximity(self, probe_mm: float, log=None) -> None:
+        self._pm = None
+        self._probe_mm = 0.0
+        # Every registered manager was cloned from the collision scene as it stood, with
+        # margins set then, so a rebuild invalidates all of them and not just the wide
+        # one.  They are rebuilt on demand; see _probe_for.
+        self._probes.clear()
+        if probe_mm > 0.0:
+            self._pm = self._clone_probe(probe_mm)
+            self._probe_mm = float(probe_mm)
         # Readings taken against the old manager, at whatever probe it had, do not carry.
         self._clearance_cache.clear()
+        # Whether the narrow manager is worth having depends on how wide this one came
+        # out, so it is decided here rather than when the penalty was attached.
+        self._build_penalty_probe(log=log)
+
+    def _build_penalty_probe(self, log=None) -> None:
+        """A second clearance manager, no wider than the penalty can actually read.
+
+        Every clearance penalty in this program returns exactly 1.0 at and beyond its own
+        ``probe_mm`` -- ``SteppedPenalty`` at ``--stepped-penalty-zero-mm``,
+        ``ClearancePenalty`` at its cutoff -- and a manager asked for a probe reports that
+        probe when nothing is within it.  So a factor read off a manager sized at
+        ``probe_mm`` is not an approximation of the one off the wide manager: for every
+        state at or beyond the threshold both give 1.0, and for every state inside it both
+        give the same distance.  The costs this program computes do not change.
+
+        What changes is the price.  The wide manager exists because ``_reads_near`` is
+        asked whether a state is within ``--near-panel-mm`` or ``--linear-introduce-mm``
+        and has to be able to tell a measurement from the query running out of range, so
+        it is sized past the wider of those -- 145 mm at the defaults.  That inflates every
+        shell's bounds by 145 mm before the broadphase runs.  Measured on Path 4's cell,
+        11688 convex shells: 252 ms a query at 145 mm against 73 ms at 25 mm, 3.46x, and
+        the penalty is the *frequent* caller -- 1.19 reads per station of a linear check,
+        against a handful of band reads per polish attempt, which the model caches per
+        state anyway.
+
+        Skipped where it would buy nothing: no penalty, a penalty switched off, or a
+        threshold already at or past the wide probe, in which case the factor reads use
+        the wide manager and its cache exactly as they did.
+        """
+        self._penalty_probe_mm = None
+        if self.penalty is None or not self.penalty.enabled:
+            return
+        probe_mm = float(self.penalty.probe_mm)
+        if probe_mm <= 0.0 or probe_mm >= self._probe_mm:
+            return
+        # Registered at exactly ``probe_mm`` with no epsilon, unlike every other threshold
+        # here.  The penalty returns 1.0 at and beyond its own threshold, so a reading
+        # that saturates there gives the factor the true distance would have given; the
+        # band and reach tests need the epsilon because their answer changes at the
+        # boundary, and this one does not.
+        self._probes[probe_mm] = (self._clone_probe(probe_mm), {}, probe_mm)
+        self._penalty_probe_mm = probe_mm
+        if log:
+            log(f"  and a second one that can see only {probe_mm:g} mm, for the clearance "
+                f"penalty, which reads 1x at and beyond that and is what every station of "
+                f"a linear check asks")
 
     @property
     def probe_mm(self) -> float:
@@ -362,6 +493,68 @@ class Cell:
         and anything reporting a distance has to be able to say which of the two it has.
         """
         return self._probe_mm
+
+    def _probe_for(self, threshold_mm: float):
+        """The manager, cache and probe width for deciding ``threshold_mm``.
+
+        Built on first use and kept until the geometry changes.  Keyed on the threshold
+        rather than on the width, so the epsilon stays an implementation detail and two
+        callers asking the same question share one warm cache.
+
+        The wide manager is reused where it is already no wider than a dedicated one
+        would be *and* still wide enough to decide the threshold -- that being the case
+        for whichever threshold sized it in the first place.  Both halves are needed:
+        reusing a manager narrower than the threshold would saturate inside the range the
+        caller is asking about and answer no to every state beyond it.
+        """
+        if self._pm is None:
+            return None, None, 0.0
+        key = float(threshold_mm)
+        got = self._probes.get(key)
+        if got is None:
+            width = key + PROBE_EPSILON_MM
+            if width >= self._probe_mm > key:
+                got = (self._pm, self._clearance_cache, self._probe_mm)
+            else:
+                got = (self._clone_probe(width), {}, width)
+            self._probes[key] = got
+        return got
+
+    def clearance_within(self, q: np.ndarray, threshold_mm: float, *,
+                         loaded: bool = False) -> bool:
+        """Whether anything lies within ``threshold_mm`` of the robot or the gun.
+
+        The whole of the question the band test and the reach test ask, and it belongs
+        here rather than at those callers because the answer needs the probe the reading
+        was taken at.  A reading saturates at its own
+        probe, so ``clearance_mm(q) <= threshold`` is sound only where the probe is known
+        to be wider; compared against the wrong probe it is how every state of every leg
+        once read as near and nearly every move shipped linear.
+
+        Each threshold gets a manager sized to it, so a 5 mm question costs a 5 mm query.
+        That matters because these are the frequent readers and they all used to read the
+        widest probe anything in the program asked for -- 145 mm at the defaults, since
+        ``--linear-introduce-mm`` is 120 and the reading had to be distinguishable from
+        the query running out of range.  Measured on Path 4's cell, 11688 shells, each
+        width averaged over the 45 states of one route: 180 ms a query at 145 mm, 153 at
+        120, 81 at 50, 59 at 10, 52 at 5.  An earlier sweep of the same cell read 252 ms
+        at 145 and the same 58 at 10, so the wide end of this moves about a quarter with
+        machine state while the narrow end does not.  What is stable is the ordering, and
+        that the floor is the shell sweep and the state load rather than the margin --
+        which is why a narrower probe stops paying off somewhere around 10 mm.
+
+        The reader that gained most by this was the scoped weld relaxation, which was
+        hung off :meth:`in_collision` and so sat on the path every search walked -- Path
+        1's traverse leg logged 1611 clearance queries against 1607 collision tests, one
+        apiece, every one a 5 mm question asked of a 145 mm manager.  That reader is gone
+        and the per-threshold managers are kept: the band and the reach ask often enough
+        on their own, and the 5 mm manager still serves ``--direct-clearance-mm``.
+        """
+        pm, cache, probe = self._probe_for(threshold_mm)
+        if pm is None:
+            return False
+        reading = self._clearance(q, loaded, pm=pm, cache=cache, probe=probe)
+        return reading < probe and reading <= threshold_mm
 
     def clearance_mm(self, q: np.ndarray) -> float:
         """Closest approach between the robot or gun and the static objects, in mm.
@@ -385,42 +578,73 @@ class Cell:
         """
         return self._clearance(q, loaded=True)
 
-    def _clearance(self, q: np.ndarray, loaded: bool) -> float:
-        """The cache both clearance entry points share; ``loaded`` skips the state load."""
-        if self._pm is None:
+    def _clearance(self, q: np.ndarray, loaded: bool, *,
+                   pm=None, cache=None, probe=None) -> float:
+        """The cache every clearance read shares; ``loaded`` skips the state load.
+
+        ``pm``/``cache``/``probe`` name a manager other than the wide one -- one built for
+        a single threshold, see :meth:`_probe_for`.  A cache must never be shared between
+        two widths: a reading saturates at the probe that took it, so one state honestly
+        reads 120.0 against one manager and 5.0 against another, and a caller handed the
+        wrong one is told something about a question it did not ask.
+
+        Counted per probe as well as in total, so a run says which widths its queries went
+        to.  Nothing else could: thresholds are registered by their callers, and the total
+        alone cannot tell a 50 mm band read from a 120 mm reach read.
+        """
+        if pm is None:
+            pm, cache, probe = self._pm, self._clearance_cache, self._probe_mm
+        if pm is None:
             return float("inf")
         key = (self.gun_value, np.asarray(q, dtype=float).tobytes())
-        hit = self._clearance_cache.get(key)
+        hit = cache.get(key)
         if hit is not None:
             self.counters["clearance_hits"] += 1
             return hit
         self.counters["clearance"] += 1
+        tag = f"probe:{probe:g}"
+        self.counters[tag] = self.counters.get(tag, 0) + 1
         if loaded:
             self.counters["clearance_fused"] += 1
         else:
             # Deliberately not set_state: refreshing the planning manager's transforms
             # costs as much as the query itself and nothing here will ask it anything.
             self._load_state(q)
-        got = self._clearance_now()
-        if len(self._clearance_cache) >= CLEARANCE_CACHE_MAX:
+        pm.setCollisionObjectsTransform(self._state.link_transforms)
+        worst = min((float(c.distance) for c in _contact_test(pm)), default=None)
+        got = probe if worst is None else worst / self.man.scale
+        if len(cache) >= CLEARANCE_CACHE_MAX:
             # Relocation candidates are drawn at random and never revisited, so the cache
             # grows with states that will never be asked for again.  Dropping the lot is
             # fine: what matters is the waypoints, and they are re-measured on demand.
-            self._clearance_cache.clear()
-        self._clearance_cache[key] = got
+            cache.clear()
+        cache[key] = got
         return got
-
-    def _clearance_now(self) -> float:
-        """Clearance at the state already loaded.  Assumes ``_load_state`` has just run."""
-        self._pm.setCollisionObjectsTransform(self._state.link_transforms)
-        worst = min((float(c.distance) for c in _contact_test(self._pm)), default=None)
-        return self._probe_mm if worst is None else worst / self.man.scale
 
     def penalty_factor(self, q: np.ndarray) -> float:
         """Cost multiplier for standing where ``q`` puts the robot."""
-        if self._pm is None or self.penalty is None:
+        return self._factor(q, loaded=False)
+
+    def _factor_here(self, q: np.ndarray) -> float:
+        """:meth:`penalty_factor` for a state whose joints are already loaded."""
+        return self._factor(q, loaded=True)
+
+    def _factor(self, q: np.ndarray, loaded: bool) -> float:
+        """The penalty factor, read at the narrowest probe that can answer it.
+
+        ``_penalty_probe_mm`` is that probe where one is worth building; where it is not
+        -- see :meth:`_build_penalty_probe` -- this falls back to the wide manager and
+        behaves exactly as it did before there were two.
+        """
+        if self.penalty is None:
             return 1.0
-        return self.penalty.factor(self.clearance_mm(q))
+        if self._penalty_probe_mm is not None:
+            pm, cache, probe = self._probe_for(self._penalty_probe_mm)
+            return self.penalty.factor(
+                self._clearance(q, loaded, pm=pm, cache=cache, probe=probe))
+        if self._pm is None:
+            return 1.0
+        return self.penalty.factor(self._clearance(q, loaded))
 
     # -- state / collision ---------------------------------------------------
     def _load_state(self, q: np.ndarray) -> None:
@@ -435,11 +659,62 @@ class Cell:
         self._cm.setCollisionObjectsTransform(self._state.link_transforms)
 
     def in_collision(self, q: np.ndarray) -> bool:
-        self.counters["collision_tests"] += 1
-        self.set_state(q)
-        res = ContactResultMap()
-        self._cm.contactTest(res, ContactRequest(ContactTestType_FIRST))
-        return res.size() > 0
+        """Whether ``q`` is in contact at the margins in force.
+
+        **This is the whole of the collision question, and that is deliberate.**  The
+        margins the environment holds are what the sampling planner is handed and what it
+        validates its own route against, so a verdict reached here and a verdict reached
+        inside the planner differ only in how finely the move between two states is
+        sampled -- never in what counts as clear.  There used to be a second rule on top,
+        the scoped weld relaxation, which refused a state the margins allowed; it lived
+        here, in Python, where the planner could not see it, and it is gone.  See
+        ``ToolpathPlanner._earned_weld_clearance`` for what replaced it.
+
+        **The contact test is remembered per state.**  It is where the time goes -- split
+        statement by statement on a 5185-shell cell, 13.4 ms of a 13.5 ms call is
+        ``contactTest`` and 0.13 ms is everything the binding does around it -- and the
+        callers ask it of the same states again and again, by construction rather than by
+        accident.  A station on a tracked line is tested once as the inverse kinematics'
+        answer and twice more as an end of the gap either side of it; a route is swept
+        whole when it is found, again when it is scored, again when it is densified and
+        again when it is verified.  Clearance and tool position were already cached for
+        exactly this reason and the verdict under them was not.
+
+        What a verdict depends on is the margins and the gun -- the gun is in the key, as
+        it is for every cache on the cell, and ``_set_obstacle_clearance`` empties this
+        when the margins move.
+
+        **A remembered clear state is still loaded.**  Callers read the tool's position
+        and the clearance off the state this leaves in the environment --
+        :meth:`segment_scan` does both -- and a hit that skipped the load would have them
+        reading whichever state was tested last.  A load is about a hundredth of the test
+        it replaces.  A remembered contact loads nothing: every caller stops there.
+
+        The fused floor manager that used to stand here went with the scope.  It existed
+        to answer the scope's own question on the same contact test as the margins', and
+        with one question left there is nothing to fuse.
+        """
+        key = (self.gun_value, np.asarray(q, dtype=float).tobytes())
+        hit = self._collision_cache.get(key)
+        if hit is None:
+            self.set_state(q)
+            if len(self._collision_cache) >= CLEARANCE_CACHE_MAX:
+                # Bounded for the reason the clearance cache is: candidates drawn once
+                # and thrown away would otherwise accumulate for the length of a run.
+                self._collision_cache.clear()
+            self.counters["collision_tests"] += 1
+            res = ContactResultMap()
+            self._cm.contactTest(res, ContactRequest(ContactTestType_FIRST))
+            hit = res.size() > 0
+            self._collision_cache[key] = hit
+            return hit
+        self.counters["collision_hits"] += 1
+        if not hit:
+            # Callers read the tool position and the clearance off whatever state this
+            # leaves loaded, so a remembered clear state is still loaded.  A remembered
+            # contact loads nothing: every caller stops there.
+            self._load_state(q)
+        return hit
 
     def contact_pairs(self, q: np.ndarray) -> dict[tuple[str, str], float]:
         return {pair: c.distance for pair, c in self.contacts(q).items()}
@@ -600,37 +875,63 @@ class Cell:
         # and asking it would pay for a clearance query to learn that.
         want = (factors and self._pm is not None
                 and self.penalty is not None and self.penalty.enabled)
-        facs: list[float] | None = [] if want else None
+        facs: list[float] | None = [0.0] * n if want else None
         measure_tool = self.tcp_check_mm > 0.0
 
-        tools = []
-        for t in grid:
-            q = a + t * delta
+        # Addressed by index rather than appended, so the walk may visit the grid in any
+        # order and still hand the bisection and the pricing the same ordered lists.
+        tools: list = [None] * n
+        for i in _scan_order(n, self.coarse_stride):
+            q = a + grid[i] * delta
             if self.in_collision(q):
+                self.counters["scan_blocked"] += 1
+                if i % self.coarse_stride == 0 or i == n - 1:
+                    # Refused in the sparse pass, which is what the ordering is for.
+                    self.counters["scan_blocked_early"] += 1
                 return True, None
             if measure_tool:
-                tools.append(self._tcp_now())
+                tools[i] = self._tcp_now()
             if want:
-                facs.append(self.penalty.factor(self._clearance_here(q)))
+                # The narrow manager where there is one: this is the read that happens at
+                # every station of every linear check, and it only ever feeds a factor.
+                facs[i] = self._factor_here(q)
         if not measure_tool:
             return False, ([1.0] * n if factors and not want else facs)
 
         tool_step = self.tcp_check_mm * self.man.scale
-        # Right to left, so the halves of a split are popped in the order they are flown.
-        stack = [(grid[k], grid[k + 1], tools[k], tools[k + 1], 0)
-                 for k in range(n - 2, -1, -1)]
-        while stack:
-            t0, t1, p0, p1, depth = stack.pop()
+        spans = [(grid[k], grid[k + 1], tools[k], tools[k + 1], 0) for k in range(n - 1)]
+        if self.subdivide_coarsest_first:
+            # Double the resolution over the whole move each pass: every interval's own
+            # midpoint before any interval's grandchild, which traversal order calls
+            # breadth first.  A candidate that cuts into a panel is blocked over whole
+            # intervals of its length and one of their midpoints lands inside it, where
+            # refining one stretch at a time proves the opening stretch clear to the floor
+            # first -- up to 2^MAX_TOOL_SUBDIVISION tests before the blocked interval is
+            # looked at at all.
+            queue = collections.deque(spans)
+            take = queue.popleft
+        else:
+            # Right to left, so the halves of a split are popped in the order they are
+            # flown -- which is what makes the depth-first walk follow the move.
+            queue = list(reversed(spans))
+            take = queue.pop
+        while queue:
+            t0, t1, p0, p1, depth = take()
             if depth >= MAX_TOOL_SUBDIVISION:
                 continue
             if float(np.linalg.norm(p1 - p0)) <= tool_step:
                 continue
             tm = 0.5 * (t0 + t1)
             if self.in_collision(a + tm * delta):
+                self.counters["subdiv_blocked"] += 1
                 return True, None
             pm = self._tcp_now()
-            stack.append((tm, t1, pm, p1, depth + 1))
-            stack.append((t0, tm, p0, pm, depth + 1))
+            left = (t0, tm, p0, pm, depth + 1)
+            right = (tm, t1, pm, p1, depth + 1)
+            # Appended in whichever order leaves the left half taken first, so both walks
+            # follow the move rather than running it backwards.
+            queue.extend((left, right) if self.subdivide_coarsest_first
+                         else (right, left))
         return False, ([1.0] * n if factors and not want else facs)
 
     def segment_clearance(self, a: np.ndarray, b: np.ndarray, max_step: float = 0.05,
@@ -1564,6 +1865,7 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
           enclosed_keep_mm: float = 0.0, enclosed_dump: bool = False,
           panel_bend_mm: float = 0.0,
           obstacle_clearance_mm: float = 0.0, tcp_check_mm: float = 0.0,
+          coarse_check_stride: int = 1, subdivide_coarsest_first: bool = False,
           export_dir: str | None = None,
           penalty=None, dynamics=None,
           stop_time_weight: float = 1.0, stop_band_rad: float = 0.0,
@@ -1627,6 +1929,8 @@ def build(man: Manifest, log=print, out_dir: str | None = None,
         cell.margin, cell.obstacle_clearance = margin, clearance
         cell.margin_overrides = overrides
         cell.tcp_check_mm = max(0.0, float(tcp_check_mm))
+        cell.coarse_stride = max(1, int(coarse_check_stride))
+        cell.subdivide_coarsest_first = bool(subdivide_coarsest_first)
         cell.stop_time_weight = float(stop_time_weight)
         cell.stop_band_rad = float(stop_band_rad)
         cell.out_dir = out_dir

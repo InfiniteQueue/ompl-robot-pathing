@@ -11,6 +11,18 @@ survive both tests.  The alternative -- searching the branches for any solution 
 passes -- would find more points, but the point of a fallback is that the robot can get to
 it and back without contortion, and a solution the arm has to turn itself inside out to
 reach is not that.  Nearest-to-the-nearest-end is what keeps the detour a detour.
+
+**The clearance distance is where the walk may stop, not what it demands.**  A candidate
+that solves and is clear of the scene is *usable* whatever its clearance reading; one that
+also reaches ``fallback_mm`` is *valid*, and the caller stops looking when it finds one.
+That split matters because the figure is absolute and the thing it is asked of is not: a
+weld pose sits a few millimetres off the panel, and in a tight cell nothing within reach
+of the pocket is 100 mm clear of anything.  Measured on Path 2's ``73078-11-R_3t``, over
+65 states the Cartesian tree had already validated around that locator, the best clearance
+anywhere was **35.7 mm** and not one reached 100.  Requiring the bar outright is what made
+the retreat walk fail there and sent the search to a pose 1.4 m away, 106 degrees off the
+retreat axis.  So a sub-bar candidate comes back carrying its solution and its reading,
+and :class:`~weldpath.fallback.finder.FallbackFinder` keeps the best of them.
 """
 from __future__ import annotations
 
@@ -36,7 +48,19 @@ class Verdict:
 
     @property
     def valid(self) -> bool:
+        """Good enough to stop walking: a solution, clear, and at or over the distance."""
         return self.q is not None and self.reason is OK
+
+    @property
+    def usable(self) -> bool:
+        """Somewhere the robot can be parked, whatever its clearance reading.
+
+        ``q`` is set only where the inverse kinematics solved *and* the solution it
+        returned is out of collision, so this is exactly the set of candidates worth
+        ranking against each other.  A pose with no solution, or one in contact, carries
+        no ``q`` and is not a candidate at all.
+        """
+        return self.q is not None
 
 
 class Validator:
@@ -81,5 +105,7 @@ class Validator:
             return Verdict(None, IN_COLLISION)
         got = self.cell.clearance_mm(q)
         if got < self.fallback_mm:
-            return Verdict(None, TOO_CLOSE, got)
+            # Still usable, and it carries its solution: the caller ranks these and keeps
+            # the best of the line rather than discarding everything under the figure.
+            return Verdict(q, TOO_CLOSE, got)
         return Verdict(q, OK, got)

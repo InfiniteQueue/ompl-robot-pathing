@@ -499,7 +499,7 @@ class MotionModel:
         return self.cell.penalty is not None and self.cell.penalty.enabled
 
 
-def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
+def simplify(model: MotionModel, path: list[np.ndarray], log=None) -> list[np.ndarray]:
     """Reduce a path to the fewest waypoints that still traverse it without collision.
 
     From each kept waypoint, reach for the furthest later waypoint the robot can get to
@@ -521,6 +521,25 @@ def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
     are refused, which is what stops this pass, running last, from quietly undoing the
     standoff the shortcut pass just bought: the chord across a corner the robot took wide
     is quicker, collision free, and hard against the panel.
+
+    **A waypoint the robot may not stop at is paid to avoid.**  Reaching past a state in
+    the joint 5 stop band is a preference while there is anywhere further to reach, but
+    when nothing further qualifies the adjacent point used to be taken blind -- and a
+    waypoint left in the band is what ``clear_stop_band`` has to remove or nudge, and what
+    discards the whole route when it can do neither.  So the reach that was rejected purely
+    on *cost* is remembered as it is made, and where the forced point is in the band the
+    nearest of those is taken instead, dearer than the polyline though it is.  Nothing
+    unsafe is accepted this way: every such reach has already passed ``refuses`` and
+    ``check_and_cost``, which is what makes this a price rather than a risk, and the
+    nearest is chosen so the cheapest alternative wins by construction.
+
+    It costs no checking at all, the verdicts being the ones the downward walk already
+    paid for.  What it may cost is time on the route, so the premium is logged: a single
+    step of it overlaps with ``clear_stop_band``'s own removal, which accepts a cost
+    increase too, and the case this adds that nothing else has is the *multi-step* skip --
+    where the adjacent reach is refused or unpriceable rather than merely dear, so removal
+    downstream would fail as well.  The log line is what will say which of the two is
+    happening; nothing here assumes it.
     """
     if len(path) < 3:
         return [p.copy() for p in path]
@@ -545,12 +564,19 @@ def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
     out = [path[0]]
     i = 0
     last = len(path) - 1
+    paid = paid_for = 0
+    premium = 0.0
     while i < len(path) - 1:
         j = last
+        # Reaches that are legal and priceable and merely cost more than the polyline,
+        # recorded as the walk makes them, nearest ``last`` first.  Only read when the
+        # walk runs out on a state the robot may not stop at, and then they are the whole
+        # of what is on offer: a reach rejected for the band is the thing being avoided,
+        # and one rejected by ``refuses`` or by an unpriceable line is not legal at all.
+        dearer: list[tuple[int, float, float]] = []
         while j > i + 1:
-            # Not a stop the robot may make.  Only reached past, not forced: the adjacent
-            # point is still taken unchecked when nothing further works, and
-            # ``clear_stop_band`` deals with it afterwards.
+            # Not a stop the robot may make.  Reached past in preference to anything
+            # nearer; forced only when nothing legal is left, below.
             if j < last and model.cell.in_stop_band(path[j]):
                 j -= 1
                 continue
@@ -562,12 +588,31 @@ def simplify(model: MotionModel, path: list[np.ndarray]) -> list[np.ndarray]:
             if chord is None:
                 j -= 1
                 continue
-            if chord > polyline_cost(i, j) + 1e-9:
+            # Once: ``polyline_cost`` sums ``move_time`` over the stretch, and that settles
+            # each move's profile, which reads the band -- cached per state on the cell, but
+            # there is no reason to ask twice.
+            plain = polyline_cost(i, j)
+            if chord > plain + 1e-9:
+                dearer.append((j, chord, plain))
                 j -= 1
                 continue
             break
+        if (j == i + 1 and j != last and dearer
+                and model.cell.in_stop_band(path[j])):
+            # The walk has run out on a state the robot may not stop at, so pay for the
+            # nearest reach past it.  ``dearer`` is filled from ``last`` downward, so its
+            # final entry is the nearest and therefore the cheapest alternative there is;
+            # the end of the path is exempt, being the locator the leg runs to.
+            j, chord, plain = dearer[-1]
+            paid += 1
+            paid_for += j - i - 1
+            premium += chord - plain
         out.append(path[j])
         i = j
+    if log and paid:
+        log(f"      simplify: paid {premium:.2f} s to reach past {paid_for} waypoint"
+            f"{'' if paid_for == 1 else 's'} the robot may not stop at, over {paid} "
+            f"reach{'' if paid == 1 else 'es'}")
     return out
 
 
@@ -660,8 +705,17 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
     costs = [model.cost(pts[i], pts[i + 1], fa=fac[i], fb=fac[i + 1], stops=True)
              for i in range(len(pts) - 1)]
     before = sum(costs)
-    deadline = time.time() + time_budget
+    started = time.time()
+    deadline = started + time_budget
     dropped = moved = tried = 0
+    progress: list[tuple[int, float, float]] = []
+    # Waypoints already shown not worth removing, by the three states the question is
+    # about.  A sweep follows every relocation that is kept and asks it of every interior
+    # point, but a relocation moves one point and so changes the answer for at most three
+    # of them -- the one moved and its neighbours.  The rest are the same three states,
+    # the same check along the same curve and the same comparison as last time, and each
+    # is a whole move swept end to end to be told so again.
+    keeps: set[tuple[bytes, bytes, bytes]] = set()
 
     def unfinished() -> bool:
         """Whether the pass may keep working: the floor outranks the clock."""
@@ -673,15 +727,18 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
         # Under the same rule as the sampling loop, so that a relocation accepted past
         # the deadline still gets the removal sweep the pass promises follows every one.
         while k < len(pts) - 1 and unfinished():
+            triple = (pts[k - 1].tobytes(), pts[k].tobytes(), pts[k + 1].tobytes())
+            if triple in keeps:
+                k += 1
+                continue
             if model.refuses(pts[k - 1], pts[k + 1], [pts[k]]):
+                keeps.add(triple)
                 k += 1
                 continue
             direct = model.check_and_cost(pts[k - 1], pts[k + 1], fa=fac[k - 1],
                                           fb=fac[k + 1], stops=True)
-            if direct is None:
-                k += 1
-                continue
-            if direct >= costs[k - 1] + costs[k] - 1e-9:
+            if direct is None or direct >= costs[k - 1] + costs[k] - 1e-9:
+                keeps.add(triple)
                 k += 1
                 continue
             del pts[k], fac[k]
@@ -691,6 +748,8 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
             # to a different neighbour and deserves its own test.
 
     drop_sweep()
+    if dropped:
+        progress.append((0, time.time() - started, sum(costs)))
     while unfinished() and len(pts) > 2:
         tried += 1
         k = int(rng.integers(1, len(pts) - 1))
@@ -733,16 +792,26 @@ def polish(model: "MotionModel", path: list[np.ndarray], *, time_budget: float =
         costs[k - 1], costs[k] = first, second
         moved += 1
         drop_sweep()
+        progress.append((tried, time.time() - started, sum(costs)))
 
+    stagetrace.note(_progress_note("polish", before, progress, tried,
+                                   time.time() - started))
     if log:
         after = sum(costs)
         gain = 100.0 * (1.0 - after / before) if before > 0 else 0.0
         over = time.time() - deadline
         held = (f", held past its {time_budget:g}s budget by {over:.1f}s to reach the "
                 f"{floor}-attempt floor" if over > 0.05 and floor else "")
-        log(f"      polish: dropped {dropped} and relocated {moved} waypoints from "
-            f"{tried} attempts, penalised time {before:.2f} -> {after:.2f} s "
-            f"({gain:.0f}% better), {len(pts)} points{held}")
+        # ``dropped`` counts waypoints and ``moved`` counts moves, so one noun cannot
+        # carry both: a point is deleted once and gone, while the index to relocate is
+        # drawn afresh every attempt and the same point is improved again and again.
+        # This read "relocated 20 waypoints" of a four-point route, which has two
+        # interior points to draw from.  Phrased as kept-from-attempts to match
+        # ``shortcut``, which counts the same way.
+        log(f"      polish: dropped {dropped} waypoints and kept {moved} "
+            f"relocations from {tried} attempts, penalised time "
+            f"{before:.2f} -> {after:.2f} s "
+            f"({gain:.0f}% better), {len(pts)} points{_last_gain(progress)}{held}")
     return pts
 
 
@@ -917,6 +986,19 @@ def _retreat_path(cell: Cell, path: list[np.ndarray], mm: float, axis: np.ndarra
     waypoint at a reach limit would throw away the air gained at the other forty.  Called
     with the trial's own opening already in force, so the collision screen inside
     ``solve_pose`` reads the tip where the trial puts it.
+
+    **Solved with ``avoid_stop_band``**, which is what that flag is for: every point this
+    touches is a waypoint, and a waypoint is a stop.  Without it a band solution won on
+    nearness like any other, so this was the one pass that could move an existing waypoint
+    *into* the band -- ``polish`` refuses such a relocation outright, and ``shortcut`` only
+    installs interior states ``simplify`` may decline to anchor.  The reason the flag is
+    left off elsewhere does not apply here: that is for a solve tracking a line, whose
+    stations have to stay on the branch they started on, where this retreats each waypoint
+    on its own.  It is a preference and not a guarantee -- ``solve_pose`` still returns a
+    band solution when it finds nothing else -- and it cannot make a trial fail: a
+    non-band solution further from the seed simply trips ``STAND_OFF_JUMP_RAD`` and the
+    waypoint keeps the state it had, which is the same fallback as a pose that will not
+    solve at all.  ``clear_stop_band`` remains the gate; this stops feeding it work.
     """
     out = [np.asarray(path[0], dtype=float)]
     held = 0
@@ -924,7 +1006,7 @@ def _retreat_path(cell: Cell, path: list[np.ndarray], mm: float, axis: np.ndarra
         q = np.asarray(state, dtype=float)
         T = cell.pose_mm(q)
         T[:3, 3] -= mm * (T[:3, :3] @ axis)
-        got = cell.solve_pose(T, [q])
+        got = cell.solve_pose(T, [q], avoid_stop_band=True)
         if got is None or float(np.max(np.abs(got - q))) > STAND_OFF_JUMP_RAD:
             held += 1
             out.append(q)
@@ -1100,7 +1182,7 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     improved = shortcut(model, path, time_budget=shortcut_seconds, anchors=anchors,
                         log=log)
     stagetrace.stage("shortcut", model, improved)
-    reduced = simplify(model, improved)
+    reduced = simplify(model, improved, log=log)
     stagetrace.stage("simplify", model, reduced)
     chosen = opening
     if polish_seconds > 0:
@@ -1342,25 +1424,177 @@ def shortcut(model: "MotionModel", path: list[np.ndarray], *, time_budget: float
 
     rng = rng or np.random.default_rng(0)
     before = span_cost(0, len(dense) - 1)
-    deadline = time.time() + time_budget
+    started = time.time()
+    deadline = started + time_budget
     tried = cuts = 0
+    # Spans tried and refused since the route last changed.  A cut is a function of the
+    # route and its two ends and of nothing drawn -- the line is tracked from a fixed
+    # seed -- so a span that failed fails again, and re-drawing it buys nothing.  The
+    # draw was with replacement, so on a short route a pass spent its budget re-asking.
+    # Emptied whenever a cut is kept, since that moves the indices and every cost they
+    # stand for.
+    refused: set[tuple[int, int]] = set()
+    progress: list[tuple[int, float, float]] = []
+    exhausted = False
 
     while time.time() < deadline and len(dense) > 2:
+        # Half the attempts are aimed at a stop-band crossing while there is one to aim
+        # at, and the aim quietly stops costing anything once there is not -- ``_band_span``
+        # then finds nothing and the draw is the uniform one again.  Half rather than all
+        # because the pass has two jobs here and no reason to prefer either: a route whose
+        # band crossings are all forced would otherwise spend its whole budget proving it.
+        span = (_band_span(model.cell, dense, rng)
+                if rng.random() < BAND_CUT_SHARE else None)
+        if span is None or span in refused:
+            span = _open_span(rng, len(dense), refused)
+            if span is None:
+                # Every span there is has been tried on the route as it stands.  The
+                # clock has nothing left to buy, so it is handed back rather than spent.
+                exhausted = True
+                break
         tried += 1
-        cuts += _try_cut(model, dense, fac, marks, rng, penalised, whole, span_cost)
+        if _try_cut(model, dense, fac, marks, rng, penalised, whole, span_cost,
+                    span=span):
+            cuts += 1
+            refused.clear()
+            progress.append((tried, time.time() - started,
+                             span_cost(0, len(dense) - 1)))
+        else:
+            refused.add(span)
 
+    spent = time.time() - started
+    stagetrace.note(_progress_note("shortcut", before, progress, tried, spent))
     if log:
         after = span_cost(0, len(dense) - 1)
         gain = 100.0 * (1.0 - after / before) if before > 0 else 0.0
         detail = "penalised cruise time" if penalised else "cruise time"
         log(f"      shortcut: {cuts} cuts kept from {tried} attempts, "
-            f"{detail} {before:.2f} -> {after:.2f} s ({gain:.0f}% better)")
+            f"{detail} {before:.2f} -> {after:.2f} s ({gain:.0f}% better)"
+            + _last_gain(progress)
+            + (f"; stopped {spent:.1f}s into its {time_budget:g}s, every span of the "
+               f"route having been tried since the last cut" if exhausted else ""))
     return dense
 
 
+def _open_span(rng, n: int, refused: set[tuple[int, int]]) -> tuple[int, int] | None:
+    """A span ``(i, j)`` of an ``n``-point route not yet refused, or ``None`` if none is left.
+
+    Uniform over the spans a cut could apply to, those with at least one point between
+    their ends, which is what drawing two indices and discarding the unusable pairs gave
+    before -- so nothing about which cuts are proposed changes, only that one already
+    refused is not proposed again.
+
+    Drawn by rejection while most spans are open, which is nearly always: a dense route
+    of 150 points has eleven thousand of them and a pass tries a few hundred.  Listed
+    outright once fewer than half are, so the last few are found without drawing for them.
+    """
+    total = (n - 1) * (n - 2) // 2
+    if len(refused) >= total:
+        return None
+    if 2 * len(refused) < total:
+        while True:
+            i, j = sorted(int(v) for v in rng.integers(0, n, size=2))
+            if j - i >= 2 and (i, j) not in refused:
+                return i, j
+    left = [(i, j) for i in range(n - 2) for j in range(i + 2, n)
+            if (i, j) not in refused]
+    return left[int(rng.integers(len(left)))]
+
+
+def _last_gain(progress: list[tuple[int, float, float]]) -> str:
+    """When a pass last improved its route, for the end of its log line.
+
+    The budgets are wall clock and both passes spend theirs in full, so the one figure a
+    log could not give was how much of a budget was still buying anything.  A pass whose
+    last gain came 20 s into 240 is saying its budget is twelve times what it used.
+    """
+    if not progress:
+        return ""
+    attempt, seconds, _cost = progress[-1]
+    return f", the last gain at attempt {attempt}, {seconds:.1f}s in"
+
+
+def _progress_note(name: str, before: float, progress: list[tuple[int, float, float]],
+                   tried: int, spent: float) -> str:
+    """Every gain of a pass as ``attempt@seconds=cost``, for the stage trace.
+
+    The stage trace records a route before and after each pass and nothing of how the
+    pass got from one to the other.  This is the whole of that in one line: which
+    attempts were kept, when, and what the route cost after each -- the convergence curve,
+    which is what a budget should be sized against and what no log carried.
+    """
+    steps = " ".join(f"{a}@{s:.1f}={c:.3f}" for a, s, c in progress) or "none"
+    return (f"{name} progress, {tried} attempts in {spent:.1f}s from {before:.3f}: "
+            f"{steps}")
+
+
+# What share of ``shortcut``'s attempts are aimed at a stop-band crossing rather than
+# drawn uniformly.  Half, because the pass has two jobs and nothing says which matters
+# more on a given route: the aim costs nothing once no crossing can be cut -- ``_band_span``
+# returns ``None`` and the draw is the uniform one -- so the share is only ever spent where
+# there is something to spend it on.
+BAND_CUT_SHARE = 0.5
+
+
+def _band_span(cell: Cell, dense: list[np.ndarray], rng) -> tuple[int, int] | None:
+    """A span of ``dense`` whose two ends straddle a joint 5 stop-band crossing, or ``None``.
+
+    A waypoint in the band is what ``clear_stop_band`` has to remove or nudge, and what
+    discards the route when it can do neither.  ``shortcut`` is the pass that can make the
+    band states *not exist*, by replacing the stretch holding them -- but it draws its
+    spans uniformly, so on a dense route of hundreds of states it almost never draws one.
+
+    **The ends have to sit on the same side of the band, and that is not a heuristic.**  A
+    joint move is ``a + t*(b - a)``, so joint 5 runs monotonically from one end to the
+    other: if both ends are outside the band on the same side, no state of the replacement
+    can be inside it, and the removal is guaranteed rather than hoped for.  Where the two
+    ends straddle zero the replacement must cross through, and the cut achieves nothing.
+    A linear move's stations come from inverse kinematics along the tool's line and are
+    not monotone in any joint, so there the guarantee does not hold and the ``_try_cut``
+    comparison is all there is -- which is why this aims the draw and decides nothing.
+
+    So returning ``None`` is itself the diagnosis of a forced crossing: where joint 5
+    crosses zero once and stays on the far side, no same-sided span straddles it, and no
+    cut of any kind can remove the band states.  That is the case ``--finish-attempts``
+    exists to stop the planner chasing.
+
+    The minimal span is returned -- out to the nearest state outside the band on each side
+    -- being both the likeliest to be collision free and the cheapest to check.  Width is
+    left to the uniform draw, which is still running on the other attempts.
+
+    Indices are read off ``dense`` as it stands, not cached: ``_try_cut`` splices the list,
+    which shifts every index past a kept cut.  It is a pure arithmetic test per state, so a
+    walk of the whole list is nothing beside the collision check an attempt is about to pay.
+    """
+    inside = [cell.in_stop_band(q) for q in dense]
+    band = [k for k, hit in enumerate(inside) if hit]
+    if not band:
+        return None
+    k = int(band[rng.integers(len(band))])
+    i = k - 1
+    while i >= 0 and inside[i]:
+        i -= 1
+    j = k + 1
+    while j < len(dense) and inside[j]:
+        j += 1
+    if i < 0 or j >= len(dense) or j - i < 2:
+        return None                     # the crossing runs off one end of the route
+    a = float(dense[i][STOP_BAND_JOINT])
+    b = float(dense[j][STOP_BAND_JOINT])
+    if (a >= 0.0) != (b >= 0.0):
+        return None                     # straddles zero: the crossing is forced
+    return i, j
+
+
 def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
-             span_cost) -> int:
+             span_cost, span: tuple[int, int] | None = None) -> int:
     """Replace dense[i..j] with the straight move between the ends, if that is cheaper.
+
+    ``span`` names the stretch to try instead of drawing one uniformly -- see
+    ``_band_span``, which aims some of the attempts at a stop-band crossing.  It changes
+    only which cut is *proposed*: the comparison below is the same cost test either way, so
+    an aimed cut that is dearer is rejected exactly as a drawn one would be.  This pass
+    therefore cannot be made to install a band removal that costs time, and does not try.
 
     The comparison is made over the whole region between the anchors either side of the
     cut, not over ``i..j`` alone.  Under the per-sub-step rule those outer stretches are
@@ -1378,7 +1612,7 @@ def _try_cut(model: "MotionModel", dense, fac, marks, rng, penalised, whole,
     Where the waypoints go is ``simplify``'s decision, made on stop-to-stop time where an
     extra stop costs a pair of ramps; this pass may only reshape the route between them.
     """
-    i, j = sorted(rng.integers(0, len(dense), size=2))
+    i, j = span if span is not None else sorted(rng.integers(0, len(dense), size=2))
     if j - i < 2:
         return 0
     # How wide the comparison has to be.  Under the whole-move rule a cut that swallows an
@@ -1600,6 +1834,16 @@ def _make_program(cell: Cell, qa: np.ndarray, qb: np.ndarray) -> cl.CompositeIns
 # How long one OMPL solve may run.  Tesseract's own default, and what this used to be
 # stuck with; see _set_planning_time for why changing it is awkward.
 DEFAULT_PLANNING_TIME = 5.0
+# How many of a transit's candidate routes may be offered to ``_finish`` before the
+# transit is given up on -- see ``_finish_ranked``, which is where this is argued.  Here
+# rather than beside that function because ``plan_freespace`` reads it as a default, and a
+# default is evaluated where the ``def`` is.  Bounded rather than exhaustive because the
+# failure it exists for is not always a property of the route: where the only way between
+# the two ends takes joint 5 through zero, every candidate is refused for the same reason
+# and each attempt costs a whole refinement.  Four is enough to get past a route whose
+# shape happened to be unlucky and few enough that a forced crossing is found out inside
+# one segment clock.
+DEFAULT_FINISH_ATTEMPTS = 4
 # The rest of OMPLSolverConfig's documented defaults, used to recognise the struct.
 _SOLVER_SIGNATURE = (10, 0, 1)          # max_solutions, simplify, optimize
 _planning_time_warned = False
@@ -2001,6 +2245,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    retune_openings: int = 0,
                    zone: LinearZone | None = None,
                    direct_clearance: float = 0.0,
+                   finish_attempts: int = DEFAULT_FINISH_ATTEMPTS,
                    cartesian: "CartesianBudget | None" = None,
                    relocate: "Relocation | None" = None,
                    deadline: "Deadline | None" = None,
@@ -2118,6 +2363,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                      cartesian=cartesian, relocate=relocate,
                                      openings=direct, gun=gun,
                                      stand_off=stand_off,
+                                     finish_attempts=finish_attempts,
                                      deadline=deadline, log=log,
                                      record=raw)
         if record is not None:
@@ -2151,7 +2397,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                        check_step=check_step, continuous_check=continuous_check,
                        direct_clearance=direct_clearance, zone=zone,
                        cartesian=cartesian, relocate=relocate, gun=gun,
-                       stand_off=stand_off, deadline=deadline)
+                       stand_off=stand_off, finish_attempts=finish_attempts,
+                       deadline=deadline)
     # Into a list of its own and handed on only once every leg is in hand, for the reason
     # the direct attempt's is: the caller pairs raw routes with returned legs by position,
     # and a detour that captured two legs and then failed would leave entries behind for
@@ -2186,6 +2433,7 @@ class _LegSettings:
     relocate: "Relocation | None"
     gun: "GunPreference | None"
     stand_off: "StandOff | None"
+    finish_attempts: int
     deadline: Deadline
 
 
@@ -2241,18 +2489,27 @@ def _tree_leg(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, opening: float | No
                                  deadline=cfg.deadline, zone=cfg.zone, gun=cfg.gun)
     if not found:
         raise PlanningError(f"the cartesian tree found no route for {what}")
-    best = _cheapest(found, log)
-    _capture(record, best.route)
-    with cell.gun_opening(opening):
-        # No refinement budget here.  A leg is refined once the whole detour is settled,
-        # grouped with whichever neighbours share its opening -- refining it now would
-        # spend the passes on a route the next leg may yet fail to continue.  The stand-off
-        # trials are part of that deferral and cannot fire without a polish budget, so the
-        # opening that comes back is the one handed in and the caller still owns it.
-        runs, _ = _finish(cell, best.route, zone=cfg.zone, relocate=cfg.relocate,
-                          shortcut_seconds=0.0, polish_seconds=0.0,
-                          check_step=cfg.check_step, log=log)
-        return runs
+
+    def finish(cand: _Solution, _first: bool) -> tuple[list[Run], float | None]:
+        with cell.gun_opening(opening):
+            # No refinement budget here.  A leg is refined once the whole detour is
+            # settled, grouped with whichever neighbours share its opening -- refining it
+            # now would spend the passes on a route the next leg may yet fail to continue.
+            # The stand-off trials are part of that deferral and cannot fire without a
+            # polish budget, so the opening that comes back is the one handed in and the
+            # caller still owns it.  Nothing to clamp on a retry for the same reason.
+            return _finish(cell, cand.route, zone=cfg.zone, relocate=cfg.relocate,
+                           shortcut_seconds=0.0, polish_seconds=0.0,
+                           check_step=cfg.check_step, log=log)
+
+    # Offered the same ranked retry as a direct transit, and here it is nearly free: with
+    # no refinement budget an attempt is a densify, a reduction and the stop-band pass, so
+    # what a second one costs is not what it costs on a transit.  It is worth having for
+    # the same reason -- this leg has no other solver, and a route the stop band refuses is
+    # the end of an extraction and so of the whole detour.
+    runs, _ = _finish_ranked(found, attempts=cfg.finish_attempts, finish=finish,
+                             deadline=cfg.deadline, record=record, log=log)
+    return runs
 
 
 def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
@@ -2378,6 +2635,7 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
                             zone=cfg.zone, cartesian=cfg.cartesian,
                             direct_clearance=cfg.direct_clearance,
                             relocate=cfg.relocate,
+                            finish_attempts=cfg.finish_attempts,
                             openings=GunOpenings.pinned(opening),
                             gun=cfg.gun, deadline=cfg.deadline, log=log, record=got)
             except PlanningError as exc:
@@ -2730,10 +2988,35 @@ def _route_fault(cell: Cell, path: list[np.ndarray], check_step: float) -> str |
     Rejecting it here costs one sweep and hands the failure to the retries the caller
     already has: another run of phase one, phase two, the Cartesian tree, or the next gun
     opening.  A run that solves into a blocked route has not solved.
+
+    **The refusal says which test made it**, because the two call for different remedies
+    and the message used to name only the move.  The tool-space subdivision is a
+    *resolution* disagreement, a state the planner's own joint-space step carried the tool
+    across, and is what ``--segment-length-rad`` and ``--check-step-mm`` trade against each
+    other.  The joint grid is neither, the cell's grid being the coarser of the two --
+    contact there is a state the planner should have seen, and is worth knowing about for
+    that reason.
+
+    There used to be a third, and it was the common one: a *margin* disagreement, where
+    the scoped weld clearance refused a state the planner's own margin allowed.  That was
+    not a resolution problem and no resolution answered it -- counted over the shipped
+    logs of seven studies, every one of 161 such refusals fell on the first or the last
+    move of its route, where a route crossed a weld's radius and the cell's own floor came
+    back, and a step-over has no reason to prefer the ends.  The scope is gone, so the
+    planner and this check now work to one margin and only resolution can separate them.
     """
+    counters = getattr(cell, "counters", None) or {}
     for k, (a, b) in enumerate(zip(path, path[1:])):
+        subdivided = counters.get("subdiv_blocked", 0)
         if cell.segment_collides(a, b, max_step=check_step):
-            return f"move {k} -> {k + 1} of {len(path)} points is blocked"
+            # The scan stops at the first state it refuses, so a subdivision refusal
+            # counted across this one move is that state and no other.
+            if counters.get("subdiv_blocked", 0) > subdivided:
+                why = (", in contact between two samples of the joint grid, where only "
+                       "the tool-space check looks")
+            else:
+                why = ", in contact on the joint grid"
+            return f"move {k} -> {k + 1} of {len(path)} points is blocked{why}"
     return None
 
 
@@ -2788,6 +3071,78 @@ def _cheapest(candidates: list[_Solution], log) -> _Solution:
             f"{best.cost:.2f} s against {worst:.2f} s for the worst"
             f"{_gun_note(best.opening)}{mixed}")
     return best
+
+
+def _finish_ranked(candidates: list[_Solution], *, attempts: int, finish,
+                   deadline: "Deadline | None" = None, record: list | None = None,
+                   log=print) -> tuple[list[Run], float | None]:
+    """The cheapest candidate route ``finish`` accepts, over at most ``attempts`` of them.
+
+    ``_finish`` can refuse a route outright, and both of its refusals are properties of
+    the route's shape rather than of the transit: ``clear_stop_band`` where a waypoint
+    holds joint 5 inside the stop band and can be neither removed nor nudged out of it,
+    and ``_verify_runs`` where the finished path will not fly.  So the next candidate is
+    worth offering -- a different homotopy class, often at a different gun opening, found
+    by a different seed or by the other search entirely.
+
+    Taking only the cheapest threw every other candidate away unexamined, and did so on
+    exactly the transits where the searches had found more than one to choose between.
+    Measured on Path 3: ``73052-11-R_2t -> 73052-06-R_2t`` solved twice in phase one, at
+    115 mm and at 140 mm, refined the cheaper of the two for 366 s, lost it to the stop
+    band at waypoint 4 of 8, and went to the detour with the 327.71 s route never
+    densified.  914 s of a 1777 s segment, and nothing kept from any of it.
+
+    **A retry gets the full refinement budget**, which is the honest cost of this: up to
+    ``attempts`` times what one transit used to spend after its search.  What bounds it is
+    the segment clock, asked before each retry rather than during one -- a refinement
+    stopped halfway leaves nothing usable, exactly as a search does.  The first attempt is
+    untouched and takes the budget it always took, so a transit whose cheapest route
+    finishes costs what it did.
+
+    The caller supplies ``finish`` because the two call sites finish differently: one has
+    the transit's own budgets and stand-off trials, the other is a detour leg deferring
+    all of that.  It is passed the candidate and whether this is the first attempt, the
+    latter being what lets a retry clamp its budgets to the clock while the first does not.
+
+    ``record`` is appended to only for the candidate that succeeds.  A raw route is paired
+    with a returned leg by position at the top of this module, so an attempt that captured
+    its route and was then refused would leave an entry behind for a leg that never
+    shipped -- the same reason ``plan_freespace`` keeps its own captures in a local list.
+    """
+    if not candidates:
+        # Not reachable from either caller -- both raise on an empty set before they get
+        # this far -- but guarded here rather than left to ``_cheapest``, whose ``min``
+        # would answer an empty set with a ``ValueError``.  That is not a planning failure
+        # and would not be caught as one anywhere up the stack.
+        raise PlanningError("no candidate route to finish")
+    best = _cheapest(candidates, log)
+    pool = sorted(candidates, key=lambda c: c.cost)[:max(int(attempts), 1)]
+    last: PlanningError | None = None
+    for n, cand in enumerate(pool, 1):
+        if n > 1:
+            if deadline is not None and deadline.ran_out(
+                    log, f"the next of {len(pool)} candidate routes"):
+                break
+            log(f"      offering candidate {n} of {len(pool)} instead: cost "
+                f"{cand.cost:.2f} s against {best.cost:.2f} s for the cheapest"
+                f"{_gun_note(cand.opening)}, from {cand.source}")
+        mine: list = []
+        _capture(mine, cand.route)
+        try:
+            out, flown = finish(cand, n == 1)
+        except PlanningError as exc:
+            last = exc
+            log(f"      that route cannot be finished: {exc}")
+            continue
+        if record is not None:
+            record.extend(mine)
+        return out, flown
+    if last is not None:
+        # The last refusal, not a summary of them: it names the waypoint and the joint
+        # value, which is the diagnosis, and the lines above have already said how many
+        # were tried.
+        raise last
+    raise PlanningError("no candidate route to finish")
 
 
 def _interleave(first: int, second: int) -> list[bool]:
@@ -2986,6 +3341,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
                  openings: "GunOpenings | None" = None,
                  gun: "GunPreference | None" = None,
                  stand_off: "StandOff | None" = None,
+                 finish_attempts: int = DEFAULT_FINISH_ATTEMPTS,
                  deadline: "Deadline | None" = None, log=print,
                  record: list | None = None) -> tuple[list[Run], float | None]:
     """A route from ``qa`` to ``qb``, and the gun opening it is to be flown at.
@@ -3003,6 +3359,12 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     see ``_path_cost``.  It reaches the searched routes and not the straight move, which
     is taken at the first opening that clears it rather than being scored against
     anything; ``plan_freespace``'s retune is where that choice is revisited.
+
+    ``finish_attempts`` is how many of the candidate routes may be offered to ``_finish``
+    before the transit is given up on -- see ``_finish_ranked``.  Ranking picks the route;
+    this is what happens when the route that was picked cannot be reduced to one the
+    robot may fly.  1 is the old behaviour, where the cheapest candidate was the only one
+    ever densified.
     """
     openings = openings or GunOpenings.pinned(None)
     deadline = deadline or Deadline()
@@ -3136,15 +3498,23 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
             + (" and the cartesian tree" if tree is not None else "")
             + (f": {sampler.message}" if sampler.message else ""))
 
-    best = _cheapest(candidates, log)
-    _capture(record, best.route)
-    with cell.gun_opening(best.opening):
-        # Shortcut before reducing: the dense path gives the cuts somewhere to land.
-        out, flown = _finish(cell, best.route, zone=zone, relocate=relocate,
-                             shortcut_seconds=shortcut_seconds,
-                             polish_seconds=polish_seconds, check_step=check_step,
-                             opening=best.opening, stand_off=stand_off, gun=gun,
-                             deadline=deadline, log=log)
+    def finish(cand: _Solution, first: bool) -> tuple[list[Run], float | None]:
+        # A retry is work this transit did not used to do, so it takes only the time that
+        # is left; the first attempt keeps the budget it always had, or a long segment
+        # would start finishing its routes differently for a flag about retries.
+        with cell.gun_opening(cand.opening):
+            # Shortcut before reducing: the dense path gives the cuts somewhere to land.
+            return _finish(cell, cand.route, zone=zone, relocate=relocate,
+                           shortcut_seconds=(shortcut_seconds if first
+                                             else deadline.clamp(shortcut_seconds)),
+                           polish_seconds=(polish_seconds if first
+                                           else deadline.clamp(polish_seconds)),
+                           check_step=check_step,
+                           opening=cand.opening, stand_off=stand_off, gun=gun,
+                           deadline=deadline, log=log)
+
+    out, flown = _finish_ranked(candidates, attempts=finish_attempts, finish=finish,
+                                deadline=deadline, record=record, log=log)
     log(f"      reduced to {sum(len(r.states) for r in out)} points in "
         f"{len(out)} run{'' if len(out) == 1 else 's'}{_gun_note(flown)}")
     return out, flown
@@ -3522,10 +3892,34 @@ def _report_work(cell: Cell, before: dict[str, int], elapsed: float, log) -> Non
     # state load the collision check had already paid for, so without it the loads would
     # have been this much higher.
     share = f", {fused} of them off a walk already made" if fused else ""
+    # Which of the two resolutions a refused move was refused by.  Measured over 80
+    # sampler solves it was always the tool-space bisection and never the joint grid, and
+    # this counts that rather than repeating it -- it is also what says whether
+    # --coarse-check-stride or --subdivide-coarsest-first is the one worth turning on.
+    grid, sub = d.get("scan_blocked", 0), d.get("subdiv_blocked", 0)
+    early = d.get("scan_blocked_early", 0)
+    where = (f"; {grid} moves refused on the joint grid"
+             + (f" ({early} in its sparse pass)" if early else "")
+             + f" and {sub} by the tool-space subdivision" if grid or sub else "")
+    # Which probe the queries actually went to, each threshold having its own manager.
+    # The total alone cannot tell a 50 mm band read from a 120 mm reach read in a pass,
+    # and the two differ about twofold in cost -- so without this there is no way to say
+    # where a transit's clearance time went.
+    widths = sorted(((k.split(":", 1)[1], v) for k, v in d.items()
+                     if k.startswith("probe:") and v > 0), key=lambda kv: -kv[1])
+    byprobe = ("; by probe " + ", ".join(f"{n} at {w} mm" for w, n in widths)
+               if widths else "")
+    # The contact test is remembered per state, as clearance is, and for a pass that is
+    # mostly re-asking: a station on a tracked line is tested as the inverse kinematics'
+    # answer and again as an end of the gap either side of it.
+    tests = d["collision_tests"]
+    wanted = tests + d.get("collision_hits", 0)
+    remembered = (f" ({100.0 * (wanted - tests) / wanted:.0f}% of {wanted} served from "
+                  f"cache)" if wanted > tests else "")
     log(f"      work: {d['clearance']} clearance queries ({served:.0f}% of {asked} served "
-        f"from cache{share}), {d['collision_tests']} collision tests, "
+        f"from cache{share}), {tests} collision tests{remembered}, "
         f"{d['state_loads']} state loads, {d['fk']} forward kinematics, "
-        f"in {elapsed:.1f}s")
+        f"in {elapsed:.1f}s{where}{byprobe}")
 
 
 def _finish(cell: Cell, path: list[np.ndarray], *, zone: "LinearZone | None",
@@ -3790,18 +4184,19 @@ def _chain_scan(cell: Cell, chain: list[np.ndarray], check_step: float,
 def _reads_near(cell: Cell, q: np.ndarray, near_mm: float) -> bool:
     """Whether ``q`` is within ``near_mm`` of the parts, as far as the clearance query knows.
 
-    ``clearance_mm`` returns the probe distance itself when nothing lies within the probe,
-    so a reading at the probe is "nothing seen", not a distance, and it has to be kept out
-    of an at-or-under test.  Compared as a distance it passed whenever the probe was no
-    wider than the band: ``ToolpathPlanner`` sized the two equal, every state of every leg
-    read as near, and nearly every move shipped linear.
+    A reading saturates at the probe that took it, so a reading at the probe is "nothing
+    seen" and not a distance, and it has to be kept out of an at-or-under test.  Compared
+    as a distance it passed whenever the probe was no wider than the band: every state of
+    every leg read as near, and nearly every move shipped linear.
 
-    The caller has to have sized the probe past ``near_mm`` -- ``ToolpathPlanner`` does --
-    or states clear by more than the probe and less than the band are missed.  The probe
-    only ever grows, so once it is past the band this answer no longer depends on it.
+    Both halves of that test, and the choice of a manager wide enough to make it, are
+    ``Cell.clearance_within``'s now.  They moved because the test needs the probe the
+    reading came off and this caller can no longer know it: each threshold gets a manager
+    sized to itself, so ``near_mm`` is decided by a ``near_mm`` probe rather than by the
+    widest one anything in the program asked for -- 81 ms a query against 180 at the
+    defaults, measured on Path 4's cell.  Nothing about the answer changed.
     """
-    reading = cell.clearance_mm(q)
-    return reading < cell.probe_mm and reading <= near_mm
+    return cell.clearance_within(q, near_mm)
 
 
 def _split_runs(model: "MotionModel", pts: list[np.ndarray]) -> list[Run]:
@@ -3960,7 +4355,21 @@ def plan_linear(cell: Cell, pose_a: np.ndarray, pose_b: np.ndarray, seed: np.nda
     current = np.asarray(seed, dtype=float)
     for k in range(n + 1):
         pose = interpolate_pose(pose_a, pose_b, k / n)
-        q = cell.solve_pose(pose, [current], require_collision_free=not allow_collision)
+        # On-branch first, scattered seeds only if that finds nothing -- the pattern
+        # ``cartesian._steer`` already holds its own line to.  ``solve_pose`` defaults to
+        # eight extra seeds scattered across the joint ranges, which exist to expose the
+        # *other* arm configurations; tracking a line is the one job that does not want
+        # them, since the jump rule below refuses any station on a different branch than
+        # the one before it.  Measured over 991 station solves of a real polish pass: not
+        # once did a scattered seed find a station the seeded solve missed, and where it
+        # found a nearer solution it was nearer by 2.7e-4 rad.  Paying for them at every
+        # station cost 4x -- 87 ms against 21 ms on a 127 mm line -- and this is the call
+        # under every linear check in the program.
+        q = cell.solve_pose(pose, [current], require_collision_free=not allow_collision,
+                            branch_seeds=0)
+        if q is None:
+            q = cell.solve_pose(pose, [current],
+                                require_collision_free=not allow_collision)
         if q is None:
             raise PlanningError(
                 f"no collision-free IK at {100.0 * k / n:.0f}% along a {dist:.0f} mm "

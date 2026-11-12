@@ -8,6 +8,11 @@ Only named stages are written, never the individual attempts inside them.  Readi
 asks the cell for forward kinematics and clearance at every point, which the passes have
 usually cached already but not always, so the work counters in the run log include it,
 and the cell's clearance cache is warmed by it.
+
+The one thing recorded about what happened *inside* a pass is its convergence, as a single
+``progress`` note ahead of the stage it produced: each attempt that was kept, when, and
+what the route cost after it.  Both timed passes spend their budget in full, so this is
+the only place that says how much of a budget was still buying anything.
 """
 from __future__ import annotations
 
