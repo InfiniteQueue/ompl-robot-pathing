@@ -498,6 +498,10 @@ function buildPanel() {
     el('span', { text: `${DATA.clearance.margin} ${DATA.units} (margin)` }),
     el('span', { text: `${DATA.clearance.probe} (probe)` }),
   ]));
+  // Grey is the one colour on the ramp that is not a reading, and in a capped file it is
+  // most of the dots.  Worth a line: it is a node nobody measured, not a bad one.
+  panel.appendChild(el('div', { class: 'lbl', text:
+    'grey: no pose was baked for this node, so it is not clickable' }));
 
   panel.appendChild(el('h2', { text: 'node' }));
   panel.appendChild(readout);
@@ -644,7 +648,19 @@ function draw() {
 // ------------------------------------------------------------------------- interaction
 /* Picking in screen space rather than through a colour buffer: the sets are at most a few
  * thousand points, so projecting them all is far cheaper than a second render pass, and it
- * cannot disagree with what is on screen about which node is in front. */
+ * cannot disagree with what is on screen about which node is in front.
+ *
+ * A node with no baked pose is passed over rather than picked.  The whole of what picking
+ * is for is putting the robot at a node, and --treeview-max-poses means most nodes in a
+ * big file have no pose to put it at: selecting one used to succeed and leave the arm
+ * drawn nowhere, which reads as the robot vanishing rather than as "this node was not one
+ * of the ones baked".  Skipped here rather than filtered when the sets are built, because
+ * every node still has to project for its own sake -- it is drawn, and it is part of the
+ * shape the diagnostic exists to show. */
+function posed(s, i) {
+  return !s.pose || !!s.pose[i];
+}
+
 function pick(px, py) {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const w = canvas.width, h = canvas.height;
@@ -652,6 +668,7 @@ function pick(px, py) {
   for (const s of sets) {
     if (!s.on) continue;
     for (let i = 0; i < s.count; i++) {
+      if (!posed(s, i)) continue;
       const p = s.tcp[i];
       const cx = mvp[0] * p[0] + mvp[4] * p[1] + mvp[8] * p[2] + mvp[12];
       const cy = mvp[1] * p[0] + mvp[5] * p[1] + mvp[9] * p[2] + mvp[13];
