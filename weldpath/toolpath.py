@@ -26,6 +26,7 @@ from . import treetrace
 from .cell import PROBE_EPSILON_MM, STOP_BAND_JOINT, Cell
 from .manifest import Locator, Manifest
 from .cartesian import CartesianBudget
+from .jointtree import JointBudget
 from .fallback import FallbackFinder
 from .penalty import GunPreference
 from .planning import (DEFAULT_FINISH_ATTEMPTS, LIN, PTP, Deadline, LinearZone,
@@ -233,6 +234,7 @@ class ToolpathPlanner:
     def __init__(self, cell: Cell, man: Manifest, *,
                  ompl: OmplBudget | None = None,
                  cartesian: CartesianBudget | None = None,
+                 joint: JointBudget | None = None,
                  fallback_runs: int = 0, relocate: Relocation | None = None,
                  segment_seconds: float = 0.0,
                  main_openings: int = 5, extra_openings: int = 0,
@@ -270,6 +272,12 @@ class ToolpathPlanner:
         # only where the near-panel band is in force.  A cell whose transits solve never
         # pays for it.
         self.cartesian = cartesian
+        # Set, the sampling planner's slot is run by ``weldpath.jointtree`` instead of
+        # OMPL -- ``--joint-tree``.  It replaces that planner rather than joining the
+        # candidate set: the two answer the same question over the same state space, so
+        # running both would spend one budget twice.  The Cartesian tree is untouched and
+        # still ranked against whatever this returns.
+        self.joint = joint
         self.fallback_runs = fallback_runs
         # Wall clock for one segment's search.  Every budget below it bounds a part of the
         # search and they multiply, so this is what bounds a segment that has no route at
@@ -1240,7 +1248,7 @@ class ToolpathPlanner:
         raw_legs: list | None = [] if self.keep_unrefined else None
         legs = plan_freespace(
             self.cell, transit_start, transit_end,
-            ompl=self.ompl, cartesian=self.cartesian,
+            ompl=self.ompl, cartesian=self.cartesian, joint=self.joint,
             segment_length=self.segment_length,
             continuous_check=self.continuous_check,
             check_step=self.check_step,

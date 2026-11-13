@@ -338,6 +338,46 @@ def build_parser() -> argparse.ArgumentParser:
                         "straight joint move is already clear takes that move and spends "
                         "no runs; one the planner cannot join keeps its Cartesian states, "
                         "so this can only cost time, never a route (default: %(default)s)")
+    #PLAN THE SAMPLING PLANNER'S SLOT WITH OUR OWN JOINT-SPACE TREE INSTEAD OF OMPL
+    p.add_argument("--joint-tree", type=boolean, nargs="?", const=True, default=False,
+                   metavar="BOOL",
+                   help="run every sampling-planner search with weldpath.jointtree "
+                        "instead of OMPL -- phase one, phase two and the gap joins inside "
+                        "--cartesian-recut. It is the same question over the same state "
+                        "space, so it replaces that planner rather than joining the "
+                        "candidate set, and the Cartesian tree is untouched and still "
+                        "ranked against whatever this returns. --phase-one-runs and "
+                        "--phase-one-solve-seconds still bound it. Two differences are "
+                        "worth knowing before reading a log: every edge is checked by this "
+                        "cell's own --check-step-deg grid with the tool-space bisection "
+                        "under it, so a route from here cannot be refused as 'not clear "
+                        "under this cell's own check' the way 47 of 1017 OMPL runs over "
+                        "nine studies were; and it is far slower per sample, measured at "
+                        "about 183 ms against OMPL's C++ state validator, so on six real "
+                        "Path 4 legs at 15 s each it solved 2 of 12 attempts against "
+                        "OMPL's 3. It is here to be measured, not because it is better "
+                        "(default: %(default)s)")
+    #JOINT TREE: HOW FAR ONE EXTEND REACHES
+    p.add_argument("--joint-tree-extend-rad", type=float, default=0.5, metavar="RAD",
+                   help="furthest any one joint moves in a single extend of the joint "
+                        "tree. An extend costs at most this over --check-step-deg "
+                        "collision tests and nothing else -- there is no inverse "
+                        "kinematics behind it -- so this sets the price of a sample "
+                        "directly. Untuned: 0.5 rad is about ten check steps "
+                        "(default: %(default)g)")
+    #JOINT TREE: WHETHER IT SAMPLES THE WHOLE OF THE JOINT LIMITS
+    p.add_argument("--joint-tree-margin-rad", type=float, default=0.0, metavar="RAD",
+                   help="confine the joint tree's samples to the box the transit's two "
+                        "endpoints span, inflated by this much and intersected with the "
+                        "joint limits. 0 samples the whole of the limits, which is what "
+                        "OMPL does and so is the default for comparing against it. Worth "
+                        "raising above 0: uniform sampling over the limits puts most "
+                        "samples in open air, and that is where being in Python rather "
+                        "than C++ costs most -- about 10x a state against 1.04x for a "
+                        "state 5 mm off a panel -- so narrowing the box concentrates the "
+                        "search where the handicap is smallest. Like "
+                        "--cartesian-margin-mm it is a hard wall on where the arm may be "
+                        "put, not a preference (default: %(default)g)")
     #HOW MANY GUN OPENINGS A TRANSIT IS PLANNED OVER
     p.add_argument("--min-gun-openings", type=int, default=5, metavar="N",
                    help="gun openings a transit is planned over in phase one. The runs of "
@@ -1170,6 +1210,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     from weldpath.penalty import ClearancePenalty, GunPreference, SteppedPenalty
     from weldpath import profile as profile_mod
     from weldpath.cartesian import CartesianBudget
+    from weldpath.jointtree import JointBudget
     from weldpath.planning import OmplBudget, Relocation
     from weldpath.toolpath import ToolpathPlanner
 
@@ -1374,6 +1415,13 @@ def _run(args: argparse.Namespace, directory: str) -> int:
                                   wide_box_mm=args.cartesian_wide_box_mm,
                                   tilt_deg=args.cartesian_tilt_deg,
                                   recut=args.cartesian_recut),
+        # ``None`` unless asked for, which is what ``_Sampler`` reads to decide whether to
+        # call OMPL at all -- so the flag being off leaves that path byte for byte as it
+        # was rather than routing through a branch that happens to pick OMPL.
+        joint=(JointBudget(extend_rad=args.joint_tree_extend_rad,
+                           margin_rad=(args.joint_tree_margin_rad
+                                       if args.joint_tree_margin_rad > 0.0 else None))
+               if args.joint_tree else None),
         fallback_runs=args.fallback_runs,
         segment_seconds=args.segment_minutes * 60.0,
         fallback_mm=args.fallback_distance_mm,

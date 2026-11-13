@@ -2247,6 +2247,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    direct_clearance: float = 0.0,
                    finish_attempts: int = DEFAULT_FINISH_ATTEMPTS,
                    cartesian: "CartesianBudget | None" = None,
+                   joint: "JointBudget | None" = None,
                    relocate: "Relocation | None" = None,
                    deadline: "Deadline | None" = None,
                    record: list | None = None,
@@ -2360,7 +2361,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                      shortcut_seconds=shortcut_seconds,
                                      polish_seconds=polish_seconds,
                                      zone=zone, direct_clearance=direct_clearance,
-                                     cartesian=cartesian, relocate=relocate,
+                                     cartesian=cartesian, joint=joint,
+                                     relocate=relocate,
                                      openings=direct, gun=gun,
                                      stand_off=stand_off,
                                      finish_attempts=finish_attempts,
@@ -2396,7 +2398,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     cfg = _LegSettings(ompl=reduced, segment_length=segment_length,
                        check_step=check_step, continuous_check=continuous_check,
                        direct_clearance=direct_clearance, zone=zone,
-                       cartesian=cartesian, relocate=relocate, gun=gun,
+                       cartesian=cartesian, joint=joint, relocate=relocate, gun=gun,
                        stand_off=stand_off, finish_attempts=finish_attempts,
                        deadline=deadline)
     # Into a list of its own and handed on only once every leg is in hand, for the reason
@@ -2430,6 +2432,10 @@ class _LegSettings:
     direct_clearance: float
     zone: "LinearZone | None"
     cartesian: "CartesianBudget | None"
+    # Which planner the detour's traverse leg uses.  The two extractions have no sampling
+    # planner at all -- the Cartesian tree is their only solver -- so this reaches one leg
+    # of three, which is the same reach it has on a direct transit.
+    joint: "JointBudget | None"
     relocate: "Relocation | None"
     gun: "GunPreference | None"
     stand_off: "StandOff | None"
@@ -2644,6 +2650,7 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
                             continuous_check=cfg.continuous_check,
                             shortcut_seconds=0.0, polish_seconds=0.0,
                             zone=cfg.zone, cartesian=cfg.cartesian,
+                            joint=cfg.joint,
                             direct_clearance=cfg.direct_clearance,
                             relocate=cfg.relocate,
                             finish_attempts=cfg.finish_attempts,
@@ -3044,6 +3051,7 @@ def _route_fault(cell: Cell, path: list[np.ndarray], check_step: float) -> str |
 # Which search a solution came from.  Reporting only: they are ranked on cost alone.
 SAMPLED = "the sampling planner"
 STEERED = "the cartesian tree"
+JOINTED = "the joint tree"       # the sampling planner's slot, run by weldpath.jointtree
 
 
 @dataclass
@@ -3221,8 +3229,29 @@ class _Sampler:
     gun: "GunPreference | None" = None
     deadline: Deadline = field(default_factory=Deadline)
     continuous_check: bool = False
+    # Set, every run here is the joint-space tree instead of OMPL -- ``--joint-tree``.
+    # It sits on the sampler rather than beside it because what is being swapped is the
+    # *solver for a pair of endpoints*, and every caller that wants one comes through
+    # here: phase one, phase two, and the recut's gap joins.  Both budgets travel
+    # together so a run can say which it used, and ``OmplBudget``'s run counts and
+    # per-run seconds still bound the search -- it is the same question asked the same
+    # number of times, by a different planner.
+    joint: "JointBudget | None" = None
     log: object = print
     message: str = ""
+    # **How many runs this sampler has spent on the joint tree, which is its seed.**  That
+    # tree is deterministic in its seed and nothing was varying it, so every run of a phase
+    # came back byte for byte the same: measured on one Path 4 leg, four runs of
+    # ``phase_one`` at one opening returned the same 13-state route at the same cost to
+    # four decimals, where six different seeds gave five distinct routes and one failure.
+    # The repeat costs both halves of what a phase is for -- ``_cheapest`` has no choice to
+    # rank, and a leg the first seed cannot solve is failed again once per run, at the full
+    # per-run clock each time.  A counter rather than the run index because ``phase_one``,
+    # ``phase_two`` and the recut's gap joins all reach ``_run`` and only two of them have
+    # an index to offer; it is reset per sampler, so a transit is still reproducible.
+    # OMPL needs none of this: its generator is its own and these bindings do not reach it,
+    # which is why its runs already differ.
+    joint_runs: int = 0
 
     def phase_one(self, qa: np.ndarray, qb: np.ndarray,
                   label: str = "phase 1",
@@ -3314,6 +3343,8 @@ class _Sampler:
     def _run(self, qa: np.ndarray, qb: np.ndarray, planning_time: float,
              label: str, opening: float | None = None) -> _Solution | None:
         """One sampling-planner solve, scored and reported.  ``None`` when it did not solve."""
+        if self.joint is not None:
+            return self._run_joint(qa, qb, planning_time, label, opening)
         with self.cell.gun_opening(opening):
             # The gun is not an inverse-kinematics variable but it is very much a state
             # one, and the planner reads the state the environment is holding rather than
@@ -3352,6 +3383,67 @@ class _Sampler:
                  f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
         return _Solution(cost, plain, raw, opening)
 
+    def _run_joint(self, qa: np.ndarray, qb: np.ndarray, planning_time: float,
+                   label: str, opening: float | None) -> _Solution | None:
+        """:meth:`_run` through the joint-space tree -- ``--joint-tree``.
+
+        The same question, the same budget and the same scoring, so a run of this is
+        comparable with a run of OMPL on the figures in the log.  Three differences are
+        deliberate and worth knowing when reading those figures:
+
+        * **No ``sync_env``.**  That exists because OMPL is handed ``cell.env`` and reads
+          the gun opening off the state the environment is holding.  This search reads the
+          cell, which the ``gun_opening`` block above has already set, so moving the
+          environment would be 2.6-4.6 ms of bookkeeping nobody then queries.
+        * **``_route_fault`` is still asked**, although the tree validated every edge with
+          exactly that call and so cannot fail it.  Keeping it means the two solvers are
+          judged by one test rather than on trust, and a refusal here would be a real
+          bookkeeping bug rather than a resolution disagreement.  It is nearly free: the
+          states are one check step apart and the cell remembers a contact test per state.
+        * **The route arrives dense**, every station the search validated, where OMPL
+          returns four points typical.  ``_densify_marked`` hands a stretch already inside
+          the spacing straight through, so this costs nothing downstream -- it is the same
+          footing a Cartesian-tree route arrives on.
+        """
+        from .jointtree import plan_joint      # deferred: jointtree.py reads this module
+        t0 = time.time()
+        note = _gun_note(opening)
+        # The configured seed is the *first* run's, so a single-run phase reproduces what
+        # ``--joint-tree`` would give on its own and a multi-run phase walks on from there.
+        seed = self.joint.seed + self.joint_runs
+        self.joint_runs += 1
+        # **It goes in every line this run prints.**  The search is deterministic in its
+        # seed, so that is the one number saying whether two runs asked the same question,
+        # and while nothing printed it four identical runs read as a planner with nothing
+        # to offer rather than as a caller that had forgotten to vary anything.  It is also
+        # what a reader needs to reproduce one run of a phase on its own.
+        at = f"{note}, seed {seed}"
+        with self.cell.gun_opening(opening):
+            try:
+                route = plan_joint(self.cell, qa, qb, max_step=self.check_step,
+                                   label=f"{label}{note}",
+                                   budget=replace(self.joint, seconds=planning_time,
+                                                  seed=seed))
+            except PlanningError as exc:
+                self.message = str(exc)
+                self.log(f"      {label}{at}: {self.message} "
+                         f"({time.time() - t0:.1f}s)")
+                return None
+            dt = time.time() - t0
+            fault = _route_fault(self.cell, route, self.check_step)
+            if fault is not None:
+                self.message = (f"the joint tree returned a route that is not clear under "
+                                f"this cell's own check ({fault}), which is a bug rather "
+                                f"than a resolution disagreement -- it validated every "
+                                f"edge with that same call")
+                self.log(f"      {label}{at}: {self.message} ({dt:.1f}s)")
+                return None
+            cost, plain = _path_cost(self.cell, route, self.check_step, zone=self.zone,
+                                     gun=self.gun, opening=opening)
+        self.log(f"      {label}{at}: solved in {dt:.1f}s ({len(route)} states, "
+                 f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
+        return _Solution(cost, plain, route, opening, JOINTED)
+
 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget,
                  segment_length: float, check_step: float,
@@ -3360,6 +3452,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
                  zone: LinearZone | None = None,
                  direct_clearance: float = 0.0,
                  cartesian: "CartesianBudget | None" = None,
+                 joint: "JointBudget | None" = None,
                  relocate: "Relocation | None" = None,
                  openings: "GunOpenings | None" = None,
                  gun: "GunPreference | None" = None,
@@ -3459,7 +3552,8 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     # anyway, dealing them round the openings makes the same choice over a wider set.
     sampler = _Sampler(cell=cell, ompl=ompl, segment_length=segment_length,
                        check_step=check_step, zone=zone, openings=openings, gun=gun,
-                       deadline=deadline, continuous_check=continuous_check, log=log)
+                       deadline=deadline, continuous_check=continuous_check,
+                       joint=joint, log=log)
     candidates = sampler.phase_one(qa, qb)
 
     tree = cartesian if (cartesian is not None and cartesian.enabled
