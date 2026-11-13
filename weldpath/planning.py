@@ -3319,8 +3319,10 @@ class _Sampler:
             # one, and the planner reads the state the environment is holding rather than
             # anything in the program it is handed.  Loading a pose here is what puts this
             # run's opening in front of it; before, the run inherited whatever the last
-            # collision query happened to have left there.
-            self.cell.set_state(qa)
+            # collision query happened to have left there.  ``sync_env`` rather than
+            # ``set_state`` because collision checking no longer moves the environment
+            # at all, and this is one of the few places that has to.
+            self.cell.sync_env(qa)
             profiles = ProfileDictionary()
             profiles.addProfile(OMPL_NAMESPACE, "DEFAULT",
                                 _ompl_profile(self.segment_length, planning_time,

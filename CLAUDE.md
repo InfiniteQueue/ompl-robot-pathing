@@ -1195,11 +1195,51 @@ the way, so the joint values in between are whatever that line demands.
     nothing. `--no-tip-standoff` leaves the pass out.
 - **Where the time goes, and what stopped being asked twice.** Every budget in the planner
   is wall clock, so there are only two levers: what a second buys, and whether a second is
-  spent after there is nothing left to buy. Profiled on a reduced-budget run of a
-  5186-shell cell, 681 s end to end: **513 s was `contactTest`**, 112 s was OMPL's own
-  solve, and inverse kinematics was 2.5 s -- 0.15 ms a call, 16 thousand of them. So the
-  program is a contact-test budget and nothing else on the Python side is worth touching
-  until that is.
+  spent after there is nothing left to buy. A profile of a reduced-budget run of a
+  5186-shell cell used to stand here, reporting 513 s of `contactTest` in 681 s end to end
+  against 112 s of OMPL's own solve and 2.5 s of inverse kinematics -- 0.15 ms a call, 16
+  thousand of them. **The contact-test figure does not reproduce and the conclusion drawn
+  from it was wrong**; the IK figure does. See the state-solver bullet below for what the
+  split really was.
+  - **`env.setState` was most of the program, and it is not forward kinematics.** Every
+    collision query and every `fk` pushed its state at the `Environment`, which costs
+    **2.6-4.6 ms** on this cell's 7055 prepared shells -- against **0.005 ms** for the
+    same joint vector and the same name list through the state solver that environment
+    owns, and 0.009 ms for `calcFwdKin`. So it is neither the kinematics nor the binding
+    marshalling the names: it is the environment's own bookkeeping, its revision and the
+    transforms of contact managers *it* holds, and nothing here queries those -- `_cm` is
+    a clone and is pushed at directly. `Cell` now drives a cloned solver and leaves the
+    environment where it stands.
+    - **It was paying for the broadphase to be ignored.** Bullet's culling works
+      extremely well: `contactTest` is **0.013 ms** with the robot 150 mm clear against
+      **4.7 ms** with it 5 mm off a panel, a factor of **360**. The flat 4.6 ms buried
+      that, so a check in open air cost almost exactly what one against a panel cost and
+      the whole gradient read as under 2x.
+    - **Timed apart over 1795 real states** spanning contact out to open air: through the
+      environment, **97.1%** of the work was loading the state and 2.9% was `contactTest`,
+      3.61 ms a state. Through the solver the same states split 40/60 at **0.13 ms** a
+      state. That is where the old 513 s figure goes: the time was real, the attribution
+      was not.
+    - **Nothing answers differently, and that is checked rather than argued.** The link
+      transforms the two routes produce are bit-identical over 150 states and 13 links.
+      On a fixed Cartesian tree search -- a sample count and a seed, not a clock, so both
+      sides do the same searching -- the route came back identical state for state, the
+      cost identical to the last digit, and the same 82 collision tests and 490 state
+      loads were asked, in **0.18 s against 2.65 s, x14.8**.
+    - **Three callers do need the environment moved and they say so**, via
+      `Cell.sync_env`: `_Sampler._run`, because OMPL is handed `cell.env` and reads the
+      gun opening off its current state; `toolpath._export_blocked` and
+      `cell._export_start_contacts`, because the hull exporters write the pose the
+      environment is holding; and `--probe-point`, which now states the pose it reports at
+      instead of inheriting whatever the build left behind. Everything else reads
+      `Cell.state`, the state the load produced -- which is what `fk`, `_tcp_now` and
+      `fallback.retreat`'s bounds helpers were changed to do, the environment no longer
+      being where the answer is.
+    - What this does **not** do is make a budgeted search finish sooner; it makes it
+      search more, exactly as the collision cache did. What it does change is where a
+      search's time goes: near-panel states are now about 30x dearer than open-air ones
+      rather than 1.8x, so the tree's habit of re-covering the pocket at a median 6.7 mm
+      node spacing against an 80 mm extend is worth a great deal more than it was.
   - **The contact test is remembered per state.** `Cell.in_collision` keeps its verdict in
     `_collision_cache`, keyed like every other cache on the cell by the gun and the joint
     vector, and emptied where the margins move. Clearance and tool position were cached
@@ -1217,10 +1257,10 @@ the way, so the joint values in between are whatever that line demands.
       so the cache is emptied in one place, `_set_obstacle_clearance`, and keyed on the
       gun.
     - **A remembered clear state is still loaded.** `segment_scan` reads the tool position
-      and the clearance off the state `in_collision` leaves in the environment, so a hit
-      that skipped the load would have it reading whichever state was tested last. The
-      load is 0.13 ms against a test of 2 to 30. A remembered contact loads nothing, every
-      caller stopping there.
+      and the clearance off the state `in_collision` leaves loaded, so a hit that skipped
+      the load would have it reading whichever state was tested last. A remembered contact
+      loads nothing, every caller stopping there. This said the load was 0.13 ms against a
+      test of 2 to 30, which had it the wrong way round -- see the state-solver bullet.
     - **Keys are exact, and that leaves some on the table.** A chain re-derived from a
       different seed lands within inverse-kinematics tolerance of the states it had
       before and misses, so `solve_pose` hits only 26%. Rounding the key would catch them

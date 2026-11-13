@@ -684,7 +684,7 @@ class ToolpathPlanner:
             return
         from . import hullexport
         try:
-            self.cell.set_state(q)
+            self.cell.sync_env(q)
             hullexport.export_pair(self.cell.env, self.man, self.export_dir, pair, tag,
                                    log=self.log)
         except Exception as exc:                # diagnostics must not mask the failure

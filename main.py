@@ -1352,6 +1352,10 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         # blocked, and the answer does not depend on the toolpath.  The export, if one was
         # asked for, has already happened inside build().
         from weldpath import probe
+        # It reads the environment's own state, and collision checking no longer moves
+        # that -- so the pose it reports at is said here rather than being whatever the
+        # build happened to leave behind, which is what it used to be.
+        cell.sync_env(man.start_q(cell.joint_names))
         probe.report(cell.env, man, args.probe_point, log=print)
         return 0
 

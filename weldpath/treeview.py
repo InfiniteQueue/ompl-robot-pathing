@@ -136,13 +136,13 @@ def _geometry(cell, man, log) -> dict:
 def _bake(cell, man, q: np.ndarray, links: list[str]) -> dict:
     """Where every moving link sits at ``q``, plus what the tool reads there.
 
-    One state load for the whole set rather than a forward-kinematics call per link, which
-    is the same trick ``toolpath._export_blocked`` uses: the environment already computes
-    every link transform when the state is set, so asking per link pays for that again.
+    One state load for the whole set rather than a forward-kinematics call per link:
+    setting a state computes every link transform, so asking per link pays for that
+    again.  Read off ``cell.state`` -- the hot path does not move the environment, so
+    its own state is not the one just loaded.
     """
     cell.set_state(q)
-    state = cell.env.getState()         # held, as above
-    transforms = state.link_transforms
+    transforms = cell.state.link_transforms
     unit = 1.0 / man.scale
     pose = {}
     for name in links:

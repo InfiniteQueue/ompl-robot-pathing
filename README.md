@@ -440,10 +440,20 @@ sake.
 ### What a second of budget buys
 
 Every budget here is wall clock, so a run can only be made better two ways: by getting more
-out of a second, or by not spending one once there is nothing left to buy. Profiled on a
-5186-shell cell with the search budgets cut short, 513 s of a 681 s run was one call — the
-contact test over the collision scene — against 112 s inside the sampling planner and 2.5 s
-of inverse kinematics. Outside the sampler, that call is the whole of the question.
+out of a second, or by not spending one once there is nothing left to buy. A profile of a
+5186-shell cell with the search budgets cut short used to be quoted here as 513 s of a 681 s
+run inside the contact test, against 112 s inside the sampling planner and 2.5 s of inverse
+kinematics. The inverse-kinematics figure holds. The contact-test one does not: timed apart
+over 1795 real states, **97% of a check was pushing the state into the environment and 2.9%
+was the contact test itself**, and pushing a state at the environment is not forward
+kinematics — the same joint vector through the state solver that environment owns is 500
+times quicker, and answers bit-identically.
+
+That fixed cost is gone, and with it the reason a check cost the same wherever the robot
+stood. Bullet's culling is in fact very good: the contact test is 0.013 ms with the robot
+150 mm clear against 4.7 ms with it 5 mm off a panel. So a check is now 0.13 ms a state
+rather than 3.61, and what a search spends depends on where it is looking — near the parts
+is about 30x dearer than open air, where the flat cost used to level the two.
 
 **The contact test is remembered per state.** The passes re-ask it by construction: a
 station on a straight tool move is tested as the inverse kinematics' answer and again as an

@@ -142,6 +142,19 @@ class Cell:
         self.lower, self.upper = limits[:, 0], limits[:, 1]
         self._cm = env.getDiscreteContactManager()
         self._cm.setActiveCollisionObjects(env.getActiveLinkNames())
+        # **The hot path drives a clone of the environment's state solver, not the
+        # environment.**  ``env.setState`` is not forward kinematics: measured on this
+        # cell's 7055 prepared shells it costs 2.6-4.6 ms, against 0.005 ms for the same
+        # joint vector and the same name list through the solver and 0.009 ms for
+        # ``calcFwdKin`` -- so it is neither the kinematics nor the binding marshalling
+        # the names.  What it buys is the environment's own bookkeeping: its revision,
+        # and the transforms of contact managers it owns.  Nothing here queries those --
+        # ``_cm`` is a clone and is pushed at directly -- so the whole of it was being
+        # paid on every state and read by nobody.  Checked over 150 real states and 13
+        # links, the transforms the two routes produce are bit-identical, and the
+        # collision verdict agreed on every one.  :meth:`sync_env` is for the callers
+        # that genuinely do need the environment moved.
+        self._solver = env.getStateSolver()
         # Clearance is the dearest query in the planner -- a contact test over every
         # convex piece within the probe, reduced in Python -- and the optimisation passes
         # ask it of the same states repeatedly.  Keyed by the gun opening as well as the
@@ -309,6 +322,11 @@ class Cell:
         # the proximity manager is a clone of it, so that has to be rebuilt too.
         self._cm = self.env.getDiscreteContactManager()
         self._cm.setActiveCollisionObjects(self.env.getActiveLinkNames())
+        # A margin command is not kinematics, so the solver should be untouched by it --
+        # but it was cloned off this environment, which has just had commands applied to
+        # it, and a second clone costs a fraction of the manager re-taken above.  Cheaper
+        # to re-take than to have to be sure.
+        self._solver = self.env.getStateSolver()
         # Every remembered verdict was reached under the margins just replaced.
         self._collision_cache.clear()
         self.attach_penalty(self.penalty)
@@ -649,14 +667,40 @@ class Cell:
     # -- state / collision ---------------------------------------------------
     def _load_state(self, q: np.ndarray) -> None:
         self.counters["state_loads"] += 1
-        self.env.setState(self._state_names, self._state_values(q))
-        # Must hold a reference: passing env.getState().link_transforms inline lets the
+        self._solver.setState(self._state_names, self._state_values(q))
+        # Must hold a reference: passing getState().link_transforms inline lets the
         # temporary die and the binding then reads freed memory.
-        self._state = self.env.getState()
+        self._state = self._solver.getState()
 
     def set_state(self, q: np.ndarray) -> None:
         self._load_state(q)
         self._cm.setCollisionObjectsTransform(self._state.link_transforms)
+
+    def sync_env(self, q: np.ndarray) -> None:
+        """:meth:`set_state`, and move the environment itself as well.
+
+        The hot path leaves the environment where it stands -- see ``_solver`` -- so a
+        caller that reads ``self.env`` rather than this cell has to say so.  There are
+        three kinds and they are all outside the search: the sampling planner, which is
+        handed ``self.env`` and reads the gun opening off its current state; the hull
+        exporters, which write geometry at whatever pose the environment is holding; and
+        ``--probe-point``, which asks what the links contain at a pose.
+
+        It costs what a state load used to cost, which is the whole reason it is asked
+        for by name instead of being what every collision check pays.
+        """
+        self.env.setState(self._state_names, self._state_values(q))
+        self._state = self.env.getState()
+        self._cm.setCollisionObjectsTransform(self._state.link_transforms)
+
+    @property
+    def state(self):
+        """The scene state the last load left, for callers that want link transforms.
+
+        Setting a state computes every link's transform, so a caller wanting several of
+        them should read this rather than ask :meth:`fk` once per link.
+        """
+        return self._state
 
     def in_collision(self, q: np.ndarray) -> bool:
         """Whether ``q`` is in contact at the margins in force.
@@ -670,12 +714,10 @@ class Cell:
         here, in Python, where the planner could not see it, and it is gone.  See
         ``ToolpathPlanner._earned_weld_clearance`` for what replaced it.
 
-        **The contact test is remembered per state.**  It is where the time goes -- split
-        statement by statement on a 5185-shell cell, 13.4 ms of a 13.5 ms call is
-        ``contactTest`` and 0.13 ms is everything the binding does around it -- and the
-        callers ask it of the same states again and again, by construction rather than by
-        accident.  A station on a tracked line is tested once as the inverse kinematics'
-        answer and twice more as an end of the gap either side of it; a route is swept
+        **The contact test is remembered per state**, the callers asking it of the same
+        states again and again, by construction rather than by accident.  A station on a
+        tracked line is tested once as the inverse kinematics' answer and twice more as
+        an end of the gap either side of it; a route is swept
         whole when it is found, again when it is scored, again when it is densified and
         again when it is verified.  Clearance and tool position were already cached for
         exactly this reason and the verdict under them was not.
@@ -685,10 +727,21 @@ class Cell:
         when the margins move.
 
         **A remembered clear state is still loaded.**  Callers read the tool's position
-        and the clearance off the state this leaves in the environment --
+        and the clearance off the state this leaves loaded --
         :meth:`segment_scan` does both -- and a hit that skipped the load would have them
-        reading whichever state was tested last.  A load is about a hundredth of the test
-        it replaces.  A remembered contact loads nothing: every caller stops there.
+        reading whichever state was tested last.  A remembered contact loads nothing:
+        every caller stops there.
+
+        **What the two halves cost is not what it was, and not what this used to claim.**
+        It said a load was about a hundredth of the test it replaced.  Timed apart over
+        1795 real states spanning contact out to open air, the load was **97%** of the
+        work and the contact test 2.9%, because the load went through the environment --
+        see ``_solver``, which is what it goes through now.  On the same states the split
+        is 40/60 and the whole is 0.13 ms a state against 3.61.  Which way it leans
+        depends on the states: the test is 0.013 ms with the robot 150 mm clear and
+        4.7 ms with it 5 mm off a panel, a factor of 360, so a search dwelling near the
+        parts is dearer per state than one in open air -- by about 30x now, where the
+        fixed cost used to flatten it to under 2x.
 
         The fused floor manager that used to stand here went with the scope.  It existed
         to answer the scope's own question on the same contact test as the margins', and
@@ -1136,15 +1189,17 @@ class Cell:
         :meth:`fk` answers the same question but pushes the state first, which is the
         expensive half.  This is for callers that have just collision-checked a state and
         so have already paid for it.
+
+        Read off the state the load left rather than out of the environment, which the
+        hot path no longer moves.
         """
-        return np.array(self.env.getLinkTransform(TCP_LINK).matrix(),
+        return np.array(self._state.link_transforms[TCP_LINK].matrix(),
                         dtype=float)[:3, 3]
 
     def fk(self, q: np.ndarray, link: str = TCP_LINK) -> np.ndarray:
         self.counters["fk"] += 1
-        self.env.setState(self._state_names, self._state_values(q))
-        self._state = self.env.getState()
-        return np.array(self.env.getLinkTransform(link).matrix(), dtype=float)
+        self._load_state(q)
+        return np.array(self._state.link_transforms[link].matrix(), dtype=float)
 
     def pose_mm(self, q: np.ndarray) -> np.ndarray:
         """TCP pose at ``q`` as a 4x4 with its translation in manifest units.
@@ -1883,7 +1938,7 @@ def _export_start_contacts(cell: Cell, man: Manifest, directory: str,
     loaded: what lands in it is the geometry at the pose that read as contact.
     """
     from . import hullexport
-    cell.set_state(start)
+    cell.sync_env(start)
     for a, b in pairs:
         try:
             hullexport.export_pair(cell.env, man, directory, (a, b),
