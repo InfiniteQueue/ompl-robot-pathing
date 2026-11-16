@@ -37,6 +37,25 @@ where we can read the clock.
   gap: those legs are not short of samples, they are short of a *shape*, and a joint edge
   is the shape they were missing.
 
+**Nodes keep out of the joint 5 stop band, and an extend overshoots to see that they do.**
+A node is a stop -- ``plan_joint`` returns the node chain, and the reduction passes pick
+their waypoints out of it -- and the band is where the robot may not stop, so a station
+inside it is not offered as one.
+
+Refusing to *enter* the band would be the simpler rule and it would be a trap.  The band is
+``2 * Cell.stop_band_rad`` wide, 0.524 rad at the 15 degrees these cells use, against an
+``extend_rad`` of 0.50: no single extend could carry joint 5 across it, so joint 5 could
+never change sign, so the wrist could never be reconfigured -- which is most of what this
+search is here for, a Cartesian edge being unable to turn a wrist at all.  The margin is 5%,
+so the rule would look sound and would quietly turn solvable transits into unsolvable ones.
+
+So an extend that ends inside the band keeps going rather than stopping there, by at most
+``band_overshoot_rad`` past its own reach, and takes the first station the other side.  Two
+cases have no better answer and are left alone: an extend that cannot get clear within that
+much falls back to its last station outside the band, and one that *began* inside it -- from
+a locator that placed in the band, which ``toolpath`` reports when it happens -- is not held
+to the rule at all.
+
 **Edges do not carry their states, and that is a real difference from the Cartesian
 tree.**  That rule is there because ``plan_linear`` is greedy and seeded, so asking it the
 same question twice can give a different chain or none; a route that re-derived
@@ -110,6 +129,7 @@ class JointBudget:
     gun_openings: int = 3           # least openings attempted, where that many exist
     max_iters: int = 20000          # sample budget, whichever runs out first
     extend_rad: float = 0.50        # furthest any one joint moves in one extend
+    band_overshoot_rad: float = 0.50  # extra reach to carry joint 5 clear of the stop band
     goal_bias: float = 0.10         # share of samples aimed at the far tree's root
     margin_rad: float | None = None  # confine sampling to the endpoints' box, inflated
     weights: tuple | None = None    # per-joint scaling before the metric; None is unit
@@ -185,7 +205,7 @@ def _span(a: np.ndarray, b: np.ndarray, w: np.ndarray | None) -> float:
 # ---------------------------------------------------------------------------
 def _steer(cell: Cell, max_step: float, budget: JointBudget, w: np.ndarray | None,
            q_from: np.ndarray, q_to: np.ndarray,
-           reach_rad: float) -> list[np.ndarray] | None:
+           reach_rad: float, exact: bool = False) -> list[np.ndarray] | None:
     """Drive the joint vector along the chord towards ``q_to``, as far as it will go.
 
     Returns the stations it reached, ``q_from`` pinned first, or ``None`` when it could not
@@ -211,17 +231,52 @@ def _steer(cell: Cell, max_step: float, budget: JointBudget, w: np.ndarray | Non
     # chose this neighbour, not to the check that validates the edge.
     raw = float(np.max(np.abs(d))) * t
     n = max(1, int(np.ceil(raw / max_step)))
+    dt = t / n
+
+    # Stations of that same size are what the overshoot walks too, so the only thing it
+    # changes is how many there may be.  Bounded by the chord as well: there is nothing
+    # past ``q_to`` to walk to.
+    most = n
+    if dt > 1e-12:
+        reach = min(1.0, (reach_rad + max(budget.band_overshoot_rad, 0.0)) / span)
+        most = max(n, int(reach / dt))
+
+    # Whether the parent is itself a state the robot may not stop at.  It can be: a
+    # locator with no solution outside the band is placed inside it, and a tree rooted
+    # there would otherwise be unable to put down a single node.
+    from_banded = cell.in_stop_band(q_from)
 
     chain = [q_from]
     current = q_from
-    for k in range(1, n + 1):
-        q = q_from + d * (t * k / n)
+    k = 0
+    while k < most:
+        # Past its own reach the extend carries on only while the station it has arrived
+        # at is one the robot may not stop at -- that is the whole of the overshoot.
+        if k >= n and not cell.in_stop_band(current):
+            break
+        k += 1
+        q = q_from + d * (dt * k)
         if not cell.within_limits(q):
             break
         if cell.segment_collides(current, q, max_step=max_step):
             break
         chain.append(q)
         current = q
+
+    # The node this extend offers is ``chain[-1]`` and a node is a stop, so trailing
+    # stations inside the band are dropped and the extend ends at the last one outside it.
+    # An extend left with nothing outside returns None, which reads to the caller as any
+    # other blocked extend: the trees swap and another sample is drawn.
+    #
+    # ``exact`` is the connect's: it has to arrive on the far tree's own node to join, and
+    # a far node inside the band is one of the endpoints, which the reduction passes leave
+    # alone anyway.  Trimming that arrival away would leave the two halves unable to meet
+    # at all.
+    if not from_banded:
+        while len(chain) > 1 and cell.in_stop_band(chain[-1]):
+            if exact and _span(chain[-1], q_to, w) <= 1e-9:
+                break
+            chain.pop()
 
     return chain if len(chain) > 1 else None
 
@@ -307,7 +362,8 @@ def plan_joint(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
         cursor, cursor_index = a.nodes[new].q, new
         while time.perf_counter() < deadline:
             far = b.nodes[j].q
-            step = _steer(cell, max_step, budget, w, cursor, far, budget.extend_rad)
+            step = _steer(cell, max_step, budget, w, cursor, far, budget.extend_rad,
+                          exact=True)
             if step is None:
                 break
             cursor_index = a.add(step[-1], cursor_index)
