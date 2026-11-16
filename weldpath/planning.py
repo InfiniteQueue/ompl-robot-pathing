@@ -2545,9 +2545,13 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
 
     **Each leg has its own solver.**  A locator to its own fallback goes to the Cartesian
     tree alone -- see ``_tree_leg`` -- and the traverse between the two fallbacks goes to
-    the joint solver: the straight chord first, then phase one dealt round the openings,
-    whichever search occupies that slot.  The two ends of the route are extractions and the
-    middle is a traverse, and those want different solvers.
+    the joint solver, whichever search occupies that slot, on **phase two's** budget: the
+    straight chord first, then the sampling runs ``--phase-two-max-runs`` and
+    ``--phase-two-solve-seconds`` describe.  Phase two's job is what this function took
+    over, so phase two's figures are the ones its legs spend; phase one's runs buy a choice
+    between homotopy classes dealt round the gun openings, and a leg with one opening pinned
+    has no such choice to make.  The two ends of the route are extractions and the middle is
+    a traverse, and those want different solvers.
 
     **The traverse does not get the Cartesian tree, and that is the point of the split.**
     Two reasons, and the second is the one that decides it:
@@ -2612,16 +2616,30 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
         log("      the cartesian tree is switched off, so the legs out of the locators "
             "go to the joint solver too, like the traverse between the poses")
 
-    # The traverse's tree, which is normally none of one: see the note above.  It is kept
-    # only where there is no joint solver to hand the leg to instead -- phase one bounds
-    # that slot, and at no runs the leg would be left with the straight chord and nothing
-    # else, which is a worse answer than the wrong solver.
+    # The traverse spends **phase two's** budget, not phase one's.  The detour took phase
+    # two's job when it replaced it and went on spending phase one's runs, which was never
+    # the figure governing this leg: phase one's runs buy a choice between homotopy classes
+    # and are dealt round the gun openings, and a detour leg has one opening pinned and no
+    # choice to make -- it needs a route to exist.  That is phase two's question, and
+    # ``OmplBudget`` already says what the budget for it is for: "a transit that beat phase
+    # one is usually one where restarting the tree is the problem, so the time that helps is
+    # a longer single search rather than another shake of the sampler".
+    #
+    # It also decouples the leg from a phase one turned down to nothing, which left the one
+    # solver that can cross an inverse-kinematics branch not merely unpreferred but unbuilt.
+    traverse_ompl = replace(cfg.ompl,
+                            phase_one_runs=cfg.ompl.phase_two_max_runs,
+                            phase_one_seconds=cfg.ompl.phase_two_seconds)
+
+    # The tree is kept only where even that leaves nothing to search with.  Both budgets at
+    # zero means there is no joint solver to hand the leg to, and the straight chord on its
+    # own is a worse answer than the wrong solver.
     traverse = None
-    if cfg.ompl.phase_one_runs <= 0:
+    if traverse_ompl.phase_one_runs <= 0:
         traverse = cfg.cartesian
         if traverse is not None and traverse.enabled:
-            log("      no sampling runs, so the traverse between the poses keeps the "
-                "cartesian tree for want of a joint solver to use instead")
+            log("      no sampling runs in phase two's budget either, so the traverse "
+                "between the poses keeps the cartesian tree for want of a joint solver")
 
     options = list(openings.all)
     if options and options[0] is None:
@@ -2644,10 +2662,12 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
     middle = STEERED if (traverse is not None and traverse.enabled) else jointly
     solvers = (f"the legs out of the locators by the cartesian tree, the rest by {middle}"
                if any(own) else f"every leg by {middle}")
+    # Phase two's figures, since those are the ones the traverse now spends -- a line
+    # quoting phase one's would not describe any leg of this.
+    runs = traverse_ompl.phase_one_runs
     log(f"      detour: {n} legs through {', '.join(names[1:-1])} over "
-        f"{_openings_note(options)}, {solvers}, at up to "
-        f"{cfg.ompl.phase_one_runs} sampling run"
-        f"{'' if cfg.ompl.phase_one_runs == 1 else 's'} per leg")
+        f"{_openings_note(options)}, {solvers}, at up to {runs} sampling run"
+        f"{'' if runs == 1 else 's'} of {traverse_ompl.phase_one_seconds:g}s per leg")
 
     solved: list[list[Run] | None] = [None] * n
     raws: list[list[np.ndarray]] = [[] for _ in range(n)]
@@ -2680,7 +2700,7 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
                 else:
                     with cell.gun_opening(opening):
                         runs, _ = _plan_direct(
-                            cell, points[i], points[i + 1], ompl=cfg.ompl,
+                            cell, points[i], points[i + 1], ompl=traverse_ompl,
                             segment_length=cfg.segment_length,
                             check_step=cfg.check_step,
                             continuous_check=cfg.continuous_check,
