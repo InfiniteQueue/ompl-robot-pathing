@@ -339,7 +339,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "no runs; one the planner cannot join keeps its Cartesian states, "
                         "so this can only cost time, never a route (default: %(default)s)")
     #PLAN THE SAMPLING PLANNER'S SLOT WITH OUR OWN JOINT-SPACE TREE INSTEAD OF OMPL
-    p.add_argument("--joint-tree", type=boolean, nargs="?", const=True, default=False,
+    p.add_argument("--joint-tree", type=boolean, nargs="?", const=True, default=True,
                    metavar="BOOL",
                    help="run every sampling-planner search with weldpath.jointtree "
                         "instead of OMPL -- phase one, phase two and the gap joins inside "
