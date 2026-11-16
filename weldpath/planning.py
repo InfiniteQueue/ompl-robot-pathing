@@ -2544,10 +2544,33 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
     question, and the openings phase two would have walked are walked here per leg anyway.
 
     **Each leg has its own solver.**  A locator to its own fallback goes to the Cartesian
-    tree alone -- see ``_tree_leg`` -- and the leg between the two fallbacks, which runs
-    through open air, gets everything ``_plan_direct`` has: the straight chord, phase one
-    dealt round the openings, and the tree ranked against them.  The two ends of the route
-    are extractions and the middle is a traverse, and those want different solvers.
+    tree alone -- see ``_tree_leg`` -- and the traverse between the two fallbacks goes to
+    the joint solver: the straight chord first, then phase one dealt round the openings,
+    whichever search occupies that slot.  The two ends of the route are extractions and the
+    middle is a traverse, and those want different solvers.
+
+    **The traverse does not get the Cartesian tree, and that is the point of the split.**
+    Two reasons, and the second is the one that decides it:
+
+    * The tree's edge is a straight tool move, which earns its cost in the corridor beside
+      a panel and nowhere else -- which is why ``_plan_direct`` gates it on the band at
+      all.  A fallback pose is found by backing a locator out until it stands clear of the
+      parts, so the traverse between two of them is open air by construction.  There is no
+      corridor there to thread.
+    * **A tool-line edge cannot turn a wrist.**  Every station of one is an inverse
+      kinematics solve, refused past ``jump_rad`` however the solution was found, so the
+      tree cannot cross from one inverse-kinematics branch to another -- the branch each of
+      its two halves starts in is the branch it dies in.  A fallback pose is seeded from
+      its locator's own solution and so inherits that locator's branch, and the two
+      locators of a transit need not agree.  A joint edge has no such rule: it is already a
+      joint path, and it turns a wrist as readily as it swings an elbow.
+
+    Measured on Path 4's ``73052-11-R_2t -> 73052-06-R_2t``, whose two welds placed on
+    opposite wrist branches: the tree's two halves met at the *same tool pose* 1824 times
+    over and were refused at every one of them, J4 and J6 half a turn apart with the arm
+    within 0.03 rad of itself, at eight gun openings and 120 s each.  The two extraction
+    legs, whose ends share a branch, joined after 1 and 11 samples.  Sixteen minutes of
+    that segment went on asking the one solver that could not answer.
 
     **Each leg chooses its own gun opening, and a solved leg is never re-solved.**  The
     legs out of the locators are settled first, both because they are the constrained ones
@@ -2587,7 +2610,18 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
         own[-1] = True
     if not tree:
         log("      the cartesian tree is switched off, so the legs out of the locators "
-            "are planned with every solver, like the one between the poses")
+            "go to the joint solver too, like the traverse between the poses")
+
+    # The traverse's tree, which is normally none of one: see the note above.  It is kept
+    # only where there is no joint solver to hand the leg to instead -- phase one bounds
+    # that slot, and at no runs the leg would be left with the straight chord and nothing
+    # else, which is a worse answer than the wrong solver.
+    traverse = None
+    if cfg.ompl.phase_one_runs <= 0:
+        traverse = cfg.cartesian
+        if traverse is not None and traverse.enabled:
+            log("      no sampling runs, so the traverse between the poses keeps the "
+                "cartesian tree for want of a joint solver to use instead")
 
     options = list(openings.all)
     if options and options[0] is None:
@@ -2606,8 +2640,10 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
                 f"change there, so the legs either side of it fly at one opening")
         lock[i] = lock[i - 1] + (0 if frozen else 1)
 
-    solvers = ("the legs out of the locators by the cartesian tree alone" if any(own)
-               else "every leg with every solver")
+    jointly = JOINTED if cfg.joint is not None else SAMPLED
+    middle = STEERED if (traverse is not None and traverse.enabled) else jointly
+    solvers = (f"the legs out of the locators by the cartesian tree, the rest by {middle}"
+               if any(own) else f"every leg by {middle}")
     log(f"      detour: {n} legs through {', '.join(names[1:-1])} over "
         f"{_openings_note(options)}, {solvers}, at up to "
         f"{cfg.ompl.phase_one_runs} sampling run"
@@ -2649,7 +2685,7 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
                             check_step=cfg.check_step,
                             continuous_check=cfg.continuous_check,
                             shortcut_seconds=0.0, polish_seconds=0.0,
-                            zone=cfg.zone, cartesian=cfg.cartesian,
+                            zone=cfg.zone, cartesian=traverse,
                             joint=cfg.joint,
                             direct_clearance=cfg.direct_clearance,
                             relocate=cfg.relocate,
