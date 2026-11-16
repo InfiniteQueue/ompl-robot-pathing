@@ -313,8 +313,8 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     they already work under the linear profile.
 
     ``label`` names this search in the failure view and is used for nothing else -- see
-    :mod:`weldpath.treetrace`, which keeps the biggest pair of trees a segment builds in
-    case the segment ends up with no route at all.
+    :mod:`weldpath.treetrace`, which keeps the trees a segment builds, these and the joint
+    tree's alike, in case the segment ends up with no route at all.
     """
     budget = budget or CartesianBudget()
     rng = np.random.default_rng(budget.seed)
@@ -378,7 +378,7 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
             if cell.segment_collides(cursor, far, max_step=max_step):
                 break
             route = _join(a, cursor_index, b, j, forward)
-            treetrace.offer(label, start, goal)
+            treetrace.offer(label, start, goal, "cartesian")
             if log:
                 log(f"      cartesian tree: joined after {iters} samples, "
                     f"{len(start.nodes) + len(goal.nodes)} nodes, {len(route)} states")
@@ -410,7 +410,7 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
 
         a, b, forward = b, a, not forward
 
-    treetrace.offer(label, start, goal)
+    treetrace.offer(label, start, goal, "cartesian")
     raise PlanningError(
         f"cartesian tree: no straight-line route after {iters} samples and "
         f"{budget.seconds:g}s ({len(start.nodes)} and {len(goal.nodes)} nodes)"

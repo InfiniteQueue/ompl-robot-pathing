@@ -1190,6 +1190,7 @@ class ToolpathPlanner:
             self.cell, self.man, self.man.directory,
             segment=f"{a.name}--to--{b.name}", failure=failure,
             qa=anchors.get(a.name), qb=anchors.get(b.name),
+            check_step=self.check_step,
             kept=treetrace.kept(), searches=treetrace.searches(),
             dropped=treetrace.dropped(),
             opening=self.openings.get(b.name),

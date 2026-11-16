@@ -61,7 +61,8 @@ tree.**  That rule is there because ``plan_linear`` is greedy and seeded, so ask
 same question twice can give a different chain or none; a route that re-derived
 differently downstream would be thrown out by a verifier right to throw it out.  A joint
 chord has nothing to re-derive -- ``a + t * (b - a)`` is the same points every time -- so
-only the two ends need keeping.  What is returned is nevertheless the **dense** station
+only the two ends need keeping.  It is also why the failure view can draw an edge this
+never stored and still be drawing the motion that was checked: see ``plan_joint``.  What is returned is nevertheless the **dense** station
 list rather than the waypoints, for a different reason: ``planning._split_runs`` may label
 a near-panel move linear, and a linear move is flown along the tool's straight line rather
 than along the joint chord this validated.  At one check step apart the two curves
@@ -86,6 +87,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from . import treetrace
 from .cell import Cell
 from .planning import PlanningError
 
@@ -317,11 +319,18 @@ def plan_joint(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     The states come back dense, every station the search validated, as the Cartesian
     tree's do.  See the module docstring for why that and not the waypoints.
 
-    ``label`` names this search in the log line and is used for nothing else.  Nothing is
-    offered to :mod:`weldpath.treetrace`: the failure view bakes a tool pose and a
-    clearance reading per node, and this search never computes a pose, so offering it
-    would make every run pay forward kinematics for a diagnostic only a failed segment
-    reads.
+    ``label`` names this search in the log line and in the failure view.
+
+    **Both trees are offered to :mod:`weldpath.treetrace` whatever this returned**, as the
+    Cartesian tree's are, so a failed segment can be looked at rather than read off a log
+    line that says two node counts.  Offering costs a reference and nothing else: the nodes
+    are already built, and the search computes no pose, no clearance and no chain for them.
+    The objection to this was that the failure view needs all three per node -- and it
+    does, which is why :mod:`weldpath.treeview` derives them from ``q`` when it writes the
+    file, on a segment that has already failed, rather than here on every run that has not.
+    Deriving an edge there is exact and not an approximation: the stations are
+    ``a + t * (b - a)`` at the same ``max_step``, which is the same arithmetic ``_steer``
+    did and therefore the same points, so the view draws the motion that was validated.
     """
     budget = budget or JointBudget()
     rng = np.random.default_rng(budget.seed)
@@ -371,6 +380,7 @@ def plan_joint(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
             if _span(cursor, far, w) > 1e-9:
                 continue
             route = _join(a, cursor_index, b, j, forward, max_step)
+            treetrace.offer(label, start, goal, "joint")
             if log:
                 log(f"      joint tree: joined after {iters} samples, "
                     f"{len(start.nodes) + len(goal.nodes)} nodes, {len(route)} states")
@@ -378,6 +388,7 @@ def plan_joint(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
 
         a, b, forward = b, a, not forward
 
+    treetrace.offer(label, start, goal, "joint")
     raise PlanningError(
         f"joint tree: no route after {iters} samples and {budget.seconds:g}s "
         f"({len(start.nodes)} and {len(goal.nodes)} nodes)")

@@ -1114,8 +1114,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="write a failed segment's search into the study directory, "
                         "beside the manifest it was read from, as something that can be "
                         "opened and looked at: the cell as the "
-                        "planner collided against it, the biggest pair of Cartesian trees "
-                        "the segment built, and the robot wherever a node is clicked. "
+                        "planner collided against it, the trees the segment built -- the "
+                        "Cartesian tree's and the joint tree's, each labelled with which "
+                        "it was -- and the robot wherever a node is clicked. "
                         "Three files per failure -- a page, its data, and the viewer "
                         "itself, shared -- and the page opens on a double click with no "
                         "server and nothing to install. Written whatever the segment "
@@ -1124,8 +1125,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "straight chord between the endpoints and the reason "
                         "(default: %(default)s)")
     p.add_argument("--treeview-searches", type=int, default=12, metavar="N",
-                   help="how many of a segment's Cartesian tree searches the failure "
-                        "view keeps. A segment runs the tree many times -- successive "
+                   help="how many of a segment's tree searches the failure view keeps. "
+                        "A segment runs a tree many times -- successive "
                         "seeds, one per gun opening, again in phase two, again per half "
                         "of a detour -- and they fail in different places, so which "
                         "opening got furthest is a question about the set rather than "
@@ -1135,6 +1136,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "every segment pays that whether or not it fails. Past the limit "
                         "the smallest kept search makes way for a bigger one, so what is "
                         "lost is the searches that died early -- raise it to see those. "
+                        "No kind of search is lost whole: a segment runs the Cartesian "
+                        "tree and, under --joint-tree, the joint tree, both go in the one "
+                        "file, and the limit may not evict the last pair of either, so a "
+                        "search that ran is never missing from the view. "
                         "0 keeps every search offered (default: %(default)g)")
     p.add_argument("--treeview-max-poses", type=int, default=1500, metavar="N",
                    help="how many of a tree's nodes get the robot's pose baked into the "

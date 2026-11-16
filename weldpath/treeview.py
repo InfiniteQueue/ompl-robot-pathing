@@ -1,4 +1,4 @@
-"""Write a failed segment's Cartesian trees out as something that can be looked at.
+"""Write a failed segment's search trees out as something that can be looked at.
 
 Called only when a segment has failed, from :meth:`weldpath.toolpath.ToolpathPlanner.run`,
 with whatever :mod:`weldpath.treetrace` kept.  Three files land in the study directory --
@@ -33,6 +33,18 @@ again per half of a detour -- and the questions worth asking are about the set: 
 opening got furthest, whether a second half failed where the first half had no trouble.
 One tree per file could not answer either, and writing a file per search would mean
 comparing them by opening two windows.
+
+**Both kinds of tree are written, and what a node holds differs between them.**
+:mod:`weldpath.cartesian` steers by a tool pose and validates each edge by solving a chain
+of inverse kinematics, so its nodes carry both.  :mod:`weldpath.jointtree` steers by the
+joint vector and its edge is a chord, so its nodes carry neither -- making every joint run
+compute a pose for a file only a failed segment opens is exactly the cost that search
+exists to avoid.  So the pose and the edge are derived *here*, from ``q``, by
+:func:`_node_pose` and :func:`_edge_states`.  The derived edge is not an approximation of
+the validated one: the chord's stations at ``check_step`` are the same arithmetic
+``jointtree._steer`` did, so they are the same points.  What the viewer is told is the
+``kind`` per search, because the same drawn line means a straight tool move in one and a
+joint chord in the other.
 
 The pose budget is therefore shared.  ``max_poses`` is a **total** over every tree in the
 file, apportioned by node count in :func:`_share`, not a limit each tree gets to itself: a
@@ -191,13 +203,59 @@ def _share(counts: list[int], budget: int) -> list[int]:
     return out
 
 
-def _tree(cell, man, tree, links: list[str], limit: int, log) -> dict:
+def _node_pose(cell, node) -> np.ndarray:
+    """Where the tool was at one node, as a 4x4 in manifest units.
+
+    A Cartesian node carries it, because the search steered by it.  A joint node does not,
+    and ``pose_mm`` is that same quantity asked for now -- one state load on a segment that
+    has already failed, rather than one per node on every run that has not.
+
+    ``pose_mm`` and not ``fk``: the stored pose has the scale taken out, the edges below
+    divide it out themselves, and all three have to agree or the nodes float off their own
+    edges.
+    """
+    got = getattr(node, "pose", None)
+    if got is None:
+        return np.asarray(cell.pose_mm(np.asarray(node.q, dtype=float)), dtype=float)
+    return np.asarray(got, dtype=float)
+
+
+def _edge_states(node, parent_q, step: float) -> list:
+    """The joint states one edge passes through, parent's ``q`` pinned first.
+
+    ``node.chain`` where the search kept one.  :mod:`weldpath.cartesian` does, because
+    ``plan_linear`` is greedy and seeded and asking it twice can answer differently, so a
+    chain it did not keep would be a chain nobody can get back.
+
+    :mod:`weldpath.jointtree` keeps none, and does not need to: its edge is the chord, and
+    the stations along it are ``a + (b - a) * k / n`` for ``n = ceil(max|b - a| / step)``,
+    which is the arithmetic its ``_steer`` did.  At the same ``step`` that gives the same
+    ``n`` and the same points -- including for an extend that was cut short, since the node
+    sits at a station and a prefix of a grid at this spacing is a grid at this spacing.  So
+    this is the edge that was checked and not a line drawn between its ends, which is the
+    whole difference worth seeing: the chord bows through tool space, and where it bows is
+    where the gun went.
+    """
+    chain = getattr(node, "chain", None)
+    if chain is not None and len(chain):
+        return list(chain)
+    a = np.asarray(parent_q, dtype=float)
+    b = np.asarray(node.q, dtype=float)
+    span = float(np.max(np.abs(b - a)))
+    n = max(1, int(np.ceil(span / step))) if step > 0.0 else 1
+    return [a + (b - a) * (k / n) for k in range(n + 1)]
+
+
+def _tree(cell, man, tree, links: list[str], limit: int, step: float, log) -> dict:
     """One tree: its nodes with baked poses and clearance, and its edges' tool paths.
 
-    An edge is drawn along ``_Node.chain`` -- the states the steer actually validated to
-    get there -- rather than as a straight line between the two nodes.  The chain is the
+    An edge is drawn along the states the steer actually validated to get there --
+    ``_Node.chain`` where the search kept one, the chord re-derived at ``step`` where it
+    did not -- rather than as a straight line between the two nodes.  Those states are the
     motion; a line between the nodes is a shortcut that was never checked and often has no
-    inverse kinematics at all, which is precisely the shape this search exists to find.
+    inverse kinematics at all, which is precisely the shape these searches exist to find.
+    ``step`` is the cell's own ``--check-step-deg``, and it has to be: see
+    :func:`_edge_states`.
 
     ``limit`` caps how many nodes get a baked pose, a pose being most of the file's size.
     Every node is still written, so the structure is whole and every edge still draws; the
@@ -217,11 +275,10 @@ def _tree(cell, man, tree, links: list[str], limit: int, log) -> dict:
     for i, node in enumerate(nodes):
         out_q.append([round(float(v), 6) for v in np.asarray(node.q).reshape(-1)])
         out_parent.append(int(node.parent))
-        # Already in manifest units: the tree stores cell.pose_mm, which is fk with the
-        # scale taken out.  The edges below go through fk and have to divide it out
-        # themselves, and the two have to agree or the nodes float off their own edges.
+        # In manifest units, stored or derived -- see _node_pose, which is where the two
+        # kinds of node are reconciled.
         out_tcp.append([round(float(v), _POS_DP)
-                        for v in np.asarray(node.pose)[:3, 3]])
+                        for v in _node_pose(cell, node)[:3, 3]])
         if i in keep:
             out_clr.append(round(float(cell.clearance_mm(node.q)), 2))
             out_pose.append(_bake(cell, man, node.q, links))
@@ -231,10 +288,13 @@ def _tree(cell, man, tree, links: list[str], limit: int, log) -> dict:
 
     edges = []
     for i, node in enumerate(nodes):
-        if node.parent < 0 or not len(node.chain):
+        if node.parent < 0:
+            continue
+        states = _edge_states(node, nodes[node.parent].q, step)
+        if len(states) < 2:
             continue
         path = []
-        for q in node.chain:
+        for q in states:
             p = np.asarray(cell.fk(np.asarray(q, dtype=float)))[:3, 3] / man.scale
             path.append([round(float(v), _POS_DP) for v in p])
         edges.append({"a": int(node.parent), "b": int(i), "path": path})
@@ -280,13 +340,18 @@ def write_app(directory: str, log=print) -> str | None:
 
 
 def write(cell, man, directory: str, *, segment: str, failure: str,
-          qa, qb, kept=None, searches: int = 0, dropped: int = 0, opening=None,
-          max_poses: int = 0, chord_samples: int = 24, log=print) -> str | None:
+          qa, qb, check_step: float, kept=None, searches: int = 0, dropped: int = 0,
+          opening=None, max_poses: int = 0, chord_samples: int = 24,
+          log=print) -> str | None:
     """Write one failed segment's viewer files.  Returns the HTML to open, or ``None``.
 
     ``kept`` is every search :mod:`weldpath.treetrace` held, in the order it was offered;
     ``searches`` and ``dropped`` are how many were offered and how many the limit turned
     away, which is what lets the file say it is a sample rather than the whole of it.
+
+    ``check_step`` is the cell's own joint check step, the one the searches validated their
+    edges at.  A joint tree's edges are re-derived from it -- see :func:`_edge_states` --
+    so passing anything else would draw a line through points nobody tested.
 
     Never raises: a diagnostic that takes the run down with it is worse than no diagnostic.
     The caller is already handling a failure and must be left to report it.
@@ -305,6 +370,10 @@ def write(cell, man, directory: str, *, segment: str, failure: str,
             "units": man.units,
             "searches": searches,
             "dropped": dropped,
+            # How many kept pairs each kind has.  The one question a reader opening a
+            # failure view asks first is whether both searches are in there, and counting
+            # them off the panel is not an answer the file should make them work for.
+            "kinds": {},
             "gun_opening_mm": None if opening is None else float(opening),
             "clearance": {
                 "margin": round(float(cell.obstacle_clearance / man.scale), 3),
@@ -329,18 +398,30 @@ def write(cell, man, directory: str, *, segment: str, failure: str,
             flat.append((s, "goal", search.goal))
         shares = _share([len(t.nodes) for _, _, t in flat], max_poses)
         for s, search in enumerate(kept or []):
+            kind = str(getattr(search, "kind", "cartesian"))
+            data["kinds"][kind] = data["kinds"].get(kind, 0) + 1
             data["solves"].append({
                 "id": int(getattr(search, "order", s + 1)),
                 "label": str(search.label),
+                # Additive and optional, so the format is not bumped for it: a viewer that
+                # does not know the key says nothing extra, and a file that does not carry
+                # it reads as it always did.  The labels do not say which search ran -- they
+                # are the caller's phase names -- so without this a joint pair and a
+                # Cartesian pair are two sets of dots with the same story.
+                "kind": kind,
                 "nodes": int(len(search.start.nodes) + len(search.goal.nodes)),
             })
         for (s, name, tree), share in zip(flat, shares):
             data["trees"].append({"solve": s, "name": name,
-                                  **_tree(cell, man, tree, links, share, log)})
+                                  **_tree(cell, man, tree, links, share,
+                                          check_step, log)})
         baked = sum(sum(1 for p in t["pose"] if p is not None) for t in data["trees"])
         if data["solves"]:
+            kinds = data["kinds"]
             log(f"      treeview: {len(data['solves'])} search"
                 f"{'' if len(data['solves']) == 1 else 'es'} of {searches} offered"
+                + (f" ({', '.join(f'{n} {k}' for k, n in sorted(kinds.items()))})"
+                   if len(kinds) > 1 else f" ({next(iter(kinds))})")
                 + (f", {dropped} dropped by --treeview-searches" if dropped else "")
                 + f"; {baked} of {sum(t['count'] for t in data['trees'])} nodes have a "
                 f"baked pose (--treeview-max-poses)")

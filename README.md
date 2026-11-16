@@ -721,8 +721,17 @@ to search; none of them says why a particular transit could not be solved, and t
 only say that OMPL returned no solution. So when a segment fails, `--treeview` writes the
 search into the study directory, beside the manifest it was read from, as a page that opens
 on a double click — no server, no install, nothing fetched. It shows the cell as the planner collided against it, the
-Cartesian trees the segment built, each node coloured by how much clearance the robot had
+trees the segment built, each node coloured by how much clearance the robot had
 there, and the robot itself — arm and gun — wherever a node is clicked.
+
+**Both searches are shown, and the viewer says which is which.** A segment can run the
+Cartesian tree on the direct transit and the joint tree (`--joint-tree`) in the sampling
+planner's slot, and the two are worth reading side by side: the same endpoints, the same
+cell, failing in different places. The kind is named against every search in the panel,
+because the same drawn edge means different things — a Cartesian edge is a straight tool
+move, checked pose by pose, while a joint edge is a chord in joint space, which bows
+through the cell and bows where the arm swung. Both are drawn through the stations the
+search actually validated and never as a line between two nodes.
 
 **Every search goes into the one file.** A segment runs the tree many times — successive
 seeds until the solve budget is spent, once per gun opening, and again per leg of a detour,
@@ -735,6 +744,14 @@ many are held; it is a memory limit, since a kept search's nodes stay alive unti
 segment ends and every segment pays that whether or not it fails. Past it the smallest kept
 search makes way for a bigger one, so what is lost is the searches that died early — the
 file says how many were dropped, and raising the limit is how to see them.
+
+**The limit cannot lose a search whole.** The Cartesian tree and the joint tree both go
+into the one file for the segment, and the two do not run to the same size: a joint search
+that solved goes in at a handful of nodes where a Cartesian pair runs to hundreds. Under a
+size rule alone a segment with a full set of big Cartesian pairs would turn away every
+joint pair offered, and the file would say the joint tree never ran when it ran and solved.
+So the limit may not evict the last pair of a kind, and a kind nobody is holding goes in
+whatever its size. The panel says how many of each are in the file.
 
 The two trees of each search grow towards each other from the start and the goal, so what
 the picture is for is the gap between them: which one got how far, and where they stopped
@@ -1748,7 +1765,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--gun-opening-weight` | 1.5 | what a second counts as with the gun at full travel, against 1x shut; multiplies a route's whole penalised cost, so candidates found at different openings compete on it. 1 switches it off |
 | `--retune-gun-openings` | 4 | openings each finished leg is re-priced at, after every other pass, validated along the whole leg and never re-planned. 0 leaves it at the opening it was found at |
 | `--treeview` | on | write a failed segment's search into the study directory as a page that can be opened and looked at |
-| `--treeview-searches` | 12 | how many of a segment's tree searches the view keeps, all of them filterable separately in the viewer. A memory limit; past it the smallest kept search makes way. 0 keeps every one |
+| `--treeview-searches` | 12 | how many of a segment's tree searches the view keeps, all of them filterable separately in the viewer. A memory limit; past it the smallest kept search makes way, except that the last search of a kind is never evicted, so the Cartesian tree and the joint tree are both always in the file. 0 keeps every one |
 | `--treeview-max-poses` | 1500 | how many nodes get the robot's pose baked in, those being most of the file's size. A total over every tree in the file, split between them by node count |
 | `--fallback-poses` | 2 | how many of a transit's two ends get a fallback pose of their own, the detour being `w1 -> f1 -> f2 -> w2`. 2 is every pose there is; 0 looks for none, so a transit with no direct route fails rather than detouring |
 | `--fallback-distance-mm` | 100 | room a fallback pose must leave around the robot and gun |

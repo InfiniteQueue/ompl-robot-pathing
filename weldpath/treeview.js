@@ -1,8 +1,15 @@
 /* weldpath failure viewer.
  *
  * Reads window.WELDPATH_TREE, written beside it by weldpath.treeview, and draws the
- * Cartesian search that failed: the cell as the planner collided against it, the two trees
- * that grew towards each other, and the gun and arm wherever a node is clicked.
+ * searches that failed: the cell as the planner collided against it, the two trees of each
+ * pair that grew towards each other, and the gun and arm wherever a node is clicked.
+ *
+ * A search is a cartesian tree or a joint tree -- solves[].kind, absent in files written
+ * before the joint tree was wired up -- and the kind is worth knowing while reading one,
+ * because the same drawn edge means different things.  A cartesian edge is a straight tool
+ * move, checked pose by pose; a joint edge is a chord in joint space, which bows through
+ * tool space and bows exactly where the arm swung.  Both are drawn through the stations the
+ * search validated, never as a line between two nodes.
  *
  * No dependencies on purpose.  This has to open from a file:// path on a machine with no
  * internet, so there is nothing to fetch and nothing to install -- raw WebGL 1, which every
@@ -95,6 +102,11 @@ label.row .n { color: #80868f; font-variant-numeric: tabular-nums; }
   border: 1px solid #32363d; border-radius: 4px; padding: 3px 0; font: inherit;
   font-size: 11px; }
 .bar button:hover { background: #2b2f36; }
+.bar button.on { background: #1d4f45; border-color: #2c7d6c; color: #d8fff6; }
+#mlabel { position: fixed; transform: translate(-50%,-50%); pointer-events: none;
+  padding: 2px 7px; border-radius: 4px; background: #0d2b26e8; color: #7df0d4;
+  border: 1px solid #2c7d6c; font-variant-numeric: tabular-nums; font-size: 12px;
+  white-space: nowrap; display: none; }
 table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
 td { padding: 1px 0; vertical-align: top; }
 td.k { color: #8b929b; padding-right: 8px; white-space: nowrap; }
@@ -144,6 +156,9 @@ const C = {
   goal:   [0.78, 0.52, 1.00],
   chord:  [0.55, 0.58, 0.62],
   pick:   [1.00, 0.30, 0.30],
+  // Deliberately not near any of the above.  A measurement is laid over everything else
+  // in the scene, so its one job is to not be mistaken for a node, the arm or the gun.
+  rule:   [0.20, 0.95, 0.78],
 };
 
 /* One hue per solve, so several shown at once stay tellable apart, and within a solve the
@@ -291,6 +306,11 @@ const gunSet = new Set(DATA.links.gun || []);
  * in the list because it is the one set that always exists -- a segment can fail with no
  * tree at all, and the file is written anyway. */
 const SOLVES = DATA.solves || [];
+/* Older files carry no kind.  They were all cartesian -- it was the only tree there was --
+ * but saying so for a file that never claimed it would be the viewer inventing a reading,
+ * so an unlabelled search is shown without a kind and not as one. */
+const KIND = { cartesian: 'cartesian tree', joint: 'joint tree' };
+const kindOf = info => (info && info.kind) ? (KIND[info.kind] || info.kind) : '';
 /* The biggest search is the one shown first.  Every search is in the file and one click
  * away, but a dozen overlapping trees on opening is a picture of nothing. */
 let biggest = 0;
@@ -376,12 +396,23 @@ function eyePos() {
 const opts = { statics: true, translucent: false, arm: true, gun: true,
                edges: true, nodes: true, chordPose: true, bySolve: false };
 let picked = null;          // {set, index}
+const measure = { on: false, pts: [] };     // the rule; see "measuring" below
 
 const panel = el('div', { id: 'panel' });
 document.body.appendChild(panel);
-document.body.appendChild(el('div', { id: 'hint', text:
-  'drag to orbit · wheel to zoom · right-drag or shift-drag to pan · ' +
-  'click a node to put the robot there · R resets the view' }));
+const hint = el('div', { id: 'hint' });
+document.body.appendChild(hint);
+const mlabel = el('div', { id: 'mlabel' });
+document.body.appendChild(mlabel);
+
+function showHint() {
+  hint.textContent = measure.on
+    ? 'measuring · click two points to measure between them · a third starts again · ' +
+      'points snap to nodes · Esc clears · m leaves'
+    : 'drag to orbit · wheel to zoom · right-drag or shift-drag to pan · ' +
+      'click a node to put the robot there · m measures · R resets the view';
+}
+showHint();
 
 /* Clearance is what the node colours are for, and it is the right default: it is the
  * reading that explains a failure.  But with several searches shown at once every node is
@@ -416,6 +447,42 @@ function rows(pairs) {
 }
 
 const readout = el('div');
+const mread = el('div');
+
+/* Declared beside the readout rather than with the rest of the measuring code, for the
+ * same reason `measure` is: `buildPanel` calls this, and it runs long before that point
+ * in the file. */
+function showMeasure() {
+  mread.innerHTML = '';
+  if (!measure.on) {
+    mread.appendChild(el('p', { class: 'none', text:
+      'Off. Press m, or the button above.' }));
+    return;
+  }
+  if (!measure.pts.length) {
+    mread.appendChild(el('p', { class: 'none', text:
+      'Click a node, or anywhere on the geometry, for the first point.' }));
+    return;
+  }
+  const fix = p => p.map(v => v.toFixed(1)).join(', ');
+  const a = measure.pts[0], b = measure.pts[1];
+  const pairs = [['from', a.what || 'a surface'], ['', fix(a.p)]];
+  if (!b) {
+    pairs.push(['to', 'click the second point']);
+  } else {
+    pairs.push(['to', b.what || 'a surface'], ['', fix(b.p)]);
+    const d = sub(b.p, a.p);
+    pairs.push(['distance', `${measureLength().toFixed(1)} ${DATA.units}`],
+               ['Δ x, y, z', fix(d)]);
+  }
+  mread.appendChild(rows(pairs));
+  // Said once, beside the number, rather than left to be remembered: the figure is not
+  // what a CAD measurement of the same two places would give.
+  if ((a && a.surface) || (b && b.surface))
+    mread.appendChild(el('p', { class: 'none', text:
+      'A surface point is on the convex hull the planner collides against, which stands ' +
+      'a little outside the CAD it was cut from.' }));
+}
 
 function buildPanel() {
   panel.innerHTML = '';
@@ -462,7 +529,13 @@ function buildPanel() {
       el('span', { text: `search ${info.id}` }),
       el('span', { class: 'n', text: `${info.nodes}` }),
     ]));
-    if (info.label) group.appendChild(el('div', { class: 'lbl', text: info.label }));
+    /* The kind, then the caller's own name for the search.  Some labels already say
+     * which tree ran -- "cartesian tree run 2" does -- and prefixing those with the kind
+     * again reads as a stutter, so the label stands on its own where it covers it. */
+    const kind = kindOf(info);
+    const note = (kind && info.label && info.label.indexOf(kind) >= 0)
+      ? info.label : [kind, info.label].filter(Boolean).join(' — ');
+    if (note) group.appendChild(el('div', { class: 'lbl', text: note }));
     for (const s of mine) {
       const input = el('input', { type: 'checkbox' });
       input.checked = s.on;
@@ -487,9 +560,16 @@ function buildPanel() {
   }
   if (!sets.some(s => s.key !== 'chord'))
     panel.appendChild(el('p', { class: 'none', text:
-      'No Cartesian tree was built for this segment — the band was off, the segment ' +
-      'failed before the tree had a turn, or it failed at a locator rather than a ' +
+      'No search tree was built for this segment — the band was off, the segment ' +
+      'failed before a tree had a turn, or it failed at a locator rather than a ' +
       'transit. The straight chord is shown instead.' }));
+  /* Said once here rather than per search: the two kinds draw the same way and mean
+   * different things, and a reader comparing a bowed tree against a straight one needs to
+   * know that is the edge and not the search doing better. */
+  if (SOLVES.some(s => s.kind === 'joint') && SOLVES.some(s => s.kind === 'cartesian'))
+    panel.appendChild(el('div', { class: 'lbl', text:
+      'a joint tree draws its chords, which bow through space; a cartesian tree ' +
+      'draws straight tool moves, which is what it was steering by' }));
 
   panel.appendChild(el('h2', { text: 'clearance' }));
   if (SOLVES.length > 1) panel.appendChild(checkbox('colour nodes by search', 'bySolve'));
@@ -507,6 +587,16 @@ function buildPanel() {
   panel.appendChild(readout);
   showPicked();
 
+  panel.appendChild(el('h2', { text: 'measure' }));
+  const mon = el('button', { text: measure.on ? 'measuring — m to stop' : 'measure (m)' });
+  if (measure.on) mon.className = 'on';
+  mon.onclick = () => toggleMeasure();
+  const mclear = el('button', { text: 'clear' });
+  mclear.onclick = () => { measure.pts = []; showMeasure(); draw(); };
+  panel.appendChild(el('div', { class: 'bar' }, [mon, mclear]));
+  panel.appendChild(mread);
+  showMeasure();
+
   panel.appendChild(el('h2', { text: 'segment' }));
   const info = [['units', DATA.units]];
   if (DATA.gun_opening_mm !== null && DATA.gun_opening_mm !== undefined)
@@ -514,6 +604,13 @@ function buildPanel() {
   if (DATA.searches)
     info.push(['tree searches', DATA.dropped
       ? `${SOLVES.length} kept of ${DATA.searches}` : `${DATA.searches}`]);
+  /* Spelled out rather than left to be counted off the panel: whether both searches made
+   * it into this file is the first thing a reader wants, and a segment runs the cartesian
+   * tree and the joint tree on the same two endpoints. */
+  const kinds = DATA.kinds || {};
+  const names = Object.keys(kinds).sort();
+  if (names.length)
+    info.push(['of which', names.map(k => `${kinds[k]} ${KIND[k] || k}`).join(', ')]);
   if (DATA.dropped) info.push(['dropped', `${DATA.dropped} (--treeview-searches)`]);
   panel.appendChild(rows(info));
 }
@@ -534,7 +631,11 @@ function showPicked() {
     ['clearance', clr === null || clr === undefined
       ? 'not measured' : `${clr} ${DATA.units}`],
   ];
-  if (mine && mine.label) pairs.push(['search', mine.label]);
+  if (mine && (mine.label || mine.kind)) {
+    const kind = kindOf(mine);
+    pairs.push(['search', (kind && mine.label && mine.label.indexOf(kind) >= 0)
+      ? mine.label : [kind, mine.label].filter(Boolean).join(', ')]);
+  }
   if (set.parent) pairs.push(['parent', set.parent[index] < 0 ? 'root' : set.parent[index]]);
   const p = set.tcp[index];
   pairs.push(['tool', `${p[0]}, ${p[1]}, ${p[2]}`]);
@@ -629,6 +730,7 @@ function draw() {
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(p), gl.DYNAMIC_DRAW);
     drawFlat(gl.POINTS, draw._pick.pos, draw._pick.col, 1, 13 * dpr, 1);
   }
+  drawMeasure(dpr);
 
   if (opts.statics && opts.translucent) {
     gl.useProgram(meshProg);
@@ -643,6 +745,9 @@ function draw() {
     gl.depthMask(true);
     gl.disable(gl.BLEND);
   }
+
+  // Last, and outside the GL work: it is a DOM element positioned off this frame's mvp.
+  placeLabel();
 }
 
 // ------------------------------------------------------------------------- interaction
@@ -661,14 +766,19 @@ function posed(s, i) {
   return !s.pose || !!s.pose[i];
 }
 
-function pick(px, py) {
+function pick(px, py, anyNode) {
   const dpr = Math.min(window.devicePixelRatio || 1, 2);
   const w = canvas.width, h = canvas.height;
   let best = null, bestD = 18 * 18, bestZ = Infinity;
   for (const s of sets) {
     if (!s.on) continue;
     for (let i = 0; i < s.count; i++) {
-      if (!posed(s, i)) continue;
+      /* `anyNode` is the measuring tool's, and it is the one caller that wants a node
+       * with no baked pose.  Putting the robot somewhere needs a pose; measuring to a
+       * tool position does not -- that position is in the file for every node and is
+       * drawn for every node, so refusing to measure to one would be refusing to measure
+       * to a point the user is looking at. */
+      if (!anyNode && !posed(s, i)) continue;
       const p = s.tcp[i];
       const cx = mvp[0] * p[0] + mvp[4] * p[1] + mvp[8] * p[2] + mvp[12];
       const cy = mvp[1] * p[0] + mvp[5] * p[1] + mvp[9] * p[2] + mvp[13];
@@ -685,6 +795,205 @@ function pick(px, py) {
     }
   }
   return best;
+}
+
+/* ------------------------------------------------------------------------- measuring
+ * Two points and the distance between them.  The reason it is worth having in a viewer
+ * that already prints a clearance per node is that the clearance answers one question --
+ * how close is the robot to anything at all -- and a failure asks others it cannot: how
+ * far did this tree get along the retreat axis, how deep is the pocket, how much room is
+ * there between the gun and the fixture *here*.  Those are distances between two places
+ * the reader can see and point at.
+ *
+ * What a point may be: a node's tool position, snapped to when the click lands near one,
+ * or the first surface the click ray meets.  Snapping first because a node is a place the
+ * program reasoned about, so a measurement from one is a measurement of something the log
+ * also talks about.
+ *
+ * **The surfaces are the convex hulls, not the source CAD**, which is what the whole file
+ * draws and is deliberate -- see ``treeview``'s own note. So a distance to a face is a
+ * distance to what the planner collided against, which is the useful answer here and not
+ * the same as what a CAD measurement would give. The readout says so.
+ *
+ * `measure` itself is declared with `picked`, up where the UI is built: the panel holds
+ * the toggle, and `buildPanel` runs before this point in the file.
+ */
+
+/* A ray through a pixel, built from the camera basis rather than by inverting the
+ * view-projection: the basis is already how `lookAt` is defined, so there is one
+ * convention in play instead of two that have to agree. */
+function rayAt(px, py) {
+  const w = canvas.clientWidth || 1, h = canvas.clientHeight || 1;
+  const z = norm(sub(eye, cam.at));           // `lookAt`'s own z: from the target to the eye
+  const x = norm(cross([0, 0, 1], z));        // ...so x is screen right and y screen up
+  const y = cross(z, x);
+  const tan = Math.tan(Math.PI / 8);          // the perspective's fovy is PI/4
+  const ndcx = (px / w) * 2 - 1, ndcy = 1 - (py / h) * 2;
+  const sx = ndcx * tan * (w / h), sy = ndcy * tan;
+  return { o: eye.slice(),
+           d: norm([sx * x[0] + sy * y[0] - z[0],
+                    sx * x[1] + sy * y[1] - z[1],
+                    sx * x[2] + sy * y[2] - z[2]]) };
+}
+
+/* A rigid model matrix applied to a ray backwards, so a link's triangles can be tested
+ * where they are stored.  Cheaper and steadier than transforming the triangles: the
+ * rotation is orthonormal, so `t` means the same thing in both frames and the hit point
+ * can be taken off the original ray. */
+function intoFrame(M, o, d) {
+  const w = sub(o, [M[12], M[13], M[14]]);
+  const c0 = [M[0], M[1], M[2]], c1 = [M[4], M[5], M[6]], c2 = [M[8], M[9], M[10]];
+  return { o: [dot(c0, w), dot(c1, w), dot(c2, w)],
+           d: [dot(c0, d), dot(c1, d), dot(c2, d)] };
+}
+
+/* Moller-Trumbore over a flat-shaded soup, nearest hit under `tMax`.  Brute force and no
+ * acceleration structure: this runs on a click and not per frame, and a cell of a million
+ * triangles costs tens of milliseconds, where a BVH would cost a build on every load --
+ * including the loads where nobody measures anything.
+ *
+ * Two-sided on purpose.  With "see through it" on the reader is often inside a hull, and
+ * a measurement to the face they are looking at from behind is still the face they mean. */
+function rayTris(raw, o, d, tMax) {
+  let best = tMax;
+  for (let i = 0; i < raw.length; i += 9) {
+    const ax = raw[i], ay = raw[i + 1], az = raw[i + 2];
+    const e1x = raw[i + 3] - ax, e1y = raw[i + 4] - ay, e1z = raw[i + 5] - az;
+    const e2x = raw[i + 6] - ax, e2y = raw[i + 7] - ay, e2z = raw[i + 8] - az;
+    const hx = d[1] * e2z - d[2] * e2y;
+    const hy = d[2] * e2x - d[0] * e2z;
+    const hz = d[0] * e2y - d[1] * e2x;
+    const det = e1x * hx + e1y * hy + e1z * hz;
+    if (det > -1e-12 && det < 1e-12) continue;
+    const inv = 1 / det;
+    const sx = o[0] - ax, sy = o[1] - ay, sz = o[2] - az;
+    const u = (sx * hx + sy * hy + sz * hz) * inv;
+    if (u < 0 || u > 1) continue;
+    const qx = sy * e1z - sz * e1y;
+    const qy = sz * e1x - sx * e1z;
+    const qz = sx * e1y - sy * e1x;
+    const v = (d[0] * qx + d[1] * qy + d[2] * qz) * inv;
+    if (v < 0 || u + v > 1) continue;
+    const t = (e2x * qx + e2y * qy + e2z * qz) * inv;
+    if (t > 1e-6 && t < best) best = t;
+  }
+  return best;
+}
+
+/* The nearest surface under a pixel, over exactly what is drawn: a hidden static is not
+ * measured to, and the arm and gun are only there at all when a node is picked, that
+ * being the only pose they are drawn at. */
+function surfaceHit(px, py) {
+  const ray = rayAt(px, py);
+  let best = Infinity, what = null;
+  if (opts.statics)
+    for (const o of statics) {
+      const t = rayTris(o.mesh.raw, ray.o, ray.d, best);
+      if (t < best) { best = t; what = o.name; }
+    }
+  const pose = picked && picked.set.pose[picked.index];
+  if (pose)
+    for (const name in pose) {
+      const mesh = moving[name];
+      if (!mesh) continue;
+      const isGun = gunSet.has(name);
+      if (isGun ? !opts.gun : !opts.arm) continue;
+      const L = intoFrame(fromQuat(pose[name].q, pose[name].p), ray.o, ray.d);
+      const t = rayTris(mesh.raw, L.o, L.d, best);
+      if (t < best) { best = t; what = name; }
+    }
+  if (!isFinite(best)) return null;
+  return { p: [ray.o[0] + ray.d[0] * best, ray.o[1] + ray.d[1] * best,
+               ray.o[2] + ray.d[2] * best],
+           what: what, surface: true };
+}
+
+function measurePoint(px, py) {
+  const hit = pick(px, py, true);
+  if (hit) {
+    const mine = SOLVES[hit.set.solve];
+    return { p: hit.set.tcp[hit.index].slice(),
+             what: (mine ? `search ${mine.id}, ` : '') +
+                   `${hit.set.name} node ${hit.index}`,
+             clearance: hit.set.clearance[hit.index] };
+  }
+  return surfaceHit(px, py);
+}
+
+function measureClick(px, py) {
+  const got = measurePoint(px, py);
+  // A click that hits nothing leaves the reading alone.  Clicking past the geometry into
+  // the background is easy to do while orbiting round a measurement to read it from
+  // another angle, and throwing the measurement away for it would be the one way to lose
+  // a reading by accident.  `clear` and Esc are how to lose one on purpose.
+  if (!got) return;
+  // A third click starts again from it rather than being ignored or replacing the second.
+  // Measuring is usually a run of readings from one place, and starting again from the
+  // place just clicked is the one behaviour that needs no extra control to drive.
+  measure.pts = measure.pts.length === 1 ? [measure.pts[0], got] : [got];
+  showMeasure();
+}
+
+function measureLength() {
+  if (measure.pts.length < 2) return null;
+  return Math.hypot(...sub(measure.pts[1].p, measure.pts[0].p));
+}
+
+function toggleMeasure(on) {
+  measure.on = on === undefined ? !measure.on : !!on;
+  // The points are kept across a toggle.  Leaving the mode to orbit round and read a
+  // measurement from another angle is the common thing to want, and losing it on the way
+  // out would make the mode something to stay in rather than something to use.
+  buildPanel();
+  showHint();
+  draw();
+}
+
+/* The label is HTML over the canvas rather than glyphs in the scene.  The panel is
+ * already a DOM, so this needs no font atlas and no third shader, and it stays legible
+ * against whatever is behind it. */
+function placeLabel() {
+  const d = measure.on ? measureLength() : null;
+  if (d === null || !mvp) { mlabel.style.display = 'none'; return; }
+  const a = measure.pts[0].p, b = measure.pts[1].p;
+  const m = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2];
+  const cx = mvp[0] * m[0] + mvp[4] * m[1] + mvp[8] * m[2] + mvp[12];
+  const cy = mvp[1] * m[0] + mvp[5] * m[1] + mvp[9] * m[2] + mvp[13];
+  const cw = mvp[3] * m[0] + mvp[7] * m[1] + mvp[11] * m[2] + mvp[15];
+  if (cw <= 0) { mlabel.style.display = 'none'; return; }   // behind the eye
+  const r = canvas.getBoundingClientRect();
+  mlabel.style.left = `${r.left + (cx / cw * 0.5 + 0.5) * r.width}px`;
+  mlabel.style.top = `${r.top + (1 - (cy / cw * 0.5 + 0.5)) * r.height}px`;
+  mlabel.textContent = `${d.toFixed(1)} ${DATA.units}`;
+  mlabel.style.display = 'block';
+}
+
+/* Drawn with the flat program, which the caller already has bound.  The line goes down
+ * twice: once against the depth buffer, and once through it at low alpha, so a rule that
+ * passes inside a panel can still be followed to its far end -- which is most of them,
+ * the interesting distances here running through the fixture rather than beside it. */
+function drawMeasure(dpr) {
+  const n = measure.pts.length;
+  if (!measure.on || !n) return;
+  if (!drawMeasure._b)
+    drawMeasure._b = { pos: buffer(new Float32Array(6)),
+                       col: buffer(new Float32Array([C.rule, C.rule].flat())) };
+  const pos = new Float32Array(6);
+  for (let i = 0; i < n; i++)
+    for (let k = 0; k < 3; k++) pos[i * 3 + k] = measure.pts[i].p[k];
+  gl.bindBuffer(gl.ARRAY_BUFFER, drawMeasure._b.pos);
+  gl.bufferData(gl.ARRAY_BUFFER, pos, gl.DYNAMIC_DRAW);
+  if (n === 2) {
+    drawFlat(gl.LINES, drawMeasure._b.pos, drawMeasure._b.col, 2, 1, 0.95);
+    gl.disable(gl.DEPTH_TEST);
+    drawFlat(gl.LINES, drawMeasure._b.pos, drawMeasure._b.col, 2, 1, 0.3);
+    gl.enable(gl.DEPTH_TEST);
+  }
+  // The ends over the top of the line, and through the geometry as well: a point taken on
+  // a face the reader has since orbited behind is still where the measurement is from.
+  gl.disable(gl.DEPTH_TEST);
+  drawFlat(gl.POINTS, drawMeasure._b.pos, drawMeasure._b.col, n, 11 * dpr, 1);
+  gl.enable(gl.DEPTH_TEST);
 }
 
 let drag = null;
@@ -717,6 +1026,14 @@ canvas.addEventListener('pointerup', e => {
   drag = null;
   if (!was || was.moved > 6) return;
   const r = canvas.getBoundingClientRect();
+  if (measure.on) {
+    // A measuring click does not move the robot.  The arm and gun are drawn at the picked
+    // node, so re-picking here would move the very surfaces the second point is about to
+    // be taken against, between the two clicks of one measurement.
+    measureClick(e.clientX - r.left, e.clientY - r.top);
+    draw();
+    return;
+  }
   const hit = pick(e.clientX - r.left, e.clientY - r.top);
   if (hit) { picked = hit; showPicked(); draw(); }
 });
@@ -730,6 +1047,12 @@ canvas.addEventListener('wheel', e => {
 window.addEventListener('keydown', e => {
   if (e.key === 'r' || e.key === 'R') {
     cam.yaw = -0.9; cam.pitch = 0.5; cam.dist = span * 1.5; cam.at = centre.slice();
+    draw();
+  } else if (e.key === 'm' || e.key === 'M') {
+    toggleMeasure();
+  } else if (e.key === 'Escape') {
+    measure.pts = [];
+    showMeasure();
     draw();
   }
 });
