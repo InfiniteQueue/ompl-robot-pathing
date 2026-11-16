@@ -1,0 +1,1374 @@
+> **This file is a log of findings, not a specification.**
+>
+> It was `CLAUDE.md` until 2026-11-13, which meant it was loaded into Claude's
+> context on every turn and read as standing instruction.  It is not that.  It is
+> an accumulation of measurements and decisions written down as they were made,
+> between 2026-08-25 (65 lines) and 2026-11-13 (1361 lines), and parts of it
+> describe mechanisms the program no longer has.  Two figures in it were wrong for
+> weeks and were cited as fact in the meantime: a 513 s `contactTest` profile that
+> does not reproduce, and a shell count of 11688 for a cell that builds 11020.
+>
+> So: nothing here is current until it has been checked against the code or
+> re-measured.  Quote the code, or a run; not this.
+
+# Tesseract weldpath — working notes
+
+## Terminology: motion profiles
+
+These two terms describe **how the robot moves between two waypoints**, not how a path was
+found. They are properties of a segment, and the planner is free to use different ones on
+different parts of the same route.
+
+### Joint profile (`PTP`)
+
+Each joint is driven from its start value to its end value on its own ramp, all finishing
+together. Nothing constrains where the tool goes in between: the TCP sweeps an arc whose
+shape falls out of the arm's configuration and is not visible anywhere in the cell.
+
+- Timing comes from the joint limits in `weldpath.profile` — `Cell.move_time` /
+  `Cell.cruise_time`.
+- Collision checking interpolates **in joint space**: `Cell.segment_collides` steps
+  `a + t*(b - a)` over the joint vector, bisecting further wherever the tool moves more
+  than `--check-step-mm` between samples, which is exactly the path the robot takes.
+- This is what OMPL produces, and what every move keeps that has neither end in the band.
+
+### Linear profile (`LIN`)
+
+The TCP is driven in a **straight line in Cartesian space** from the start pose to the end
+pose, orientation interpolated alongside it. The controller solves inverse kinematics along
+the way, so the joint values in between are whatever that line demands.
+
+- Timing is additionally capped by the commanded tool speed: `output.Timing.phase_times`
+  takes `max(joint_move_time, travel / linear_speed)`, with `--linear-speed-mm-s`.
+- Collision checking **must follow the Cartesian line**, not the joint chord between the
+  same two states. Those are different curves through the cell. For waypoints a
+  collision-check step apart the two nearly coincide; for a long chord — anything
+  `shortcut` produces — they do not, and a joint-space check on a LIN segment is checking
+  a path the robot will not take.
+- Inverse kinematics has to exist and be collision free everywhere along the line, or the
+  robot faults mid-move. A LIN segment is not merely a labelled joint move: emitting one
+  is a claim about the whole line between its endpoints.
+
+## Consequences worth remembering
+
+- `MoveInstructionType_LINEAR` in `tesseract_command_language` is an annotation consumed by
+  the simple planner's LVS interpolation, TrajOpt, or Descartes. **OMPL cannot plan linear
+  motion** — its only move profile is `OMPLRealVectorMoveProfile`, whose state space is the
+  joint vector, so every edge it produces is a joint-space straight line. There is no
+  configuration that changes this.
+- **`--segment-length-rad` is OMPL's own collision resolution, and 0.025 settles a
+  question the code left open.** It is `longest_valid_segment_length`: one distance in
+  *joint* space, so how far it carries the tool depends on which joint moved. Measured at
+  the start pose, 0.01 rad carries it 20.8 mm on Path 1 and 20.2 mm on Path 6 at the worst
+  joint, which is **j3** on both, against 7.2 and 5.6 mm at j4 -- so a single figure is
+  either wasteful at the wrist or coarse at the arm, and it is coarse at the arm.
+  - **The value had drifted rather than been decided.** OMPL's own default is 0.005 rad,
+    which spends about a second of collision checking per tree edge here and exhausts the
+    budget before finding anything, so coarsening it is what makes the sampler usable at
+    all. The flag was 0.02 when `--ompl-continuous-check` was added, went to 0.01 during
+    cell testing, to 0.05 an hour later, and back to 0.01 when a bundle revert undid the
+    0.05 -- so 0.01 was where a revert left it, and the `#was 0.05` beside it was the
+    leftover. The module docstring's own target, "a few hundredths of a radian", never
+    included 0.01.
+  - **Measured: 80 solves over 10 real transits from Paths 1, 2 and 7**, OMPL alone with no
+    anchor pass, no detour and no refinement, endpoints taken from each study's own shipped
+    route. 2.5x coarser is a median **x0.58** per transit, geometric mean x0.68, and leaves
+    route quality alone -- 11.4 s of raw motion against 11.0 s, better on the median. 5x
+    coarser is a median x0.35 but costs 29% longer routes, which is the worse trade: the
+    refinement budget is fixed, so a worse starting route is not bought back.
+  - It also solved what the finer step could not. `73052-14-R_2t -> via136` timed out twice
+    at 30 s at 0.01 rad and solved in 3.45 s at 0.025. One transit, so not a rate -- but a
+    transit the sampler cannot crack is what sends the planner into the detour, which is
+    where a segment's hours go.
+  - **Every refusal comes from the tool-space bisection and none from the joint grid.** Of
+    those 80 solves, not one route OMPL returned was refused by a joint-space check at the
+    cell's own 3 deg grid; every refusal was `--check-step-mm`'s. The two tests disagree
+    because they measure *different quantities* rather than because one is finer: OMPL
+    bounds one distance over the whole joint vector in its own metric, while
+    `--check-step-deg` bounds the **largest single joint's** delta, so the figures are not
+    commensurable -- and taken at face value 0.025 rad against 3 deg (0.0524 rad) is only
+    about 2x anyway. So coarsening `--check-step-mm` does not compensate for coarsening
+    this, and it is the only thing catching the step-overs.
+    - This said "about 5x finer" until it was checked. That held at the old 0.01 rad, and
+      the commit that moved the default to 0.025 left the ratio behind -- the same drift
+      this bullet exists to record. What is several times finer is the *tool-space*
+      bisection, which is what `_route_fault` and `_verify_runs` say: 0.025 rad carries
+      the tool about 52 mm at j3 against the 7 mm `--check-step-mm` holds it to.
+    `_route_fault` is what rejects, and the retries the caller already has are what make the
+    trade safe: a refused route costs its own solve time and nothing unsafe ships.
+    - **That measurement could not see the cause that mattered, and it has since been
+      removed rather than tuned.** The 80 solves drove OMPL directly, with no weld scope
+      installed, so they were structurally blind to the *margin* disagreement: the scope
+      lived on `Cell.in_collision` where OMPL cannot see it, and a route that left a weld
+      close to a panel was legal to the planner and refused here at a *sample*, with
+      nothing stepped over. Counted over the shipped logs of seven studies run with the
+      scope on: of 309 routes the sampler returned, **161 were refused, and every one of
+      the 161 on the first or the last move of its route** -- where a route crossed a
+      weld's radius and the cell's own floor came back -- and none on a move between. A
+      step-over has no reason to prefer the ends. The scope is gone and the margin is
+      earned instead, so `_route_fault` has two causes left and both are resolution; what
+      a refusal in the next log means is therefore narrower than what it used to.
+  - **The refusal rate this costs is inside the one the cells already have.** Counted over
+    the shipped logs of nine studies, all at 0.01 rad: **47 refusals in 1017 sampler runs,
+    4.6%**, spread 0% to 14.8% by study -- Good 240R1 at 14.8%, Path 2 at 10.0%, Path 3 at
+    7.0%, Paths 1 and 4 at about 1.5%, Paths 5, 6 and 7 at 0. That spread is wider than
+    anything the resolution did, so which cell is being planned decides this more than which
+    step it is planned at, and the 5% measured at 0.025 is not distinguishable from the
+    status quo. `grep -c "not clear under this cell's own check"` on a run's log is the
+    whole measurement; nothing in the program counts it and nothing needs to.
+  - **The floor is absolute and geometric.** What grows with the step is the tool gap one
+    sub-step can hide -- about 21 mm at 0.01, 52 mm at 0.025, 104 mm at 0.05 -- and an
+    obstacle has a fixed thickness, so the safe step is set by the thinnest thing the gun
+    must clear and differs per cell. No time budget trades against it. There is no rule in
+    the code deriving it: ten transits on three studies does not support writing one.
+  - `--ompl-continuous-check` is the principled answer to the step-over and it is too slow.
+    Swept at 0.05 rad it solved 11 of 20 transits where the sampled check at 0.05 solved 20
+    of 20, at about 30 s expected per usable route against 6 s. Still off by default, and
+    now measured rather than staged.
+- `plan_linear` is not a planner. It interpolates the pose and runs IK at each step,
+  seeding from the previous solution, and takes whatever comes back nearest. It is greedy
+  and never backtracks, so it can report "no collision-free IK at 45%" for a line that is
+  perfectly reachable from a different starting configuration.
+  - Stations come from `line_stations`: no step travels further than `--check-step-mm`
+    **or turns the tool further than `--check-step-deg`**. Travel alone used to decide,
+    so a move that mostly reoriented the tool was checked at its two ends only.
+  - A station more than `LINE_JUMP_RAD` from the previous one is a branch flip and fails
+    the line, as `cartesian._steer` already required of its edges.
+  - `linear_chain` pins the chain's ends onto `a` and `b`, but only after
+    `_line_end_fault` confirms the tracked line actually arrives there. Pinning blind
+    let a line that ends a whole joint 6 turn away, or on another wrist branch, pass
+    with the flip hidden in its last joint gap. Measured on Path 1, real lines end
+    within 1.1e-4 rad of their target and step at most 0.031 rad per station.
+- `_densify_marked` fills the OMPL path in at `--check-step-deg` resolution, measured as the
+  **largest joint delta** — not time, not tool distance. OMPL itself returns very few
+  points (four is typical); everything downstream runs on the dense list.
+  - The fill follows **the curve each move will really be flown along**: the joint
+    chord for a joint move, the tool's straight line for a linear one, which `_fill`
+    takes from `MotionModel.clear_path`. This used to be the chord in both cases,
+    which left the optimisation passes drawing their candidate cut endpoints from
+    states the robot never visits. Measured on a transit that withdrew 921 mm to
+    cross between two welds 59 mm apart: cuts taken off the real line were clear and
+    46% cheaper than the route that shipped, and not one of their endpoints existed
+    in the chord fill the pass was given.
+  - The linear fill is **thinned back to the same spacing**, by `_resample`'s own
+    largest-joint-delta rule walked along the real curve. `plan_linear` stations
+    every `--check-step-mm` of tool travel, which is far finer — over a hundred
+    points against seven on a metre-long move. Only the curve was wrong, not the
+    density, and changing both at once would have made the fix impossible to
+    attribute.
+  - A linear move that will not validate falls back to the chord. Densifying is not
+    where a route is rejected; `_verify_runs` sweeps the finished path and reports
+    there.
+  - A stretch already inside the spacing is handed straight through, before the model
+    is consulted at all. That is the whole of a cartesian-tree route — its stations
+    arrive one `--check-step-mm` of tool travel apart, far inside one joint step, and
+    are the states it validated. Asking for a chain there would re-derive them, which
+    is exactly what that planner keeps its own edge states to avoid, and would build
+    hundreds of chains only to be told there is nothing to insert.
+  - Which profile applies is asked of the model, not taken from where the path came
+    from. Every solver's edges do have a known type, but that is how the edge was
+    *planned*; `_split_runs` decides how it will be *flown*, and an OMPL edge with
+    both ends in the band ships linear.
+- The profile is **not stored** against a waypoint. `MotionModel.motion(a, b)` derives it
+  from the two states a move runs between: linear when either end is inside the band. That
+  is what lets `shortcut` and `polish` move points around without invalidating anything.
+  - **There is no per-leg gate any more.** `_linear_allowed` used to ask, before any move
+    was labelled, whether the leg earned linear motion at all -- `--near-panel-min-pct` of
+    its samples near, or one unbroken near stretch of `--near-panel-min-mm` tool travel --
+    and a leg meeting neither was given a model with no zone, so every move on it was
+    joint motion however close it ran. Both flags and the function are gone. The band is
+    now the whole of the decision and it is asked per move, so a route that touches the
+    band once comes out with the two moves either side of that state linear, where before
+    it came out entirely `PTP`. Expect more phases per transit and more short `LIN` runs;
+    `--near-panel-mm 0` or `--no-near-panel-linear` is what turns linear motion off.
+  - Dropping it took the second sampling pass in `_finish` with it. The fill has to follow
+    the curve each move will really be flown along, which needs a model, and the model
+    could not exist until the gate had ruled -- so the route was densified once along the
+    chord to answer the gate and again along the real curves afterwards. One pass now.
+  - "Near" is `Cell.clearance_within(q, near_mm)`: the reading at or under `near_mm`
+    **and** short of the probe that took it. A manager reports its own probe distance when
+    nothing is in range, so a saturated reading is "nothing seen", never a distance, and
+    both halves are needed. Before, the probe was `max(near_mm, obstacle clearance + 25)`,
+    exactly `near_mm` at the defaults, and the plain `<=` test put every state in range:
+    logs said 100% of every leg, and nearly every move shipped linear.
+  - **Every threshold has its own clearance manager, and that is why the test lives on the
+    cell rather than at the caller.** `Cell._probe_for` keeps one manager per threshold
+    asked of it, built on demand, sized to that threshold plus `PROBE_EPSILON_MM`, with
+    its own cache. So the band is decided by a 50 mm probe instead of by the widest probe
+    anything in the program asked for -- 81 ms a query against 180, measured on Path 4's
+    11688 shells. The test moved off `_reads_near` because it needs the probe the reading
+    came from and the caller can no longer know which manager answered; `_reads_near`
+    remains as a one-line delegation and the answer is unchanged.
+    - **The caches have to stay separate, and that is the whole reason for the structure.**
+      One state honestly reads 120.0 against one manager and 5.0 against another, so a
+      shared cache would hand the band test a reading saturated at 5 mm -- the same
+      confusion that once made every move linear, read from the other end.
+    - `clearance_within` is at-or-under, and is the only polarity left. `clearance_under`
+      was strictly under, for the scoped weld relaxation, which counted a state exactly at
+      its floor as clear where the band counts one exactly at `near_mm` as near; the two
+      were deliberately not interchangeable. The relaxation was its only caller and both
+      are gone.
+    - `fallback.validity.Validator` widening the shared probe mid-run used to change
+      labels too. It still cannot, and now for a structural reason rather than a numerical
+      one: the band reads a manager of its own that nothing else resizes.
+    - The widest threshold reuses the shared manager rather than cloning a twin, that
+      being the threshold which sized it. Reuse needs both halves of `width >=
+      self._probe_mm > key`: a manager narrower than the threshold would saturate inside
+      the range being asked about and answer no to every state beyond it.
+  - A failed `_verify_runs` discards the route. Nothing re-plans or relabels a stretch
+    whose profile cannot be flown.
+- `shortcut`, `simplify` and `polish` all go through `MotionModel`, so a move destined for
+  a linear profile is costed under the tool speed cap and collision checked along the
+  straight line the tool will take.
+  - Its clearance penalty is read along that line too: `MotionModel.cost` prices a linear
+    move off the factors at the stations `linear_chain` places, through `Cell.price`.
+    Until this was fixed it sampled the **joint chord** for both profiles, which nothing
+    collision checks and which can pass through the parts. Measured on Path 1's
+    73075-05 -> 73075-03 transit: a 707 mm linear move clear by 3.6 mm at worst was priced
+    at 54.4 s off a chord reaching 64.5 mm into the panel, against 3.6 s off its line, so
+    simplify and polish kept a joint detour up and over rather than take it. Shortcut's
+    cuts were never affected; they priced the chain they installed.
+  - `_path_cost` reads it the same way now. Ranking used to go straight to
+    `Cell.segment_cost`, which knows nothing of profiles, so a candidate was scored on
+    cruise time with the penalty off its joint chord -- no tool speed cap, no crossing
+    penalty, no line. That undercharged exactly the routes most likely to be capped, the
+    Cartesian tree's being straight tool moves throughout, against phase one's, which
+    mostly ship as joint motion and were priced about right. Harmless while the tree was a
+    fallback; deciding, once the two started competing on every transit.
+  - Still read off the joint chord: `_plan_direct`'s check of whether a clear direct move
+    runs close enough to the parts to be worth refining.
+- **Candidate routes are scored the way the refinement passes score.** `_path_cost`
+  builds a `MotionModel` with the leg's zone and sums `model.cost(a, b, stops=True)`, so a
+  stretch that will ship linear is capped at `--linear-speed-mm-s`, charged
+  `--linear-crossing-penalty-s`, and has its clearance penalty read along the tool's line.
+  The second figure it returns is the same time without either penalty -- cap included --
+  so "cost against plain" still reads as what the penalties added.
+  - **Two terms, and `_scored_points` returns two lists to keep them apart.** Travel is
+    summed over the route's *own* moves, filled in where it is coarser than
+    `--check-step-deg`, in **cruise** time -- additive under subdivision, so it does not
+    depend on how finely the route is described. Stops are the ramps a route of that shape
+    would pay, taken as full-move minus cruise over a copy *thinned* back to
+    `--check-step-deg`. That second term is the one `--stop-time-weight` acts in.
+  - Thinning is sound for counting stops and unsound for pricing moves, which is the whole
+    reason the two lists exist. A route of straight tool moves is a **polyline**: the
+    tree's guarantee is that each consecutive pair of its stations is a straight move it
+    solved and swept, and the line between two non-adjacent stations cuts the corner, was
+    never checked, and often has no IK at all -- which is the shape the tree exists to
+    find. Pricing such a span prices a route the candidate does not contain, and where its
+    line will not solve `MotionModel.cost` calls it infinity. Scored on one thinned list,
+    cartesian solutions came back at `inf` and `_cheapest` dropped them, on exactly the
+    transits where the tree was winning.
+  - The stop term asks the joint dynamics only and never for a line, so a thinned span
+    that cuts a corner cannot make a route unpriceable.
+  - A move whose line will not price is charged as a joint move rather than costing
+    infinity. `MotionModel.cost` answers infinity because a pass must never *install* what
+    it cannot price; ranking installs nothing, and dropping a candidate there is dropping
+    it before the passes could move the waypoint that could not be reached. `_fill` takes
+    the same view of the same question. `_verify_runs` is where an unflyable route dies.
+  - The fill is the profile-aware one, so where the route is coarse the states scored are
+    on the curve each move will really be flown along.
+  - What it costs is one profile-aware densify per candidate rather than one per transit,
+    the winner being densified again in `_finish`. Phase one returns at most
+    `--phase-one-runs` of them.
+  - `_Sampler` carries the zone for scoring only. Nothing plans differently for it: OMPL
+    cannot produce linear motion, so the zone says how the route it returns will be flown,
+    not how it is searched for.
+- **Ranking picks which route to keep; `_finish_ranked` is what happens when the route it
+  picked cannot be finished.** `_finish` refuses a route outright in two places --
+  `clear_stop_band`, where a waypoint holds joint 5 inside the stop band and can be
+  neither removed nor nudged out of it, and `_verify_runs`, where the finished path will
+  not fly -- and both are properties of that route's *shape*, not of the transit. So the
+  candidates are tried in cost order and the first that finishes ships, over at most
+  `--finish-attempts` (4) of them.
+  - **Taking only the cheapest threw the rest away unexamined, and did so exactly where
+    the searches had found a choice.** Measured on Path 3: `73052-11-R_2t ->
+    73052-06-R_2t` solved twice in phase one, at 115 mm and at 140 mm, refined the cheaper
+    for 366 s, lost it to the stop band at waypoint 4 of 8, and went to the detour with
+    the 327.71 s route never densified -- 914 s of a 1777 s segment and nothing kept from
+    any of it.
+  - **A retry gets the full refinement budget**, so the honest cost is up to
+    `--finish-attempts` times what a transit used to spend after its search. What bounds
+    it is the segment clock, asked before each retry rather than during one, since a
+    refinement stopped halfway leaves nothing usable -- exactly as a search does. The
+    *first* attempt is untouched and takes the budget it always took: clamping that one
+    too would have a long segment start finishing its routes differently because of a flag
+    about retries. A retry clamps, which is the only thing the `first` argument to
+    `finish` is for.
+  - **Bounded rather than exhaustive, and that is the point of the cap.** Where the only
+    way between the two ends takes joint 5 through zero, every candidate is refused for the
+    same reason, and chasing all twenty of phase one's would spend the segment proving it.
+    `--finish-attempts 1` is the old behaviour; 0 is refused by the CLI, a transit that
+    searches and then finishes nothing being no transit.
+  - `record` is appended to only for the candidate that succeeds. Raw routes are paired
+    with returned legs by position, so an attempt that captured its route and was then
+    refused would leave an entry behind for a leg that never shipped -- the reason
+    `plan_freespace` and `_plan_detour` already keep their captures in local lists.
+  - **It covers `_tree_leg` too, where it is nearly free.** A detour's extraction defers
+    all refinement, so an attempt there is a densify, a reduction and the stop-band pass.
+    Worth having for a different reason than on a transit: that leg has no other solver,
+    and a route the stop band refuses ends the extraction and so the whole detour.
+  - The last refusal is what gets raised, not a summary of them. It names the waypoint and
+    the joint value, which is the diagnosis; how many were tried is already in the lines
+    above it.
+- The passes ask one question before checking or pricing anything: `MotionModel.refuses`,
+  which is `demotes` or `overreaches`. The two guard the same thing from opposite sides --
+  one stops a near-panel stretch being dissolved, the other stops one being grown outward.
+- `MotionModel.overreaches` is the `--linear-introduce-mm` limit, default 120 mm. The
+  endpoint rule makes a move `LIN` when *either* end is in the band and says nothing about
+  where the other end is, so a cut from a state a metre clear straight to one against the
+  panel ships as a single straight move whose whole line needs collision-free IK and which
+  flies in under the tool speed cap. A replacement that is `LIN` with an end beyond the
+  limit is refused **unless the stretch it replaces already had such a move**, which is
+  what keeps this a limit on *introducing* linear motion rather than on having it: a
+  Cartesian route recut with a long reach still gets shortened, thinned and relocated.
+  - `LinearZone.reach_mm` never reads under `near_mm`. A move with both ends in the band is
+    linear wherever it runs, so a tighter limit would refuse the reshaping `demotes`
+    deliberately allows and freeze every near-panel stretch. 0 switches the rule off, and
+    `refuses` is then `demotes` exactly.
+  - Measured by `clearance_within` against the limit, on a manager sized to the limit.
+    `ToolpathPlanner` still asks for `max(near_mm, reach_mm) + NEAR_PANEL_HEADROOM_MM`,
+    but that headroom is now `PROBE_EPSILON_MM` and the figure is 120 mm -- against 145
+    before the headroom was looked at, and 75 before the limit existed. **The 25 mm bought
+    nothing.** What the width has to do is let a state standing exactly at the threshold
+    read its real distance instead of saturating, which any epsilon does; both callers
+    keep the comparison and throw the reading away. It cost the difference between a
+    145 mm probe and a 120 mm one, 180 ms a query against 153. Contrast
+    `CLEARANCE_REPORT_HEADROOM_MM`, still 25 mm, which widens a probe so the *number* in
+    a locator's report is informative and where the magnitude is the whole of the point.
+  - Beyond the probe every state reads the same, so this is deliberately a yes-or-no
+    rather than a ranking of one overreach against another -- there is no measurement to
+    rank with.
+  - It gates the passes only. The initial split is untouched: the dense route's states sit
+    one check step apart, so a move out of the band into it is short by construction, and
+    the reach only appears once a pass lengthens a move.
+- `MotionModel.demotes` is why the linear stretches survive those passes. Deleting a
+  waypoint is nearly always quicker — every retained hop pays its own ramps — so left
+  alone the passes collapse a near-panel polyline into one chord whose ends sit outside
+  the band, which the endpoint rule then reads as joint motion straight through the region
+  the linear profile was chosen for. Replacements that take points out of the band without
+  inheriting it are refused.
+- `--linear-crossing-penalty-s` is a **flat** surcharge on each move that reaches into
+  the band from outside it — the same figure however long the move. It therefore prices
+  how many times the route enters the band and nothing else. This replaced
+  `--linear-crossing-speed-mm-s`, which charged the crossing move by its length.
+  - What the flat charge does *not* do is the point of it. Deleting a waypoint from
+    inside the band crosses the edge once either way, so the charge appears on both sides
+    of `simplify`'s comparison and cancels exactly, leaving the decision to ordinary time
+    — where one fewer stop is one fewer pair of ramps. Those deletions are wanted: they
+    do not move where linear motion begins, which stays at the last waypoint outside the
+    band regardless, and the pairs of near-coincident vias straddling the edge cost a
+    stop apiece for nothing.
+  - What holds a linear sweep back from growing outward is `--linear-speed-mm-s`, and it
+    does so structurally rather than by being tuned to. Growing the sweep converts a
+    *joint* hop into a linear one, so the cap lands on one side of the comparison and not
+    the other and does not cancel. A rearrangement wholly inside the band converts
+    nothing, and a straight line is never longer than the polyline it replaces, so the
+    cap correctly stays out of it. The length-based charge could not tell the two apart,
+    because it read the crossing move's total length, which grows under both.
+  - The earlier note here said a multiplier "cannot decide the question at all" and that
+    the collapse survives *any* multiplier, measured at 10^6. That holds only where both
+    sides of the comparison are wholly linear, which is the in-band case — there the
+    factor is exact and cancels at every magnitude. Where the polyline still contains a
+    joint hop, which is the sweep-growing case, it lands on one side only: measured on a
+    stub fixture, ×1 deletes the edge waypoint and ×10 already refuses to. So the
+    original measurement was sound and the generalisation drawn from it was not.
+  - It is not scaled by the clearance penalty. That penalty is a multiplier on time spent
+    near the parts; a fixed preference is not time, so every caller adds this outside its
+    own factor arithmetic — `MotionModel.cost`, `simplify`'s `polyline_cost`, and both
+    sides of `shortcut`'s comparison. Charged on the same footing everywhere or it would
+    not cancel where it is supposed to.
+- `Deadline` is the wall clock for one segment, `--segment-minutes` (60). Every other
+  budget bounds a part of the search and they multiply -- runs x seconds x openings, plus
+  the detour's three legs -- so this is the only figure that bounds a segment with no route.
+  The product used to carry fallback poses and pairs of openings at each pose as factors of
+  their own; committing each leg to the opening that carried it removed both, and dropping
+  phase two removed a whole stage. `ran_out` is asked where work is about to start rather than
+  interrupting it, since a run stopped halfway leaves nothing usable, and `clamp` cuts each
+  per-run limit to the time left. What is already found is still ranked, refined and
+  shipped; a segment with nothing raises, and `ToolpathPlanner.run` records the reason and
+  goes on, which is what it already did with a segment that failed outright.
+- **The gun opening is a search variable, not a setting picked before the search.**
+  `_opening_lists` builds two lists per leg: `main`, the rotation phase one and the
+  Cartesian tree deal their runs round, and `extra`, held back from them. Both are
+  drawn in preference order -- departure, arrival, closed, widest, half open, then
+  bisections of the widest range nothing has been tried in yet -- and screened as they are
+  built, so an opening that repeats one already offered, or that leaves a pose of the leg
+  in collision, is skipped and counts against neither total. `--min-gun-openings` and
+  `--extra-gun-openings` are counts of openings that can be planned at.
+  - Phase one deals its runs round `main`, and `_cheapest` keeps the best of the whole set
+    whichever opening it came from, ties going to the earlier one, which is the opening
+    already in force. This is why `_Solution` carries an opening: the caller can no longer
+    infer it from the order it asked in, and everything downstream -- `_finish`, the recut,
+    the per-phase validation -- has to run at the opening its route was found at, the tip
+    being part of the machine that has to fit through the gap.
+  - **`extra` is not phase two's any more**, phase two having stopped being a stage of a
+    transit. What walks it is the detour, which tries `GunOpenings.all` -- both lists, in
+    preference order -- leg by leg, and `_recut_outside_band`'s gap join, which is pinned
+    to one opening and so reads neither list. Holding some back is still worth doing: it
+    is what keeps a wider rotation from spreading phase one so thin that no opening gets
+    enough runs to choose between routes with.
+  - The rotation belongs to the direct transit alone. Each leg of a detour is planned at
+    one pinned opening -- the gun does not change partway through a move -- so those walk
+    `GunOpenings.pinned` one opening at a time. A cell with no gun joint gets
+    `pinned(None)`, which is exactly what it did before any of this.
+  - `_Sampler.phase_two` survives for one caller. The recut is joining a gap inside a
+    route that is already in hand, at an opening already settled, and "any route, with one
+    longer search" is exactly the right question there -- which is what phase two was,
+    and what it was the wrong question for was a whole transit.
+- **A transit with no direct route is retried as `w1 -> f1 -> f2 -> w2`, and that is what
+  runs where phase two used to.** `f1` is the start locator's own fallback pose and `f2` the
+  end locator's, each a place to stand just clear of the pocket that end sits in, so the
+  route is two extractions with a traverse between them. `_plan_detour` is the whole of it.
+  - **Why it replaced phase two rather than following it.** Phase two asked the same
+    sampling planner the same question again -- longer, from a new seed, at a gun opening
+    phase one had not reached. But a transit that has already beaten the straight chord,
+    every phase-one run and the Cartesian tree is not one waiting for a longer look at the
+    same space; it is one whose two ends cannot see each other, and the answer to that is
+    to stop asking for one move. Nothing on offer there was given up: the openings phase
+    two would have walked are walked here per leg, and a longer single search is still
+    what the recut gets for its gap joins.
+  - **Each leg gets the solver that suits it.** A locator to its *own* fallback goes to the
+    Cartesian tree alone, `_tree_leg`: the tree steers along the tool's own straight line
+    with orientations drawn near the endpoints', which is the shape a pull-back out of a
+    pocket has, where OMPL samples joint space uniformly with nothing drawing it into the
+    gap beside the fixture and is both slower here and likelier to come back swinging the
+    gun across the panel. The leg between the two poses runs through open air and gets
+    everything `_plan_direct` has -- chord, phase one, the tree ranked against it.
+    `process_seconds` is dropped to nothing on the extractions: that budget buys a
+    *choice* between routes and there is nothing to choose about getting out of a pocket,
+    and it is paid per leg per opening. `gun_openings` is left alone and does nothing
+    there, each leg being pinned to one opening already.
+  - **The extractions are settled before the traverse.** They are the constrained legs --
+    the tip has to clear the pocket -- so a failure there is attributable to one pose
+    rather than to the detour as a whole, and settling them first means the traverse is
+    offered openings an extraction has already been shown to fly at. The traverse has the
+    most solvers and the most room, so it is the leg most able to take what it is given.
+  - **Each leg commits to the opening that carried it, and a solved leg is never
+    re-solved.** A leg walks `GunOpenings.all` led by the openings its neighbours already
+    hold -- `_lead_with`, so no gun change is introduced where none is needed -- and the
+    first that carries it settles it. Consecutive legs at one opening are joined and
+    refined as one route by `_join_detour`, the corner at the pose between them being
+    exactly the kind the passes exist to cut; legs at different openings ship separately,
+    each refined with its own opening in force, and the gun changes at the pose between
+    them, where the robot is stationary. A detour the gun never changes on is one leg of
+    output, not three.
+  - What that commitment costs is coverage: a leg that flies at no opening ends the
+    transit rather than sending the search back to re-derive a pose. Re-deriving would be
+    paying twice for the parts of the detour that were never the problem, which is the
+    repeat this ordering exists to remove. The failure names the leg and says how many of
+    the three were in hand, that being the diagnosis.
+  - **A fallback pose inside the joint 5 stop band cannot change the gun** -- the robot
+    stands still there and nothing downstream moves an endpoint -- so the legs either side
+    of it are locked to one opening between them, and the first of them to be solved
+    chooses for both. Two such poses lock the whole detour to a single opening. Expressed
+    as an equivalence class over the legs rather than as a check against each neighbour,
+    which is what makes the both-locked case fall out instead of needing its own rule.
+  - **`--fallback-poses` (2) is how many of the two ends get a pose, and it is enforced in
+    `FallbackFinder.pair` rather than by slicing the list the planner gets.** A walk costs
+    real time whether or not its pose is used -- it solves inverse kinematics at every step
+    it takes, for as long as the line lasts -- so a cap read at the planner would save
+    none of it. A transit has two ends and each has one fallback, so 2 is every pose there
+    is and anything above it is read as 2. 1 asks for the start end's alone and the detour
+    is then `w1 -> f1 -> w2`, which still asks one leg to reach all the way into the end
+    locator's pocket; 0 looks for none, and a transit with no direct route then fails
+    instead of detouring.
+  - An end that yields nothing contributes nothing, and the detour is attempted through
+    whatever came back. A leg is an extraction only where the pose at its end is the
+    fallback of the locator at its other end, so a start locator that could not be backed
+    out leaves the end locator's pose standing alone and the leg into it is a traverse
+    like any other. Two walks that arrive at the same configuration are kept once --
+    possible where both ends fall through to their neutral walks and the locators sit
+    almost on top of each other -- since a leg from a pose to itself is not a move.
+  - With `--cartesian-solve-seconds 0` there is no tree to give the extractions, so every
+    leg takes every solver and the log says so. The detour is not switched off by it.
+  - A cell with no gun joint has `pinned(None)` in both lists, so `GunOpenings.all` offers
+    the same nothing twice. Collapsed to one entry here, or every leg would be solved
+    twice at nothing.
+- **A fallback pose belongs to one end of the transit, and is looked for in two places.**
+  `weldpath.fallback.methods.ENDS` pairs each end with its own two methods, tried in order:
+  out along that locator's retreat axis -- the direction that points into the gun's bulk,
+  which is the way out of the pocket -- and, where that yields nothing, out from that same
+  locator towards where its own nearest neutral pose puts the tool. Both walk outward a
+  `--fallback-step-mm` step at a time from the locator itself.
+  - **A walk runs the whole line and keeps the airiest pose on it.** It stops early only
+    where a candidate reaches `--fallback-distance-mm`, which is good enough by
+    definition; otherwise it keeps stepping and returns the highest-clearance pose it
+    saw. So that figure is where a walk *may* stop, not what it demands.
+    - **Requiring it outright is what broke this, and the figure is absolute where the
+      thing it is asked of is not.** A weld pose sits a few millimetres off the panel, and
+      in a tight cell nothing within reach of the pocket is 100 mm clear of anything.
+      Measured on Path 2's `73078-11-R_3t`, over the 65 states the Cartesian tree had
+      already validated around that locator: the best clearance anywhere was **35.7 mm**
+      and **not one reached 100**. So every step of the retreat walk was refused as too
+      close, the method was abandoned, and the pose that shipped came from the *neutral*
+      walk -- 1438.6 mm away, **106.0 deg** off the retreat axis, with a **-397.5 mm**
+      component along it. The gun does come clear backing out; it does not come 100 mm
+      clear.
+    - A sub-bar candidate therefore comes back from `validity` carrying its solution.
+      `Verdict.valid` is "good enough to stop", `Verdict.usable` is "somewhere the robot
+      can be parked", and only no-IK and in-collision discard the `q`.
+    - The comparison is strictly greater, so a tie keeps the nearer pose, which is what
+      keeps a detour a detour.
+  - **A single missed inverse-kinematics solve no longer ends a walk.** It used to, on the
+    reasoning that everything further along the line was unreachable too. That holds for a
+    walk heading radially outward and **not** for a retreat axis, which runs nearly
+    tangential to the reach sphere: measured on the same locator, 440 mm along it moves
+    the tool from 2450 mm to 2441 mm from the shoulder, while tree nodes in that same cell
+    reach 2616 mm. The one miss that ended that walk said nothing about reach, and the
+    walk gave up one step short -- the *next* segment's start locator found 109 mm at
+    exactly 11 steps on its own retreat axis.
+    - `finder.IK_GIVE_UP_MM` (200) is the run of consecutive misses that does call a
+      direction exhausted. A **distance** rather than a step count, so it does not change
+      meaning with `--fallback-step-mm`; five steps at the default. No flag: there is one
+      cell's worth of evidence behind the number and a flag would imply more.
+    - A step in contact resets the run and does not end anything. The walk starts inside a
+      pocket, so the first candidates are expected to be blocked.
+  - **The retreat method now nearly always answers, so the neutral walk rarely runs.**
+    That is the intent -- the neutral walk is a different search, not a looser version of
+    the retreat -- but it means a retreat pose only a little clearer than the weld is
+    preferred to a neutral pose far out in open air. It is only reached where the retreat
+    line has nothing usable on it at all.
+  - **Why this matters beyond the pose itself: it decides where the Cartesian tree may
+    look.** `cartesian._sample` draws position uniformly from the box the leg's two
+    endpoints span, inflated by `--cartesian-margin-mm` (300), so the extraction's
+    search volume is
+    built around the locator-to-fallback line. With the fallback 106 deg off the retreat
+    axis that box was a 1.7 m corridor through open air: measured on Path 2's leg at the
+    200 mm margin then in force, only **26.8%** of samples had any component along the
+    retreat axis, **0.18%** fell within one extend (80 mm) of the locator, and the
+    median sample was **789 mm** away. The start tree reached 26-60 nodes against the goal tree's
+    794-1071, and the leg failed at all eight gun openings. Putting the fallback back on
+    the retreat axis is what aligns the box with the direction the gun has to move.
+    - **Those figures were first quoted off the dataclass defaults, which are not what a
+      run uses.** Every `CartesianBudget` field that has a flag had drifted from it:
+      `margin_mm` said 150 against `--cartesian-margin-mm` 200, `extend_mm` 120 against
+      `--cartesian-extend-mm` 80, `tilt_deg` 30 against `--cartesian-tilt-deg` 45. Three
+      for three, and the dead one is always the easier to find. The dataclass now carries
+      the command line's values and `tree_test` pins every such pair, which is the only
+      thing that stops this recurring -- it found the second and third as soon as it
+      existed.
+    - **What the margin really bounds is how far the tool may be backed out of a pocket**,
+      and on an extraction that is the whole question. At 200 mm the box reached 266.6 mm
+      from the weld along its own retreat axis; at 300 it reaches 370.9 mm. The start trees
+      got 44-163 mm along it, so they were not pressed against the 200 mm wall -- but a
+      pocket deeper than the box is a leg no budget can solve, which is the case for
+      raising it.
+    - **Dilution is the cost, and it is only a cost where the near region still has
+      something to give.** 200 -> 300 mm takes the box from 1.18 to 2.03 m^3 and the share
+      of samples within one extend of the locator from 0.59% to 0.36%. Measured on the
+      same leg, the start tree's nodes sit a median **6.7 mm** apart and the goal tree's
+      **26.7 mm**, against an extend of 80 mm -- so both trees had already covered their
+      own regions three to twelve times finer than one extend, and samples landing there
+      were buying nothing. That is what makes the trade worth taking here and not in
+      general: dilution costs nothing where the near region is saturated.
+    - **The box is a hard wall on where the tool may be put, not a preference about
+      detours**, which is what makes the margin the figure an extraction stands or falls
+      on. A steer travels at most `extend_mm` from a node the tree already holds, so every
+      node lies in the convex hull of the two endpoints and the box, and the box contains
+      them, so the hull *is* the box. No budget walks the tool further out than the margin
+      allows.
+  - **There is a second box, drawn round the panels and tooling, and only the detour's
+    extractions get it.** `--cartesian-wide-box-mm` (300) is how far clear of that
+    geometry each of its faces stands; `Cell.statics_bounds` measures the geometry and
+    `planning._wide_box` inflates it.
+    - **Round the fixture rather than as a looser margin, because the fixture is what a
+      detour has to get round and because it bounds the answer.** A margin large enough to
+      cover a detour nobody can predict the shape of has no natural figure; the cell has a
+      known size. Measured on Path 2's leg: the endpoint box at 300 mm is 2.03 m^3 and this
+      one is 9.12 m^3, both endpoints inside it. On another cell, 3.39 m^3 of statics
+      becoming 9.34 m^3, with every locator inside.
+    - **Unioned with the endpoint box, not substituted for it.** "A wider box" reads as a
+      replacement and that is wrong in the case that matters: a box round a fixture need
+      not contain the leg's own ends, and a search whose samples never come near the place
+      it has to reach is worse off than one given no extra room. A union can only add.
+    - **Escalated after a failure rather than set**, in `_cartesian_solutions`: the first
+      seed at an opening samples the endpoint box and only a seed following a failure gets
+      the wide one, and once that opening has solved it is not offered again -- the later
+      seeds there are looking for a *better* route, and the box that produced one is not
+      the thing to change. The two boxes are right in different cases and nothing can tell
+      which case a leg is beforehand, so a failed seed is the evidence, and it is the only
+      evidence there is. An extraction that comes out of its pocket at the first attempt
+      pays nothing, measuring included.
+    - **Only `_tree_leg` asks for it, and that is the mirror of why that leg has no
+      process budget.** There is nothing to choose about getting out of a pocket, and
+      everything to lose by not getting out: a transit's tree search failing costs a
+      candidate, where this one failing at every opening ends the detour and so the
+      segment. So the decision is an argument at the call site rather than a reading of
+      the budget -- a direct transit has other solvers and a route to fall back on, which
+      is what makes the dilution not worth paying there.
+    - **It is not a reach model**, and only 60.3% of it lies inside the arm's observed
+      reach shell against 85.8% for the endpoint box. That is affordable because a sample
+      is a *direction* and not a destination: the steer moves one extend from a node
+      already in hand, so a target the arm could never stand at costs one steer and no
+      more than any other. What the box changes is the distribution of directions and the
+      wall, not where a steer is attempted.
+    - Dilution is real and is not the objection -- the share of samples within one extend
+      of the locator goes from 0.10% to 0.026%, in a region already covered far finer than
+      one extend. The cost worth naming is the measurement: a pass over the statics'
+      prepared hulls, 1.8 s on a 7051-shell cell and 4.8 s on 128 MB of geometry, kept on
+      the cell and so paid once per run.
+    - `Cell.statics_bounds` reads the **prepared** hulls rather than the source meshes, so
+      the box is the extent of what the planner collides against; the two differ, and on
+      the C-shaped castings here the hulls are larger. The moving links are left out
+      because they move and not because of where their geometry sits -- a link's mesh is
+      in its capture frame exactly as a static's is, and on one cell the arm's span reads
+      like a seventh static. `meshprep.obj_bounds` is the scan, parsed per `o` block so
+      that each block's vertex region is one slice numpy can take in a single call: 4.8 s
+      against 14.4 s for the obvious loop over lines, and held against `read_groups`'
+      own answer by `recut_test`.
+    - **The log line that described `extra` as phase two's is fixed.** It said "then 20,
+      70, 120 mm for phase two", which named a stage no run has had since `_plan_detour`
+      replaced it, and reading it is what produced the belief that a phase two exists and
+      uses the fallback poses. The openings it describes are the detour's. A stale name in
+      a log line is the worst place for one: it is what a reader reasons about the program
+      from, and the docstring on `GunOpenings` had the same error.
+  - The arrangement before this walked three methods -- retreat from the start, retreat
+    from the end, then a line out of the *midpoint* towards neutral -- and handed the
+    planner whatever poses they produced as interchangeable candidates for a single via.
+    Two things were wrong with it. The poses were not alternatives: "retreat from the end
+    locator" is the end locator's extraction, and offering it as the remedy for a start
+    locator that could not be backed out answers a different question. And one via means
+    one leg out of each pocket, so the transit still had to get from the start locator's
+    pocket all the way into the end locator's in a single move -- the move that had just
+    failed directly.
+  - The secondary walk is per end for the same reason. A single line out of the midpoint
+    is the same line for both ends, and the nearest valid pose on it is usually the same
+    pose for both, which would leave the traverse with nothing to join. Each end projects
+    its own configuration onto the neutral set and walks from its own locator, so the two
+    lines cannot coincide unless the locators do.
+  - Each candidate keeps its locator's own orientation for the whole walk. What is being
+    searched is a line of *positions*; turning the tool as it goes would search a
+    different curve at every step, which is a harder thing to reason about when it fails.
+  - The package no longer imports the planner at all. It did, for the midpoint
+    interpolation; with the walks starting at the locators there is nothing to interpolate,
+    and `weldpath.fallback` is a leaf again -- which is what its own docstring claims.
+  - `_Sampler._run` loads a pose through `cell.set_state` inside its own `gun_opening`
+    block. OMPL reads the gun from the environment's current state and not from the program
+    it is handed, and before this each run inherited whatever the last collision query had
+    left there -- right in practice only because the endpoint screen always ran first.
+- **A weld's two gun openings describe the transits either side of it, not a squeeze.**
+  The squeeze is not modelled -- the robot is stationary through the weld -- so a study
+  chains them, one weld's `gun_opening_leave` being the next weld's `gun_opening_arrive`,
+  which is the same transit read from its two ends. Checked across Paths 2 and 3: every
+  pair agrees. Anything that reasons about `leave` as "the gun closing on the part" is
+  wrong, and a weld declaring 0/0 is not a weld that does nothing, it is one planned with
+  the gun shut throughout.
+  - `manifest._opening` parses an absent field as `None`, not `0.0`. The two were the same
+    value, so a manifest missing the field planned the weld closed with nothing said, which
+    either failed to place or placed somewhere nobody chose. `None` means "nobody said" and
+    is what `toolpath._search_opening` fills in.
+  - `_search_opening` sweeps the gun's travel for the reachable opening with the most
+    clearance, for a weld that declares none and for one whose declared opening places the
+    robot nowhere. **Arrival only.** An independent sweep of the departure opening would be
+    the same function of the same pose and the same ranking, so it would return the same
+    value every time -- and the departure opening is not a geometric question here anyway.
+  - The two axes are searched in order, never as one grid: a stand-off is restored before
+    export and costs nothing visible, an opening is process data that ships. So the
+    declared opening at the declared stand-off, then the declared opening across the
+    stand-offs, then other openings at the chosen stand-off, and only then both together --
+    one stand-off sweep per opening, coarse grid, since each sample is already a whole
+    sweep of the other axis. Searched as one grid, an opening reading a millimetre more
+    clearance could displace the study's own choice.
+  - `_scan_for_clear` is that sweep, shared by both axes: scan, split every gap between two
+    *blocked* samples down to the resolution, then climb from each window's best. Not a
+    bisection, because clear is not monotonic in either parameter -- backing a weld off
+    frees the tip but can put the throat into tooling, and opening the gun frees the throat
+    but swings the electrode into what is beside it.
+  - `_plan_pair` writes the departure opening back over the weld phase from what the
+    transit out of it was actually solved at, the declared value having only seeded that
+    search. Without it the gun changes as the robot starts moving instead of while it
+    stands still at the weld. `_arrive_opening` reads `self.openings` for the same reason:
+    the declared arrival is a pose the robot may never have been shown to reach.
+- **`--gun-opening-round-mm` (5) is the grid every opening the program *chooses* lands
+  on, and it covers more than the bisections.** `gun_opening_max` is
+  `2 * arm * sin(limit / 2)` -- 164.158939 mm on this cell -- so the widest opening is
+  never a round number, and neither is its half. Both were offered raw by
+  `_opening_stream` and by `toolpath._locator_openings`, and both reached shipped
+  waypoints as `gun_opening_mm`, which is a number nobody can set the gun to. The rounding
+  used to be applied to the bisections alone.
+  - `planning.opening_cap` rounds the widest **down**, because that one is a joint limit
+    and rounding it up names an opening the gun cannot reach -- which the endpoint screen
+    would then reject for what looks like a geometric reason. What it costs is the last
+    few millimetres of travel, 160 mm against 164.16, and `0` is how to decline the trade.
+  - `planning.snap_opening` is everything else: to nearest, then clamped to the cap. The
+    clamp has to be against the *cap* and not the raw widest, that being the other way an
+    unroundable number got out -- a bisection rounding past the limit came back as the
+    limit itself.
+  - **A weld's declared opening is never rounded.** It is process data from the study, and
+    snapping it would plan the weld at an opening nobody asked for. `named` passes through
+    `_opening_stream` untouched, and `_locator_openings` returns a weld's declared value
+    as it stands.
+  - `_search_opening`'s sweep is snapped **and re-solved** at the snapped value, never
+    merely relabelled: its grid is `widest` divided into cells and halved down to the
+    resolution, so its answer is never round, and the state and clearance beside it were
+    measured at the exact value. A snap that does not place the robot keeps the exact
+    value and says so -- a real opening that works beats a tidy one that does not.
+  - `cell._waypoint_openings` still spans the raw travel. It measures the clearance spread
+    for the allowed-collision relaxation and never ships a value, and measuring the wider
+    figure is the conservative side of that question.
+- **The opening is priced as well as searched over.** `penalty.GunPreference` is a flat
+  multiplier on a route's penalised cost for the opening it is to be flown at: 1x shut,
+  `--gun-opening-weight` (1.5) at full travel, linear between. Without it nothing in the
+  program prefers a narrow gun and two things prefer a wide one -- the clearance penalty
+  most of all, swinging the tip out of the way being the cheapest clearance there is to
+  buy, and the endpoint screen second, a wide tip failing less often beside a fixture than
+  a shut one fails inside a panel. Linear rather than a curve because there is no geometry
+  to put a knee at: clearance has one in the last few millimetres before contact, the
+  gun's travel has nothing of the kind.
+  - Applied to the **whole** penalised figure, not to the part the clearance penalty
+    added. A transit nowhere near the panels has no penalty to scale, and scaling nothing
+    would make the widest opening free exactly where nothing else objects to it either --
+    which is the case this exists for. The plain figure is untouched, being real seconds.
+  - It lands in `_path_cost` and therefore on every candidate route: phase one's, phase
+    two's, the Cartesian tree's and the recut's, all of which `_cheapest` ranks on one
+    number. It reaches nothing else. Wherever the opening is held fixed -- inside
+    `_finish`, and so in shortcut, simplify and polish -- it is the same constant on both
+    sides of every comparison and cancels exactly, which is why `MotionModel` knows
+    nothing about it and those passes are untouched.
+- **`_retune_opening` is the last pass of a segment, and it moves the gun rather than the
+  route.** Everything before it picks an opening in order to *find* a route: the phases
+  search at several and the cheapest answer ships whichever one it came from, and a clear
+  straight move is simply taken at the first opening that clears it, never scored against
+  another at all. So the opening ends up decided by what it did for the search. The search
+  is then over, the route is fixed, and the opening is still free -- the route is a list of
+  robot joint vectors and the gun is not one of them. This asks, last, which of the
+  openings that fly it is the one worth flying it at.
+  - Candidates come from `_opening_lists`, the same screened preference order the search
+    uses, `--retune-gun-openings` (4) of them. Each is then **validated along the whole
+    leg**, which is the reason for doing this here rather than in the list: the tip is
+    200 mm of swing and part of the machine that has to fit, so an opening both endpoints
+    are clear at can still put the electrode through a fixture halfway along. Upstream
+    that is a route the search would have failed to find; here there is a route in hand
+    and the only question is whether it survives the gun moving under it.
+  - The incumbent is scored on the same terms and kept on a tie, so a leg changes hands
+    only where another opening is strictly cheaper. An opening that fails validation is
+    dropped and nothing is offered in its place -- the count bounds the expensive half of
+    the test, which is the validation and not the proposal.
+  - The route is **not** re-planned or re-refined at the winning opening. The passes ran
+    with the gun where the route was found, and running them again would be a fresh search
+    rather than a reading of the one already done, and would leave the leg costing
+    something other than what was ranked.
+  - Both the check and the price read each run under the profile it will really be flown
+    under, `_path_cost` being **pinned** to `run.motion`. Deriving from the band is right
+    for a candidate, no split having happened yet, and wrong twice over here: the split is
+    settled, so a derived profile prices a leg the controller will not execute; and the
+    band moves with the gun -- `_reads_near` measures a clearance the tip is part of -- so
+    deriving would make the *profiles* a function of the opening and feed that back into
+    the comparison as a real difference between openings. `MotionModel.pinned` is the only
+    exception to "the profile is not stored", and it exists for the one caller that is
+    reading a settled split rather than deciding one; `_crosses` returns False under a pin
+    for the same reason, the crossing count belonging to the split.
+  - That is the shape of the whole pass. The route is fixed, so travel, ramps, the tool
+    speed cap and the crossing count are identical at every opening and cancel in the
+    comparison. What genuinely varies is the clearance penalty, which reads the tip where
+    the gun has put it, and the gun's own weight. Anything else that varied with the
+    opening would be an artefact.
+  - Its cost is therefore internal to the pass. Priced per run, it charges a stop at each
+    run boundary -- which is what the robot does there, that boundary being a phase
+    boundary -- where a candidate's cost is taken over its whole route at once. The two
+    numbers are not comparable and nothing compares them.
+  - Applied per **leg**, a leg being the unit that has one opening, so it covers the
+    direct transit, a route through a fallback pose and both halves of a two-leg split
+    alike. The halves of a split retune independently, which is sound because they meet at
+    a pose the robot is stationary at: the gun changes there whatever the two openings turn
+    out to be, and a split whose halves retune onto the same opening is a phase boundary
+    with nothing happening at it.
+  - `_plan_pair` writes the first leg's opening back over the departing weld phase, so a
+    retuned opening is what the weld is recorded as leaving at -- which is the point, that
+    figure describing the transit out rather than anything at the weld.
+  - Skipped when the segment clock has run out. There is already a valid answer and this
+    only improves it, so it is dropped whole rather than clamped: half a pass proves
+    nothing.
+- **A transit with a weld at either end is planned at the clearance its own weld poses
+  have earned, and that is the only margin in force.** `_clearance_for` wraps the whole of
+  `_plan_pair` -- every search and every refinement pass -- so whatever margin it installs
+  is the one number the planners are handed, the passes work to, and the cell's own sweep
+  judges against. `_earned_weld_clearance` makes it the tightest reading at the leg's own
+  weld poses less `--weld-clearance-slack-mm` (1), clamped into `[--weld-clearance-mm`
+  (0)`, --obstacle-clearance-mm` (5)`]`.
+  - **Why it is not simply `--weld-clearance-mm`.** The gun closes on the panel it welds,
+    so a weld pose cannot be held to an ordinary transit's margin, and
+    `_relax_at_waypoints` does not cover it -- that pass excludes obstacle pairs and
+    handles the robot's own geometry only. But 0 only ever had to be loose enough for the
+    weld pose itself to place, and `--weld-shift-mm` (-5) has already backed every weld
+    locator off its panel, with `pose_as_imported` restoring the original for export, so
+    the pose the robot actually stands at has real air around it and the shift is free at
+    the output. **Nothing read that figure.** The searches were told the whole transit
+    could graze a panel and explored a region that wide.
+    - **Measured over ten studies' shipped logs: 37 weld placements read 4.3 to 5.6 mm**
+      at the 5 mm shift, median 5.2 -- so on most legs the margin moves from 0 to about
+      4 mm. The distribution is what makes the clamp the whole safety story rather than a
+      tidiness: Path 7 has a weld at **0.1 mm**, Path 1 one at 2.7 and Path 9 one at 3.2,
+      and each of those legs comes out at or near the declared figure on its own. A weld
+      with nothing to spare earns nothing, which is correct -- there is no air there.
+  - **It had never once engaged, and the cause was the opening set.** The margin is read
+    at the openings the leg will be flown at: the first locator's `_leave_opening` and the
+    last one's `_arrive_opening`, each weld pose at each of them, minimum taken. An anchor
+    is robot joints and the gun is a state variable applied over the top, so the same pose
+    reads differently as the tip swings, and the leg holds one opening across *both* ends
+    at a time -- taking each weld at its own opening alone would set the margin from a
+    geometry the leg is never in. What nothing guarded against is an opening at which a
+    weld pose reads *through* the part: a penetration is a finite negative number, so it
+    won the minimum outright and the clamp pulled the margin back to the declared 0.
+    - **Measured on Path 1's `via114 -> 73050-01-R_2t`.** `via114` is placed with the gun
+      shut, so the openings consulted are 0 and 25 mm. At 0 mm the weld pose is 6.4 mm
+      inside `Assy_ST200_RH` -- the log says so on the next line, `_opening_lists` having
+      screened 0 mm out of the rotation for exactly that reason -- and at its own 25 mm it
+      reads +2.7 mm. So the leg earned 0 mm where it should have earned 1.7.
+    - **The log line only prints when the margin beats the declared figure, and it had
+      never appeared in a run of any study.** `grep -l "the weld rule declares"` over all
+      ten studies' logs was empty. A whole committed mechanism was inert and nothing said
+      so, which is the argument for the line reporting what it read rather than only what
+      it chose.
+    - Such an opening is now skipped, and the report names only the openings that
+      contributed plus how many were skipped. Asked as a **penetration** (`got <= 0.0`)
+      rather than as `in_collision`, deliberately: a collision test answers against
+      whatever margin happens to be in force, and at the cell's own 5 mm that would
+      reject the weld's own opening too -- Path 1's +2.7 mm being exactly the figure
+      wanted here.
+    - The rest of the rotation is still left out. A wider opening that reads tighter at an
+      endpoint is screened out of the rotation by the endpoint check that already exists,
+      which is the right answer for that opening, where folding it in here would tighten
+      every leg to its worst.
+  - **It is not a guarantee and must not be read as one.** The reading is at the
+    endpoints, and a transit's tight spot is often neither -- a weld's 5 mm is usually the
+    electrode against the panel it welds, while a pinch halfway along is the gun's throat
+    against tooling beside it. A leg whose only route ran under the earned figure fails or
+    detours. What bounds that is the clamp: never stricter than an ordinary transit's
+    margin, which is what every leg with no weld on it already flies to.
+  - Placement is untouched. `_clearance_for` is called with no anchors there and returns
+    the declared figure flat, there being nothing measured to derive a margin from until a
+    locator has been placed -- so a weld that places today cannot stop placing because of
+    a flag about transits.
+- **`--scoped-weld-clearance` is gone, and with it the last rule that refused a state the
+  planners were told was legal.** It confined the weld relaxation to within
+  `--weld-clearance-radius-mm` (50) of each weld and had `Cell.weld_relaxation` take the
+  difference back beyond that: a state the margins cleared, further than the radius from
+  every weld on the leg and reading under `--obstacle-clearance-mm`, was reported in
+  collision after all. It hung off `Cell.in_collision`, in Python, where OMPL cannot see
+  it -- `request.env = self.cell.env` carries the pair margins and nothing else, and there
+  is no Python state validator.
+  - **That asymmetry was the dominant cause of "returned a route that is not clear under
+    this cell's own check".** `_route_fault` names which test refused, and on Path 1's run
+    of 2026-11-10 -- the only shipped log on code carrying that message -- **all five
+    refused routes named the scope**, none the tool-space subdivision and none the joint
+    grid. The segment refused **3095 states** that way. Every one is a state OMPL was told
+    was legal and spent time reaching, and the sampler keeps going back, since nothing it
+    can see says otherwise.
+  - **What it was guarding against is not what the routes do.** The leg that shipped from
+    that same segment is three points, reading 120.0 mm, 52.6 mm and 2.7 mm, the last
+    being the weld itself; its penalty factors are 1.00, 1.00 and 23.58. So the only
+    near-panel point on the route is the weld, the whole of the 34x penalised-to-plain
+    ratio is that terminal pose, and polish's "1% better" over 282 attempts is a route
+    with nothing left to gain rather than a pass that could not move it.
+  - **What replaces it is a price plus a margin, and the price is steep.** The stepped
+    curve is the default and `--clearance-penalty-*` is ignored while it is: 200x at
+    touching, 40.75x at 2 mm, 8.90x at 4 mm, 1x at 10 mm. Near clearances are acceptable
+    where there is no other option and expensive where there is, which is what a
+    multiplier expresses and what a Python-side refusal cannot.
+  - **Measured over ten studies' stage logs** before the removal, travel-weighted at the
+    densify stage, each move charged at the worse of its two endpoint clearances: of
+    265.7 m of tool travel, **3.03 m ran under 5 mm** and 1.05 m of that under 2 mm.
+    1.98 m of it is within 75 mm of a route end, which is the weld approach the relaxation
+    exists for; **1.05 m is further in than that**. It is concentrated rather than spread
+    -- `73063-23-R_2t -> 73063-15-R_2t`, which appears in both Path 4 and Path 9,
+    contributes 396 mm of it and runs under 5 mm for 64% of its length. That is the
+    travel the earned margin is now meant to remove, and by a means the searches can see.
+  - **The same measurement says the clearance penalty is almost never in force**: 95.84%
+    of that travel is at or beyond 25 mm, where the stepped curve is exactly 1x. So the
+    penalty acts on the remaining 4.2%, and a margin rather than a price is what decides
+    the rest.
+  - **The margin still cannot vary per state**, which is why the scoped rule existed at
+    all. `_set_obstacle_clearance` re-applies every pair margin and rebuilds the contact
+    manager, so it is a per-block setting and switching it per move would cost more than
+    the planning. The earned margin is one figure for the leg, which is what fits that
+    constraint; the scope was the other way of fitting it, at the price of the planners
+    not being able to see it.
+  - **Most of `0928ac8` went with it.** `Cell._floor_manager` and `_planning_contact`
+    existed to answer the scope's floor question on the same contact test as the margins',
+    `_clear_of` to remember that it had been answered, and `clearance_under` had the scope
+    as its only caller. With one question left there is nothing to fuse, so all four are
+    gone, along with the `weld_scoped` and `collision_fused` counters. **The per-state
+    `_collision_cache` is independent and stays** -- it is the larger half of that commit
+    and the callers still re-ask by construction.
+  - What is left on `in_collision` is the contact test at the margins in force and nothing
+    else. A verdict reached there and a verdict reached inside the planner now differ only
+    in how finely the move between two states is sampled, never in what counts as clear --
+    so `_route_fault` has two causes rather than three, and both are resolution.
+- **`--direct-clearance-mm` is a floor under the straight move, and under nothing else.**
+  `_plan_direct` tries the direct joint chord at each opening before any search, and the
+  only question asked of it was `segment_collides`. That is a yes-or-no at the collision
+  margin, so a transit sliding along a panel at 5 mm is "clear" and ships, and the phases
+  that would have routed round it never run -- the one shape of answer no amount of
+  standing off a straight line can reach, since the passes cannot move a route into
+  another homotopy class. The floor makes the chord earn the shortcut: under it, the loop
+  moves to the next opening, and a set of openings none of which clears it falls through
+  to `_Sampler` as though the move had collided.
+  - Measured by `Cell.segment_clearance`, which walks what `segment_scan` walks -- the
+    joint grid at `--check-step-deg`, then the tool-space bisection under it -- and
+    returns the worst reading. The subdivision **is** included here, where scoring leaves
+    it out: nothing is being priced, so there is no cost to make depend on how finely the
+    move had to be checked, and a dip between two grid samples is the case those midpoints
+    exist to catch.
+  - `floor` stops that walk at the first reading under it, so a move that is going to be
+    refused is not measured to the end. What comes back is then that reading rather than
+    the worst on the move, which is all the log claims.
+  - Bounded below by `--obstacle-clearance-mm`, since a move closer than the margin is
+    already a collision, and above by the probe: `ToolpathPlanner` adds
+    `NEAR_PANEL_HEADROOM_MM` to it when widening the clearance manager, for the reason the
+    band does -- a reading at the probe is "nothing found", so a floor at the probe is one
+    every state meets.
+  - It gates the shortcut only. Nothing re-asks it of what the searches return, or of what
+    the refinement passes do afterwards; the clearance penalty is what governs those, and
+    it is a price rather than a limit. Raising this does not raise the clearance of the
+    routes that ship, it only stops the straight move being taken on trust.
+- `plan_cartesian` is the only search that builds straight tool moves. `_plan_direct`
+  runs it on every transit the band is on for, whatever phase one did, and adds its best
+  route to the same candidate set -- `_cheapest` then ranks the two searches on one number
+  and names the winner's `_Solution.source`. It used to run only where phase one returned
+  nothing, which meant a transit phase one solved never had the tree's route costed at all;
+  the two differ less in whether they solve than in what they return, uniform joint
+  sampling having nothing drawing it into the corridor beside the panel that the tree
+  steers along. What it costs is `--cartesian-gun-openings` times
+  `--cartesian-solve-seconds` plus `--cartesian-process-seconds` on every transit rather
+  than only on the ones nothing else reached, bounded by `Deadline` alone. It runs for every leg of a detour too, and on the two extractions it is the *only*
+  solver -- see `_plan_detour`. A leg is a candidate for being shipped as its own leg of
+  the output, so it is searched and scored under the band it will be flown in. What that
+  costs is the tree's budget per leg per opening tried, which is why the extractions drop
+  `--cartesian-process-seconds` to nothing.
+  - **Its three budgets are per gun opening, and that is a change.**
+    `_cartesian_solutions` takes each opening of the rotation in turn: searches from
+    successive seeds until one solves or `--cartesian-solve-seconds` passes, at which point
+    that opening is given up; once it has solved, further searches until
+    `--cartesian-process-seconds` has passed *since that first route*, which is not
+    restarted by a second route or an opening that keeps solving would never be left.
+    `--cartesian-gun-openings` (3) openings are attempted, or all of them where the
+    rotation is shorter -- there is no inventing an opening, the rotation having already
+    been screened. Routes accumulate over every opening attempted, are ranked by
+    `_path_cost` as phase one's are, and only the cheapest is recut, since the recut runs
+    the sampling phases per stretch.
+    - **Both figures used to be counted from the first run of the transit**, which made
+      them one window shared by every opening, and the opening advanced only when a search
+      ended early. So a single failing search spent the whole window and no later opening
+      was ever reached: measured over the shipped logs of nine studies, 12 of the 30
+      direct-transit tree calls tried exactly one opening for this reason, each burning
+      120 s to do it. How many openings a transit saw was a consequence of how quickly the
+      first one solved rather than anything anyone set.
+    - A search that fails spends its whole window, so the floor on a hopeless transit is
+      the product: 3 x 120 s before the detour is reached, against 120 s before. That is
+      the price of the guarantee and `--cartesian-gun-openings 1` is how to decline it.
+      Inside the process window a failed search likewise spends the rest of it -- there is
+      no third figure capping one search, and the window is what contains it.
+    - The gun is why per opening is the right scope. The tree's every edge is a straight
+      move of the tool and a tip 200 mm open sweeps a corridor a closed one never enters,
+      so a search that failed is evidence about the opening it ran at and about no other.
+      `_route_fault` has no counterpart here: a failed search is a failed search.
+  - It returns every station it validated, about `--check-step-mm` of tool travel apart,
+    each gap swept as a joint chord — close enough that chord and line coincide — plus
+    one stationary joint move where the two trees meet at the same pose.
+  - With `--cartesian-recut` (default on), `_recut_outside_band` then cuts the route
+    where it leaves the band, before it becomes a candidate. The first and last state of
+    each far stretch stay as waypoints just outside the band; every state between them is
+    dropped, and the gap is re-planned by `_Sampler` -- phase one, then phase two, which
+    is the one place phase two still runs -- or taken as the joint chord when that is
+    already clear. A gap
+    that cannot be joined keeps its tree states. A route with no near state is left
+    alone, since that query is the one phase one just failed.
+  - Afterwards it is treated exactly like an OMPL route. With the recut off, joint motion
+    enters it only through the endpoint rule, and the refinement passes then replace
+    out-of-band stretches with long joint chords, so a route found by searching linear
+    space can still ship with few linear moves on it.
+  - `_fill` hands stations straight through only while consecutive ones are within
+    `--check-step-deg`. `jump_rad` allows 0.5 rad per station, and a linear gap wider
+    than the step is re-derived by `plan_linear`, which need not reproduce the chain the
+    tree validated.
+  - `--unrefined-output` writes every transit as one `PTP` phase regardless.
+- **A hull that refuses an input waypoint is measured against the raw CAD, and re-cut
+  where the CAD says it is wrong.** `_solve_locator` fails a locator when the collision
+  check rejects every pose that reaches it, and the check reads convex hulls, which claim
+  every hollow they span. So the refusal may be the approximation rather than the cell.
+  `ToolpathPlanner._recut_blocking_hulls` is the appeal: it re-measures the blocking pair
+  against the raw concave meshes, and where those say the pair is clear it cuts the
+  offending hull finer and places every locator again.
+  - **The hull is named, not guessed at.** A `ContactResult` carries `subshape_id`, which
+    is the index of the convex piece each link was hit on -- that link's own `o` group in
+    the prepared OBJ, in file order. `shape_id` is *not* it and is 0 for everything here: a
+    link is one `<collision>` element, so the whole decomposition arrives as the subshapes
+    of one compound mesh. Verified against a two-cube scene, where reversing the groups in
+    the file reverses the indices reported. `Cell.contacts` returns it as
+    `Contact.hulls`, in the order its pair key names the links.
+  - **Only that hull is re-cut, not the link.** `meshprep.recut_groups` reads the prepared
+    OBJ back, re-cuts the named groups with `split_by_grid` where they stand in the file,
+    and copies every other group through. The piece's own triangles are in that file --
+    they are what Tesseract builds the hull from -- so this needs no source mesh and no
+    decomposition. A cell size is a property of a *link*, and a link is thousands of
+    hulls: lowering one costs about four times the hulls over all of them, measured at
+    901 -> 15508 on one panel shell between a 20 mm cell and a 5 mm one, against +7 for
+    re-cutting the one piece that was in the way. Every hull of a link goes in one call,
+    since the indices are that file's own and cutting one shifts the rest.
+  - **The error runs the safe way**, for the same reason the grid is sound to begin with:
+    each piece is hulled from triangles the original group also held, so the union of the
+    pieces is contained in the hull it replaces and every triangle is still inside one of
+    them. A re-cut can stop reporting a contact that was never there; it cannot stop
+    reporting one that is.
+  - **Nothing is re-cut on a hull reading alone.** A pair whose raw geometry really is too
+    close is the study being wrong, and no cell size answers it; a pair that could not be
+    measured is not evidence either way. Both are reported and left standing, which is
+    also what stops the pass walking a hull down to the floor for a refusal it was never
+    going to fix. The threshold is the one the build holds that pair to: the obstacle
+    clearance against the parts, the self-collision margin between the robot's own links,
+    `--weld-clearance-mm` in place of the first at a weld.
+  - **The cell comes from the hull, not from the link's flag.** What has to divide is this
+    piece; the flag describes the whole link, and a piece the fill gate never refined may
+    be far larger than the flag suggests. `RECUT_FRACTION` of the piece's own diagonal is
+    the coarsest cut certain to say anything -- a cell no smaller than the piece cannot
+    divide it at all. The piece shrinks at every step, so this converges on its own and
+    `--recut-floor-mm` is what stops it.
+  - **The whole anchor pass runs again, not just the locator that failed.** A re-cut
+    changes what the hulls read, and the pair margins the build derives are shifted by
+    exactly that reading -- measured at the start pose and at every waypoint -- so a finer
+    hull moves the margins as well as the geometry, and not necessarily the same way for
+    every pose. A locator placed under the coarser hulls is not guaranteed to place again.
+  - It runs **before any segment is planned**, every locator being solved up front, so no
+    route has been costed against the hulls that are about to change. That is also why the
+    rebuild is a whole new `Cell`: these bindings have no command to swap a link's
+    collision geometry under a loaded environment, and `AddLinkCommand` would mean building
+    `Link` geometry through SWIG. A scene load is about 9 s on a 5.5k-hull cell, paid once
+    per attempt.
+  - `build` takes `geometry`, a per-link stand-in for what the decomposition resolves, and
+    that is the only way re-cut geometry reaches a scene -- the decomposition itself is
+    untouched and its cache is never written over. `stop_time_weight` and `stop_band_rad`
+    became `build` parameters at the same time: they were assigned to the cell by `main`
+    afterwards, and a setting applied after the fact is one a rebuild silently drops, which
+    this code has already been bitten by once with `tcp_check_mm`.
+  - The raw measurements are cached per pair and state on the cell and carried across
+    rebuilds. They stay true however the hulls change -- they are the raw meshes, and
+    re-cutting a convex piece does not move the CAD it was cut from -- so a rebuild does
+    not pay again for the slowest thing the build does.
+  - `--recut-blocking-hulls false` leaves the whole pass out. `--recut-attempts 0` keeps
+    the measurement and its diagnosis and skips only the retry, which is the setting for
+    finding out *why* a waypoint is refused without spending hulls on it.
+- **A segment that fails leaves a viewer behind.** `treetrace` keeps the pairs of
+  Cartesian trees a segment built -- offered by `plan_cartesian` at each of its two exits --
+  and `ToolpathPlanner.run` hands them to `treeview` from the
+  `except` that records the failure. Three files land in the **study directory** --
+  `Manifest.directory`, the one the manifest was read from: the viewer
+  (`weldpath-treeview.js`, shared), one segment's data, and a stub page that pulls both in.
+  `--treeview` turns it off.
+  - Not `export_dir`. That is set only when `--export-collision-geometry` is passed, so a
+    view hung off it is one that never appears on an ordinary run -- which is what the
+    first cut of this did, logging "no --export-dir" and writing nothing. The study
+    directory is the one directory the program is always given.
+  - `treetrace` mirrors `stagetrace`: off until `start`, every call a no-op while it is, so
+    the search offers its trees without knowing whether anyone is listening. It reads
+    nothing and touches no disk -- a segment that succeeds must not pay for a diagnostic it
+    will never write -- so all of the work is `treeview`'s, done once, after the failure.
+  - **Both trees of a pair are kept.** The two grow towards each other and
+    the thing worth looking at is the gap between them: which got how far, and where they
+    stopped short. The deeper branch of one tree would hide exactly that.
+  - **Every search goes in the one file, and the viewer filters them per solve.** A segment
+    runs the tree many times -- successive seeds until the solve budget is spent, once per
+    gun opening, and again per leg of a detour, where the two extractions have no other
+    solver -- and they fail in different places. Which opening got furthest, and whether a
+    traverse failed where the extractions had no trouble, are questions about the *set*;
+    the single biggest tree
+    answered neither, and a file per search would mean comparing them in two windows. Each
+    search is a `solve` carrying the label `plan_cartesian` was given -- run number and gun
+    opening -- and the viewer groups the filters under it, colours each one its own hue,
+    and names the search in the readout when a node is picked.
+  - `--treeview-searches` (12) bounds how many are held, and it is a **memory** bound
+    rather than a file one: a kept search's nodes stay alive until the segment ends, and
+    every segment pays that whether or not it fails. Past the limit the *smallest* kept
+    search makes way for a bigger one. What is lost is therefore the searches that died
+    early -- and those are informative, a tree of four nodes saying the endpoint is boxed
+    in at that opening -- so the file records how many were offered and how many were
+    dropped, and raising the limit is how to see them. 0 keeps everything offered.
+  - **The geometry written is the geometry the planner collided against** --
+    `hullexport._link_hulls`, the convex decomposition, not the source meshes. They differ,
+    badly on the C-shaped castings here, where hulls over-report contact. A viewer showing
+    the source meshes would show a gun comfortably clear of something the planner was
+    certain it hit, which is worse than showing nothing.
+  - Statics are written placed in the world; moving links in their own frames, which is why
+    `_link_hulls` is handed an empty transform map for them -- its lookup raises, it falls
+    back to the identity, and the geometry stays where the link's frame puts it. Each node
+    then carries one baked transform per link, read from a single `set_state` rather than a
+    forward-kinematics call per link.
+  - Node tool positions come from `_Node.pose`, which is `cell.pose_mm` and already in
+    manifest units; the edges go through `cell.fk`, which answers in metres, and divide the
+    scale out themselves. The two have to agree or the nodes float off their own edges.
+  - Edges are drawn along `_Node.chain`, the stations the steer validated, not as a line
+    between the two nodes. That line is a shortcut nothing checked and often has no inverse
+    kinematics at all, which is the shape this search exists to find.
+  - `--treeview-max-poses` caps how many nodes get a baked pose, a pose being most of the
+    file. Every node is still written and every edge still joins them, so the shape of the
+    search is whole; the capped ones are simply not clickable, and they are chosen evenly
+    rather than taking the first N, so what is clickable is spread over everything reached.
+    It is a **total over every tree in the file**, apportioned by node count in
+    `treeview._share`, not a limit each tree gets to itself: a baked pose costs a state
+    load and a clearance query, which is a collision call, so per-tree it would have
+    multiplied the slowest part of this by the number of searches kept. Every non-empty
+    tree is guaranteed one, which is the only thing here that can exceed the budget and
+    only where there are more trees than poses asked for.
+  - **Written whatever the segment failed on.** A tree only exists where the band was on and
+    the clock left room, and a segment that failed at a locator never attempted a transit at
+    all. What lands there then is the cell, the straight chord between the endpoints with
+    its clearance, and the reason -- and where even the endpoints are missing, the cell and
+    the reason. A file that said nothing in those cases would be a puzzle, not a diagnostic.
+  - The data is a `.js` assigning a global rather than a `.json`: a page opened from
+    `file://` may not `fetch` a sibling, which is the one machine this is for, but a classic
+    `<script src>` to the same directory is allowed. Nothing is fetched and nothing served.
+  - `treeview.write` never raises. The caller is already handling a failure and must be left
+    to report it; a diagnostic that takes the run down with it is worse than none.
+- **`_stand_off` is the one refinement pass that moves the gun as well as the route, and
+  it runs immediately before polishing.** The gap between the electrodes is the clearance
+  the tool has to work with, and there are two ways to widen it: open the gun, which backs
+  the *moving* electrode off the panel, and back the whole tool off, which moves the
+  *fixed* one. The pass tries four combinations of the two over the whole route and keeps
+  whichever is cheapest, or the route as planned where none of them is.
+  - **`STAND_OFF_TRIALS` is (how much wider, what share of that is taken out of the
+    approach)**: `+5/0`, `+5/½`, `+5/all`, `+10/½`. A share of 0 spends the increase
+    entirely on the moving electrode, 1 entirely on the fixed one, and ½ opens the gap
+    symmetrically about the weld. Written as a *share* rather than a distance so the pair
+    stays coherent once the opening is snapped to `--gun-opening-round-mm`: an increase
+    that lands at 3 mm rather than 5 is still split evenly at 1.5 mm. On the grid, where a
+    declared opening normally sits, they read as +5/0, +5/2.5, +5/5 and +10/5 mm.
+  - **Which way "back" is comes off the gun joint, not off a convention.** `_open_axis`
+    takes the tangent the moving electrode travels along at the TCP -- `axis x (tcp -
+    anchor)`, signed by the travel the limits allow -- and expresses it in the TCP's own
+    frame, where it is a constant of the gun. On the supplied cell that is the tool's own
+    +z to within 1.2e-4, the same axis `--weld-shift-mm` backs a weld off along. The
+    agreement is worth knowing and is not relied on.
+  - **What decides between the trials is `_path_cost` with the gun weight**, the number
+    every candidate route in the program is ranked on. So the air bought is priced by the
+    clearance penalty and the wider gun is charged by `GunPreference`, and that is what
+    makes the pass self-limiting: a transit in open air has no clearance penalty to
+    reduce, every trial costs it the gun weight alone, and the route it was planned with
+    wins. At the defaults the trade is worth making where a route really does run close --
+    the curve in force is the **stepped** one, `1 + 11.129 * 0.7^(d/2) - 0.129`, so a
+    state at 5 mm is charged 5.43x and the same state 2.5 mm further out 3.79x, **30%**
+    off the time spent there against the 1.5% the gun weight adds for 5 mm of a 164 mm
+    travel.
+  - **Those figures used to be quoted off the power curve, which is not the default.**
+    `--stepped-penalty` defaults to on, and every `--clearance-penalty-*` flag is ignored
+    while it is, so `1 + 7 * ((100 - d) / 100) ** 5` -- 6.42x at 5 mm against 5.74x at
+    7.5 mm, 11% -- describes a curve the program does not run unless
+    `--stepped-penalty false` is passed. The conclusion held; the arithmetic understated
+    the pass by a factor of nearly three, the stepped curve spending its whole range
+    inside 25 mm where the power curve spreads it over 100.
+  - **The ends do not move.** They are the locators the leg runs between, and one of them
+    is usually the weld itself: the pose it was placed at is the one the study asked for,
+    and the stand-off it already has is `--weld-shift-mm`'s to give.
+  - A waypoint whose retreated pose will not solve, or whose solution is further than
+    `STAND_OFF_JUMP_RAD` from the state it came from, **keeps the state it had**. Inverse
+    kinematics is a local solve, so a solution that far off is another arm or wrist branch
+    rather than the same pose backed off, and installing one would put a reconfiguration
+    in the middle of a route that has already been checked. The candidate is validated and
+    priced as one whole path either way, so a route that is mostly backed off is still a
+    real route; dropping the trial over one waypoint at a reach limit would throw away the
+    air gained at the other forty.
+  - **`_retreat_path` solves with `avoid_stop_band`, and until it did this was the one
+    pass that could move an existing waypoint into the joint 5 band.** Every point it
+    touches is a waypoint and a waypoint is a stop, which is exactly what the flag is for;
+    without it a band solution won on nearness like any other. Contrast the other two
+    passes: `polish` refuses such a relocation outright, and `shortcut` installs interior
+    states that are not anchors, which `simplify` then prefers not to keep. The reason the
+    flag is left off elsewhere -- a solve tracking a line, whose stations must stay on the
+    branch they started on -- does not apply, each waypoint here being retreated on its
+    own. It is a preference and not a guarantee, `solve_pose` still answering with a band
+    state where it finds nothing else, and it cannot cost a trial: a non-band solution
+    further from the seed trips `STAND_OFF_JUMP_RAD` and the waypoint keeps what it had,
+    the same fallback as a pose that will not solve. `clear_stop_band` is still the gate;
+    this stops feeding it work.
+  - **The opening it chooses is part of the answer and it ships.** The retreat and the
+    opening are one trade: flying the backed-off route at the opening it was planned at
+    would put the moving electrode back where it started and leave the route priced on a
+    geometry it is not flown in. So `_refine`, `_finish` and `_refine_runs` all return the
+    opening alongside the route, and the pass leaves the gun where the trial put it with
+    `set_gun_opening` -- the caller's own `gun_opening` block is what puts it back when the
+    leg is done with. Polish, the stop-band clearing, the split and the verification then
+    all read the route at the opening it will be flown at.
+  - **A fresh `MotionModel` for every opening.** Its `_near` and `_reach` caches are keyed
+    on the state alone, and the whole point of moving the gun is that a state reads
+    differently with the tip somewhere else. The cell's own caches are keyed on the gun
+    value and need no such care. This is why `_refine` rebuilds its model after a trial is
+    kept, and `_finish` and `_refine_runs` theirs again before the split.
+  - Each trial is checked move by move under the profile the band gives it **at that
+    opening**. Deriving is right here and wrong in `_retune_opening`: no split has happened
+    yet, so there is nothing settled for a derived profile to contradict.
+  - **Gated on the polish budget**, not on its own switch alone. A leg planned with no
+    budget may yet be discarded -- the detour's extractions, and the legs `_tree_leg`
+    returns -- so the trials are paid for once, on the leg that ships, where `_refine_runs`
+    picks them up with the rest of the deferred refinement.
+  - `_retune_opening` still runs afterwards and may move the opening again, on the
+    retreated route. That is sound and not a contradiction: it validates and prices the
+    whole leg at each opening it considers, so whatever it picks is a reading of the route
+    actually in hand. What it will not do is move the waypoints back.
+  - Dropped whole when the segment clock has run out, for the reason `_retune_opening` is:
+    there is a valid route in hand, this only improves it, and half the trials prove
+    nothing. `--no-tip-standoff` leaves the pass out.
+- **Where the time goes, and what stopped being asked twice.** Every budget in the planner
+  is wall clock, so there are only two levers: what a second buys, and whether a second is
+  spent after there is nothing left to buy. A profile of a reduced-budget run of a
+  5186-shell cell used to stand here, reporting 513 s of `contactTest` in 681 s end to end
+  against 112 s of OMPL's own solve and 2.5 s of inverse kinematics -- 0.15 ms a call, 16
+  thousand of them. **The contact-test figure does not reproduce and the conclusion drawn
+  from it was wrong**; the IK figure does. See the state-solver bullet below for what the
+  split really was.
+  - **`env.setState` was most of the program, and it is not forward kinematics.** Every
+    collision query and every `fk` pushed its state at the `Environment`, which costs
+    **2.6-4.6 ms** on this cell's 7055 prepared shells -- against **0.005 ms** for the
+    same joint vector and the same name list through the state solver that environment
+    owns, and 0.009 ms for `calcFwdKin`. So it is neither the kinematics nor the binding
+    marshalling the names: it is the environment's own bookkeeping, its revision and the
+    transforms of contact managers *it* holds, and nothing here queries those -- `_cm` is
+    a clone and is pushed at directly. `Cell` now drives a cloned solver and leaves the
+    environment where it stands.
+    - **It was paying for the broadphase to be ignored.** Bullet's culling works
+      extremely well: `contactTest` is **0.013 ms** with the robot 150 mm clear against
+      **4.7 ms** with it 5 mm off a panel, a factor of **360**. The flat 4.6 ms buried
+      that, so a check in open air cost almost exactly what one against a panel cost and
+      the whole gradient read as under 2x.
+    - **Timed apart over 1795 real states** spanning contact out to open air: through the
+      environment, **97.1%** of the work was loading the state and 2.9% was `contactTest`,
+      3.61 ms a state. Through the solver the same states split 40/60 at **0.13 ms** a
+      state. That is where the old 513 s figure goes: the time was real, the attribution
+      was not.
+    - **Nothing answers differently, and that is checked rather than argued.** The link
+      transforms the two routes produce are bit-identical over 150 states and 13 links.
+      On a fixed Cartesian tree search -- a sample count and a seed, not a clock, so both
+      sides do the same searching -- the route came back identical state for state, the
+      cost identical to the last digit, and the same 82 collision tests and 490 state
+      loads were asked, in **0.18 s against 2.65 s, x14.8**.
+    - **Three callers do need the environment moved and they say so**, via
+      `Cell.sync_env`: `_Sampler._run`, because OMPL is handed `cell.env` and reads the
+      gun opening off its current state; `toolpath._export_blocked` and
+      `cell._export_start_contacts`, because the hull exporters write the pose the
+      environment is holding; and `--probe-point`, which now states the pose it reports at
+      instead of inheriting whatever the build left behind. Everything else reads
+      `Cell.state`, the state the load produced -- which is what `fk`, `_tcp_now` and
+      `fallback.retreat`'s bounds helpers were changed to do, the environment no longer
+      being where the answer is.
+    - What this does **not** do is make a budgeted search finish sooner; it makes it
+      search more, exactly as the collision cache did. What it does change is where a
+      search's time goes: near-panel states are now about 30x dearer than open-air ones
+      rather than 1.8x, so the tree's habit of re-covering the pocket at a median 6.7 mm
+      node spacing against an 80 mm extend is worth a great deal more than it was.
+  - **The contact test is remembered per state.** `Cell.in_collision` keeps its verdict in
+    `_collision_cache`, keyed like every other cache on the cell by the gun and the joint
+    vector, and emptied where the margins move. Clearance and tool position were cached
+    for exactly this reason and the verdict under them was not. The callers re-ask it **by
+    construction**: counted by caller over that run, `_chain_scan` asked 11265 times and
+    99% were states `plan_linear` had tested a moment before as the inverse kinematics'
+    own answer; `cartesian._steer` 92%; `_checked` and the final `validate` 100%. A third
+    of all 59144 calls, and about half of the time, since the repeats are concentrated on
+    tracked lines beside the panels where a test is dearest.
+    - **The contact test is the whole of what is remembered, and now the whole of what
+      is asked.** While the scoped weld relaxation existed it was deliberately left out of
+      this cache -- it depended on points, a radius and a floor the cache knew nothing
+      about -- which is what let a scope be installed and removed without anything being
+      forgotten. With the scope gone the verdict depends on the margins and the gun alone,
+      so the cache is emptied in one place, `_set_obstacle_clearance`, and keyed on the
+      gun.
+    - **A remembered clear state is still loaded.** `segment_scan` reads the tool position
+      and the clearance off the state `in_collision` leaves loaded, so a hit that skipped
+      the load would have it reading whichever state was tested last. A remembered contact
+      loads nothing, every caller stopping there. This said the load was 0.13 ms against a
+      test of 2 to 30, which had it the wrong way round -- see the state-solver bullet.
+    - **Keys are exact, and that leaves some on the table.** A chain re-derived from a
+      different seed lands within inverse-kinematics tolerance of the states it had
+      before and misses, so `solve_pose` hits only 26%. Rounding the key would catch them
+      and would make a verdict at a boundary depend on what had been asked earlier, which
+      is not a trade this takes.
+  - **The fused floor manager that used to stand here is gone, and so is the second
+    question it answered.** Outside a weld's radius `in_collision` asked for contact at
+    the margins and then, of every state that cleared, whether anything was within the
+    scope's floor -- a second pass over the whole scene through a clearance manager, 23844
+    of the 29358 clearance queries one transit's refinement made. `Cell._floor_manager`
+    was the planning manager with no robot-to-part pair held to less than the floor, so a
+    state it found nothing at was clear on both counts from one test, and a contact it
+    found was *read* to say which question it settled. It was checked state for state
+    against the two questions asked apart on a real cell -- **6000 states, every branch
+    populated, none differing** -- and it bought 3.46 ms to 1.94 on a clear state outside
+    the radius.
+    - **Removing the scope removed the question rather than the optimisation.** With one
+      question left there is nothing to fuse, so `_floor_manager`, `_planning_contact` and
+      `_clear_of` went with it. The saving they represented is still had, and for free:
+      the second contact test is not made faster, it is not made.
+    - This was already visible before the scope was removed. Where the earned weld
+      clearance came out at the cell's own, the margins already reached the floor, the
+      planning manager *was* its own floor manager, and the scope's question could never
+      have refused a state -- it was still asked of every one.
+  - **Measured as the same work done both ways**, every stage a fixed amount of work from
+    a fixed seed rather than a budget, the old `in_collision` restored for one side: a tree
+    search to its join, the route swept, scored, densified, reduced, verified, stood off
+    and retuned.
+
+    | stage | before | after | |
+    |---|---|---|---|
+    | tree search to a join | 39.3 s | 19.8 s | x1.98 |
+    | the route swept for faults | 4.6 s | 0.1 s | |
+    | the route scored | 20.2 s | 11.4 s | x1.78 |
+    | densify, reduce, split, verify | 41.6 s | 30.1 s | x1.38 |
+    | the four stand-off trials | 79.2 s | 25.3 s | x3.12 |
+    | the opening retuned | 30.5 s | 6.1 s | x4.96 |
+    | **all of it** | **215.2 s** | **92.8 s** | **x2.32** |
+
+    **The route, its cost, the reduced route, the stand-off's choice and the retuned
+    opening were identical**, which is the claim that matters: nothing here changes an
+    answer. The two timed passes cannot be compared that way, being wall clock by design;
+    given the same budget shortcut made 27 attempts where it had made 19, and polish
+    reached its 20-attempt floor in 31 s where it had needed 55.
+  - **What this does not do is shorten a run by 2.3x, and the reason is the architecture
+    rather than the measurement.** The stages that got faster are the unbudgeted ones.
+    Everything else stops on a clock, so a faster test there buys more samples in the same
+    time -- a tree likelier to join inside its window, more cuts tried -- and not a shorter
+    wait. Summed over the shipped logs of ten studies the stage times divide as: phase-one
+    runs that timed out 35%, Cartesian searches that failed 19%, `_finish` 22%, phase-one
+    runs that solved 9%, tree searches that solved 6%, refused routes 4%. **More than half
+    of a run is searches that return nothing**, each spent to the last second of its
+    window.
+    - **A give-up rule for phase one was replayed against those logs and not built.**
+      "An opening that has had P runs and never solved gets no more", applied to the 47
+      logged blocks with their real outcomes: P=2 would not have spent 9555 s of 23164 and
+      would have cost 3 blocks their only solution; P=3, 6645 s and 2 blocks. The sampler
+      is heavy-tailed -- two blocks solved first at their 18th and 22nd run -- so there is
+      no patience that is both worth having and free, and which side of that to take is
+      the operator's call -- and `--phase-one-solve-seconds` has only ever been raised, 8
+      to 15 to 25 to 30.
+  - **`shortcut` no longer proposes a span it has already refused, and stops when there is
+    none left.** A cut is a function of the route and its two ends and of nothing drawn --
+    the line is tracked from a fixed seed -- so a span refused on the route as it stands is
+    refused again. `refused` holds them and is emptied when a cut is kept, that moving the
+    indices and every cost they stand for; `_open_span` draws uniformly over what is left.
+    When every span has been tried since the last cut the pass ends and says so, handing
+    back the rest of its budget -- the one place a budget is now returned rather than
+    spent, and it is lossless. How often that happens is not known: it needs a short
+    dense route, a route of 150 points having eleven thousand spans and a pass trying a
+    few hundred, and the logs record the raw point count rather than the dense one. The
+    log line says when it does.
+  - **`polish` asks whether a waypoint can be dropped once per three states.** A removal
+    sweep follows every relocation that is kept and asked it of every interior waypoint,
+    each a whole move swept end to end. A relocation moves one point, so it changes that
+    question for three of them at most. `keeps` remembers the triples already answered.
+  - **Both passes now say when they last gained anything**, in the log line -- "the last
+    gain at attempt 22, 17.4s in" -- and as a `progress` note in the stage trace carrying
+    every kept attempt as `attempt@seconds=cost`. Both spend their budget in full, and
+    until this nothing recorded how much of it was still buying anything: over the
+    shipped logs of seven studies 11 of 29 polish passes gained 1% or less for their
+    240 s. **No stall rule
+    was added**, there being no convergence curve to size one against; that note is the
+    curve, and the next logs will have it for every leg.
+  - `_report_work` prints the hits beside the tests, and how many tests settled the weld
+    scope as well. Note that it still covers `_finish` alone -- its snapshot is taken
+    there -- so nothing counts the searches' own work.
+- Order in `_finish` is densify → refine → split → verify, one sampling pass. It was
+  sample → gate → densify → … while the gate stood: the fill follows the curve each move
+  will really be flown along, which needs a model, and there was no model until the gate
+  had said whether the leg was to have a zone, so the route was sampled once along the
+  chord for the gate and again along the real curves for the passes. With the band
+  answering per move the model exists first and the profile-aware fill is the only fill.
+  The split is a reading of the finished path, not a decision imposed before it.
+  Inside `refine` it is shortcut → simplify → stand-off → polish → stop band: the
+  stand-off trials come after the route has been reduced, so they are not re-deciding cuts
+  that are already settled, and before polish, so polish judges the route as it will be
+  flown rather than one the gun has since moved out from under.
