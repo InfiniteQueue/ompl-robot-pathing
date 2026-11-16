@@ -33,6 +33,14 @@ Two things this module holds to, both learned the hard way elsewhere in the plan
   Scattered seeds are still tried, so other configurations remain reachable, but only by
   starting a new edge from a node that already sits in one -- never by flipping halfway
   along a line the robot will drive without stopping.
+
+  The consequence is worth stating plainly, because it bounds what this search can ever
+  answer: **the configuration each half starts in is the one it dies in.**  Every node is
+  joined to its root by a chain of stations none of which moved a joint more than
+  ``jump_rad``, so a tree cannot walk from one inverse-kinematics branch to another, and
+  two endpoints that need a wrist turned between them have no route here at any budget.
+  ``branch_refusals`` is how the search notices that it is in that case rather than
+  spending the clock on it -- see ``plan_cartesian``.
 """
 from __future__ import annotations
 
@@ -92,6 +100,7 @@ class CartesianBudget:
     jump_rad: float = 0.50          # largest per-joint step allowed between two stations
     orient_weight_mm_per_rad: float = 200.0     # a radian of turn as this much tool travel
     branch_seeds: int = 8           # scattered seeds tried when the continuing one fails
+    branch_refusals: int = 16       # coincident meetings refused before the case is given up
     recut: bool = True              # re-plan the stretches outside the band with OMPL
     seed: int = 0
     box: tuple | None = None        # a wider box to sample in as well; see ``_sample``
@@ -322,6 +331,8 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     forward = True                          # whether `a` is still the start tree
 
     iters = 0
+    met = refused = 0       # arrivals at one pose, and those refused on the branch test
+    worst = 0.0             # furthest apart two such arrivals were, on any one joint
     while iters < budget.max_iters and time.perf_counter() < deadline:
         iters += 1
         target = (b.nodes[0].pose if rng.uniform() < budget.goal_bias
@@ -357,8 +368,12 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
             # state: `link` ended wherever the inverse kinematics landed, and the far
             # tree's node is its own solution for that pose.  Closing that gap is a joint
             # move at a standstill, so it is checked as one.
+            met += 1
             far = b.nodes[j].q
-            if float(np.max(np.abs(cursor - far))) > budget.jump_rad:
+            apart = float(np.max(np.abs(cursor - far)))
+            if apart > budget.jump_rad:
+                refused += 1
+                worst = max(worst, apart)
                 break                       # met in space, on different branches
             if cell.segment_collides(cursor, far, max_step=max_step):
                 break
@@ -369,12 +384,39 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                     f"{len(start.nodes) + len(goal.nodes)} nodes, {len(route)} states")
             return _checked(cell, route, max_step, qa, qb)
 
+        # Every meeting so far has been at one pose with the two halves in different
+        # configurations, and enough of them to be the case rather than the luck of where
+        # the connect aimed.  That is not a search that needs longer: the two trees are in
+        # branches neither can leave -- see the note on this module -- so every remaining
+        # second would buy another arrival refused on the same test.  Ended here rather
+        # than predicted beforehand, because this is the tree's own evidence at poses it
+        # really reached, where a test on the endpoints alone can only guess: a transit
+        # whose J1 honestly sweeps two radians looks identical to one needing a wrist
+        # turned, and refusing that one its tree would cost a route to save a minute.
+        #
+        # Conservative in the one way that matters: a single meeting the branch test
+        # *passed* -- refused by the collision check instead, so ``refused`` falls behind
+        # ``met`` -- means the two halves can hold one configuration between them after
+        # all, and then the problem is geometry and the clock is worth spending.
+        if refused >= budget.branch_refusals and refused == met:
+            treetrace.offer(label, start, goal)
+            raise PlanningError(
+                f"cartesian tree: the two halves met at one tool pose {met} times and "
+                f"arrived in a different configuration every time, up to {worst:.3f} rad "
+                f"apart on one joint against the {budget.jump_rad:g} rad a straight move "
+                f"may change; a tool-line edge cannot turn a wrist, so this pair has no "
+                f"route here at any budget ({iters} samples, "
+                f"{len(start.nodes)} and {len(goal.nodes)} nodes)")
+
         a, b, forward = b, a, not forward
 
     treetrace.offer(label, start, goal)
     raise PlanningError(
         f"cartesian tree: no straight-line route after {iters} samples and "
-        f"{budget.seconds:g}s ({len(start.nodes)} and {len(goal.nodes)} nodes)")
+        f"{budget.seconds:g}s ({len(start.nodes)} and {len(goal.nodes)} nodes)"
+        + (f"; the two halves met at one pose {met} time"
+           f"{'' if met == 1 else 's'} and were refused on the branch test every time"
+           if met and refused == met else ""))
 
 
 def _join(a: _Tree, ia: int, b: _Tree, ib: int, forward: bool) -> list[np.ndarray]:
