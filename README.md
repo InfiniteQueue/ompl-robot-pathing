@@ -716,6 +716,21 @@ different openings are labelled separately, each under its own opening. The fina
 validation checks each phase under its label, and `output.Timing` holds `LIN` moves to the
 tool speed cap.
 
+**The refinement happens after every segment has been searched, not inside each one.**
+A search owns the cell for the length of its segment — `_clearance_for` sets the obstacle
+margin the whole route is judged to, and the gun opening moves with it — so no two
+searches can run at once. A refinement owns none of that: it takes a finished route and
+reads clearances off it. So the searches run in order, each segment's shortcut and polish
+are queued, and the queue is emptied across `--workers` threads once there is no searching
+left to interleave with. A study is a dozen segments and more, so that is where the
+parallelism is, with nothing pinned and nothing merged.
+
+The legs are queued *finished* — the candidate ranking, the stop-band clearing, the split
+by motion type and the verification all ran during the search, because those are what let
+a route be refused and the next candidate offered. What is deferred is only the two passes
+that make a working route quicker, and a refinement that fails leaves the segment with the
+route it already had.
+
 **A segment that fails leaves something to look at.** Every budget above decides how hard
 to search; none of them says why a particular transit could not be solved, and the log can
 only say that OMPL returned no solution. So when a segment fails, `--treeview` writes the
@@ -1758,7 +1773,8 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--phase-two-max-runs` | 2 | OMPL runs for a gap the recut has to join, stopping at the first solution. No longer a stage of a transit |
 | `--phase-two-solve-seconds` | 240 | how long one of those runs may search |
 | `--segment-minutes` | 60 | wall clock for one segment's search; past it the segment is reported as failed and the run moves on. 0 removes the limit |
-| `--workers` | 1 | how many solve and polish attempts run at once, on threads. 0 is one per core bar one, capped at 8. Reaches the Cartesian tree (one thread per gun opening), the joint tree's phase one (one per run) and the polish (one per stretch of the route, merged, over two rounds with the cuts moved between them; a route too short to cut is polished from several seeds and the cheapest kept); OMPL stays sequential. 1 runs everything inline |
+| `--workers` | 1 | how many attempts run at once, on threads. 0 is one per core bar one, capped at 8. Reaches the Cartesian tree (one thread per gun opening), the joint tree's phase one (one per run) and the refinement, which is deferred until every segment has been searched and then run a segment per thread; OMPL stays sequential. 1 runs everything inline |
+| `--refine-attempts` | 1 | how many times each segment's shortcut and polish are run, the quickest kept. Every attempt is a job in the one deferred queue, so attempts fill the threads alongside other segments rather than waiting their turn |
 | `--direct-clearance-mm` | 0 | room the straight joint move has to keep to be taken without searching; under it the next gun opening is tried and then the searches. 0 asks nothing beyond the collision check |
 | `--min-gun-openings` | 5 | gun openings phase one deals its runs round, the cheapest solution of the set shipping |
 | `--extra-gun-openings` | 3 | further openings held back from the direct transit, for the detour to walk leg by leg |

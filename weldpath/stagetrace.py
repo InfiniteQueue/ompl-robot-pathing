@@ -55,6 +55,15 @@ def stop() -> None:
     _fh = None
 
 
+def active() -> bool:
+    """Whether a trace is being written, for a caller deciding how to schedule around it.
+
+    The file is one stream of stages belonging to one route at a time, so a caller that
+    would otherwise run several routes at once has to know not to.
+    """
+    return _fh is not None
+
+
 def section(title: str) -> None:
     """A heading for whatever follows, such as the segment being planned."""
     if _fh is not None:

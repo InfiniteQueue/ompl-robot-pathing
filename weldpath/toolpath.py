@@ -29,10 +29,11 @@ from .cartesian import CartesianBudget
 from .jointtree import JointBudget
 from .fallback import FallbackFinder
 from .penalty import GunPreference
+from . import parallel
 from .planning import (DEFAULT_FINISH_ATTEMPTS, LIN, PTP, Deadline, LinearZone,
-                       OmplBudget, PlanningError,
+                       MotionModel, OmplBudget, PlanningError,
                        Relocation, StandOff, opening_cap, snap_opening, unique_openings,
-                       plan_freespace,
+                       plan_freespace, _flatten, _refine_runs, _stop_cost,
                        validate)
 
 
@@ -210,6 +211,35 @@ class Segment:
     raw_phases: list[Phase] = field(default_factory=list)
 
 
+# How far apart two attempts' seeds are kept.  An attempt seeds both randomised passes of
+# every leg it refines, so the stride has to clear the leg count of any segment by a wide
+# margin, or attempt 1 of leg 2 would be attempt 2 of leg 1 and the second attempt would
+# repeat the first's draws on a leg it had already done.
+_ATTEMPT_SEED_STRIDE = 1_000
+
+
+@dataclass
+class _Pending:
+    """One searched segment, waiting for the refinement that was deferred off it.
+
+    Everything ``_assemble`` needs and nothing it does not.  ``legs`` is what the search
+    returned -- a list of ``(runs, opening)``, one per leg of the transit, a detour having
+    three where a direct transit has one -- and it is the only part a refinement replaces.
+    The phases built before the search (the weld the segment departs from) travel with it
+    because they are already in ``phases`` and the refinement does not touch them.
+    """
+    a: Locator
+    b: Locator
+    final: bool
+    qa: np.ndarray
+    qb: np.ndarray
+    legs: list
+    raw_legs: list | None
+    phases: list
+    raw_phases: list
+    weld_phase: "Phase | None"
+
+
 # Headroom past the clearance a locator has to meet, so the report can distinguish a pose
 # that just scrapes past from one with room around it.  Without it the query stops at the
 # threshold and every success reads the same.
@@ -263,7 +293,7 @@ class ToolpathPlanner:
                  stand_off: bool = True,
                  recut_hulls: bool = True, recut_attempts: int = 3,
                  recut_floor_mm: float = 2.0,
-                 keep_unrefined: bool = False, log=print):
+                 keep_unrefined: bool = False, refine_attempts: int = 1, log=print):
         self.cell = cell
         self.man = man
         self.log = log
@@ -371,6 +401,9 @@ class ToolpathPlanner:
         self.treeview_max_poses = max(0, int(treeview_max_poses))
         self.treeview_searches = max(0, int(treeview_searches))
         self.keep_unrefined = keep_unrefined
+        # How many times each segment's refinement is run once every segment has been
+        # searched; the quickest result is kept.  See ``_refine_pending``.
+        self.refine_attempts = max(1, int(refine_attempts))
         # None means "no separate weld rule", i.e. the cell's own clearance throughout.
         self.weld_clearance = (None if weld_clearance_mm is None
                                else weld_clearance_mm * man.scale)
@@ -955,6 +988,7 @@ class ToolpathPlanner:
         self.fallback.announce()
 
         segments: list[Segment] = []
+        pending: dict = {}
         pairs = list(zip(locators, locators[1:]))
         for index, (a, b) in enumerate(pairs):
             seg = Segment(a.name, b.name)
@@ -975,7 +1009,7 @@ class ToolpathPlanner:
                 if b.name not in anchors:
                     raise PlanningError(f"no reachable joint solution for '{b.name}'")
                 with self._clearance_for(a, b, anchors=anchors):
-                    seg.phases, seg.raw_phases = self._plan_pair(
+                    pending[len(segments)] = self._plan_pair(
                         a, b, anchors, deadline, final=index == len(pairs) - 1)
                 spent = deadline.spent
             except PlanningError as exc:
@@ -989,7 +1023,142 @@ class ToolpathPlanner:
                 treetrace.stop()
                 self.log(f"    segment {a.name} -> {b.name} planned in {_took(spent)}")
             segments.append(seg)
+
+        self._refine_pending(segments, pending, anchors)
         return segments
+
+    def _refine_pending(self, segments: list[Segment], pending: dict, anchors) -> None:
+        """Spend the refinement budgets, every segment's at once, now the searching is done.
+
+        **Why this is a stage of its own.**  Refining a segment the moment it is searched
+        is the one ordering that cannot use more than one thread: a search owns the cell's
+        margins and its gun for the length of a segment -- ``_clearance_for`` wraps the
+        whole of it and writes to the environment -- so nothing of another segment may run
+        beside it.  A refinement owns none of that.  It takes a finished route and asks
+        clearances of it, which is what :meth:`Cell.worker` makes safe for a thread.  So
+        every segment is searched first, and the refinements, which by then have nothing
+        left to interleave with, are run together.
+
+        That is also the better parallel axis.  A study is a dozen segments and more; the
+        work splits across them with nothing pinned and nothing merged, where splitting one
+        route into stretches had to pin a waypoint at every cut and so changed which
+        waypoints the pass was able to drop.
+
+        ``--refine-attempts`` is how many times a segment is refined.  One by default, so
+        the passes are spent exactly as they were; more runs the same segment from
+        different seeds and keeps whichever came out quickest, the two randomised passes
+        being hill climbs whose seed chooses the hill.  Every attempt is its own job in the
+        one queue, so three segments at two attempts is six jobs over the threads rather
+        than three that each wait their turn.
+
+        A refinement that fails leaves the segment with the route it already had.  That
+        route was finished and verified during the search -- the stop band cleared, the
+        split made, the whole of it checked -- so it is shippable, and the passes that
+        failed on it only ever had its speed to offer.  Failing the segment over them would
+        throw away a working route to no end.
+        """
+        jobs = [(index, p, number)
+                for index, p in pending.items() if p.legs
+                for number in range(max(1, self.refine_attempts))]
+        if not jobs:
+            return
+        # The stage trace is one file written as the passes run, so several refinements
+        # writing at once would interleave two segments inside one route's stages and the
+        # file would describe a route nobody planned.  It is a diagnostic asked for by
+        # name, so the honest trade is to keep it readable and spend the time.
+        traced = stagetrace.active()
+        threads = 1 if traced else parallel.threads(len(jobs))
+        self.log(f"refining {len(pending)} segment"
+                 f"{'' if len(pending) == 1 else 's'}: {len(jobs)} job"
+                 f"{'' if len(jobs) == 1 else 's'} of up to "
+                 f"{self.shortcut_seconds:g}s shortcutting and "
+                 f"{self.polish_seconds:g}s polishing"
+                 + (f", {threads} at once" if threads > 1
+                    else ", one at a time because the stage trace is on" if traced
+                    else ""))
+        # **Every job gets its own cell, and it is cloned here, under that segment's own
+        # margins.**  A segment is planned inside ``_clearance_for``, which sets the
+        # obstacle clearance the whole of it is judged to -- a weld at either end earns a
+        # more permissive figure than a transit between two vias -- and that margin lives
+        # on the *environment*, which every worker shares.  Two segments refining at once
+        # under one environment would therefore be judged to whichever margin was set
+        # last.  What makes it sound is that a worker's contact managers are clones: they
+        # carry the margins in force when the clone was taken, and are never consulted
+        # against the environment again.  So the clone is taken inside the context, one
+        # per job, on this thread, and each refinement then runs to the margin its own
+        # segment was planned to.
+        #
+        # Taken even at one thread, so there is one path through here rather than two.
+        views = []
+        for _index, p, _number in jobs:
+            with self._clearance_for(p.a, p.b, anchors=anchors):
+                views.append(self.cell.worker())
+
+        def attempt(index: int, p: "_Pending", number: int, view: Cell):
+            seg = segments[index]
+
+            def job(log):
+                try:
+                    return self._refine_legs(view, p, number, log)
+                except PlanningError as exc:
+                    log(f"    ! {seg.source} -> {seg.target} attempt {number + 1} could "
+                        f"not be refined, so the route it had stands: {exc}")
+                    return None
+
+            return job
+
+        done = parallel.run(
+            [attempt(index, p, number, view)
+             for (index, p, number), view in zip(jobs, views)], threads, self.log)
+        self.cell.absorb(*views)
+
+        # The quickest attempt per segment, then assembled in segment order on this thread.
+        best: dict = {}
+        for (index, _p, _number), got in zip(jobs, done):
+            if got is not None and (index not in best or got[0] < best[index][0]):
+                best[index] = got
+        for index, p in pending.items():
+            if not p.legs:
+                continue
+            seg = segments[index]
+            if index in best and self.refine_attempts > 1:
+                costs = ", ".join(f"{got[0]:.2f}" for (i, _p, _n), got in zip(jobs, done)
+                                  if got is not None and i == index)
+                self.log(f"  {seg.source} -> {seg.target}: {costs} s over "
+                         f"{self.refine_attempts} attempts, keeping the quickest")
+            legs = best[index][1] if index in best else p.legs
+            try:
+                with self._clearance_for(p.a, p.b, anchors=anchors):
+                    seg.phases, seg.raw_phases = self._assemble(p, legs)
+            except PlanningError as exc:
+                seg.error = str(exc)
+                self.log(f"  ! {seg.source} -> {seg.target}: {exc}")
+
+    def _refine_legs(self, cell: Cell, p: "_Pending", number: int, log):
+        """One attempt at one segment: every leg refined, and what the result costs.
+
+        Each leg is refined at the gun opening it is flown at, which the refinement may
+        itself change -- ``_stand_off`` trades the opening for air around the tool -- so
+        the opening comes back with the leg and travels on to ``_assemble``.
+
+        The cost is the stop-to-stop time of the whole segment under the penalty, which is
+        what the passes themselves work against, so ranking two attempts by it ranks them
+        on the thing they were trying to improve.
+        """
+        out = []
+        for leg, (runs, opening) in enumerate(p.legs):
+            with cell.gun_opening(opening):
+                got, chosen = _refine_runs(
+                    cell, runs, zone=self.zone,
+                    shortcut_seconds=self.shortcut_seconds,
+                    polish_seconds=self.polish_seconds,
+                    check_step=self.check_step, relocate=self.relocate,
+                    opening=opening, stand_off=self.stand_off, gun=self.gun,
+                    seed=number * _ATTEMPT_SEED_STRIDE + leg, log=log)
+            out.append((got, chosen))
+        model = MotionModel(cell, max_step=self.check_step, zone=self.zone)
+        cost = sum(_stop_cost(model, _flatten(runs)) for runs, _o in out)
+        return cost, out
 
     def _place_locators(self) -> dict[str, np.ndarray]:
         """Solve every locator in manifest order, seeding each from the last that placed.
@@ -1216,8 +1385,25 @@ class ToolpathPlanner:
         return [leave_open, arrive_open]
 
     def _plan_pair(self, a: Locator, b: Locator, anchors,
-                   deadline: Deadline | None = None, final: bool = False
-                   ) -> tuple[list[Phase], list[Phase]]:
+                   deadline: Deadline | None = None, final: bool = False) -> "_Pending":
+        """Solve one segment and stop at the legs, leaving the refinement to be queued.
+
+        **The search and the optimisation are two stages of a run now, not one.**  The
+        optimisation is the only part of a segment that is worth running beside another
+        segment's -- a search holds the cell's margins and its gun, where a refinement
+        takes a finished route and reads clearances off it -- and it is also the part that
+        has no reason to happen when it happens.  Nothing downstream of a segment needs
+        that segment refined before the next one is searched.  So this returns what the
+        search found, ``run`` collects those across every segment, and the refinements run
+        together once there is no searching left to interleave with.
+
+        The legs come back unrefined but **not unfinished**: the candidate ranking, the
+        stop-band clearing, the split by motion type and the verification all ran, because
+        those are what let a route be *refused* and the next candidate offered -- see
+        ``_finish_ranked``.  Deferring those would mean deferring the whole candidate list
+        and the cell state that ranked it.  What is deferred is the two passes that only
+        make a working route quicker: the shortcut and the polish.
+        """
         # The path starts at the first locator, not at start_state. start_state seeds
         # inverse kinematics and sets the gun's initial opening; it never contributes a
         # waypoint of its own, and it is not what a difficult transit detours through --
@@ -1256,8 +1442,13 @@ class ToolpathPlanner:
             fallback_find=self._fallback_for(a, b, transit_start, transit_end),
             fallback_runs=self.fallback_runs, relocate=self.relocate,
             deadline=deadline,
-            shortcut_seconds=self.shortcut_seconds,
-            polish_seconds=self.polish_seconds,
+            # Nothing here.  ``plan_freespace`` already understands a leg handed no
+            # refinement budget -- it is how the two-leg fallback defers legs it may yet
+            # discard -- and this is that same deferral applied to every leg.  The real
+            # budgets are spent by ``_refine_pending`` once every segment has been
+            # searched.
+            shortcut_seconds=0.0,
+            polish_seconds=0.0,
             zone=self.zone,
             direct_clearance=self.direct_clearance_mm,
             finish_attempts=self.finish_attempts,
@@ -1268,6 +1459,22 @@ class ToolpathPlanner:
             gun=self.gun, stand_off=self.stand_off,
             retune_openings=self.retune_openings,
             record=raw_legs, log=self.log)
+        return _Pending(a=a, b=b, final=final, qa=qa, qb=qb, legs=legs,
+                        raw_legs=raw_legs, phases=phases, raw_phases=raw_phases,
+                        weld_phase=weld_phase)
+
+    def _assemble(self, p: "_Pending", legs: list) -> tuple[list[Phase], list[Phase]]:
+        """Turn one segment's refined legs into the phases that ship, and check them.
+
+        Everything here reads or writes the one cell this planner owns and none of it is a
+        search, so it stays on the calling thread and runs per segment in order: a few
+        milliseconds of validation against the minutes the refinement it follows takes.
+        """
+        a, b, final = p.a, p.b, p.final
+        qa, qb = p.qa, p.qb
+        phases, raw_phases = p.phases, p.raw_phases
+        weld_phase, raw_legs = p.weld_phase, p.raw_legs
+
         # What the robot leaves a weld holding is what the transit out of it was solved
         # at, which is only known now.  The declared value seeded that search and is a
         # preference, not a commitment: writing it out unchanged would have the gun change

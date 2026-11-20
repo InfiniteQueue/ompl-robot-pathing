@@ -357,6 +357,18 @@ def build_parser() -> argparse.ArgumentParser:
                         "Path 4 legs at 15 s each it solved 2 of 12 attempts against "
                         "OMPL's 3. It is here to be measured, not because it is better "
                         "(default: %(default)s)")
+    #HOW MANY TIMES EACH SEGMENT IS REFINED
+    p.add_argument("--refine-attempts", type=int, default=1, metavar="N",
+                   help="how many times each segment's shortcut and polish are run, the "
+                        "quickest result being kept. The refinements of every segment are "
+                        "deferred until all the searching is done and then run together "
+                        "across --workers threads, so attempts are jobs in that one queue "
+                        "rather than repeats that wait their turn. 1 spends the passes "
+                        "exactly as they were spent before they were deferred; more is "
+                        "worth having because both passes are hill climbs whose seed "
+                        "chooses the hill, and it costs that many times the budget per "
+                        "segment, bounded by how many threads there are to spend it on "
+                        "(default: %(default)s)")
     #HOW MANY SOLVE AND POLISH ATTEMPTS RUN AT ONCE
     p.add_argument("--workers", type=int, default=0, metavar="N",
                    help="how many solve and polish attempts may run at once, on threads. "
@@ -1469,6 +1481,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         recut_hulls=args.recut_blocking_hulls,
         recut_attempts=args.recut_attempts,
         recut_floor_mm=args.recut_floor_mm,
+        refine_attempts=args.refine_attempts,
         treeview=args.treeview, treeview_max_poses=args.treeview_max_poses,
         treeview_searches=args.treeview_searches,
         relocate=Relocation(min_attempts=args.polish_min_attempts,
