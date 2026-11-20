@@ -1319,7 +1319,14 @@ def _polish_seeds(model: "MotionModel", path: list[np.ndarray], *, time_budget: 
     thread's: :func:`_polish_sectioned`.
     """
     attempts = threads
-    log(f"      polishing from {attempts} seeds at once, keeping the cheapest")
+    # **Says that it is the fallback, and why.**  This line and the divided one are the
+    # two ways a polish can report itself, and one of them reading as an ordinary
+    # description of the pass left no way to tell a short route from a stale build -- the
+    # text was the same in the release before the route was ever divided.  A log that
+    # cannot distinguish those is a log that has to be checked against a commit.
+    log(f"      {len(path)} points is too few to divide into stretches "
+        f"({_POLISH_MIN_DIVIDE} needed), so polishing the whole route from {attempts} "
+        f"seeds at once and keeping the cheapest")
     views = [model.cell.worker() for _ in range(attempts)]
     models = [MotionModel(view, max_step=model.max_step, zone=model.zone,
                           pinned=model.pinned) for view in views]
@@ -1370,7 +1377,7 @@ def _polish_best(model: "MotionModel", path: list[np.ndarray], *, time_budget: f
     threads = parallel.setting()
     if threads <= 1 or time_budget <= 0 or len(path) < 3:
         return polish(model, path, time_budget=time_budget, relocate=relocate, log=log)
-    if (len(path) - 1) // 2 >= 2:
+    if len(path) >= _POLISH_MIN_DIVIDE:
         return _polish_sectioned(model, path, time_budget=time_budget,
                                  relocate=relocate,
                                  threads=min(threads, (len(path) - 1) // 2), log=log)
@@ -2098,6 +2105,13 @@ _POLISH_ATTEMPTS = 4
 # of a stretch in the second -- and the budget is divided by this, so a third round would
 # buy a third turn nobody needs with a third less time on each of the others.
 _POLISH_ROUNDS = 2
+
+# The fewest waypoints a route can be divided into stretches at.  Two stretches need an
+# interior waypoint each and share the cut, so five: the two ends, the cut, and one point
+# either side of it.  Named rather than written out at the test, because the log line that
+# explains the fallback quotes it and a figure quoted in a message that has drifted from
+# the rule it describes is worse than no message.
+_POLISH_MIN_DIVIDE = 5
 
 # The rest of OMPLSolverConfig's documented defaults, used to recognise the struct.
 _SOLVER_SIGNATURE = (10, 0, 1)          # max_solutions, simplify, optimize
