@@ -25,6 +25,7 @@ from tesseract_robotics.tesseract_motion_planners import PlannerRequest
 from tesseract_robotics.tesseract_motion_planners_ompl import (
     OMPLMotionPlanner, OMPLRealVectorMoveProfile)
 
+from . import parallel
 from . import stagetrace
 from .cell import STOP_BAND_JOINT, Cell
 
@@ -1147,6 +1148,75 @@ def _stand_off(cell: Cell, path: list[np.ndarray], *, opening: float | None,
     return best, value
 
 
+def _stop_cost(model: "MotionModel", path: list[np.ndarray]) -> float:
+    """What a polished route costs, stop to stop, under the penalty.
+
+    The same sum ``polish`` itself works against, recomputed here so that several attempts
+    can be ranked against one another on one measure rather than on each attempt's own
+    report of itself.  It is arithmetic over the penalty factors and nothing is collision
+    checked: every path offered here has already been checked by the attempt that built
+    it, every replacement in it one at a time.
+    """
+    factors = [model.penalty_factor(p) for p in path]
+    return sum(model.cost(path[i], path[i + 1], fa=factors[i], fb=factors[i + 1],
+                          stops=True)
+               for i in range(len(path) - 1))
+
+
+def _polish_best(model: "MotionModel", path: list[np.ndarray], *, time_budget: float,
+                 relocate: "Relocation | None", log=print) -> list[np.ndarray]:
+    """Polish from several seeds at once and keep the cheapest result.
+
+    **Why a set of attempts rather than one longer one.**  ``polish`` draws a waypoint and
+    a direction at random, keeps the displacement if the two moves through it get quicker,
+    and sweeps for removals after every one it keeps.  Where a draw lands decides what it
+    finds, and a draw that lands badly is not recovered by drawing for longer in the same
+    sequence -- the pass is a hill climb and the seed chooses the hill.  Running the same
+    budget from several seeds asks the question several times instead of once, and the
+    answers are directly comparable: every attempt starts from the same reduced path and
+    ends with a route whose cost is a number.
+
+    **Each attempt gets its own cell and its own model.**  The cell for the reason every
+    thread here needs one -- see :meth:`weldpath.cell.Cell.worker` -- and the model
+    because it caches the band and reach readings per state, which is exactly the kind of
+    sharing that would have two threads answering from each other's work.
+
+    **A tie goes to the earlier seed**, so the result does not depend on which thread
+    finished first; with one worker this is seed 1 alone, which is ``polish`` as it was.
+    """
+    threads = parallel.threads(_POLISH_ATTEMPTS)
+    if threads <= 1 or time_budget <= 0 or len(path) < 3:
+        return polish(model, path, time_budget=time_budget, relocate=relocate, log=log)
+
+    attempts = threads
+    log(f"      polishing from {attempts} seeds at once, keeping the cheapest")
+    views = [model.cell.worker() for _ in range(attempts)]
+    models = [MotionModel(view, max_step=model.max_step, zone=model.zone,
+                          pinned=model.pinned) for view in views]
+
+    def attempt(index: int, mine: "MotionModel"):
+        def job(log) -> tuple[float, list[np.ndarray]]:
+            # Seeded from the index, so attempt n is the same polish however many run
+            # beside it.  Seed 1 is what a sequential polish uses, so one of these
+            # attempts is always the answer the pass gave before it had company.
+            got = polish(mine, path, time_budget=time_budget,
+                         rng=np.random.default_rng(1 + index), relocate=relocate,
+                         log=log)
+            return _stop_cost(mine, got), got
+
+        return job
+
+    results = parallel.run([attempt(i, mine) for i, mine in enumerate(models)],
+                           threads, log)
+    model.cell.absorb(*views)
+    for mine in models:
+        model.overreach_refusals += mine.overreach_refusals
+    best = min(range(len(results)), key=lambda i: results[i][0])
+    costs = ", ".join(f"{cost:.2f}" for cost, _ in results)
+    log(f"      polish: {costs} s over {attempts} seeds; keeping seed {best + 1}")
+    return results[best][1]
+
+
 def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: float,
             polish_seconds: float, relocate: "Relocation | None" = None,
             anchors: list[int] | None = None,
@@ -1204,8 +1274,8 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
             model = MotionModel(model.cell, max_step=model.max_step, zone=model.zone,
                                 pinned=model.pinned)
         stagetrace.stage("stand off", model, reduced)
-    polished = polish(model, reduced, time_budget=polish_seconds, relocate=relocate,
-                      log=log)
+    polished = _polish_best(model, reduced, time_budget=polish_seconds,
+                            relocate=relocate, log=log)
     stagetrace.stage("polish", model, polished)
     # Outside the budgets on purpose: a route refined with none still ships its stops.
     cleared = clear_stop_band(model, polished, log=log)
@@ -1844,6 +1914,24 @@ DEFAULT_PLANNING_TIME = 5.0
 # shape happened to be unlucky and few enough that a forced crossing is found out inside
 # one segment clock.
 DEFAULT_FINISH_ATTEMPTS = 4
+# How far apart the seed blocks of two gun openings are kept.  A run's seed used to be
+# its position in one counter that ran across every opening, so which seed an opening got
+# depended on how many seeds the openings before it had happened to spend -- which made a
+# search reproducible only by reproducing the timing of every search before it, and is not
+# a thing that can be true at all once openings run at once.  Each opening now draws from a
+# block of its own, so opening k seed s is the same search whatever else ran, and
+# ``--workers`` changes what a run costs rather than what it searches.  Wide enough that no
+# opening could ever exhaust its block: a seed is a tree search of at least a fraction of a
+# second, and this is thousands of them.
+_SEED_BLOCK = 10_000
+
+# How many seeds the polish is asked from where there are threads for them.  It is the
+# thread count that decides in practice -- see ``_polish_best``, which asks for as many
+# attempts as it has threads -- and this is the ceiling on that: past a handful of draws
+# the pass is sampling the same few hills again, and every attempt holds its own copy of
+# the route and its own model caches for the length of the budget.
+_POLISH_ATTEMPTS = 4
+
 # The rest of OMPLSolverConfig's documented defaults, used to recognise the struct.
 _SOLVER_SIGNATURE = (10, 0, 1)          # max_solutions, simplify, optimize
 _planning_time_warned = False
@@ -3308,6 +3396,9 @@ class _Sampler:
     # OMPL needs none of this: its generator is its own and these bindings do not reach it,
     # which is why its runs already differ.
     joint_runs: int = 0
+    # How many runs of this phase may be in the air at once, or ``None`` for the run's
+    # own setting.  Only ever more than one where ``joint`` is set: see ``phase_one``.
+    workers: int | None = None
 
     def phase_one(self, qa: np.ndarray, qb: np.ndarray,
                   label: str = "phase 1",
@@ -3319,22 +3410,58 @@ class _Sampler:
         spends its whole first phase proving it.  Nothing carries between runs -- each
         builds its own tree from scratch -- so the order decides only which openings get
         the odd extra run where the two counts do not divide.
+
+        **That "nothing carries between runs" is what makes the phase parallel.**  Every
+        run gets its own seed, its own opening and its own clock, and the phase keeps the
+        set rather than stopping at the first that solves -- so running them at once
+        changes what the phase costs and not what it finds.  ``phase_two`` is the opposite
+        on both counts and is left alone: it stops at the first solution, so running its
+        runs together would spend every one of them to find what one of them found.
+
+        **Only where the joint tree is the planner.**  An OMPL run calls
+        ``Cell.sync_env`` -- it has to, the planner being handed the environment and
+        reading the gun opening off its current state -- and that writes to the one object
+        every thread here shares.  Nothing in ``Cell.worker`` makes that safe and nothing
+        could, short of a second environment per worker, which is the cost threads were
+        chosen to avoid.  So a sampler running OMPL runs its phase one exactly as it did.
         """
         if self.ompl.phase_one_runs <= 0:
             return []
         cycle = list(rotation if rotation is not None else self.openings.main) or [None]
-        self.log(f"      {label}: {self.ompl.phase_one_runs} runs of "
+        runs = self.ompl.phase_one_runs
+        threads = (parallel.threads(runs, self.workers) if self.joint is not None
+                   else 1)
+        self.log(f"      {label}: {runs} runs of "
                  f"{self.ompl.phase_one_seconds:g}s each over {_openings_note(cycle)}, "
-                 f"keeping the cheapest that solves")
-        found: list[_Solution] = []
-        for attempt in range(1, self.ompl.phase_one_runs + 1):
-            if self.deadline.ran_out(self.log, f"{label} after {attempt - 1} runs"):
-                break
-            got = self._run(qa, qb, self.deadline.clamp(self.ompl.phase_one_seconds),
-                            f"{label} run {attempt}", cycle[(attempt - 1) % len(cycle)])
-            if got is not None:
-                found.append(got)
-        return found
+                 f"keeping the cheapest that solves"
+                 + (f", {threads} at once" if threads > 1 else ""))
+        # Seeds are handed out here rather than drawn from the counter inside the run, so
+        # that run n is the same search however many runs are in the air beside it.  The
+        # counter still advances by the whole phase, so a later phase on this sampler
+        # carries on past these rather than repeating them.
+        first = self.joint_runs
+        self.joint_runs += runs
+        views = ([self.cell.worker() for _ in range(runs)] if threads > 1
+                 else [self.cell] * runs)
+
+        def attempt(index: int, view: Cell):
+            def job(log) -> "_Solution | None":
+                if self.deadline.expired:
+                    return None
+                return self._run(qa, qb,
+                                 self.deadline.clamp(self.ompl.phase_one_seconds),
+                                 f"{label} run {index + 1}",
+                                 cycle[index % len(cycle)],
+                                 cell=view, seed=first + index, log=log)
+
+            return job
+
+        got = parallel.run([attempt(i, view) for i, view in enumerate(views)],
+                           threads, self.log)
+        if threads > 1:
+            self.cell.absorb(*views)
+        self.deadline.ran_out(self.log, label)
+        return [one for one in got if one is not None]
 
     def phase_two(self, qa: np.ndarray, qb: np.ndarray,
                   label: str = "phase 2", rotation: list | None = None,
@@ -3397,10 +3524,20 @@ class _Sampler:
         return _cheapest(candidates, self.log) if candidates else None
 
     def _run(self, qa: np.ndarray, qb: np.ndarray, planning_time: float,
-             label: str, opening: float | None = None) -> _Solution | None:
-        """One sampling-planner solve, scored and reported.  ``None`` when it did not solve."""
+             label: str, opening: float | None = None, *,
+             cell: Cell | None = None, seed: int | None = None,
+             log=None) -> _Solution | None:
+        """One sampling-planner solve, scored and reported.  ``None`` when it did not solve.
+
+        ``cell``, ``seed`` and ``log`` are what a run needs to be one of several in the
+        air: the cell it may touch, the seed it must use rather than draw, and where its
+        lines go.  All three default to the sampler's own, which is the sequential call
+        this has always been.  Only the joint tree accepts them -- an OMPL run moves the
+        environment and so is never one of several; see ``phase_one``.
+        """
         if self.joint is not None:
-            return self._run_joint(qa, qb, planning_time, label, opening)
+            return self._run_joint(qa, qb, planning_time, label, opening,
+                                   cell=cell, seed=seed, log=log)
         with self.cell.gun_opening(opening):
             # The gun is not an inverse-kinematics variable but it is very much a state
             # one, and the planner reads the state the environment is holding rather than
@@ -3440,7 +3577,9 @@ class _Sampler:
         return _Solution(cost, plain, raw, opening)
 
     def _run_joint(self, qa: np.ndarray, qb: np.ndarray, planning_time: float,
-                   label: str, opening: float | None) -> _Solution | None:
+                   label: str, opening: float | None, *,
+                   cell: Cell | None = None, seed: int | None = None,
+                   log=None) -> _Solution | None:
         """:meth:`_run` through the joint-space tree -- ``--joint-tree``.
 
         The same question, the same budget and the same scoring, so a run of this is
@@ -3462,42 +3601,54 @@ class _Sampler:
           footing a Cartesian-tree route arrives on.
         """
         from .jointtree import plan_joint      # deferred: jointtree.py reads this module
+        cell = self.cell if cell is None else cell
+        log = self.log if log is None else log
         t0 = time.time()
         note = _gun_note(opening)
         # The configured seed is the *first* run's, so a single-run phase reproduces what
         # ``--joint-tree`` would give on its own and a multi-run phase walks on from there.
-        seed = self.joint.seed + self.joint_runs
-        self.joint_runs += 1
+        # A caller running several at once hands the seed in instead, having dealt them
+        # out before any of them started -- a counter read and bumped here would make a
+        # run's seed depend on which other runs happened to reach this line first.
+        if seed is None:
+            seed = self.joint.seed + self.joint_runs
+            self.joint_runs += 1
+        else:
+            seed = self.joint.seed + int(seed)
         # **It goes in every line this run prints.**  The search is deterministic in its
         # seed, so that is the one number saying whether two runs asked the same question,
         # and while nothing printed it four identical runs read as a planner with nothing
         # to offer rather than as a caller that had forgotten to vary anything.  It is also
         # what a reader needs to reproduce one run of a phase on its own.
         at = f"{note}, seed {seed}"
-        with self.cell.gun_opening(opening):
+        # Every read and every write below is this run's own cell -- the sampler's where
+        # it is running alone, a worker's where it is one of several.  Scoring happens
+        # here, inside the run, rather than back at the caller: the cache that measured
+        # the route is this cell's, and it is warm exactly here.
+        with cell.gun_opening(opening):
             try:
-                route = plan_joint(self.cell, qa, qb, max_step=self.check_step,
+                route = plan_joint(cell, qa, qb, max_step=self.check_step,
                                    label=f"{label}{note}",
                                    budget=replace(self.joint, seconds=planning_time,
                                                   seed=seed))
             except PlanningError as exc:
                 self.message = str(exc)
-                self.log(f"      {label}{at}: {self.message} "
-                         f"({time.time() - t0:.1f}s)")
+                log(f"      {label}{at}: {self.message} "
+                    f"({time.time() - t0:.1f}s)")
                 return None
             dt = time.time() - t0
-            fault = _route_fault(self.cell, route, self.check_step)
+            fault = _route_fault(cell, route, self.check_step)
             if fault is not None:
                 self.message = (f"the joint tree returned a route that is not clear under "
                                 f"this cell's own check ({fault}), which is a bug rather "
                                 f"than a resolution disagreement -- it validated every "
                                 f"edge with that same call")
-                self.log(f"      {label}{at}: {self.message} ({dt:.1f}s)")
+                log(f"      {label}{at}: {self.message} ({dt:.1f}s)")
                 return None
-            cost, plain = _path_cost(self.cell, route, self.check_step, zone=self.zone,
+            cost, plain = _path_cost(cell, route, self.check_step, zone=self.zone,
                                      gun=self.gun, opening=opening)
-        self.log(f"      {label}{at}: solved in {dt:.1f}s ({len(route)} states, "
-                 f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
+        log(f"      {label}{at}: solved in {dt:.1f}s ({len(route)} states, "
+            f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
         return _Solution(cost, plain, route, opening, JOINTED)
 
 
@@ -3782,7 +3933,8 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                          deadline: "Deadline | None" = None,
                          zone: "LinearZone | None" = None,
                          gun: "GunPreference | None" = None,
-                         wide_box_mm: float = 0.0) -> list[_Solution]:
+                         wide_box_mm: float = 0.0,
+                         workers: int | None = None) -> list[_Solution]:
     """Cartesian-tree routes for one transit, each scored as phase one scores its own.
 
     **The budgets are per gun opening.**  Each opening in turn is searched from
@@ -3828,30 +3980,41 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
     # opening to attempt: the rotation has already been screened, and the ones left out of
     # it are left out because they repeat another or leave a pose of the leg in collision.
     wanted = max(1, min(int(budget.gun_openings), len(rotation)))
-    log(f"      cartesian tree: {_openings_note(rotation[:wanted])}, up to "
+    openings = rotation[:wanted]
+    threads = parallel.threads(len(openings), workers)
+    log(f"      cartesian tree: {_openings_note(openings)}, up to "
         f"{budget.seconds:g}s on {'each' if wanted > 1 else 'it'} to find a route in "
-        f"linear space and {budget.process_seconds:g}s more on better ones")
-    found: list[_Solution] = []
-    run = 0
-    wide: tuple | None = None
-    for opening in rotation[:wanted]:
-        began = time.time()
-        solved: float | None = None
-        seeds = 0
-        while True:
-            left = deadline.clamp((began + budget.seconds if solved is None else
-                                   solved + budget.process_seconds) - time.time())
-            if left <= 0.0:
-                if deadline.expired:
-                    # The segment clock, not this opening's: there is no next opening to
-                    # move on to either.
-                    deadline.ran_out(log, f"the cartesian tree after {run} runs")
-                    return found
-                break
-            run += 1
-            seeds += 1
-            use = budget
-            if wide_box_mm > 0.0 and seeds > 1 and solved is None:
+        f"linear space and {budget.process_seconds:g}s more on better ones"
+        + (f", {threads} openings at once" if threads > 1 else ""))
+    # Primed here, where it is paid once, rather than inside an attempt, where every
+    # opening would pay it: reading the panels' extent costs a pass over every prepared
+    # OBJ -- 4.8 s on the cell this was built for -- and the answer is cached on the cell
+    # the workers are copied from.  Only where a wide box can be asked for at all, which
+    # is the detour's extractions and nothing else.
+    if wide_box_mm > 0.0 and threads > 1:
+        cell.statics_bounds()
+    views = [cell.worker() for _ in openings] if threads > 1 else [cell] * len(openings)
+
+    def attempt(index: int, opening, view: Cell):
+        """One gun opening's whole seed loop, which is what runs on one thread."""
+
+        def job(log) -> list[_Solution]:
+            found: list[_Solution] = []
+            began = time.time()
+            solved: float | None = None
+            seeds = 0
+            wide: tuple | None = None
+            while True:
+                left = deadline.clamp((began + budget.seconds if solved is None else
+                                       solved + budget.process_seconds) - time.time())
+                if left <= 0.0:
+                    # Whether this was the opening's clock or the segment's, there is
+                    # nothing more to do at this opening.  Which of the two it was is
+                    # reported once by the caller, not once per opening.
+                    break
+                seeds += 1
+                use = budget
+                if wide_box_mm > 0.0 and seeds > 1 and solved is None:
                 # The first seed at an opening gets the endpoint box, and only a seed
                 # following a failure gets the wide one.  Escalation rather than a setting
                 # because the two boxes are right in different cases and nothing can tell
@@ -3864,23 +4027,38 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                 # Not offered once the opening has solved.  The seeds after that are
                 # looking for a *better* route, and the box that produced one is not the
                 # thing to change about the search that found it.
-                if wide is None:
-                    wide = _wide_box(cell, wide_box_mm, log)
-                if wide is not None:
-                    use = replace(budget, box=wide)
-            got = _cartesian_route(cell, qa, qb, use, seconds=left, zone=zone, gun=gun,
-                                   seed=budget.seed + run - 1, opening=opening,
-                                   check_step=check_step,
-                                   label=f"cartesian tree run {run}"
-                                         + (" (wide box)" if use is not budget else ""),
-                                   log=log)
-            if got is not None:
-                found.append(got)
-                if solved is None:
-                    # Timed from the first route at this opening and not restarted by a
-                    # second, or an opening that keeps solving would never be left.
-                    solved = time.time()
-    return found
+                    if wide is None:
+                        wide = _wide_box(view, wide_box_mm, log)
+                    if wide is not None:
+                        use = replace(budget, box=wide)
+                got = _cartesian_route(
+                    view, qa, qb, use, seconds=left, zone=zone, gun=gun,
+                    seed=budget.seed + index * _SEED_BLOCK + seeds - 1, opening=opening,
+                    check_step=check_step,
+                    label=f"cartesian tree opening {index + 1} run {seeds}"
+                          + (" (wide box)" if use is not budget else ""),
+                    log=log)
+                if got is not None:
+                    found.append(got)
+                    if solved is None:
+                        # Timed from the first route at this opening and not restarted by
+                        # a second, or an opening that keeps solving would never be left.
+                        solved = time.time()
+            return found
+
+        return job
+
+    batches = parallel.run(
+        [attempt(i, opening, view)
+         for i, (opening, view) in enumerate(zip(openings, views))], threads, log)
+    if threads > 1:
+        cell.absorb(*views)
+    deadline.ran_out(log, "the cartesian tree")
+    # Concatenated in opening order rather than in the order attempts finished, so the
+    # set handed to the ranking is the same set in the same order whatever the thread
+    # count -- and a run with --workers 1 is indistinguishable from one before any of
+    # this, bar the seeds.
+    return [got for batch in batches for got in batch]
 
 
 def _far_stretches(near: list[bool]) -> list[tuple[int, int]]:

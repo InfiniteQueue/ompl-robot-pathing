@@ -357,6 +357,23 @@ def build_parser() -> argparse.ArgumentParser:
                         "Path 4 legs at 15 s each it solved 2 of 12 attempts against "
                         "OMPL's 3. It is here to be measured, not because it is better "
                         "(default: %(default)s)")
+    #HOW MANY SOLVE AND POLISH ATTEMPTS RUN AT ONCE
+    p.add_argument("--workers", type=int, default=1, metavar="N",
+                   help="how many solve and polish attempts may run at once, on threads. "
+                        "0 is one per core bar one, capped at 8. The attempts a phase "
+                        "makes are independent by construction -- a tree search at one "
+                        "gun opening knows nothing of the one at another, and a polish "
+                        "from one seed nothing of the next -- and every phase that runs "
+                        "them already kept the set and ranked it, so this changes what a "
+                        "phase costs rather than what it finds. Threads and not "
+                        "processes: the bindings release the interpreter lock inside the "
+                        "collision and kinematics calls, which is where the time goes, so "
+                        "the geometry stays shared and a worker costs its own broadphase "
+                        "proxies and caches rather than a second copy of the cell. "
+                        "Reaches the Cartesian tree, the joint tree's phase one, and the "
+                        "polish; OMPL is left sequential because its runs move the "
+                        "environment every worker shares. 1 runs everything inline, "
+                        "exactly as before this existed (default: %(default)s)")
     #JOINT TREE: HOW FAR ONE EXTEND REACHES
     p.add_argument("--joint-tree-extend-rad", type=float, default=0.5, metavar="RAD",
                    help="furthest any one joint moves in a single extend of the joint "
@@ -1211,6 +1228,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     # Imported here so that --help works without the Tesseract bindings present.
     from weldpath import cell as cell_mod
     from weldpath import manifest as manifest_mod
+    from weldpath import parallel
     from weldpath import output as output_mod
     from weldpath.penalty import ClearancePenalty, GunPreference, SteppedPenalty
     from weldpath import profile as profile_mod
@@ -1405,7 +1423,12 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         probe.report(cell.env, man, args.probe_point, log=print)
         return 0
 
-    log("planning:")
+    threads = parallel.configure(args.workers)
+    if threads > 1:
+        log(f"planning on {threads} threads: solve and polish attempts run at once, "
+            f"and each holds its own collision managers and caches")
+    else:
+        log("planning:")
     planner = ToolpathPlanner(
         cell, man,
         ompl=OmplBudget(phase_one_runs=args.phase_one_runs,
