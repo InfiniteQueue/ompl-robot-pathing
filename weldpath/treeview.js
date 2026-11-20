@@ -294,8 +294,41 @@ function soup(pieces) {
   return { pos: buffer(pos), nrm: buffer(nrm), count: tris * 3, raw: pos };
 }
 
+/* The outline of every convex piece, as line segments: the edges where two faces of the
+ * piece meet at an angle, plus any edge only one face owns.  A hull's coplanar triangles
+ * share diagonals that are not part of its shape, so drawing every triangle edge would
+ * paint a mesh where there is a box.  Drawn faint over the fill, this is what lets the
+ * density of the decomposition be judged by eye: many small pieces read as a dense
+ * lattice of lines and a few big ones as a few boxes, which a flat-shaded cell hides. */
+function outline(pieces) {
+  const out = [];
+  for (const p of pieces) {
+    const nv = p.v.length / 3, seen = new Map();
+    for (let i = 0; i < p.f.length; i += 3) {
+      const t = [p.f[i], p.f[i + 1], p.f[i + 2]];
+      const P = t.map(j => [p.v[j * 3], p.v[j * 3 + 1], p.v[j * 3 + 2]]);
+      const n = norm(cross(sub(P[1], P[0]), sub(P[2], P[0])));
+      for (let e = 0; e < 3; e++) {
+        const a = t[e], b = t[(e + 1) % 3];
+        const key = a < b ? a * nv + b : b * nv + a;
+        const prev = seen.get(key);
+        if (prev === undefined) seen.set(key, { a, b, n, faces: 1, sharp: false });
+        else { prev.faces++; if (dot(prev.n, n) < 0.97) prev.sharp = true; }
+      }
+    }
+    for (const s of seen.values()) {
+      if (s.faces === 2 && !s.sharp) continue;
+      out.push(p.v[s.a * 3], p.v[s.a * 3 + 1], p.v[s.a * 3 + 2],
+               p.v[s.b * 3], p.v[s.b * 3 + 1], p.v[s.b * 3 + 2]);
+    }
+  }
+  const pos = new Float32Array(out), col = new Float32Array(out.length);
+  for (let i = 0; i < col.length; i += 3) { col[i] = 0.78; col[i + 1] = 0.84; col[i + 2] = 0.92; }
+  return { pos: buffer(pos), col: buffer(col), count: pos.length / 3 };
+}
+
 const statics = DATA.geometry.static.map(o => ({ name: o.name, category: o.category,
-                                                 mesh: soup(o.pieces) }));
+                                                 mesh: soup(o.pieces), lines: outline(o.pieces) }));
 const moving = {};
 for (const m of DATA.geometry.moving) moving[m.name] = soup(m.pieces);
 const gunSet = new Set(DATA.links.gun || []);
@@ -393,7 +426,7 @@ function eyePos() {
 }
 
 // ------------------------------------------------------------------------------ the UI
-const opts = { statics: true, translucent: false, arm: true, gun: true,
+const opts = { statics: true, translucent: false, outlines: true, arm: true, gun: true,
                edges: true, nodes: true, chordPose: true, bySolve: false };
 let picked = null;          // {set, index}
 const measure = { on: false, pts: [] };     // the rule; see "measuring" below
@@ -492,6 +525,7 @@ function buildPanel() {
   panel.appendChild(el('h2', { text: 'show' }));
   panel.appendChild(checkbox('cell geometry', 'statics', C.statik));
   panel.appendChild(checkbox('… see through it', 'translucent'));
+  panel.appendChild(checkbox('… hull outlines', 'outlines'));
   panel.appendChild(checkbox('robot arm', 'arm', C.arm));
   panel.appendChild(checkbox('gun', 'gun', C.gun));
   panel.appendChild(checkbox('edges', 'edges'));
@@ -699,8 +733,12 @@ function draw() {
   gl.disable(gl.BLEND);
   gl.depthMask(true);
 
+  // Fill pushed back a hair so its own outline, drawn at the same depth, is not eaten.
+  gl.enable(gl.POLYGON_OFFSET_FILL);
+  gl.polygonOffset(1, 1);
   if (opts.statics && !opts.translucent)
     for (const o of statics) drawMesh(o.mesh, I, C.statik, 1);
+  gl.disable(gl.POLYGON_OFFSET_FILL);
 
   if (picked && picked.set.pose[picked.index]) {
     const pose = picked.set.pose[picked.index];
@@ -717,6 +755,13 @@ function draw() {
   gl.enableVertexAttribArray(fA.pos);
   gl.enableVertexAttribArray(fA.col);
   gl.uniformMatrix4fv(fA.mvp, false, mvp);
+  if (opts.statics && opts.outlines) {
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    for (const o of statics)
+      if (o.lines.count) drawFlat(gl.LINES, o.lines.pos, o.lines.col, o.lines.count, 1, 0.22);
+    gl.disable(gl.BLEND);
+  }
   for (const s of sets) {
     if (!s.on) continue;
     if (opts.edges && s.lineCount) drawFlat(gl.LINES, s.lineBuf, s.lineCol, s.lineCount, 1, 0.8);
