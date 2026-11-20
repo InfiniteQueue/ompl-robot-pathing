@@ -1163,9 +1163,139 @@ def _stop_cost(model: "MotionModel", path: list[np.ndarray]) -> float:
                for i in range(len(path) - 1))
 
 
-def _polish_best(model: "MotionModel", path: list[np.ndarray], *, time_budget: float,
-                 relocate: "Relocation | None", log=print) -> list[np.ndarray]:
-    """Polish from several seeds at once and keep the cheapest result.
+def _section_bounds(points: int, count: int, shift: bool = False) -> list[tuple[int, int]]:
+    """Index pairs dividing ``points`` into ``count`` stretches, ends included.
+
+    Each stretch spans at least two moves, so each has at least one interior waypoint for
+    the polish to work on -- a stretch of two points is two pinned ends and nothing to do.
+    A cut that would leave a stub shorter than that is dropped and its stretch absorbed by
+    the neighbour, so the count is a ceiling rather than a promise.
+
+    ``shift`` moves every interior cut half a stretch along, which is the whole of the
+    alternation: a cut in one round lands in the middle of a stretch in the next, so no
+    waypoint is pinned twice running and no cut is permanent.  The two ends are the
+    exception and are pinned in every round -- they are the states the locators either
+    side put the robot in, and they are not this pass's to move.
+
+    A shifted round comes out less evenly sized than a plain one, the squeeze landing on
+    the last stretch -- 13 points over 3 gives 4-4-4 plain and 6-4-2 shifted.  That costs
+    no wall clock, every stretch being given the same seconds whatever its length; what it
+    costs is that a short stretch is sampled more densely than it needs while a long one
+    beside it is sampled less.  Evening it out means either more stretches than there are
+    threads, which would queue and overrun the round, or cuts that are no longer the
+    midpoints of the round before, which is what the alternation is.
+    """
+    last = points - 1
+    span = last / count
+    start = span / 2.0 if shift else 0.0
+    out = [0]
+    for i in range(1, count + (1 if shift else 0)):
+        cut = int(round(start + i * span))
+        if cut - out[-1] >= 2 and last - cut >= 2:
+            out.append(cut)
+    out.append(last)
+    return list(zip(out, out[1:]))
+
+
+def _polish_sectioned(model: "MotionModel", path: list[np.ndarray], *,
+                      time_budget: float, relocate: "Relocation | None",
+                      threads: int, log=print) -> list[np.ndarray]:
+    """Polish stretches of the route at once and merge them, over rounds that move the cuts.
+
+    **The merge is a concatenation, and that is exact rather than approximate.**  Three
+    properties of the pass make it so, and all three are properties of ``polish`` as it
+    already stands:
+
+    * the cost is a **sum over moves**, each move's term depending on its own two ends and
+      nothing else -- ``MotionModel.cost`` is per move, and so is ``crossing_penalty``;
+    * both of its moves are confined to a **three-point window**, the waypoint and its two
+      neighbours;
+    * it **never moves the ends** of the path it is given, those belonging to the locators.
+
+    So a cut at a waypoint makes two sub-problems that share no move: every move of the
+    route lies inside exactly one stretch, the stretch that owns it validated it, and the
+    total is the sum of the parts.  Nothing has to be reconciled, nothing re-checked, and
+    no edit of one thread can invalidate an edit of another.  Sticking the pieces back
+    together is ``pieces[0] + piece[1:] for the rest``.
+
+    **What this buys over running the whole route from several seeds** is density rather
+    than luck.  Four threads polishing the whole route spend four budgets sampling the
+    same waypoints and keep one of the four answers; four threads polishing a quarter each
+    spend four budgets on four disjoint quarters and keep all of it, which is about four
+    times the draws per waypoint with none of them duplicated.
+
+    **What it costs is the cut.**  A pinned waypoint cannot be relocated, and the move
+    this pass earns its budget with is exactly the one a cut forbids: displacing a point
+    so that its *neighbour* becomes droppable.  That cascade crosses a boundary.  Hence
+    the rounds -- the cuts move half a stretch between them, so a waypoint pinned in one
+    round is interior in the next and the cascade gets its turn.  Two rounds is enough for
+    every waypoint to have been interior at least once; more would divide the budget
+    further for less.
+
+    **A round that does not pay is not kept.**  Each stretch can only improve its own cost
+    -- every move of either kind is accepted only if it is cheaper -- so a merged round
+    cannot be dearer than what went into it, and measuring it is insurance against that
+    reasoning rather than a part of the method.  It costs a penalty read per waypoint.
+    """
+    rounds = _POLISH_ROUNDS
+    per_round = time_budget / rounds
+    current = [np.asarray(p, dtype=float).copy() for p in path]
+    cost = _stop_cost(model, current)
+    log(f"      polishing {len(current)} points in stretches, {rounds} rounds of "
+        f"{per_round:g}s with the cuts moved between them; {cost:.2f} s to beat")
+    for step in range(rounds):
+        count = min(threads, max(0, (len(current) - 1) // 2))
+        if count < 2:
+            # Too few points left to cut into two stretches that each have something to
+            # work on.  The remaining rounds would be one thread on the whole route, which
+            # is what the caller would have done anyway.
+            log(f"      round {step + 1}: {len(current)} points left, too few to divide; "
+                f"polishing it whole")
+            current = polish(model, current, time_budget=per_round * (rounds - step),
+                             relocate=relocate, log=log)
+            break
+        bounds = _section_bounds(len(current), count, shift=bool(step % 2))
+        views = [model.cell.worker() for _ in bounds]
+        models = [MotionModel(view, max_step=model.max_step, zone=model.zone,
+                              pinned=model.pinned) for view in views]
+        log(f"      round {step + 1}: {len(bounds)} stretch"
+            f"{'' if len(bounds) == 1 else 'es'} "
+            + ", ".join(f"{a}-{b}" for a, b in bounds)
+            + f", {per_round:g}s on each"
+            + (" at once" if len(bounds) > 1 else ""))
+
+        def attempt(index: int, a: int, b: int, mine: "MotionModel"):
+            def job(log) -> list[np.ndarray]:
+                # Distinct per round and per stretch, so a stretch is the same polish
+                # wherever it sits in the schedule and whatever runs beside it.
+                return polish(mine, current[a:b + 1], time_budget=per_round,
+                              rng=np.random.default_rng(1 + step * len(bounds) + index),
+                              relocate=relocate, log=log)
+
+            return job
+
+        pieces = parallel.run(
+            [attempt(i, a, b, mine)
+             for i, ((a, b), mine) in enumerate(zip(bounds, models))], threads, log)
+        model.cell.absorb(*views)
+        for mine in models:
+            model.overreach_refusals += mine.overreach_refusals
+        merged = list(pieces[0])
+        for piece in pieces[1:]:
+            merged.extend(piece[1:])        # the shared waypoint belongs to the piece before
+        got = _stop_cost(model, merged)
+        kept = got <= cost
+        log(f"      round {step + 1}: {len(current)} points -> {len(merged)}, "
+            f"{cost:.2f} s -> {got:.2f} s" + ("" if kept else " (worse; left alone)"))
+        if kept:
+            current, cost = merged, got
+    return current
+
+
+def _polish_seeds(model: "MotionModel", path: list[np.ndarray], *, time_budget: float,
+                  relocate: "Relocation | None", threads: int,
+                  log=print) -> list[np.ndarray]:
+    """Polish the whole route from several seeds at once and keep the cheapest result.
 
     **Why a set of attempts rather than one longer one.**  ``polish`` draws a waypoint and
     a direction at random, keeps the displacement if the two moves through it get quicker,
@@ -1183,11 +1313,11 @@ def _polish_best(model: "MotionModel", path: list[np.ndarray], *, time_budget: f
 
     **A tie goes to the earlier seed**, so the result does not depend on which thread
     finished first; with one worker this is seed 1 alone, which is ``polish`` as it was.
-    """
-    threads = parallel.threads(_POLISH_ATTEMPTS)
-    if threads <= 1 or time_budget <= 0 or len(path) < 3:
-        return polish(model, path, time_budget=time_budget, relocate=relocate, log=log)
 
+    This is what a route too short to cut gets -- see :func:`_polish_best`.  A route with
+    room in it is divided instead, which keeps every thread's work rather than one
+    thread's: :func:`_polish_sectioned`.
+    """
     attempts = threads
     log(f"      polishing from {attempts} seeds at once, keeping the cheapest")
     views = [model.cell.worker() for _ in range(attempts)]
@@ -1215,6 +1345,37 @@ def _polish_best(model: "MotionModel", path: list[np.ndarray], *, time_budget: f
     costs = ", ".join(f"{cost:.2f}" for cost, _ in results)
     log(f"      polish: {costs} s over {attempts} seeds; keeping seed {best + 1}")
     return results[best][1]
+
+
+def _polish_best(model: "MotionModel", path: list[np.ndarray], *, time_budget: float,
+                 relocate: "Relocation | None", log=print) -> list[np.ndarray]:
+    """Polish, using whatever threads the run allows.  The two ways differ in what is kept.
+
+    **Divided where the route has room to be divided.**  Stretches of it are polished at
+    once and merged, which keeps the work of every thread -- see
+    :func:`_polish_sectioned`, where the merge is argued.  That wants a route with enough
+    waypoints to cut into stretches that each still have an interior point: two stretches
+    need five waypoints, and the count of stretches is bounded by that as much as by the
+    threads.
+
+    **From several seeds where it has not.**  A short route cannot be divided, but it can
+    still be polished several times over from different seeds and the cheapest kept --
+    :func:`_polish_seeds`.  That discards all but one thread's work, which is why it is
+    the fallback rather than the method, and on a route of four or five stops there is
+    little in it to discard.
+
+    One thread, no budget, or nothing to polish, and this is ``polish`` itself, called
+    exactly as it was before any of this existed.
+    """
+    threads = parallel.setting()
+    if threads <= 1 or time_budget <= 0 or len(path) < 3:
+        return polish(model, path, time_budget=time_budget, relocate=relocate, log=log)
+    if (len(path) - 1) // 2 >= 2:
+        return _polish_sectioned(model, path, time_budget=time_budget,
+                                 relocate=relocate,
+                                 threads=min(threads, (len(path) - 1) // 2), log=log)
+    return _polish_seeds(model, path, time_budget=time_budget, relocate=relocate,
+                         threads=parallel.threads(_POLISH_ATTEMPTS), log=log)
 
 
 def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: float,
@@ -1925,12 +2086,18 @@ DEFAULT_FINISH_ATTEMPTS = 4
 # second, and this is thousands of them.
 _SEED_BLOCK = 10_000
 
-# How many seeds the polish is asked from where there are threads for them.  It is the
-# thread count that decides in practice -- see ``_polish_best``, which asks for as many
-# attempts as it has threads -- and this is the ceiling on that: past a handful of draws
-# the pass is sampling the same few hills again, and every attempt holds its own copy of
-# the route and its own model caches for the length of the budget.
+# How many seeds the polish is asked from where a route is too short to divide and the
+# fallback is a set of whole-route attempts.  The thread count decides in practice and
+# this is the ceiling on it: past a handful of draws the pass is sampling the same few
+# hills again, and every attempt holds its own copy of the route and its own model caches
+# for the length of the budget.
 _POLISH_ATTEMPTS = 4
+
+# How many times a divided polish moves its cuts and goes round again.  Two is the least
+# that gets every waypoint an interior turn -- a cut in the first round sits in the middle
+# of a stretch in the second -- and the budget is divided by this, so a third round would
+# buy a third turn nobody needs with a third less time on each of the others.
+_POLISH_ROUNDS = 2
 
 # The rest of OMPLSolverConfig's documented defaults, used to recognise the struct.
 _SOLVER_SIGNATURE = (10, 0, 1)          # max_solutions, simplify, optimize

@@ -1758,7 +1758,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--phase-two-max-runs` | 2 | OMPL runs for a gap the recut has to join, stopping at the first solution. No longer a stage of a transit |
 | `--phase-two-solve-seconds` | 240 | how long one of those runs may search |
 | `--segment-minutes` | 60 | wall clock for one segment's search; past it the segment is reported as failed and the run moves on. 0 removes the limit |
-| `--workers` | 1 | how many solve and polish attempts run at once, on threads. 0 is one per core bar one, capped at 8. Reaches the Cartesian tree (one thread per gun opening), the joint tree's phase one (one per run) and the polish (one per seed); OMPL stays sequential. 1 runs everything inline |
+| `--workers` | 1 | how many solve and polish attempts run at once, on threads. 0 is one per core bar one, capped at 8. Reaches the Cartesian tree (one thread per gun opening), the joint tree's phase one (one per run) and the polish (one per stretch of the route, merged, over two rounds with the cuts moved between them; a route too short to cut is polished from several seeds and the cheapest kept); OMPL stays sequential. 1 runs everything inline |
 | `--direct-clearance-mm` | 0 | room the straight joint move has to keep to be taken without searching; under it the next gun opening is tried and then the searches. 0 asks nothing beyond the collision check |
 | `--min-gun-openings` | 5 | gun openings phase one deals its runs round, the cheapest solution of the set shipping |
 | `--extra-gun-openings` | 3 | further openings held back from the direct transit, for the detour to walk leg by leg |

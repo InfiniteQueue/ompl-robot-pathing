@@ -358,7 +358,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "OMPL's 3. It is here to be measured, not because it is better "
                         "(default: %(default)s)")
     #HOW MANY SOLVE AND POLISH ATTEMPTS RUN AT ONCE
-    p.add_argument("--workers", type=int, default=1, metavar="N",
+    p.add_argument("--workers", type=int, default=0, metavar="N",
                    help="how many solve and polish attempts may run at once, on threads. "
                         "0 is one per core bar one, capped at 8. The attempts a phase "
                         "makes are independent by construction -- a tree search at one "
@@ -372,8 +372,14 @@ def build_parser() -> argparse.ArgumentParser:
                         "proxies and caches rather than a second copy of the cell. "
                         "Reaches the Cartesian tree, the joint tree's phase one, and the "
                         "polish; OMPL is left sequential because its runs move the "
-                        "environment every worker shares. 1 runs everything inline, "
-                        "exactly as before this existed (default: %(default)s)")
+                        "environment every worker shares. The polish divides the route "
+                        "into stretches, polishes them at once and merges them -- which "
+                        "is exact, every move of the route belonging to one stretch -- "
+                        "over two rounds with the cuts moved half a stretch between them, "
+                        "so no waypoint stays pinned. A route too short to divide is "
+                        "polished from several seeds and the cheapest kept. 1 runs "
+                        "everything inline, exactly as before this existed "
+                        "(default: %(default)s)")
     #JOINT TREE: HOW FAR ONE EXTEND REACHES
     p.add_argument("--joint-tree-extend-rad", type=float, default=0.5, metavar="RAD",
                    help="furthest any one joint moves in a single extend of the joint "
