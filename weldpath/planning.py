@@ -86,6 +86,11 @@ class MotionModel:
         # Replacements turned away for reaching in from outside the limit, so a run can
         # say whether the rule bit at all rather than leaving it to be inferred.
         self.overreach_refusals = 0
+        # The same, for cuts that would have carried a turn change into a straight move.
+        self.turn_refusals = 0
+        # Which joints have a turn number at all.  Fixed for the cell, and read once
+        # because ``changes_turn`` asks per candidate move.
+        self._revolute = getattr(cell, "_revolute", None)
 
     @property
     def tool_step(self) -> float:
@@ -201,6 +206,57 @@ class MotionModel:
         if any(self._overreaches(x, y) for x, y in zip(chain, chain[1:])):
             return False
         self.overreach_refusals += 1
+        return True
+
+    def changes_turn(self, a: np.ndarray, b: np.ndarray, replaced) -> bool:
+        """Would replacing ``replaced`` with a->b carry a turn change into a straight move?
+
+        Crossing a turn boundary during a joint move is nothing: the joint is interpolated
+        and the counter follows it.  Inside a straight tool move it is a configuration
+        change partway along one interpolation, which is what a controller will not do.
+        See the note on ``_TURN_SECTOR`` for why no per-station rule sees it -- briefly,
+        ``Cell.wrap_towards`` puts each station on its nearest turn to the one before it,
+        so once a chain is past a boundary it keeps walking rather than coming back, and
+        every step of the crossing is a small legal one.
+
+        **A rule about cutting, not about routes.**  A cut is what moves a crossing from
+        one profile to the other.  Measured on Path 1: the sampling planner returned 78
+        waypoints whose one crossing -- joint 6 over -180 deg, in a PTP move of 2.9 deg --
+        was harmless, ``simplify`` reduced them to 3, and the crossing landed inside an
+        881 mm LIN move carrying 157 deg of wrist travel, which then shipped.
+
+        So a replacement is refused when it is linear and crosses, *unless* the stretch it
+        replaces already had a linear move that crossed.  That exemption puts this on the
+        same footing as :meth:`overreaches`: a limit on introducing the fault, not on
+        living with one that arrived.  A route already crossing may still be shortened and
+        thinned -- refusing to touch it would cost optimisation for no safety -- and the
+        passes simply cannot create the crossing where it was not there before.
+
+        What that comes to is narrower than the exemption makes it sound, and worth saying
+        plainly: **a cut may not move a crossing out of a joint move and into a linear
+        one.**  Sectors are integers, so if the cut crosses then some step of the stretch
+        it replaces crossed as well; the only question is which profile that step carried.
+        Where it was linear the route was already faulty and this stands aside, so the one
+        thing refused is the promotion -- which is exactly the fault, and all of it.
+
+        **Endpoints only, which is a real limit.**  A crossing strictly inside the
+        resulting move is invisible here: a stretch that wanders over a boundary and back
+        has both ends in one sector, and whether the line's own stations stay there is
+        decided by the solve, not by this.  Catching that means reading the chain
+        ``linear_chain`` already builds, which is not this rule and not this pass.
+
+        **Not part of :meth:`refuses`,** so ``shortcut`` and ``polish`` do not ask it.
+        ``simplify`` is the pass measured creating this and is the only caller.
+        """
+        if self.motion(a, b) != LIN:
+            return False
+        if not turn_crossings(a, b, self._revolute):
+            return False
+        chain = [a, *replaced, b]
+        if any(self.motion(x, y) == LIN and turn_crossings(x, y, self._revolute)
+               for x, y in zip(chain, chain[1:])):
+            return False
+        self.turn_refusals += 1
         return True
 
     def refuses(self, a: np.ndarray, b: np.ndarray, replaced) -> bool:
@@ -510,6 +566,11 @@ def simplify(model: MotionModel, path: list[np.ndarray], log=None) -> list[np.nd
     is not: dropping a point that merely lies close to the chord can cut the corner
     straight through an obstacle.
 
+    **A cut that would carry a joint turn change into a straight move is refused.**  This
+    is the pass that creates that fault, because a cut is what moves a crossing from a
+    joint move into a linear one -- see :meth:`MotionModel.changes_turn`, which holds the
+    rule and the measurement behind it.
+
     A sampled path wanders and the controller does not need the wandering, so this is
     also what keeps the output down to the handful of points a FANUC program wants.
 
@@ -530,8 +591,9 @@ def simplify(model: MotionModel, path: list[np.ndarray], log=None) -> list[np.nd
     discards the whole route when it can do neither.  So the reach that was rejected purely
     on *cost* is remembered as it is made, and where the forced point is in the band the
     nearest of those is taken instead, dearer than the polyline though it is.  Nothing
-    unsafe is accepted this way: every such reach has already passed ``refuses`` and
-    ``check_and_cost``, which is what makes this a price rather than a risk, and the
+    unsafe is accepted this way: every such reach has already passed ``refuses``,
+    ``changes_turn`` and ``check_and_cost``, which is what makes this a price rather than
+    a risk, and the
     nearest is chosen so the cheapest alternative wins by construction.
 
     It costs no checking at all, the verdicts being the ones the downward walk already
@@ -582,6 +644,12 @@ def simplify(model: MotionModel, path: list[np.ndarray], log=None) -> list[np.nd
                 j -= 1
                 continue
             if model.refuses(path[i], path[j], path[i + 1:j]):
+                j -= 1
+                continue
+            # Ahead of the pricing, so a reach recorded in ``dearer`` has passed this too:
+            # that list is read when the walk runs out on a state the robot may not stop
+            # at, and a reach taken from it is taken without being re-tested.
+            if model.changes_turn(path[i], path[j], path[i + 1:j]):
                 j -= 1
                 continue
             chord = model.check_and_cost(path[i], path[j],
@@ -1222,8 +1290,15 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
             # And a new model for it.  The near and reach caches are keyed on the state
             # alone, so the old one would answer the band's question with what it learned
             # at the opening before -- which is the whole thing the gun has just moved.
-            model = MotionModel(model.cell, max_step=model.max_step, zone=model.zone,
+            fresh = MotionModel(model.cell, max_step=model.max_step, zone=model.zone,
                                 pinned=model.pinned)
+            # The caches go, which is the whole point of rebuilding.  The refusal tallies
+            # are the run's own record of what the rules did and are not the gun's to
+            # reset -- both passes that fill them have already run by this point, so
+            # leaving them behind reported zero for a rule that had bitten.
+            fresh.overreach_refusals = model.overreach_refusals
+            fresh.turn_refusals = model.turn_refusals
+            model = fresh
         stagetrace.stage("stand off", model, reduced)
     polished = polish(model, reduced, time_budget=polish_seconds, relocate=relocate,
                       rng=np.random.default_rng(seed + 1), log=log)
@@ -1234,6 +1309,10 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     if log and model.overreach_refusals:
         log(f"      {model.overreach_refusals} replacements refused for starting linear "
             f"motion beyond {model.zone.reach_mm:g} mm of clearance")
+    if log and model.turn_refusals:
+        log(f"      {model.turn_refusals} waypoint cut"
+            f"{'' if model.turn_refusals == 1 else 's'} refused for carrying a joint turn "
+            f"change into a straight move")
     return cleared, chosen
 
 
@@ -4659,6 +4738,62 @@ def interpolate_pose(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
 # the controller cannot make inside one straight move.
 LINE_JUMP_RAD = 0.5
 LINE_END_TOL_RAD = 1e-2
+
+
+# A joint's turn number is which ``2 * pi`` sector it sits in, the boundaries falling on
+# the odd multiples of pi, and a controller carries it as part of the configuration a move
+# is flown in.  ``_TURN_SECTOR`` is that period.
+#
+# Deliberately not covered by ``LINE_JUMP_RAD``, and the two catch different things.  The
+# jump rule tests the step between two stations, so it catches a turn that arrives as a
+# *jump* -- the 2*pi gap ``cartesian.plan_cartesian`` refuses between its two trees.  A
+# route that walks across a boundary in small steps passes the jump rule at every station,
+# each one a legal continuous solve, and changes the turn number all the same.  Measured on
+# Path 1: joint 6 crossed -180 deg inside one 881 mm LIN move carrying 157 deg of wrist
+# travel, having crossed it in a PTP move of 2.9 deg before the route was reduced.
+_TURN_SECTOR = 2.0 * np.pi
+
+# How near a boundary a state may sit without being read as across it.  Joint 3's upper
+# limit on these cells is exactly pi, so a state at its limit sits exactly on a boundary
+# and which sector it belongs to is a matter of float luck; a move that merely touches one
+# has not crossed it.
+_TURN_EDGE_TOL_RAD = 1e-6
+
+
+def _turn_sector(value: float) -> int:
+    """Which ``2 * pi`` sector a joint value sits in; sectors break on odd multiples of pi."""
+    return int(np.floor((float(value) + np.pi) / _TURN_SECTOR))
+
+
+def turn_crossings(a, b, revolute=None) -> list[int]:
+    """Indices of the joints whose turn number differs between the states ``a`` and ``b``.
+
+    Revolute joints only.  A prismatic joint's value is a length, where a sector boundary
+    at pi metres would mean nothing, so ``revolute`` is what says which are which; unset,
+    nothing is checked rather than everything being guessed at.
+
+    A pair on opposite sides of one boundary but within ``_TURN_EDGE_TOL_RAD`` of it at
+    either end has not crossed it -- see the note on that tolerance.  Two or more
+    boundaries apart is a crossing whatever the tolerance says.
+    """
+    if revolute is None:
+        return []
+    qa = np.asarray(a, dtype=float).reshape(-1)
+    qb = np.asarray(b, dtype=float).reshape(-1)
+    out: list[int] = []
+    for i in range(min(len(qa), len(qb), len(revolute))):
+        if not revolute[i]:
+            continue
+        sa, sb = _turn_sector(qa[i]), _turn_sector(qb[i])
+        if sa == sb:
+            continue
+        if abs(sa - sb) == 1:
+            edge = (2 * min(sa, sb) + 1) * np.pi
+            if (abs(qa[i] - edge) <= _TURN_EDGE_TOL_RAD
+                    or abs(qb[i] - edge) <= _TURN_EDGE_TOL_RAD):
+                continue
+        out.append(i)
+    return out
 
 
 def line_stations(pose_a: np.ndarray, pose_b: np.ndarray, step_mm: float,
