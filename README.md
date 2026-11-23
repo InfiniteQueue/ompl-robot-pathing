@@ -686,16 +686,26 @@ an edge of the Cartesian tree with both ends outside it ships as a joint move. D
 measurement is the point: where a near-panel stretch begins and ends is itself an output of
 pathfinding, so it cannot be picked in advance.
 
+The band proposes and one rule disposes. A move whose two ends disagree about any joint's
+**turn number** -- which `2 x 180 deg` sector the joint sits in -- is flown as a joint move
+however near the parts it runs. A straight move has no way to express that change: the
+controller interpolates the tool pose and solves as it goes, carrying one configuration
+from end to end, so a move commanded between two states that disagree about it is a move it
+will not make. On the joint chord the same change is nothing, the joint being interpolated
+and the counter following it. This lives in the profile rather than in any one pass, which
+is what makes it hold: every pass that proposes a move, every step that samples one, the
+split that emits the program and the sweep that verifies it all read the same derivation.
+
 From start to finish:
 
 1. **Band on or off, for the run.** `--near-panel-mm 0` or `--no-near-panel-linear` turns
    it off: every transit move is `PTP`, and the Cartesian tree is never tried either.
 2. **Solve.** Whichever solver succeeds (see [How it works](#how-it-works)) returns an
    unlabelled route.
-3. **Label, per move.** `LIN` if either end is near, else `PTP`. So a waypoint is reached
-   by a linear move when it is in the band or the waypoint before it was. Nothing is asked
-   of the leg as a whole: there is no threshold a route has to clear before any of its
-   moves may be linear.
+3. **Label, per move.** `LIN` if either end is near *and* the two ends agree about every
+   joint's turn number, else `PTP`. So a waypoint is reached by a linear move when it is
+   in the band or the waypoint before it was. Nothing is asked of the leg as a whole:
+   there is no threshold a route has to clear before any of its moves may be linear.
 4. **Refine.** Shortcut, simplify and polish move and delete waypoints, and each move they
    propose takes its profile from its new ends. A `LIN` candidate is checked along the
    tool's straight line and costed under `--linear-speed-mm-s`; a `PTP` one is checked
@@ -704,8 +714,14 @@ From start to finish:
    near-panel stretch into one long joint arc. Nor may they grow one outward: a
    replacement that is `LIN` and has an end further than `--linear-introduce-mm` from the
    parts is refused unless the stretch it replaces already reached in from that far, so
-   the approach to the band stays joint motion. `--linear-crossing-penalty-s` adds a flat
-   cost each time a move enters the band from outside.
+   the approach to the band stays joint motion. Nor may they build a straight move that
+   turns the tool further than `--linear-reorient-deg`: a reduction replaces a stretch
+   with one move between its ends, the waypoints it deletes are what made the tool's
+   rotation gradual, and nothing in the cost resists the result -- measured on one
+   segment, a 110-point stretch became a single 773 mm move carrying 143 deg of tool
+   rotation, which polishing then widened to 166 deg while every other move in the output
+   stayed under 23 deg. `--linear-crossing-penalty-s` adds a flat cost each time a move
+   enters the band from outside.
 5. **Split.** Consecutive moves under the same profile become one phase.
 6. **Verify.** Every move is swept along the path its profile implies. A failure discards
    the whole route, and the planner moves on to its next gun opening or fallback pose;
@@ -1791,8 +1807,9 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--no-tip-standoff` | off | skip the trials that open the gun wider and back the tool off before the route is polished |
 | `--polish-seconds` | 50 | time budget for the final pass over the emitted waypoints |
 | `--no-near-panel-linear` | off | every transit move `PTP`; also disables the Cartesian tree |
-| `--near-panel-mm` | 50 | clearance at or under which a waypoint is in the band, and the whole of what decides a move's profile |
+| `--near-panel-mm` | 50 | clearance at or under which a waypoint is in the band, which is what proposes every `LIN` move |
 | `--linear-introduce-mm` | 120 | clearance above which the passes may not introduce `LIN` motion that was not already there; 0 for no limit |
+| `--linear-reorient-deg` | 90 | furthest one `LIN` move an optimisation pass creates may turn the tool; 0 or 180+ for no limit |
 | `--linear-crossing-penalty-s` | 100 | costing-only surcharge on each move entering the band |
 | `--min-shell-mm` | 10 | drop collision shells smaller than this |
 | `--max-shells` | 1500 | cap convex shells per link |

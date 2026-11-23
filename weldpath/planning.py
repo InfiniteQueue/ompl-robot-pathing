@@ -86,11 +86,14 @@ class MotionModel:
         # Replacements turned away for reaching in from outside the limit, so a run can
         # say whether the rule bit at all rather than leaving it to be inferred.
         self.overreach_refusals = 0
-        # The same, for cuts that would have carried a turn change into a straight move.
-        self.turn_refusals = 0
+        # The same, for replacements that would have turned the tool too far in one
+        # straight move.
+        self.reorient_refusals = 0
         # Which joints have a turn number at all.  Fixed for the cell, and read once
-        # because ``changes_turn`` asks per candidate move.
+        # because ``motion`` asks per candidate move.
         self._revolute = getattr(cell, "_revolute", None)
+        # The tool's orientation at a state, for the reorientation cap.  See ``_rotation``.
+        self._rot: dict[tuple[float, bytes], np.ndarray] = {}
 
     @property
     def tool_step(self) -> float:
@@ -126,9 +129,45 @@ class MotionModel:
         return hit
 
     def motion(self, a: np.ndarray, b: np.ndarray) -> str:
+        """Which profile this move is flown under.  The one derivation point.
+
+        The band proposes; the turn rule disposes.  A move whose two ends sit in different
+        turn sectors is not a linear move that happens to be unwanted -- it is a move no
+        controller will fly straight at all -- so it is a *joint* move here, rather than a
+        linear one that some pass is asked to refuse, and everything downstream reads it
+        as one: the fill that samples it, the check that proves it clear, the price it is
+        compared at, and the split that emits it.  :meth:`crosses_turn` holds the rule and
+        the measurement behind it.
+
+        Deciding it here is the whole of the enforcement, which is why it is here.  A cut
+        whose merged move changes a turn is a joint move by this rule, so where the stretch
+        it replaces held any near point :meth:`demotes` refuses it unprompted -- the guard
+        that was already there, doing what it was written to do.  The pair of states
+        straddling the boundary therefore survives every reduction and the crossing rides
+        its own short joint move.  No pass had to be told, and the ones that never ask
+        ``refuses`` at all -- ``_densify_marked``, ``_split_runs``, ``_verify_runs`` -- are
+        covered by the same stroke.
+
+        This is what a gate in ``simplify`` could not do, and the reason it is written
+        this way.  That gate compared a candidate cut against the stretch it replaced and
+        stood aside where the stretch already carried the fault; but ``shortcut`` densifies
+        before it cuts, and a fill point's profile is derived afresh from where it sits, so
+        a crossing that rode a joint move in the route arrived re-labelled as riding a
+        linear one and the gate stood aside.  Measured on Path 1's second segment: the leg
+        reached refinement with its crossing on a PTP move, densifying put eighteen
+        consecutive fill points inside the band, and the sub-move carrying the crossing
+        read LIN.  A rule about the profile cannot be enforced anywhere but at the profile.
+
+        The reorientation cap is *not* here, and that asymmetry is deliberate: see
+        :meth:`reorients`.
+        """
         if self.pinned is not None:
             return self.pinned
-        return LIN if (self.near(a) or self.near(b)) else PTP
+        if not (self.near(a) or self.near(b)):
+            return PTP
+        if self.crosses_turn(a, b):
+            return PTP
+        return LIN
 
     def demotes(self, a: np.ndarray, b: np.ndarray, replaced) -> bool:
         """Would replacing ``replaced`` with the move a->b drop it out of the profile?
@@ -208,67 +247,132 @@ class MotionModel:
         self.overreach_refusals += 1
         return True
 
-    def changes_turn(self, a: np.ndarray, b: np.ndarray, replaced) -> bool:
-        """Would replacing ``replaced`` with a->b carry a turn change into a straight move?
+    def crosses_turn(self, a: np.ndarray, b: np.ndarray) -> bool:
+        """Whether this move changes a joint's turn number.
 
-        Crossing a turn boundary during a joint move is nothing: the joint is interpolated
-        and the counter follows it.  Inside a straight tool move it is a configuration
-        change partway along one interpolation, which is what a controller will not do.
-        See the note on ``_TURN_SECTOR`` for why no per-station rule sees it -- briefly,
-        ``Cell.wrap_towards`` puts each station on its nearest turn to the one before it,
-        so once a chain is past a boundary it keeps walking rather than coming back, and
-        every step of the crossing is a small legal one.
+        A joint's turn number is which ``2 * pi`` sector it sits in, and a controller
+        carries it as part of the configuration a move is flown in.  Changing it over a
+        joint move is nothing: the joint is interpolated and the counter follows it.
+        Between the two ends of a straight move it is a configuration change the move
+        itself has no way to express -- the controller interpolates the tool pose and
+        solves as it goes, carrying one configuration -- so :meth:`motion` flies such a
+        move on the joint chord instead.
 
-        **A rule about cutting, not about routes.**  A cut is what moves a crossing from
-        one profile to the other.  Measured on Path 1: the sampling planner returned 78
-        waypoints whose one crossing -- joint 6 over -180 deg, in a PTP move of 2.9 deg --
-        was harmless, ``simplify`` reduced them to 3, and the crossing landed inside an
-        881 mm LIN move carrying 157 deg of wrist travel, which then shipped.
+        No per-station rule sees this, and that is why it needed its own.
+        ``Cell.wrap_towards`` puts each station of a line on its nearest turn to the
+        station before it, so once a chain is past a boundary it keeps walking rather than
+        coming back, and every step of the crossing is a small legal one that
+        ``LINE_JUMP_RAD`` passes.  Measured on Path 1: joint 6 crossed -180 deg inside one
+        881 mm LIN move carrying 157 deg of wrist travel, in steps of some 1.5 deg, having
+        crossed the same boundary in a PTP move of 2.9 deg before the route was reduced.
 
-        So a replacement is refused when it is linear and crosses, *unless* the stretch it
-        replaces already had a linear move that crossed.  That exemption puts this on the
-        same footing as :meth:`overreaches`: a limit on introducing the fault, not on
-        living with one that arrived.  A route already crossing may still be shortened and
-        thinned -- refusing to touch it would cost optimisation for no safety -- and the
-        passes simply cannot create the crossing where it was not there before.
-
-        What that comes to is narrower than the exemption makes it sound, and worth saying
-        plainly: **a cut may not move a crossing out of a joint move and into a linear
-        one.**  Sectors are integers, so if the cut crosses then some step of the stretch
-        it replaces crossed as well; the only question is which profile that step carried.
-        Where it was linear the route was already faulty and this stands aside, so the one
-        thing refused is the promotion -- which is exactly the fault, and all of it.
-
-        **Endpoints only, which is a real limit.**  A crossing strictly inside the
-        resulting move is invisible here: a stretch that wanders over a boundary and back
-        has both ends in one sector, and whether the line's own stations stay there is
-        decided by the solve, not by this.  Catching that means reading the chain
-        ``linear_chain`` already builds, which is not this rule and not this pass.
-
-        **Not part of :meth:`refuses`,** so ``shortcut`` and ``polish`` do not ask it.
-        ``simplify`` is the pass measured creating this and is the only caller.
+        **The two ends, and only those, which is the right reading rather than a limit.**
+        A line whose stations leave a sector and come back has both ends in one sector and
+        is not caught here.  Nor should it be: what the controller cannot represent is a
+        difference between the configurations of the two states it is commanded with, and
+        an excursion that returns is flown by the same continuous solve that flies the rest
+        of the line.  An earlier note here called this a hole to be closed by reading the
+        chain ``linear_chain`` builds; it is not, and reading the chain would instead
+        reject ordinary moves whose ends sit within a station of a boundary -- which on
+        these cells, where a weld pose can sit at -200 deg on joint 6, is not rare.
         """
+        return bool(turn_crossings(a, b, self._revolute))
+
+    def _rotation(self, q: np.ndarray) -> np.ndarray:
+        """The tool's orientation at a state, remembered.
+
+        Forward kinematics here is not a matrix multiply: it pushes the joints into the
+        environment and rebuilds every link transform, the same load a collision test
+        pays.  So this is cached exactly as ``near`` is, and keyed by the gun opening as
+        well as the joint vector, since the tip the tool centre point sits on swings with
+        it -- the same reason ``Cell.tcp_at`` keys its own cache that way.
+        """
+        key = (self.cell.gun_value, np.asarray(q, dtype=float).tobytes())
+        hit = self._rot.get(key)
+        if hit is None:
+            hit = np.array(self.cell.fk(q)[:3, :3], dtype=float)
+            self._rot[key] = hit
+        return hit
+
+    def tool_turn_rad(self, a: np.ndarray, b: np.ndarray) -> float:
+        """How far the tool turns between two states, in radians.  See ``rotation_angle``."""
+        return rotation_angle(self._rotation(a), self._rotation(b))
+
+    def over_reorients(self, a: np.ndarray, b: np.ndarray) -> bool:
+        """Whether the tool turns further between these two states than the cap allows.
+
+        Says nothing about the profile: :meth:`reorients` is what asks this of a move that
+        would be flown straight, and a joint move's reorientation is nobody's concern.
+
+        The free bound comes first.  Measuring this is forward kinematics at both ends,
+        which loads a joint state into the environment, while ``rotation_bound_rad`` is
+        arithmetic on the two joint vectors and settles every move whose joints barely
+        move -- which on a densified route is nearly all of them.  It can only err towards
+        measuring, never towards passing a move it has not measured.
+        """
+        if self.zone is None or self.zone.reorient_rad <= 0.0:
+            return False
+        cap = self.zone.reorient_rad
+        if rotation_bound_rad(a, b, self._revolute) <= cap:
+            return False
+        return self.tool_turn_rad(a, b) > cap
+
+    def reorients(self, a: np.ndarray, b: np.ndarray) -> bool:
+        """Whether this move is a straight one that turns the tool further than allowed.
+
+        A refusal, not a demotion, and that is the whole difference between this and
+        :meth:`crosses_turn`.  A turn change is something a straight move cannot do, so
+        the profile has to say so.  Turning the tool 165 deg over 763 mm is something a
+        straight move does perfectly well and that nobody wants: it is a preference, it
+        belongs in :meth:`refuses` with the other preferences, and it is enforced by
+        refusing the replacements that build such a move rather than by handing the robot
+        the joint chord between its ends.  Demoting it would reroute a move that currently
+        ships onto a different curve, which nothing has checked and which may well be
+        blocked, and turn a working leg into a verification failure.
+
+        Refusing is enough because this fault is *created*, every time.  A route arrives
+        from the solvers in small steps; the long reorienting move is what a reduction
+        makes of them.  Measured on Path 1's second segment: the solver's 78 states moved
+        2.86 deg at most, ``simplify`` reduced a 110-point stretch to 7 and made one move
+        of 773 mm carrying 142.9 deg of tool rotation, and ``polish`` then relocated its
+        ends out to 165.9 deg.  Refuse the replacements and the waypoints that make the
+        reorientation gradual are kept, which is the wanted outcome and not a second best.
+
+        No exemption, unlike :meth:`overreaches`.  That rule exempts a stretch that
+        already reached in from far out, because reaching in can be a property of where the
+        route legitimately has to go.  There is no matching case here: the cap bounds one
+        move's own content, so a stretch that already exceeds it is precisely a stretch
+        whose points must not be merged any further.
+
+        Off entirely with no cap set, where it is the constant False it was before.
+        """
+        if self.zone is None or self.zone.reorient_rad <= 0.0:
+            return False
         if self.motion(a, b) != LIN:
             return False
-        if not turn_crossings(a, b, self._revolute):
+        if not self.over_reorients(a, b):
             return False
-        chain = [a, *replaced, b]
-        if any(self.motion(x, y) == LIN and turn_crossings(x, y, self._revolute)
-               for x, y in zip(chain, chain[1:])):
-            return False
-        self.turn_refusals += 1
+        self.reorient_refusals += 1
         return True
 
     def refuses(self, a: np.ndarray, b: np.ndarray, replaced) -> bool:
         """Whether the profile rules forbid replacing ``replaced`` with the move a->b.
 
-        The one question the optimisation passes ask.  Both halves guard the same thing
-        from opposite sides -- :meth:`demotes` stops a near-panel stretch being dissolved
-        into a joint chord through it, :meth:`overreaches` stops a linear one being grown
-        outward into the approach -- and neither is about cost, so they are settled before
-        the move is checked or priced.
+        The one question the optimisation passes ask.  Three preferences about linear
+        motion, none of them about cost, so all three are settled before the move is
+        checked or priced: :meth:`demotes` stops a near-panel stretch being dissolved into
+        a joint chord through it, :meth:`overreaches` stops a linear one being grown
+        outward into the approach, and :meth:`reorients` stops one being grown into a
+        sweep that turns the tool further than a straight move should.
+
+        The turn rule is deliberately absent.  It is not a preference about linear motion
+        but a statement that a given move *is not* linear motion, so it lives in
+        :meth:`motion` and reaches the passes through the profile rather than through here
+        -- which is also how it reaches ``_densify_marked``, ``_split_runs`` and
+        ``_verify_runs``, none of which ask this.
         """
-        return self.demotes(a, b, replaced) or self.overreaches(a, b, replaced)
+        return (self.demotes(a, b, replaced) or self.overreaches(a, b, replaced)
+                or self.reorients(a, b))
 
     # -- what it forbids ----------------------------------------------------
     def blocked(self, a: np.ndarray, b: np.ndarray) -> bool:
@@ -482,12 +586,16 @@ class MotionModel:
 
         So this asks only what is already known.  Every clearance factor is at least 1, so
         the joint-limit time alone is always a valid floor.  The tool speed cap can be
-        added on top of it whenever one end is *known* to be near, since the move is then
-        linear whatever the other end turns out to be -- and in a cell where the route
-        hugs the panels that is the common case, so the bound is usually as tight as the
-        real one for nothing.  Where neither end has been measured the cap is left out
-        rather than measured for: a looser bound rejects fewer candidates, which is a
-        cost, but a wrong one would reject a candidate that should have won.
+        added on top of it whenever one end is *known* to be near and the move does not
+        change a joint's turn number: it is then linear whatever the other end turns out
+        to be -- and in a cell where the route hugs the panels that is the common case, so
+        the bound is usually as tight as the real one for nothing.  Where neither end has
+        been measured the cap is left out rather than measured for: a looser bound rejects
+        fewer candidates, which is a cost, but a wrong one would reject a candidate that
+        should have won.  The turn test is free, being arithmetic on the two joint vectors,
+        so it is asked rather than assumed away -- without it a near-ended move that
+        ``motion`` flies as a joint move would be charged a tool speed cap it never pays,
+        and the bound would stop being one.
 
         The crossing penalty is always left out.  ``_crosses`` compares both ends and so
         cannot be answered from one of them, and since it only ever raises the cost,
@@ -498,6 +606,8 @@ class MotionModel:
         if self.zone is None or self.zone.linear_speed_mm_s <= 0.0:
             return base
         if not (self._known_near(a) or self._known_near(b)):
+            return base
+        if self.crosses_turn(a, b):
             return base
         return max(base, _tcp_travel(self.cell, [a, b]) / self.zone.linear_speed_mm_s)
 
@@ -566,10 +676,17 @@ def simplify(model: MotionModel, path: list[np.ndarray], log=None) -> list[np.nd
     is not: dropping a point that merely lies close to the chord can cut the corner
     straight through an obstacle.
 
-    **A cut that would carry a joint turn change into a straight move is refused.**  This
-    is the pass that creates that fault, because a cut is what moves a crossing from a
-    joint move into a linear one -- see :meth:`MotionModel.changes_turn`, which holds the
-    rule and the measurement behind it.
+    **A cut that would carry a joint turn change into a straight move is refused, and
+    this pass does not have to do anything about it.**  Such a merged move is a joint move
+    by ``MotionModel.motion``, so where the stretch being cut holds a near point
+    ``demotes`` turns the cut away as a profile demotion -- which is what it is.  The pair
+    of states straddling the boundary therefore survives, and the crossing keeps its own
+    short joint move.  ``MotionModel.crosses_turn`` holds the rule and the measurement.
+
+    **A cut that would turn the tool further than one straight move should is refused too**,
+    by ``MotionModel.reorients``, and that one this pass was measured creating: a
+    110-point stretch reduced to 7 made a single 773 mm move carrying 142.9 deg of tool
+    rotation.  The waypoints being deleted are exactly what made the sweep gradual.
 
     A sampled path wanders and the controller does not need the wandering, so this is
     also what keeps the output down to the handful of points a FANUC program wants.
@@ -591,9 +708,8 @@ def simplify(model: MotionModel, path: list[np.ndarray], log=None) -> list[np.nd
     discards the whole route when it can do neither.  So the reach that was rejected purely
     on *cost* is remembered as it is made, and where the forced point is in the band the
     nearest of those is taken instead, dearer than the polyline though it is.  Nothing
-    unsafe is accepted this way: every such reach has already passed ``refuses``,
-    ``changes_turn`` and ``check_and_cost``, which is what makes this a price rather than
-    a risk, and the
+    unsafe is accepted this way: every such reach has already passed ``refuses`` and
+    ``check_and_cost``, which is what makes this a price rather than a risk, and the
     nearest is chosen so the cheapest alternative wins by construction.
 
     It costs no checking at all, the verdicts being the ones the downward walk already
@@ -643,13 +759,10 @@ def simplify(model: MotionModel, path: list[np.ndarray], log=None) -> list[np.nd
             if j < last and model.cell.in_stop_band(path[j]):
                 j -= 1
                 continue
-            if model.refuses(path[i], path[j], path[i + 1:j]):
-                j -= 1
-                continue
-            # Ahead of the pricing, so a reach recorded in ``dearer`` has passed this too:
+            # Ahead of the pricing, so a reach recorded in ``dearer`` has passed it too:
             # that list is read when the walk runs out on a state the robot may not stop
             # at, and a reach taken from it is taken without being re-tested.
-            if model.changes_turn(path[i], path[j], path[i + 1:j]):
+            if model.refuses(path[i], path[j], path[i + 1:j]):
                 j -= 1
                 continue
             chord = model.check_and_cost(path[i], path[j],
@@ -1297,7 +1410,7 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
             # reset -- both passes that fill them have already run by this point, so
             # leaving them behind reported zero for a rule that had bitten.
             fresh.overreach_refusals = model.overreach_refusals
-            fresh.turn_refusals = model.turn_refusals
+            fresh.reorient_refusals = model.reorient_refusals
             model = fresh
         stagetrace.stage("stand off", model, reduced)
     polished = polish(model, reduced, time_budget=polish_seconds, relocate=relocate,
@@ -1309,11 +1422,44 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     if log and model.overreach_refusals:
         log(f"      {model.overreach_refusals} replacements refused for starting linear "
             f"motion beyond {model.zone.reach_mm:g} mm of clearance")
-    if log and model.turn_refusals:
-        log(f"      {model.turn_refusals} waypoint cut"
-            f"{'' if model.turn_refusals == 1 else 's'} refused for carrying a joint turn "
-            f"change into a straight move")
+    if log and model.reorient_refusals:
+        log(f"      {model.reorient_refusals} replacement"
+            f"{'' if model.reorient_refusals == 1 else 's'} refused for turning the tool "
+            f"past {model.zone.reorient_deg:g} deg in one straight move")
+    if log:
+        for line in _profile_notes(model, cleared):
+            log(f"      {line}")
     return cleared, chosen
+
+
+def _profile_notes(model: "MotionModel", path: list[np.ndarray]) -> list[str]:
+    """What the two linear-motion rules left in a finished route, for the run log.
+
+    Read off the route rather than tallied as the passes ran, and for opposite reasons.
+    The turn rule is not a refusal at all -- it is part of the profile, so what it does
+    shows up as the shape of the route and not as a count of candidates turned away, and
+    the only honest way to report it is to look at what shipped.  The reorientation line
+    is the other way about: a cap that is working reports nothing here, because every such
+    move was refused as it was proposed, so a line here means one arrived with the route
+    and no replacement was ever offered that would have removed it.
+    """
+    if model.zone is None:
+        return []
+    out: list[str] = []
+    turned = sum(1 for a, b in zip(path, path[1:])
+                 if (model.near(a) or model.near(b)) and model.crosses_turn(a, b))
+    if turned:
+        out.append(f"{turned} near move{'' if turned == 1 else 's'} flown as joint motion "
+                   f"for changing a joint's turn number")
+    if model.zone.reorient_rad > 0.0:
+        over = sum(1 for a, b in zip(path, path[1:])
+                   if model.motion(a, b) == LIN and model.over_reorients(a, b))
+        if over:
+            out.append(f"{over} straight move{'' if over == 1 else 's'} "
+                       f"turn{'s' if over == 1 else ''} the tool past "
+                       f"{model.zone.reorient_deg:g} deg; no replacement may create one, "
+                       f"so it arrived with the route")
+    return out
 
 
 def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.ndarray]:
@@ -4238,9 +4384,12 @@ class Run:
 class LinearZone:
     """Settings for turning the near-panel parts of a transit into linear motion.
 
-    The band is the whole of the decision.  A move is linear when either of its ends reads
-    within ``near_mm`` of the parts, asked of every move and of nothing larger; there is no
-    per-leg qualification a route has to pass before any of its moves may be linear.
+    The band proposes every linear move and nothing larger: a move is linear when either
+    of its ends reads within ``near_mm`` of the parts, asked of every move, and no leg has
+    to qualify before any of its moves may be linear.  What the band proposes, one rule
+    takes back -- a move whose ends disagree about a joint's turn number is flown on the
+    joint chord, no controller having any way to fly it straight -- and ``reorient_deg``
+    bounds what the optimisation passes may build out of what is left.
     """
     near_mm: float = 0.0            # clearance at or under which the route counts as near
     linear_speed_mm_s: float = 0.0  # tool speed cap; 0 leaves linear moves costed on joints
@@ -4248,10 +4397,24 @@ class LinearZone:
                                      # reaches into the band from outside it; 0 charges none
     introduce_mm: float = 0.0       # furthest clearance a refinement pass may introduce a
                                     # linear move from; 0 places no limit.  See reach_mm
+    reorient_deg: float = 0.0       # furthest a refinement pass may let one straight move
+                                    # turn the tool; 0 places no limit
 
     @property
     def enabled(self) -> bool:
         return self.near_mm > 0.0
+
+    @property
+    def reorient_rad(self) -> float:
+        """``reorient_deg`` in radians, or 0 for no cap.  See ``MotionModel.reorients``.
+
+        180 deg and above is no cap rather than a wide one, and says so here instead of
+        leaving every caller to find out.  The measure is the geodesic angle between two
+        orientations, which cannot exceed pi, so a figure at or above it can never bite.
+        """
+        if not 0.0 < self.reorient_deg < 180.0:
+            return 0.0
+        return float(np.deg2rad(self.reorient_deg))
 
     @property
     def reach_mm(self) -> float:
@@ -4430,8 +4593,11 @@ def _trace_zone(zone: "LinearZone | None") -> str:
     """Which band is in force, as the stage trace reports it."""
     if zone is None or not zone.enabled:
         return "linear band: off, every move is PTP"
+    cap = (f", cap {zone.reorient_deg:g} deg of tool rotation per straight move"
+           if zone.reorient_rad > 0.0 else "")
     return (f"linear band: {zone.near_mm:g} mm, a move is LIN when either end reads "
-            f"inside it (reach {zone.reach_mm:g} mm)")
+            f"inside it and its ends share every joint's turn number "
+            f"(reach {zone.reach_mm:g} mm{cap})")
 
 
 def _traced_verify(model: "MotionModel", runs: list[Run], where: str, log=None) -> None:
@@ -4794,6 +4960,44 @@ def turn_crossings(a, b, revolute=None) -> list[int]:
                 continue
         out.append(i)
     return out
+
+
+def rotation_angle(Ra: np.ndarray, Rb: np.ndarray) -> float:
+    """How far the tool turns going from orientation ``Ra`` to ``Rb``, in radians.
+
+    The geodesic angle on SO(3): the single rotation about a single axis that takes one
+    orientation to the other, which is the one reading of "how far the tool turned" that
+    does not depend on how the orientation is parameterised.  Euler angles do -- a flip
+    reads as anything between 0 and 540 deg depending on the convention and on which axis
+    happens to be degenerate -- and summing joint deltas does not measure the tool at all.
+
+    Takes either the 3x3 blocks or the whole 4x4 poses; the translation is ignored.
+    """
+    R = np.asarray(Ra, dtype=float)[:3, :3].T @ np.asarray(Rb, dtype=float)[:3, :3]
+    return float(np.arccos(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)))
+
+
+def rotation_bound_rad(a, b, revolute=None) -> float:
+    """An upper bound on how far the tool can turn between two states, for free.
+
+    The tool's orientation is a product of one rotation per joint.  Composing rotations
+    cannot move further on SO(3) than the sum of the angles composed -- the geodesic
+    distance obeys the triangle inequality, and multiplying on either side is an isometry
+    -- so the summed revolute joint deltas bound the reorientation above without the
+    forward kinematics that measuring it needs.
+
+    A prismatic joint is left out because it contributes no rotation; with no ``revolute``
+    to say which are which every joint is counted, which can only make the bound looser.
+    Used to skip a measurement and never to make a decision: under a cap this says the
+    move is certainly within it, and over the cap it says nothing whatever.
+    """
+    qa = np.asarray(a, dtype=float).reshape(-1)
+    qb = np.asarray(b, dtype=float).reshape(-1)
+    if revolute is None:
+        return float(np.sum(np.abs(qb - qa)))
+    n = min(len(qa), len(qb), len(revolute))
+    turning = np.asarray(revolute[:n], dtype=bool)
+    return float(np.sum(np.abs(qb[:n] - qa[:n])[turning]))
 
 
 def line_stations(pose_a: np.ndarray, pose_b: np.ndarray, step_mm: float,

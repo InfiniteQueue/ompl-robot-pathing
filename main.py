@@ -641,6 +641,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "than --near-panel-mm, since a move with both ends in the band is "
                         "linear wherever it runs and has nothing to introduce. 0 places no "
                         "limit (default: %(default)g)")
+    #HOW FAR THE TOOL MAY TURN WITHIN ONE STRAIGHT MOVE
+    p.add_argument("--linear-reorient-deg", type=float, default=90.0, metavar="DEG",
+                   help="furthest the tool may turn within a single straight move that "
+                        "an optimisation pass creates. A reduction replaces a stretch of "
+                        "route with one move between its ends, and nothing in the cost "
+                        "resists that move reorienting the tool on the way: measured on "
+                        "one segment, a 110-point stretch became a single 773 mm move "
+                        "carrying 143 deg of tool rotation, which polishing then widened "
+                        "to 166 deg. The waypoints such a reduction deletes are exactly "
+                        "what made the sweep gradual, so a replacement turning the tool "
+                        "further than this is refused and they are kept. Measured as the "
+                        "angle between the orientations at the two ends, which cannot "
+                        "exceed 180, so 180 or more places no limit -- and neither does "
+                        "0 (default: %(default)g)")
     #PRICE OF REACHING INTO THE BAND FROM OUTSIDE IT
     p.add_argument("--linear-crossing-penalty-s", type=float, default=100.0,
                    metavar="SECONDS",
@@ -1291,6 +1305,9 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.linear_introduce_mm < 0.0:
         print("error: --linear-introduce-mm cannot be negative", file=sys.stderr)
         return 2
+    if args.linear_reorient_deg < 0.0:
+        print("error: --linear-reorient-deg cannot be negative", file=sys.stderr)
+        return 2
     if args.segment_minutes < 0.0:
         print("error: --segment-minutes cannot be negative", file=sys.stderr)
         return 2
@@ -1496,6 +1513,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         linear_speed_mm_s=args.linear_speed_mm_s,
         linear_crossing_penalty_s=args.linear_crossing_penalty_s,
         linear_introduce_mm=args.linear_introduce_mm,
+        linear_reorient_deg=args.linear_reorient_deg,
         direct_clearance_mm=args.direct_clearance_mm,
         finish_attempts=args.finish_attempts,
         weld_clearance_mm=args.weld_clearance_mm,

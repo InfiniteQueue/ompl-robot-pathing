@@ -278,6 +278,7 @@ class ToolpathPlanner:
                  near_panel_mm: float = 0.0, linear_speed_mm_s: float = 0.0,
                  linear_crossing_penalty_s: float = 0.0,
                  linear_introduce_mm: float = 0.0,
+                 linear_reorient_deg: float = 0.0,
                  direct_clearance_mm: float = 0.0,
                  finish_attempts: int = DEFAULT_FINISH_ATTEMPTS,
                  weld_clearance_mm: float | None = None,
@@ -348,7 +349,8 @@ class ToolpathPlanner:
         self.zone = LinearZone(near_mm=near_panel_mm,
                                linear_speed_mm_s=linear_speed_mm_s,
                                crossing_penalty_s=linear_crossing_penalty_s,
-                               introduce_mm=linear_introduce_mm)
+                               introduce_mm=linear_introduce_mm,
+                               reorient_deg=linear_reorient_deg)
         # How much air the straight move between two waypoints has to keep before it is
         # taken in preference to searching.  A collision check answers whether the move
         # touches anything, not whether it is a move anybody would choose, and the two
