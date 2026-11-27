@@ -25,6 +25,7 @@ from tesseract_robotics.tesseract_motion_planners import PlannerRequest
 from tesseract_robotics.tesseract_motion_planners_ompl import (
     OMPLMotionPlanner, OMPLRealVectorMoveProfile)
 
+from . import parallel
 from . import stagetrace
 from .cell import STOP_BAND_JOINT, Cell
 
@@ -85,6 +86,14 @@ class MotionModel:
         # Replacements turned away for reaching in from outside the limit, so a run can
         # say whether the rule bit at all rather than leaving it to be inferred.
         self.overreach_refusals = 0
+        # The same, for replacements that would have turned the tool too far in one
+        # straight move.
+        self.reorient_refusals = 0
+        # Which joints have a turn number at all.  Fixed for the cell, and read once
+        # because ``motion`` asks per candidate move.
+        self._revolute = getattr(cell, "_revolute", None)
+        # The tool's orientation at a state, for the reorientation cap.  See ``_rotation``.
+        self._rot: dict[tuple[float, bytes], np.ndarray] = {}
 
     @property
     def tool_step(self) -> float:
@@ -120,9 +129,45 @@ class MotionModel:
         return hit
 
     def motion(self, a: np.ndarray, b: np.ndarray) -> str:
+        """Which profile this move is flown under.  The one derivation point.
+
+        The band proposes; the turn rule disposes.  A move whose two ends sit in different
+        turn sectors is not a linear move that happens to be unwanted -- it is a move no
+        controller will fly straight at all -- so it is a *joint* move here, rather than a
+        linear one that some pass is asked to refuse, and everything downstream reads it
+        as one: the fill that samples it, the check that proves it clear, the price it is
+        compared at, and the split that emits it.  :meth:`crosses_turn` holds the rule and
+        the measurement behind it.
+
+        Deciding it here is the whole of the enforcement, which is why it is here.  A cut
+        whose merged move changes a turn is a joint move by this rule, so where the stretch
+        it replaces held any near point :meth:`demotes` refuses it unprompted -- the guard
+        that was already there, doing what it was written to do.  The pair of states
+        straddling the boundary therefore survives every reduction and the crossing rides
+        its own short joint move.  No pass had to be told, and the ones that never ask
+        ``refuses`` at all -- ``_densify_marked``, ``_split_runs``, ``_verify_runs`` -- are
+        covered by the same stroke.
+
+        This is what a gate in ``simplify`` could not do, and the reason it is written
+        this way.  That gate compared a candidate cut against the stretch it replaced and
+        stood aside where the stretch already carried the fault; but ``shortcut`` densifies
+        before it cuts, and a fill point's profile is derived afresh from where it sits, so
+        a crossing that rode a joint move in the route arrived re-labelled as riding a
+        linear one and the gate stood aside.  Measured on Path 1's second segment: the leg
+        reached refinement with its crossing on a PTP move, densifying put eighteen
+        consecutive fill points inside the band, and the sub-move carrying the crossing
+        read LIN.  A rule about the profile cannot be enforced anywhere but at the profile.
+
+        The reorientation cap is *not* here, and that asymmetry is deliberate: see
+        :meth:`reorients`.
+        """
         if self.pinned is not None:
             return self.pinned
-        return LIN if (self.near(a) or self.near(b)) else PTP
+        if not (self.near(a) or self.near(b)):
+            return PTP
+        if self.crosses_turn(a, b):
+            return PTP
+        return LIN
 
     def demotes(self, a: np.ndarray, b: np.ndarray, replaced) -> bool:
         """Would replacing ``replaced`` with the move a->b drop it out of the profile?
@@ -202,16 +247,132 @@ class MotionModel:
         self.overreach_refusals += 1
         return True
 
+    def crosses_turn(self, a: np.ndarray, b: np.ndarray) -> bool:
+        """Whether this move changes a joint's turn number.
+
+        A joint's turn number is which ``2 * pi`` sector it sits in, and a controller
+        carries it as part of the configuration a move is flown in.  Changing it over a
+        joint move is nothing: the joint is interpolated and the counter follows it.
+        Between the two ends of a straight move it is a configuration change the move
+        itself has no way to express -- the controller interpolates the tool pose and
+        solves as it goes, carrying one configuration -- so :meth:`motion` flies such a
+        move on the joint chord instead.
+
+        No per-station rule sees this, and that is why it needed its own.
+        ``Cell.wrap_towards`` puts each station of a line on its nearest turn to the
+        station before it, so once a chain is past a boundary it keeps walking rather than
+        coming back, and every step of the crossing is a small legal one that
+        ``LINE_JUMP_RAD`` passes.  Measured on Path 1: joint 6 crossed -180 deg inside one
+        881 mm LIN move carrying 157 deg of wrist travel, in steps of some 1.5 deg, having
+        crossed the same boundary in a PTP move of 2.9 deg before the route was reduced.
+
+        **The two ends, and only those, which is the right reading rather than a limit.**
+        A line whose stations leave a sector and come back has both ends in one sector and
+        is not caught here.  Nor should it be: what the controller cannot represent is a
+        difference between the configurations of the two states it is commanded with, and
+        an excursion that returns is flown by the same continuous solve that flies the rest
+        of the line.  An earlier note here called this a hole to be closed by reading the
+        chain ``linear_chain`` builds; it is not, and reading the chain would instead
+        reject ordinary moves whose ends sit within a station of a boundary -- which on
+        these cells, where a weld pose can sit at -200 deg on joint 6, is not rare.
+        """
+        return bool(turn_crossings(a, b, self._revolute))
+
+    def _rotation(self, q: np.ndarray) -> np.ndarray:
+        """The tool's orientation at a state, remembered.
+
+        Forward kinematics here is not a matrix multiply: it pushes the joints into the
+        environment and rebuilds every link transform, the same load a collision test
+        pays.  So this is cached exactly as ``near`` is, and keyed by the gun opening as
+        well as the joint vector, since the tip the tool centre point sits on swings with
+        it -- the same reason ``Cell.tcp_at`` keys its own cache that way.
+        """
+        key = (self.cell.gun_value, np.asarray(q, dtype=float).tobytes())
+        hit = self._rot.get(key)
+        if hit is None:
+            hit = np.array(self.cell.fk(q)[:3, :3], dtype=float)
+            self._rot[key] = hit
+        return hit
+
+    def tool_turn_rad(self, a: np.ndarray, b: np.ndarray) -> float:
+        """How far the tool turns between two states, in radians.  See ``rotation_angle``."""
+        return rotation_angle(self._rotation(a), self._rotation(b))
+
+    def over_reorients(self, a: np.ndarray, b: np.ndarray) -> bool:
+        """Whether the tool turns further between these two states than the cap allows.
+
+        Says nothing about the profile: :meth:`reorients` is what asks this of a move that
+        would be flown straight, and a joint move's reorientation is nobody's concern.
+
+        The free bound comes first.  Measuring this is forward kinematics at both ends,
+        which loads a joint state into the environment, while ``rotation_bound_rad`` is
+        arithmetic on the two joint vectors and settles every move whose joints barely
+        move -- which on a densified route is nearly all of them.  It can only err towards
+        measuring, never towards passing a move it has not measured.
+        """
+        if self.zone is None or self.zone.reorient_rad <= 0.0:
+            return False
+        cap = self.zone.reorient_rad
+        if rotation_bound_rad(a, b, self._revolute) <= cap:
+            return False
+        return self.tool_turn_rad(a, b) > cap
+
+    def reorients(self, a: np.ndarray, b: np.ndarray) -> bool:
+        """Whether this move is a straight one that turns the tool further than allowed.
+
+        A refusal, not a demotion, and that is the whole difference between this and
+        :meth:`crosses_turn`.  A turn change is something a straight move cannot do, so
+        the profile has to say so.  Turning the tool 165 deg over 763 mm is something a
+        straight move does perfectly well and that nobody wants: it is a preference, it
+        belongs in :meth:`refuses` with the other preferences, and it is enforced by
+        refusing the replacements that build such a move rather than by handing the robot
+        the joint chord between its ends.  Demoting it would reroute a move that currently
+        ships onto a different curve, which nothing has checked and which may well be
+        blocked, and turn a working leg into a verification failure.
+
+        Refusing is enough because this fault is *created*, every time.  A route arrives
+        from the solvers in small steps; the long reorienting move is what a reduction
+        makes of them.  Measured on Path 1's second segment: the solver's 78 states moved
+        2.86 deg at most, ``simplify`` reduced a 110-point stretch to 7 and made one move
+        of 773 mm carrying 142.9 deg of tool rotation, and ``polish`` then relocated its
+        ends out to 165.9 deg.  Refuse the replacements and the waypoints that make the
+        reorientation gradual are kept, which is the wanted outcome and not a second best.
+
+        No exemption, unlike :meth:`overreaches`.  That rule exempts a stretch that
+        already reached in from far out, because reaching in can be a property of where the
+        route legitimately has to go.  There is no matching case here: the cap bounds one
+        move's own content, so a stretch that already exceeds it is precisely a stretch
+        whose points must not be merged any further.
+
+        Off entirely with no cap set, where it is the constant False it was before.
+        """
+        if self.zone is None or self.zone.reorient_rad <= 0.0:
+            return False
+        if self.motion(a, b) != LIN:
+            return False
+        if not self.over_reorients(a, b):
+            return False
+        self.reorient_refusals += 1
+        return True
+
     def refuses(self, a: np.ndarray, b: np.ndarray, replaced) -> bool:
         """Whether the profile rules forbid replacing ``replaced`` with the move a->b.
 
-        The one question the optimisation passes ask.  Both halves guard the same thing
-        from opposite sides -- :meth:`demotes` stops a near-panel stretch being dissolved
-        into a joint chord through it, :meth:`overreaches` stops a linear one being grown
-        outward into the approach -- and neither is about cost, so they are settled before
-        the move is checked or priced.
+        The one question the optimisation passes ask.  Three preferences about linear
+        motion, none of them about cost, so all three are settled before the move is
+        checked or priced: :meth:`demotes` stops a near-panel stretch being dissolved into
+        a joint chord through it, :meth:`overreaches` stops a linear one being grown
+        outward into the approach, and :meth:`reorients` stops one being grown into a
+        sweep that turns the tool further than a straight move should.
+
+        The turn rule is deliberately absent.  It is not a preference about linear motion
+        but a statement that a given move *is not* linear motion, so it lives in
+        :meth:`motion` and reaches the passes through the profile rather than through here
+        -- which is also how it reaches ``_densify_marked``, ``_split_runs`` and
+        ``_verify_runs``, none of which ask this.
         """
-        return self.demotes(a, b, replaced) or self.overreaches(a, b, replaced)
+        return (self.demotes(a, b, replaced) or self.overreaches(a, b, replaced)
+                or self.reorients(a, b))
 
     # -- what it forbids ----------------------------------------------------
     def blocked(self, a: np.ndarray, b: np.ndarray) -> bool:
@@ -425,12 +586,16 @@ class MotionModel:
 
         So this asks only what is already known.  Every clearance factor is at least 1, so
         the joint-limit time alone is always a valid floor.  The tool speed cap can be
-        added on top of it whenever one end is *known* to be near, since the move is then
-        linear whatever the other end turns out to be -- and in a cell where the route
-        hugs the panels that is the common case, so the bound is usually as tight as the
-        real one for nothing.  Where neither end has been measured the cap is left out
-        rather than measured for: a looser bound rejects fewer candidates, which is a
-        cost, but a wrong one would reject a candidate that should have won.
+        added on top of it whenever one end is *known* to be near and the move does not
+        change a joint's turn number: it is then linear whatever the other end turns out
+        to be -- and in a cell where the route hugs the panels that is the common case, so
+        the bound is usually as tight as the real one for nothing.  Where neither end has
+        been measured the cap is left out rather than measured for: a looser bound rejects
+        fewer candidates, which is a cost, but a wrong one would reject a candidate that
+        should have won.  The turn test is free, being arithmetic on the two joint vectors,
+        so it is asked rather than assumed away -- without it a near-ended move that
+        ``motion`` flies as a joint move would be charged a tool speed cap it never pays,
+        and the bound would stop being one.
 
         The crossing penalty is always left out.  ``_crosses`` compares both ends and so
         cannot be answered from one of them, and since it only ever raises the cost,
@@ -441,6 +606,8 @@ class MotionModel:
         if self.zone is None or self.zone.linear_speed_mm_s <= 0.0:
             return base
         if not (self._known_near(a) or self._known_near(b)):
+            return base
+        if self.crosses_turn(a, b):
             return base
         return max(base, _tcp_travel(self.cell, [a, b]) / self.zone.linear_speed_mm_s)
 
@@ -508,6 +675,18 @@ def simplify(model: MotionModel, path: list[np.ndarray], log=None) -> list[np.nd
     the result is guaranteed to be traversable, which a Douglas-Peucker style reduction
     is not: dropping a point that merely lies close to the chord can cut the corner
     straight through an obstacle.
+
+    **A cut that would carry a joint turn change into a straight move is refused, and
+    this pass does not have to do anything about it.**  Such a merged move is a joint move
+    by ``MotionModel.motion``, so where the stretch being cut holds a near point
+    ``demotes`` turns the cut away as a profile demotion -- which is what it is.  The pair
+    of states straddling the boundary therefore survives, and the crossing keeps its own
+    short joint move.  ``MotionModel.crosses_turn`` holds the rule and the measurement.
+
+    **A cut that would turn the tool further than one straight move should is refused too**,
+    by ``MotionModel.reorients``, and that one this pass was measured creating: a
+    110-point stretch reduced to 7 made a single 773 mm move carrying 142.9 deg of tool
+    rotation.  The waypoints being deleted are exactly what made the sweep gradual.
 
     A sampled path wanders and the controller does not need the wandering, so this is
     also what keeps the output down to the handful of points a FANUC program wants.
@@ -580,6 +759,9 @@ def simplify(model: MotionModel, path: list[np.ndarray], log=None) -> list[np.nd
             if j < last and model.cell.in_stop_band(path[j]):
                 j -= 1
                 continue
+            # Ahead of the pricing, so a reach recorded in ``dearer`` has passed it too:
+            # that list is read when the walk runs out on a state the robot may not stop
+            # at, and a reach taken from it is taken without being re-tested.
             if model.refuses(path[i], path[j], path[i + 1:j]):
                 j -= 1
                 continue
@@ -1147,13 +1329,28 @@ def _stand_off(cell: Cell, path: list[np.ndarray], *, opening: float | None,
     return best, value
 
 
+def _stop_cost(model: "MotionModel", path: list[np.ndarray]) -> float:
+    """What a polished route costs, stop to stop, under the penalty.
+
+    The same sum ``polish`` itself works against, recomputed here so that several attempts
+    can be ranked against one another on one measure rather than on each attempt's own
+    report of itself.  It is arithmetic over the penalty factors and nothing is collision
+    checked: every path offered here has already been checked by the attempt that built
+    it, every replacement in it one at a time.
+    """
+    factors = [model.penalty_factor(p) for p in path]
+    return sum(model.cost(path[i], path[i + 1], fa=factors[i], fb=factors[i + 1],
+                          stops=True)
+               for i in range(len(path) - 1))
+
+
 def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: float,
             polish_seconds: float, relocate: "Relocation | None" = None,
             anchors: list[int] | None = None,
             opening: float | None = None, stand_off: "StandOff | None" = None,
             gun: "GunPreference | None" = None,
             check_step: float | None = None,
-            deadline: "Deadline | None" = None,
+            deadline: "Deadline | None" = None, seed: int = 0,
             log=print) -> tuple[list[np.ndarray], float | None]:
     """The whole post-processing chain, in the order the three passes need to run.
 
@@ -1179,8 +1376,13 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     else:
         log(f"      refining {len(path)} points: up to {shortcut_seconds:g}s shortcutting "
             f"then {polish_seconds:g}s polishing, both spent in full")
+    # ``seed`` is what makes a second attempt at the same leg a different attempt.  Both
+    # passes here draw -- shortcut picks the stretch to cut, polish the waypoint to move --
+    # and both default to a fixed generator, so without this a repeat would walk the same
+    # draws to the same answer and the caller would be ranking a route against itself.
+    # 0 is what each pass uses on its own, so a single attempt is what it always was.
     improved = shortcut(model, path, time_budget=shortcut_seconds, anchors=anchors,
-                        log=log)
+                        rng=np.random.default_rng(seed), log=log)
     stagetrace.stage("shortcut", model, improved)
     reduced = simplify(model, improved, log=log)
     stagetrace.stage("simplify", model, reduced)
@@ -1201,11 +1403,18 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
             # And a new model for it.  The near and reach caches are keyed on the state
             # alone, so the old one would answer the band's question with what it learned
             # at the opening before -- which is the whole thing the gun has just moved.
-            model = MotionModel(model.cell, max_step=model.max_step, zone=model.zone,
+            fresh = MotionModel(model.cell, max_step=model.max_step, zone=model.zone,
                                 pinned=model.pinned)
+            # The caches go, which is the whole point of rebuilding.  The refusal tallies
+            # are the run's own record of what the rules did and are not the gun's to
+            # reset -- both passes that fill them have already run by this point, so
+            # leaving them behind reported zero for a rule that had bitten.
+            fresh.overreach_refusals = model.overreach_refusals
+            fresh.reorient_refusals = model.reorient_refusals
+            model = fresh
         stagetrace.stage("stand off", model, reduced)
     polished = polish(model, reduced, time_budget=polish_seconds, relocate=relocate,
-                      log=log)
+                      rng=np.random.default_rng(seed + 1), log=log)
     stagetrace.stage("polish", model, polished)
     # Outside the budgets on purpose: a route refined with none still ships its stops.
     cleared = clear_stop_band(model, polished, log=log)
@@ -1213,7 +1422,44 @@ def _refine(model: "MotionModel", path: list[np.ndarray], *, shortcut_seconds: f
     if log and model.overreach_refusals:
         log(f"      {model.overreach_refusals} replacements refused for starting linear "
             f"motion beyond {model.zone.reach_mm:g} mm of clearance")
+    if log and model.reorient_refusals:
+        log(f"      {model.reorient_refusals} replacement"
+            f"{'' if model.reorient_refusals == 1 else 's'} refused for turning the tool "
+            f"past {model.zone.reorient_deg:g} deg in one straight move")
+    if log:
+        for line in _profile_notes(model, cleared):
+            log(f"      {line}")
     return cleared, chosen
+
+
+def _profile_notes(model: "MotionModel", path: list[np.ndarray]) -> list[str]:
+    """What the two linear-motion rules left in a finished route, for the run log.
+
+    Read off the route rather than tallied as the passes ran, and for opposite reasons.
+    The turn rule is not a refusal at all -- it is part of the profile, so what it does
+    shows up as the shape of the route and not as a count of candidates turned away, and
+    the only honest way to report it is to look at what shipped.  The reorientation line
+    is the other way about: a cap that is working reports nothing here, because every such
+    move was refused as it was proposed, so a line here means one arrived with the route
+    and no replacement was ever offered that would have removed it.
+    """
+    if model.zone is None:
+        return []
+    out: list[str] = []
+    turned = sum(1 for a, b in zip(path, path[1:])
+                 if (model.near(a) or model.near(b)) and model.crosses_turn(a, b))
+    if turned:
+        out.append(f"{turned} near move{'' if turned == 1 else 's'} flown as joint motion "
+                   f"for changing a joint's turn number")
+    if model.zone.reorient_rad > 0.0:
+        over = sum(1 for a, b in zip(path, path[1:])
+                   if model.motion(a, b) == LIN and model.over_reorients(a, b))
+        if over:
+            out.append(f"{over} straight move{'' if over == 1 else 's'} "
+                       f"turn{'s' if over == 1 else ''} the tool past "
+                       f"{model.zone.reorient_deg:g} deg; no replacement may create one, "
+                       f"so it arrived with the route")
+    return out
 
 
 def _resample(cell: Cell, a: np.ndarray, b: np.ndarray, step: float) -> list[np.ndarray]:
@@ -1844,6 +2090,17 @@ DEFAULT_PLANNING_TIME = 5.0
 # shape happened to be unlucky and few enough that a forced crossing is found out inside
 # one segment clock.
 DEFAULT_FINISH_ATTEMPTS = 4
+# How far apart the seed blocks of two gun openings are kept.  A run's seed used to be
+# its position in one counter that ran across every opening, so which seed an opening got
+# depended on how many seeds the openings before it had happened to spend -- which made a
+# search reproducible only by reproducing the timing of every search before it, and is not
+# a thing that can be true at all once openings run at once.  Each opening now draws from a
+# block of its own, so opening k seed s is the same search whatever else ran, and
+# ``--workers`` changes what a run costs rather than what it searches.  Wide enough that no
+# opening could ever exhaust its block: a seed is a tree search of at least a fraction of a
+# second, and this is thousands of them.
+_SEED_BLOCK = 10_000
+
 # The rest of OMPLSolverConfig's documented defaults, used to recognise the struct.
 _SOLVER_SIGNATURE = (10, 0, 1)          # max_solutions, simplify, optimize
 _planning_time_warned = False
@@ -3308,6 +3565,9 @@ class _Sampler:
     # OMPL needs none of this: its generator is its own and these bindings do not reach it,
     # which is why its runs already differ.
     joint_runs: int = 0
+    # How many runs of this phase may be in the air at once, or ``None`` for the run's
+    # own setting.  Only ever more than one where ``joint`` is set: see ``phase_one``.
+    workers: int | None = None
 
     def phase_one(self, qa: np.ndarray, qb: np.ndarray,
                   label: str = "phase 1",
@@ -3319,22 +3579,58 @@ class _Sampler:
         spends its whole first phase proving it.  Nothing carries between runs -- each
         builds its own tree from scratch -- so the order decides only which openings get
         the odd extra run where the two counts do not divide.
+
+        **That "nothing carries between runs" is what makes the phase parallel.**  Every
+        run gets its own seed, its own opening and its own clock, and the phase keeps the
+        set rather than stopping at the first that solves -- so running them at once
+        changes what the phase costs and not what it finds.  ``phase_two`` is the opposite
+        on both counts and is left alone: it stops at the first solution, so running its
+        runs together would spend every one of them to find what one of them found.
+
+        **Only where the joint tree is the planner.**  An OMPL run calls
+        ``Cell.sync_env`` -- it has to, the planner being handed the environment and
+        reading the gun opening off its current state -- and that writes to the one object
+        every thread here shares.  Nothing in ``Cell.worker`` makes that safe and nothing
+        could, short of a second environment per worker, which is the cost threads were
+        chosen to avoid.  So a sampler running OMPL runs its phase one exactly as it did.
         """
         if self.ompl.phase_one_runs <= 0:
             return []
         cycle = list(rotation if rotation is not None else self.openings.main) or [None]
-        self.log(f"      {label}: {self.ompl.phase_one_runs} runs of "
+        runs = self.ompl.phase_one_runs
+        threads = (parallel.threads(runs, self.workers) if self.joint is not None
+                   else 1)
+        self.log(f"      {label}: {runs} runs of "
                  f"{self.ompl.phase_one_seconds:g}s each over {_openings_note(cycle)}, "
-                 f"keeping the cheapest that solves")
-        found: list[_Solution] = []
-        for attempt in range(1, self.ompl.phase_one_runs + 1):
-            if self.deadline.ran_out(self.log, f"{label} after {attempt - 1} runs"):
-                break
-            got = self._run(qa, qb, self.deadline.clamp(self.ompl.phase_one_seconds),
-                            f"{label} run {attempt}", cycle[(attempt - 1) % len(cycle)])
-            if got is not None:
-                found.append(got)
-        return found
+                 f"keeping the cheapest that solves"
+                 + (f", {threads} at once" if threads > 1 else ""))
+        # Seeds are handed out here rather than drawn from the counter inside the run, so
+        # that run n is the same search however many runs are in the air beside it.  The
+        # counter still advances by the whole phase, so a later phase on this sampler
+        # carries on past these rather than repeating them.
+        first = self.joint_runs
+        self.joint_runs += runs
+        views = ([self.cell.worker() for _ in range(runs)] if threads > 1
+                 else [self.cell] * runs)
+
+        def attempt(index: int, view: Cell):
+            def job(log) -> "_Solution | None":
+                if self.deadline.expired:
+                    return None
+                return self._run(qa, qb,
+                                 self.deadline.clamp(self.ompl.phase_one_seconds),
+                                 f"{label} run {index + 1}",
+                                 cycle[index % len(cycle)],
+                                 cell=view, seed=first + index, log=log)
+
+            return job
+
+        got = parallel.run([attempt(i, view) for i, view in enumerate(views)],
+                           threads, self.log)
+        if threads > 1:
+            self.cell.absorb(*views)
+        self.deadline.ran_out(self.log, label)
+        return [one for one in got if one is not None]
 
     def phase_two(self, qa: np.ndarray, qb: np.ndarray,
                   label: str = "phase 2", rotation: list | None = None,
@@ -3397,10 +3693,20 @@ class _Sampler:
         return _cheapest(candidates, self.log) if candidates else None
 
     def _run(self, qa: np.ndarray, qb: np.ndarray, planning_time: float,
-             label: str, opening: float | None = None) -> _Solution | None:
-        """One sampling-planner solve, scored and reported.  ``None`` when it did not solve."""
+             label: str, opening: float | None = None, *,
+             cell: Cell | None = None, seed: int | None = None,
+             log=None) -> _Solution | None:
+        """One sampling-planner solve, scored and reported.  ``None`` when it did not solve.
+
+        ``cell``, ``seed`` and ``log`` are what a run needs to be one of several in the
+        air: the cell it may touch, the seed it must use rather than draw, and where its
+        lines go.  All three default to the sampler's own, which is the sequential call
+        this has always been.  Only the joint tree accepts them -- an OMPL run moves the
+        environment and so is never one of several; see ``phase_one``.
+        """
         if self.joint is not None:
-            return self._run_joint(qa, qb, planning_time, label, opening)
+            return self._run_joint(qa, qb, planning_time, label, opening,
+                                   cell=cell, seed=seed, log=log)
         with self.cell.gun_opening(opening):
             # The gun is not an inverse-kinematics variable but it is very much a state
             # one, and the planner reads the state the environment is holding rather than
@@ -3440,7 +3746,9 @@ class _Sampler:
         return _Solution(cost, plain, raw, opening)
 
     def _run_joint(self, qa: np.ndarray, qb: np.ndarray, planning_time: float,
-                   label: str, opening: float | None) -> _Solution | None:
+                   label: str, opening: float | None, *,
+                   cell: Cell | None = None, seed: int | None = None,
+                   log=None) -> _Solution | None:
         """:meth:`_run` through the joint-space tree -- ``--joint-tree``.
 
         The same question, the same budget and the same scoring, so a run of this is
@@ -3462,42 +3770,54 @@ class _Sampler:
           footing a Cartesian-tree route arrives on.
         """
         from .jointtree import plan_joint      # deferred: jointtree.py reads this module
+        cell = self.cell if cell is None else cell
+        log = self.log if log is None else log
         t0 = time.time()
         note = _gun_note(opening)
         # The configured seed is the *first* run's, so a single-run phase reproduces what
         # ``--joint-tree`` would give on its own and a multi-run phase walks on from there.
-        seed = self.joint.seed + self.joint_runs
-        self.joint_runs += 1
+        # A caller running several at once hands the seed in instead, having dealt them
+        # out before any of them started -- a counter read and bumped here would make a
+        # run's seed depend on which other runs happened to reach this line first.
+        if seed is None:
+            seed = self.joint.seed + self.joint_runs
+            self.joint_runs += 1
+        else:
+            seed = self.joint.seed + int(seed)
         # **It goes in every line this run prints.**  The search is deterministic in its
         # seed, so that is the one number saying whether two runs asked the same question,
         # and while nothing printed it four identical runs read as a planner with nothing
         # to offer rather than as a caller that had forgotten to vary anything.  It is also
         # what a reader needs to reproduce one run of a phase on its own.
         at = f"{note}, seed {seed}"
-        with self.cell.gun_opening(opening):
+        # Every read and every write below is this run's own cell -- the sampler's where
+        # it is running alone, a worker's where it is one of several.  Scoring happens
+        # here, inside the run, rather than back at the caller: the cache that measured
+        # the route is this cell's, and it is warm exactly here.
+        with cell.gun_opening(opening):
             try:
-                route = plan_joint(self.cell, qa, qb, max_step=self.check_step,
+                route = plan_joint(cell, qa, qb, max_step=self.check_step,
                                    label=f"{label}{note}",
                                    budget=replace(self.joint, seconds=planning_time,
                                                   seed=seed))
             except PlanningError as exc:
                 self.message = str(exc)
-                self.log(f"      {label}{at}: {self.message} "
-                         f"({time.time() - t0:.1f}s)")
+                log(f"      {label}{at}: {self.message} "
+                    f"({time.time() - t0:.1f}s)")
                 return None
             dt = time.time() - t0
-            fault = _route_fault(self.cell, route, self.check_step)
+            fault = _route_fault(cell, route, self.check_step)
             if fault is not None:
                 self.message = (f"the joint tree returned a route that is not clear under "
                                 f"this cell's own check ({fault}), which is a bug rather "
                                 f"than a resolution disagreement -- it validated every "
                                 f"edge with that same call")
-                self.log(f"      {label}{at}: {self.message} ({dt:.1f}s)")
+                log(f"      {label}{at}: {self.message} ({dt:.1f}s)")
                 return None
-            cost, plain = _path_cost(self.cell, route, self.check_step, zone=self.zone,
+            cost, plain = _path_cost(cell, route, self.check_step, zone=self.zone,
                                      gun=self.gun, opening=opening)
-        self.log(f"      {label}{at}: solved in {dt:.1f}s ({len(route)} states, "
-                 f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
+        log(f"      {label}{at}: solved in {dt:.1f}s ({len(route)} states, "
+            f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
         return _Solution(cost, plain, route, opening, JOINTED)
 
 
@@ -3782,7 +4102,8 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                          deadline: "Deadline | None" = None,
                          zone: "LinearZone | None" = None,
                          gun: "GunPreference | None" = None,
-                         wide_box_mm: float = 0.0) -> list[_Solution]:
+                         wide_box_mm: float = 0.0,
+                         workers: int | None = None) -> list[_Solution]:
     """Cartesian-tree routes for one transit, each scored as phase one scores its own.
 
     **The budgets are per gun opening.**  Each opening in turn is searched from
@@ -3828,30 +4149,41 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
     # opening to attempt: the rotation has already been screened, and the ones left out of
     # it are left out because they repeat another or leave a pose of the leg in collision.
     wanted = max(1, min(int(budget.gun_openings), len(rotation)))
-    log(f"      cartesian tree: {_openings_note(rotation[:wanted])}, up to "
+    openings = rotation[:wanted]
+    threads = parallel.threads(len(openings), workers)
+    log(f"      cartesian tree: {_openings_note(openings)}, up to "
         f"{budget.seconds:g}s on {'each' if wanted > 1 else 'it'} to find a route in "
-        f"linear space and {budget.process_seconds:g}s more on better ones")
-    found: list[_Solution] = []
-    run = 0
-    wide: tuple | None = None
-    for opening in rotation[:wanted]:
-        began = time.time()
-        solved: float | None = None
-        seeds = 0
-        while True:
-            left = deadline.clamp((began + budget.seconds if solved is None else
-                                   solved + budget.process_seconds) - time.time())
-            if left <= 0.0:
-                if deadline.expired:
-                    # The segment clock, not this opening's: there is no next opening to
-                    # move on to either.
-                    deadline.ran_out(log, f"the cartesian tree after {run} runs")
-                    return found
-                break
-            run += 1
-            seeds += 1
-            use = budget
-            if wide_box_mm > 0.0 and seeds > 1 and solved is None:
+        f"linear space and {budget.process_seconds:g}s more on better ones"
+        + (f", {threads} openings at once" if threads > 1 else ""))
+    # Primed here, where it is paid once, rather than inside an attempt, where every
+    # opening would pay it: reading the panels' extent costs a pass over every prepared
+    # OBJ -- 4.8 s on the cell this was built for -- and the answer is cached on the cell
+    # the workers are copied from.  Only where a wide box can be asked for at all, which
+    # is the detour's extractions and nothing else.
+    if wide_box_mm > 0.0 and threads > 1:
+        cell.statics_bounds()
+    views = [cell.worker() for _ in openings] if threads > 1 else [cell] * len(openings)
+
+    def attempt(index: int, opening, view: Cell):
+        """One gun opening's whole seed loop, which is what runs on one thread."""
+
+        def job(log) -> list[_Solution]:
+            found: list[_Solution] = []
+            began = time.time()
+            solved: float | None = None
+            seeds = 0
+            wide: tuple | None = None
+            while True:
+                left = deadline.clamp((began + budget.seconds if solved is None else
+                                       solved + budget.process_seconds) - time.time())
+                if left <= 0.0:
+                    # Whether this was the opening's clock or the segment's, there is
+                    # nothing more to do at this opening.  Which of the two it was is
+                    # reported once by the caller, not once per opening.
+                    break
+                seeds += 1
+                use = budget
+                if wide_box_mm > 0.0 and seeds > 1 and solved is None:
                 # The first seed at an opening gets the endpoint box, and only a seed
                 # following a failure gets the wide one.  Escalation rather than a setting
                 # because the two boxes are right in different cases and nothing can tell
@@ -3864,23 +4196,38 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                 # Not offered once the opening has solved.  The seeds after that are
                 # looking for a *better* route, and the box that produced one is not the
                 # thing to change about the search that found it.
-                if wide is None:
-                    wide = _wide_box(cell, wide_box_mm, log)
-                if wide is not None:
-                    use = replace(budget, box=wide)
-            got = _cartesian_route(cell, qa, qb, use, seconds=left, zone=zone, gun=gun,
-                                   seed=budget.seed + run - 1, opening=opening,
-                                   check_step=check_step,
-                                   label=f"cartesian tree run {run}"
-                                         + (" (wide box)" if use is not budget else ""),
-                                   log=log)
-            if got is not None:
-                found.append(got)
-                if solved is None:
-                    # Timed from the first route at this opening and not restarted by a
-                    # second, or an opening that keeps solving would never be left.
-                    solved = time.time()
-    return found
+                    if wide is None:
+                        wide = _wide_box(view, wide_box_mm, log)
+                    if wide is not None:
+                        use = replace(budget, box=wide)
+                got = _cartesian_route(
+                    view, qa, qb, use, seconds=left, zone=zone, gun=gun,
+                    seed=budget.seed + index * _SEED_BLOCK + seeds - 1, opening=opening,
+                    check_step=check_step,
+                    label=f"cartesian tree opening {index + 1} run {seeds}"
+                          + (" (wide box)" if use is not budget else ""),
+                    log=log)
+                if got is not None:
+                    found.append(got)
+                    if solved is None:
+                        # Timed from the first route at this opening and not restarted by
+                        # a second, or an opening that keeps solving would never be left.
+                        solved = time.time()
+            return found
+
+        return job
+
+    batches = parallel.run(
+        [attempt(i, opening, view)
+         for i, (opening, view) in enumerate(zip(openings, views))], threads, log)
+    if threads > 1:
+        cell.absorb(*views)
+    deadline.ran_out(log, "the cartesian tree")
+    # Concatenated in opening order rather than in the order attempts finished, so the
+    # set handed to the ranking is the same set in the same order whatever the thread
+    # count -- and a run with --workers 1 is indistinguishable from one before any of
+    # this, bar the seeds.
+    return [got for batch in batches for got in batch]
 
 
 def _far_stretches(near: list[bool]) -> list[tuple[int, int]]:
@@ -4037,9 +4384,12 @@ class Run:
 class LinearZone:
     """Settings for turning the near-panel parts of a transit into linear motion.
 
-    The band is the whole of the decision.  A move is linear when either of its ends reads
-    within ``near_mm`` of the parts, asked of every move and of nothing larger; there is no
-    per-leg qualification a route has to pass before any of its moves may be linear.
+    The band proposes every linear move and nothing larger: a move is linear when either
+    of its ends reads within ``near_mm`` of the parts, asked of every move, and no leg has
+    to qualify before any of its moves may be linear.  What the band proposes, one rule
+    takes back -- a move whose ends disagree about a joint's turn number is flown on the
+    joint chord, no controller having any way to fly it straight -- and ``reorient_deg``
+    bounds what the optimisation passes may build out of what is left.
     """
     near_mm: float = 0.0            # clearance at or under which the route counts as near
     linear_speed_mm_s: float = 0.0  # tool speed cap; 0 leaves linear moves costed on joints
@@ -4047,10 +4397,24 @@ class LinearZone:
                                      # reaches into the band from outside it; 0 charges none
     introduce_mm: float = 0.0       # furthest clearance a refinement pass may introduce a
                                     # linear move from; 0 places no limit.  See reach_mm
+    reorient_deg: float = 0.0       # furthest a refinement pass may let one straight move
+                                    # turn the tool; 0 places no limit
 
     @property
     def enabled(self) -> bool:
         return self.near_mm > 0.0
+
+    @property
+    def reorient_rad(self) -> float:
+        """``reorient_deg`` in radians, or 0 for no cap.  See ``MotionModel.reorients``.
+
+        180 deg and above is no cap rather than a wide one, and says so here instead of
+        leaving every caller to find out.  The measure is the geodesic angle between two
+        orientations, which cannot exceed pi, so a figure at or above it can never bite.
+        """
+        if not 0.0 < self.reorient_deg < 180.0:
+            return 0.0
+        return float(np.deg2rad(self.reorient_deg))
 
     @property
     def reach_mm(self) -> float:
@@ -4080,7 +4444,7 @@ def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
                  relocate: "Relocation | None" = None,
                  opening: float | None = None, stand_off: "StandOff | None" = None,
                  gun: "GunPreference | None" = None,
-                 deadline: "Deadline | None" = None,
+                 deadline: "Deadline | None" = None, seed: int = 0,
                  log=print) -> tuple[list[Run], float | None]:
     """Optimise an already-split route and split it again.
 
@@ -4099,7 +4463,8 @@ def _refine_runs(cell: Cell, runs: list[Run], *, zone: "LinearZone | None",
     refined, chosen = _refine(model, pts, shortcut_seconds=shortcut_seconds,
                               polish_seconds=polish_seconds, relocate=relocate,
                               opening=opening, stand_off=stand_off, gun=gun,
-                              check_step=check_step, deadline=deadline, log=log)
+                              check_step=check_step, deadline=deadline, seed=seed,
+                              log=log)
     if not _same_opening(chosen, opening):
         # The stand-off moved the gun and left it there; the split and the verification
         # have to read the leg at the opening it will be flown at, not the one it was
@@ -4228,8 +4593,11 @@ def _trace_zone(zone: "LinearZone | None") -> str:
     """Which band is in force, as the stage trace reports it."""
     if zone is None or not zone.enabled:
         return "linear band: off, every move is PTP"
+    cap = (f", cap {zone.reorient_deg:g} deg of tool rotation per straight move"
+           if zone.reorient_rad > 0.0 else "")
     return (f"linear band: {zone.near_mm:g} mm, a move is LIN when either end reads "
-            f"inside it (reach {zone.reach_mm:g} mm)")
+            f"inside it and its ends share every joint's turn number "
+            f"(reach {zone.reach_mm:g} mm{cap})")
 
 
 def _traced_verify(model: "MotionModel", runs: list[Run], where: str, log=None) -> None:
@@ -4536,6 +4904,100 @@ def interpolate_pose(a: np.ndarray, b: np.ndarray, t: float) -> np.ndarray:
 # the controller cannot make inside one straight move.
 LINE_JUMP_RAD = 0.5
 LINE_END_TOL_RAD = 1e-2
+
+
+# A joint's turn number is which ``2 * pi`` sector it sits in, the boundaries falling on
+# the odd multiples of pi, and a controller carries it as part of the configuration a move
+# is flown in.  ``_TURN_SECTOR`` is that period.
+#
+# Deliberately not covered by ``LINE_JUMP_RAD``, and the two catch different things.  The
+# jump rule tests the step between two stations, so it catches a turn that arrives as a
+# *jump* -- the 2*pi gap ``cartesian.plan_cartesian`` refuses between its two trees.  A
+# route that walks across a boundary in small steps passes the jump rule at every station,
+# each one a legal continuous solve, and changes the turn number all the same.  Measured on
+# Path 1: joint 6 crossed -180 deg inside one 881 mm LIN move carrying 157 deg of wrist
+# travel, having crossed it in a PTP move of 2.9 deg before the route was reduced.
+_TURN_SECTOR = 2.0 * np.pi
+
+# How near a boundary a state may sit without being read as across it.  Joint 3's upper
+# limit on these cells is exactly pi, so a state at its limit sits exactly on a boundary
+# and which sector it belongs to is a matter of float luck; a move that merely touches one
+# has not crossed it.
+_TURN_EDGE_TOL_RAD = 1e-6
+
+
+def _turn_sector(value: float) -> int:
+    """Which ``2 * pi`` sector a joint value sits in; sectors break on odd multiples of pi."""
+    return int(np.floor((float(value) + np.pi) / _TURN_SECTOR))
+
+
+def turn_crossings(a, b, revolute=None) -> list[int]:
+    """Indices of the joints whose turn number differs between the states ``a`` and ``b``.
+
+    Revolute joints only.  A prismatic joint's value is a length, where a sector boundary
+    at pi metres would mean nothing, so ``revolute`` is what says which are which; unset,
+    nothing is checked rather than everything being guessed at.
+
+    A pair on opposite sides of one boundary but within ``_TURN_EDGE_TOL_RAD`` of it at
+    either end has not crossed it -- see the note on that tolerance.  Two or more
+    boundaries apart is a crossing whatever the tolerance says.
+    """
+    if revolute is None:
+        return []
+    qa = np.asarray(a, dtype=float).reshape(-1)
+    qb = np.asarray(b, dtype=float).reshape(-1)
+    out: list[int] = []
+    for i in range(min(len(qa), len(qb), len(revolute))):
+        if not revolute[i]:
+            continue
+        sa, sb = _turn_sector(qa[i]), _turn_sector(qb[i])
+        if sa == sb:
+            continue
+        if abs(sa - sb) == 1:
+            edge = (2 * min(sa, sb) + 1) * np.pi
+            if (abs(qa[i] - edge) <= _TURN_EDGE_TOL_RAD
+                    or abs(qb[i] - edge) <= _TURN_EDGE_TOL_RAD):
+                continue
+        out.append(i)
+    return out
+
+
+def rotation_angle(Ra: np.ndarray, Rb: np.ndarray) -> float:
+    """How far the tool turns going from orientation ``Ra`` to ``Rb``, in radians.
+
+    The geodesic angle on SO(3): the single rotation about a single axis that takes one
+    orientation to the other, which is the one reading of "how far the tool turned" that
+    does not depend on how the orientation is parameterised.  Euler angles do -- a flip
+    reads as anything between 0 and 540 deg depending on the convention and on which axis
+    happens to be degenerate -- and summing joint deltas does not measure the tool at all.
+
+    Takes either the 3x3 blocks or the whole 4x4 poses; the translation is ignored.
+    """
+    R = np.asarray(Ra, dtype=float)[:3, :3].T @ np.asarray(Rb, dtype=float)[:3, :3]
+    return float(np.arccos(np.clip((np.trace(R) - 1.0) / 2.0, -1.0, 1.0)))
+
+
+def rotation_bound_rad(a, b, revolute=None) -> float:
+    """An upper bound on how far the tool can turn between two states, for free.
+
+    The tool's orientation is a product of one rotation per joint.  Composing rotations
+    cannot move further on SO(3) than the sum of the angles composed -- the geodesic
+    distance obeys the triangle inequality, and multiplying on either side is an isometry
+    -- so the summed revolute joint deltas bound the reorientation above without the
+    forward kinematics that measuring it needs.
+
+    A prismatic joint is left out because it contributes no rotation; with no ``revolute``
+    to say which are which every joint is counted, which can only make the bound looser.
+    Used to skip a measurement and never to make a decision: under a cap this says the
+    move is certainly within it, and over the cap it says nothing whatever.
+    """
+    qa = np.asarray(a, dtype=float).reshape(-1)
+    qb = np.asarray(b, dtype=float).reshape(-1)
+    if revolute is None:
+        return float(np.sum(np.abs(qb - qa)))
+    n = min(len(qa), len(qb), len(revolute))
+    turning = np.asarray(revolute[:n], dtype=bool)
+    return float(np.sum(np.abs(qb[:n] - qa[:n])[turning]))
 
 
 def line_stations(pose_a: np.ndarray, pose_b: np.ndarray, step_mm: float,

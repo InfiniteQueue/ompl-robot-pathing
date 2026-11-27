@@ -34,8 +34,9 @@ One block per route handed to refinement, one table per stage.  Columns:
   j5      S when joint 5 is inside the stop band
   joints  the joint vector exactly as the planner holds it (radians, metres if prismatic)
   tool    tool centre point x y z, manifest units
-  move    the move from this point to the next: profile (LIN or PTP, from the endpoint
-          rule), tool travel, largest joint delta in degrees (the --check-step-deg
+  move    the move from this point to the next: profile (LIN or PTP -- the band's
+          endpoint rule, less the moves it proposes whose ends disagree about a joint's
+          turn number), tool travel, largest joint delta in degrees (the --check-step-deg
           measure), and stop-to-stop time in seconds under that profile
 Each stage ends with a summary: move counts by profile, total stop-to-stop time, tool
 travel, and the furthest the tool gets from the straight line between the route's ends.
@@ -53,6 +54,15 @@ def stop() -> None:
     if _fh is not None:
         _fh.flush()
     _fh = None
+
+
+def active() -> bool:
+    """Whether a trace is being written, for a caller deciding how to schedule around it.
+
+    The file is one stream of stages belonging to one route at a time, so a caller that
+    would otherwise run several routes at once has to know not to.
+    """
+    return _fh is not None
 
 
 def section(title: str) -> None:

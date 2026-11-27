@@ -664,6 +664,77 @@ class Cell:
             return 1.0
         return self.penalty.factor(self._clearance(q, loaded))
 
+    # -- threads -------------------------------------------------------------
+    def worker(self) -> "Cell":
+        """A view of this cell for one thread of :mod:`weldpath.parallel`.
+
+        **What is shared is everything expensive, and it is shared outright.**  The
+        environment, the scene graph and every convex shell in it are read-only once a
+        segment is being planned, so a worker points at the same ones.  A Bullet manager
+        clone takes a reference to the shapes rather than a copy of them -- measured on
+        Path 4's cell, 11688 shells, a clone took 0.00 s, which a copy of 128 MB of
+        geometry could not -- so what a worker costs in memory is its own broadphase
+        proxies and its own caches, not a second cell.
+
+        **What is private is everything a query mutates**, because there is no lock
+        anywhere on the hot path and there must not be one:
+
+        * ``_cm`` and ``_pm``, whose transforms every check writes before reading.  Cloned
+          rather than re-taken from the environment so a worker inherits exactly the
+          margins this cell is holding, including any a caller set after it was built.
+        * ``_probes``, left empty so a worker clones only the widths it actually asks
+          for.  A thread that never reads the band pays for no band manager.
+        * ``_solver`` and ``kin``.  Both wrap KDL solvers that keep scratch of their own,
+          so two threads sharing one would be writing over each other mid-solve -- this
+          is the one sharing here that would corrupt an answer rather than merely race.
+        * the caches and ``_state``, which are per-thread by the same argument, and
+          ``counters``, so a worker's work can be counted and then added back.
+        * ``gun_value``, since an attempt at one opening must not move another's gun.
+
+        **What a worker must never do is touch the environment.**  ``sync_env`` and
+        ``_set_obstacle_clearance`` write to it, and both are called from the segment
+        level -- ``ToolpathPlanner._clearance_for`` wraps the whole segment and the OMPL
+        path syncs before it plans -- which is outside any parallel phase.  Nothing in
+        this file enforces that; it is a property of where the pool is used.
+
+        Built on the calling thread before any worker starts, so the clones themselves are
+        never concurrent either.
+        """
+        got = object.__new__(type(self))
+        got.__dict__.update(self.__dict__)
+        got._cm = self._cm.clone()
+        got._pm = None if self._pm is None else self._pm.clone()
+        got._probes = {}
+        got._solver = self.env.getStateSolver()
+        got.kin = self.env.getKinematicGroup(GROUP)
+        got._state = None
+        got._clearance_cache = {}
+        got._tcp_cache = {}
+        got._collision_cache = {}
+        got.counters = dict.fromkeys(COUNTER_NAMES, 0)
+        return got
+
+    def absorb(self, *views: "Cell") -> None:
+        """Add what workers counted to this cell's own counters.
+
+        The counters and nothing else.  A worker's caches are dropped with it, which is
+        deliberate: they are keyed on the state and would be sound to merge, but a full
+        one is 250k entries and merging eight of them would cost more memory than the
+        whole parallel phase saved in time.  What the parent would have gained is the
+        warm cache for the route it then refines, and the attempts already do their own
+        scoring -- ``_route_fault`` and ``_path_cost`` run inside the attempt, where the
+        cache that measured the route is still warm.
+
+        A run that could not say how many collision tests it did would be a run whose
+        figures stopped adding up the moment anything went parallel, and those figures are
+        how everything in this program is argued.
+        """
+        for view in views:
+            if view is None or view is self:
+                continue
+            for name, value in view.counters.items():
+                self.counters[name] = self.counters.get(name, 0) + value
+
     # -- state / collision ---------------------------------------------------
     def _load_state(self, q: np.ndarray) -> None:
         self.counters["state_loads"] += 1

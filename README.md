@@ -686,16 +686,26 @@ an edge of the Cartesian tree with both ends outside it ships as a joint move. D
 measurement is the point: where a near-panel stretch begins and ends is itself an output of
 pathfinding, so it cannot be picked in advance.
 
+The band proposes and one rule disposes. A move whose two ends disagree about any joint's
+**turn number** -- which `2 x 180 deg` sector the joint sits in -- is flown as a joint move
+however near the parts it runs. A straight move has no way to express that change: the
+controller interpolates the tool pose and solves as it goes, carrying one configuration
+from end to end, so a move commanded between two states that disagree about it is a move it
+will not make. On the joint chord the same change is nothing, the joint being interpolated
+and the counter following it. This lives in the profile rather than in any one pass, which
+is what makes it hold: every pass that proposes a move, every step that samples one, the
+split that emits the program and the sweep that verifies it all read the same derivation.
+
 From start to finish:
 
 1. **Band on or off, for the run.** `--near-panel-mm 0` or `--no-near-panel-linear` turns
    it off: every transit move is `PTP`, and the Cartesian tree is never tried either.
 2. **Solve.** Whichever solver succeeds (see [How it works](#how-it-works)) returns an
    unlabelled route.
-3. **Label, per move.** `LIN` if either end is near, else `PTP`. So a waypoint is reached
-   by a linear move when it is in the band or the waypoint before it was. Nothing is asked
-   of the leg as a whole: there is no threshold a route has to clear before any of its
-   moves may be linear.
+3. **Label, per move.** `LIN` if either end is near *and* the two ends agree about every
+   joint's turn number, else `PTP`. So a waypoint is reached by a linear move when it is
+   in the band or the waypoint before it was. Nothing is asked of the leg as a whole:
+   there is no threshold a route has to clear before any of its moves may be linear.
 4. **Refine.** Shortcut, simplify and polish move and delete waypoints, and each move they
    propose takes its profile from its new ends. A `LIN` candidate is checked along the
    tool's straight line and costed under `--linear-speed-mm-s`; a `PTP` one is checked
@@ -704,8 +714,14 @@ From start to finish:
    near-panel stretch into one long joint arc. Nor may they grow one outward: a
    replacement that is `LIN` and has an end further than `--linear-introduce-mm` from the
    parts is refused unless the stretch it replaces already reached in from that far, so
-   the approach to the band stays joint motion. `--linear-crossing-penalty-s` adds a flat
-   cost each time a move enters the band from outside.
+   the approach to the band stays joint motion. Nor may they build a straight move that
+   turns the tool further than `--linear-reorient-deg`: a reduction replaces a stretch
+   with one move between its ends, the waypoints it deletes are what made the tool's
+   rotation gradual, and nothing in the cost resists the result -- measured on one
+   segment, a 110-point stretch became a single 773 mm move carrying 143 deg of tool
+   rotation, which polishing then widened to 166 deg while every other move in the output
+   stayed under 23 deg. `--linear-crossing-penalty-s` adds a flat cost each time a move
+   enters the band from outside.
 5. **Split.** Consecutive moves under the same profile become one phase.
 6. **Verify.** Every move is swept along the path its profile implies. A failure discards
    the whole route, and the planner moves on to its next gun opening or fallback pose;
@@ -715,6 +731,21 @@ A detour whose legs share one gun opening is labelled once, over the joined rout
 different openings are labelled separately, each under its own opening. The final per-phase
 validation checks each phase under its label, and `output.Timing` holds `LIN` moves to the
 tool speed cap.
+
+**The refinement happens after every segment has been searched, not inside each one.**
+A search owns the cell for the length of its segment — `_clearance_for` sets the obstacle
+margin the whole route is judged to, and the gun opening moves with it — so no two
+searches can run at once. A refinement owns none of that: it takes a finished route and
+reads clearances off it. So the searches run in order, each segment's shortcut and polish
+are queued, and the queue is emptied across `--workers` threads once there is no searching
+left to interleave with. A study is a dozen segments and more, so that is where the
+parallelism is, with nothing pinned and nothing merged.
+
+The legs are queued *finished* — the candidate ranking, the stop-band clearing, the split
+by motion type and the verification all ran during the search, because those are what let
+a route be refused and the next candidate offered. What is deferred is only the two passes
+that make a working route quicker, and a refinement that fails leaves the segment with the
+route it already had.
 
 **A segment that fails leaves something to look at.** Every budget above decides how hard
 to search; none of them says why a particular transit could not be solved, and the log can
@@ -1758,6 +1789,8 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--phase-two-max-runs` | 2 | OMPL runs for a gap the recut has to join, stopping at the first solution. No longer a stage of a transit |
 | `--phase-two-solve-seconds` | 240 | how long one of those runs may search |
 | `--segment-minutes` | 60 | wall clock for one segment's search; past it the segment is reported as failed and the run moves on. 0 removes the limit |
+| `--workers` | 1 | how many attempts run at once, on threads. 0 is one per core bar one, capped at 8. Reaches the Cartesian tree (one thread per gun opening), the joint tree's phase one (one per run) and the refinement, which is deferred until every segment has been searched and then run a segment per thread; OMPL stays sequential. 1 runs everything inline |
+| `--refine-attempts` | 1 | how many times each segment's shortcut and polish are run, the quickest kept. Every attempt is a job in the one deferred queue, so attempts fill the threads alongside other segments rather than waiting their turn |
 | `--direct-clearance-mm` | 0 | room the straight joint move has to keep to be taken without searching; under it the next gun opening is tried and then the searches. 0 asks nothing beyond the collision check |
 | `--min-gun-openings` | 5 | gun openings phase one deals its runs round, the cheapest solution of the set shipping |
 | `--extra-gun-openings` | 3 | further openings held back from the direct transit, for the detour to walk leg by leg |
@@ -1774,8 +1807,9 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--no-tip-standoff` | off | skip the trials that open the gun wider and back the tool off before the route is polished |
 | `--polish-seconds` | 50 | time budget for the final pass over the emitted waypoints |
 | `--no-near-panel-linear` | off | every transit move `PTP`; also disables the Cartesian tree |
-| `--near-panel-mm` | 50 | clearance at or under which a waypoint is in the band, and the whole of what decides a move's profile |
+| `--near-panel-mm` | 50 | clearance at or under which a waypoint is in the band, which is what proposes every `LIN` move |
 | `--linear-introduce-mm` | 120 | clearance above which the passes may not introduce `LIN` motion that was not already there; 0 for no limit |
+| `--linear-reorient-deg` | 90 | furthest one `LIN` move an optimisation pass creates may turn the tool; 0 or 180+ for no limit |
 | `--linear-crossing-penalty-s` | 100 | costing-only surcharge on each move entering the band |
 | `--min-shell-mm` | 10 | drop collision shells smaller than this |
 | `--max-shells` | 1500 | cap convex shells per link |

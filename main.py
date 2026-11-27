@@ -357,6 +357,41 @@ def build_parser() -> argparse.ArgumentParser:
                         "Path 4 legs at 15 s each it solved 2 of 12 attempts against "
                         "OMPL's 3. It is here to be measured, not because it is better "
                         "(default: %(default)s)")
+    #HOW MANY TIMES EACH SEGMENT IS REFINED
+    p.add_argument("--refine-attempts", type=int, default=1, metavar="N",
+                   help="how many times each segment's shortcut and polish are run, the "
+                        "quickest result being kept. The refinements of every segment are "
+                        "deferred until all the searching is done and then run together "
+                        "across --workers threads, so attempts are jobs in that one queue "
+                        "rather than repeats that wait their turn. 1 spends the passes "
+                        "exactly as they were spent before they were deferred; more is "
+                        "worth having because both passes are hill climbs whose seed "
+                        "chooses the hill, and it costs that many times the budget per "
+                        "segment, bounded by how many threads there are to spend it on "
+                        "(default: %(default)s)")
+    #HOW MANY SOLVE AND POLISH ATTEMPTS RUN AT ONCE
+    p.add_argument("--workers", type=int, default=0, metavar="N",
+                   help="how many solve and polish attempts may run at once, on threads. "
+                        "0 is one per core bar one, capped at 8. The attempts a phase "
+                        "makes are independent by construction -- a tree search at one "
+                        "gun opening knows nothing of the one at another, and a polish "
+                        "from one seed nothing of the next -- and every phase that runs "
+                        "them already kept the set and ranked it, so this changes what a "
+                        "phase costs rather than what it finds. Threads and not "
+                        "processes: the bindings release the interpreter lock inside the "
+                        "collision and kinematics calls, which is where the time goes, so "
+                        "the geometry stays shared and a worker costs its own broadphase "
+                        "proxies and caches rather than a second copy of the cell. "
+                        "Reaches the Cartesian tree, the joint tree's phase one, and the "
+                        "polish; OMPL is left sequential because its runs move the "
+                        "environment every worker shares. The polish divides the route "
+                        "into stretches, polishes them at once and merges them -- which "
+                        "is exact, every move of the route belonging to one stretch -- "
+                        "over two rounds with the cuts moved half a stretch between them, "
+                        "so no waypoint stays pinned. A route too short to divide is "
+                        "polished from several seeds and the cheapest kept. 1 runs "
+                        "everything inline, exactly as before this existed "
+                        "(default: %(default)s)")
     #JOINT TREE: HOW FAR ONE EXTEND REACHES
     p.add_argument("--joint-tree-extend-rad", type=float, default=0.5, metavar="RAD",
                    help="furthest any one joint moves in a single extend of the joint "
@@ -606,6 +641,20 @@ def build_parser() -> argparse.ArgumentParser:
                         "than --near-panel-mm, since a move with both ends in the band is "
                         "linear wherever it runs and has nothing to introduce. 0 places no "
                         "limit (default: %(default)g)")
+    #HOW FAR THE TOOL MAY TURN WITHIN ONE STRAIGHT MOVE
+    p.add_argument("--linear-reorient-deg", type=float, default=90.0, metavar="DEG",
+                   help="furthest the tool may turn within a single straight move that "
+                        "an optimisation pass creates. A reduction replaces a stretch of "
+                        "route with one move between its ends, and nothing in the cost "
+                        "resists that move reorienting the tool on the way: measured on "
+                        "one segment, a 110-point stretch became a single 773 mm move "
+                        "carrying 143 deg of tool rotation, which polishing then widened "
+                        "to 166 deg. The waypoints such a reduction deletes are exactly "
+                        "what made the sweep gradual, so a replacement turning the tool "
+                        "further than this is refused and they are kept. Measured as the "
+                        "angle between the orientations at the two ends, which cannot "
+                        "exceed 180, so 180 or more places no limit -- and neither does "
+                        "0 (default: %(default)g)")
     #PRICE OF REACHING INTO THE BAND FROM OUTSIDE IT
     p.add_argument("--linear-crossing-penalty-s", type=float, default=100.0,
                    metavar="SECONDS",
@@ -1211,6 +1260,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     # Imported here so that --help works without the Tesseract bindings present.
     from weldpath import cell as cell_mod
     from weldpath import manifest as manifest_mod
+    from weldpath import parallel
     from weldpath import output as output_mod
     from weldpath.penalty import ClearancePenalty, GunPreference, SteppedPenalty
     from weldpath import profile as profile_mod
@@ -1254,6 +1304,9 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         return 2
     if args.linear_introduce_mm < 0.0:
         print("error: --linear-introduce-mm cannot be negative", file=sys.stderr)
+        return 2
+    if args.linear_reorient_deg < 0.0:
+        print("error: --linear-reorient-deg cannot be negative", file=sys.stderr)
         return 2
     if args.segment_minutes < 0.0:
         print("error: --segment-minutes cannot be negative", file=sys.stderr)
@@ -1405,7 +1458,12 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         probe.report(cell.env, man, args.probe_point, log=print)
         return 0
 
-    log("planning:")
+    threads = parallel.configure(args.workers)
+    if threads > 1:
+        log(f"planning on {threads} threads: solve and polish attempts run at once, "
+            f"and each holds its own collision managers and caches")
+    else:
+        log("planning:")
     planner = ToolpathPlanner(
         cell, man,
         ompl=OmplBudget(phase_one_runs=args.phase_one_runs,
@@ -1440,6 +1498,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         recut_hulls=args.recut_blocking_hulls,
         recut_attempts=args.recut_attempts,
         recut_floor_mm=args.recut_floor_mm,
+        refine_attempts=args.refine_attempts,
         treeview=args.treeview, treeview_max_poses=args.treeview_max_poses,
         treeview_searches=args.treeview_searches,
         relocate=Relocation(min_attempts=args.polish_min_attempts,
@@ -1454,6 +1513,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         linear_speed_mm_s=args.linear_speed_mm_s,
         linear_crossing_penalty_s=args.linear_crossing_penalty_s,
         linear_introduce_mm=args.linear_introduce_mm,
+        linear_reorient_deg=args.linear_reorient_deg,
         direct_clearance_mm=args.direct_clearance_mm,
         finish_attempts=args.finish_attempts,
         weld_clearance_mm=args.weld_clearance_mm,

@@ -45,6 +45,15 @@ this one.
 """
 from __future__ import annotations
 
+import threading
+
+# Searches are offered from several threads once attempts run in parallel -- see
+# :mod:`weldpath.parallel` -- and what `offer` does to the kept set is not one operation:
+# it counts, measures, scans for the smallest and swaps.  Two threads interleaving there
+# would lose a pair or drop one twice, and the counts would stop matching the list.  The
+# lock is free: this is taken once per *search*, where a search is seconds of work.
+_lock = threading.Lock()
+
 
 class Search:
     """One offered pair of trees, in the order it was offered.
@@ -125,12 +134,19 @@ def offer(label: str, start_tree, goal_tree, kind: str = "cartesian") -> None:
     global _runs, _dropped
     if not _on:
         return
-    _runs += 1
     try:
         size = len(start_tree.nodes) + len(goal_tree.nodes)
     except Exception:                   # diagnostics must never break a search
         return
-    got = Search(_runs, str(label), str(kind), size, start_tree, goal_tree)
+    with _lock:
+        _offer(str(label), str(kind), size, start_tree, goal_tree)
+
+
+def _offer(label: str, kind: str, size: int, start_tree, goal_tree) -> None:
+    """The body of :func:`offer`, which holds ``_lock`` for the whole of it."""
+    global _runs, _dropped
+    _runs += 1
+    got = Search(_runs, label, kind, size, start_tree, goal_tree)
     if not _limit or len(_kept) < _limit:
         _kept.append(got)
         return
