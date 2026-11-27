@@ -24,18 +24,22 @@ SIGNED_AXES = tuple((i, s) for i in range(3) for s in (1.0, -1.0))
 def link_bounds_world(cell, link_name: str) -> tuple[np.ndarray, np.ndarray] | None:
     """World-space axis-aligned bounds of a link's collision geometry, in metres.
 
-    Read from the environment rather than from the source meshes: the question is where
-    the geometry the planner is checking against actually sits, and the environment holds
-    it already placed.  ``None`` where the link carries no collision geometry, which is
+    Read from the scene rather than from the source meshes: the question is where the
+    geometry the planner is checking against actually sits, and the scene holds it
+    already placed.  ``None`` where the link carries no collision geometry, which is
     every frame-only link in the chain.
 
     Assumes the state is already loaded -- the caller sets it once and asks about several
-    links, and reloading per link would cost more than the query.
+    links, and reloading per link would cost more than the query.  The *shape* comes from
+    the environment, which does not move; the *placement* comes from the state the load
+    left, which is where it now lives -- ``Cell`` no longer pushes states at the
+    environment on the hot path, so asking it for a link transform would answer about
+    some other pose entirely.
     """
     link = cell.env.getLink(link_name)
     if link is None or not len(link.collision):
         return None
-    T = np.array(cell.env.getLinkTransform(link_name).matrix(), dtype=float)
+    T = np.array(cell.state.link_transforms[link_name].matrix(), dtype=float)
     R, t = T[:3, :3], T[:3, 3]
     lo = np.full(3, np.inf)
     hi = np.full(3, -np.inf)

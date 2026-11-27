@@ -291,11 +291,30 @@ def build_parser() -> argparse.ArgumentParser:
                         "them fails, wasting the inverse kinematics already spent on the "
                         "stations before it (default: %(default)g)")
     #HOW FAR OUTSIDE THE ENDPOINTS IT LOOKS
-    p.add_argument("--cartesian-margin-mm", type=float, default=200.0, metavar="MM",
+    p.add_argument("--cartesian-margin-mm", type=float, default=300.0, metavar="MM",
                    help="how far outside the box spanned by the two endpoints the tree "
                         "samples for a way round. A detour has to leave the straight line "
-                        "to be worth finding, but one that leaves it by more than the "
-                        "fixture is deep is not a detour (default: %(default)g)")
+                        "to be worth finding, and what the figure really bounds is how "
+                        "far the tool may be backed out of a pocket: measured on one "
+                        "extraction leg, 200 mm let the box reach 267 mm from the weld "
+                        "along its own retreat axis and 300 mm reaches 371 mm. It costs "
+                        "volume -- the same leg's box goes from 1.18 to 2.03 m3, so the "
+                        "share of samples landing within one extend of the locator falls "
+                        "from 0.59%% to 0.36%% -- which is only worth paying where the "
+                        "near region is already covered (default: %(default)g)")
+    #HOW FAR CLEAR OF THE FIXTURE THE SECOND, WIDER BOX STANDS
+    p.add_argument("--cartesian-wide-box-mm", type=float, default=300.0, metavar="MM",
+                   help="how far clear of the panels and tooling a second, wider sampling "
+                        "box stands, offered to the legs of a detour that back a locator "
+                        "out of its pocket -- the legs the tree is the only solver for. "
+                        "It is used only by a seed following a failure at the same gun "
+                        "opening, and it is unioned with the endpoint box rather than "
+                        "replacing it. The endpoint box is a hard wall on how far the tool "
+                        "may be put from the straight line between the two ends, which is "
+                        "the right guess almost always and, where it is wrong, is wrong by "
+                        "excluding the only way round; measured on one extraction leg it "
+                        "is 2.03 m3 against 9.12 m3 for this one. 0 leaves the second box "
+                        "out (default: %(default)g)")
     #HOW FAR THE TOOL MAY BE TURNED OFF THE DIRECT INTERPOLATION
     p.add_argument("--cartesian-tilt-deg", type=float, default=45.0, metavar="DEG",
                    help="how far off the interpolation between the two endpoint "
@@ -319,6 +338,46 @@ def build_parser() -> argparse.ArgumentParser:
                         "straight joint move is already clear takes that move and spends "
                         "no runs; one the planner cannot join keeps its Cartesian states, "
                         "so this can only cost time, never a route (default: %(default)s)")
+    #PLAN THE SAMPLING PLANNER'S SLOT WITH OUR OWN JOINT-SPACE TREE INSTEAD OF OMPL
+    p.add_argument("--joint-tree", type=boolean, nargs="?", const=True, default=True,
+                   metavar="BOOL",
+                   help="run every sampling-planner search with weldpath.jointtree "
+                        "instead of OMPL -- phase one, phase two and the gap joins inside "
+                        "--cartesian-recut. It is the same question over the same state "
+                        "space, so it replaces that planner rather than joining the "
+                        "candidate set, and the Cartesian tree is untouched and still "
+                        "ranked against whatever this returns. --phase-one-runs and "
+                        "--phase-one-solve-seconds still bound it. Two differences are "
+                        "worth knowing before reading a log: every edge is checked by this "
+                        "cell's own --check-step-deg grid with the tool-space bisection "
+                        "under it, so a route from here cannot be refused as 'not clear "
+                        "under this cell's own check' the way 47 of 1017 OMPL runs over "
+                        "nine studies were; and it is far slower per sample, measured at "
+                        "about 183 ms against OMPL's C++ state validator, so on six real "
+                        "Path 4 legs at 15 s each it solved 2 of 12 attempts against "
+                        "OMPL's 3. It is here to be measured, not because it is better "
+                        "(default: %(default)s)")
+    #JOINT TREE: HOW FAR ONE EXTEND REACHES
+    p.add_argument("--joint-tree-extend-rad", type=float, default=0.5, metavar="RAD",
+                   help="furthest any one joint moves in a single extend of the joint "
+                        "tree. An extend costs at most this over --check-step-deg "
+                        "collision tests and nothing else -- there is no inverse "
+                        "kinematics behind it -- so this sets the price of a sample "
+                        "directly. Untuned: 0.5 rad is about ten check steps "
+                        "(default: %(default)g)")
+    #JOINT TREE: WHETHER IT SAMPLES THE WHOLE OF THE JOINT LIMITS
+    p.add_argument("--joint-tree-margin-rad", type=float, default=0.0, metavar="RAD",
+                   help="confine the joint tree's samples to the box the transit's two "
+                        "endpoints span, inflated by this much and intersected with the "
+                        "joint limits. 0 samples the whole of the limits, which is what "
+                        "OMPL does and so is the default for comparing against it. Worth "
+                        "raising above 0: uniform sampling over the limits puts most "
+                        "samples in open air, and that is where being in Python rather "
+                        "than C++ costs most -- about 10x a state against 1.04x for a "
+                        "state 5 mm off a panel -- so narrowing the box concentrates the "
+                        "search where the handicap is smallest. Like "
+                        "--cartesian-margin-mm it is a hard wall on where the arm may be "
+                        "put, not a preference (default: %(default)g)")
     #HOW MANY GUN OPENINGS A TRANSIT IS PLANNED OVER
     p.add_argument("--min-gun-openings", type=int, default=5, metavar="N",
                    help="gun openings a transit is planned over in phase one. The runs of "
@@ -1055,8 +1114,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="write a failed segment's search into the study directory, "
                         "beside the manifest it was read from, as something that can be "
                         "opened and looked at: the cell as the "
-                        "planner collided against it, the biggest pair of Cartesian trees "
-                        "the segment built, and the robot wherever a node is clicked. "
+                        "planner collided against it, the trees the segment built -- the "
+                        "Cartesian tree's and the joint tree's, each labelled with which "
+                        "it was -- and the robot wherever a node is clicked. "
                         "Three files per failure -- a page, its data, and the viewer "
                         "itself, shared -- and the page opens on a double click with no "
                         "server and nothing to install. Written whatever the segment "
@@ -1065,8 +1125,8 @@ def build_parser() -> argparse.ArgumentParser:
                         "straight chord between the endpoints and the reason "
                         "(default: %(default)s)")
     p.add_argument("--treeview-searches", type=int, default=12, metavar="N",
-                   help="how many of a segment's Cartesian tree searches the failure "
-                        "view keeps. A segment runs the tree many times -- successive "
+                   help="how many of a segment's tree searches the failure view keeps. "
+                        "A segment runs a tree many times -- successive "
                         "seeds, one per gun opening, again in phase two, again per half "
                         "of a detour -- and they fail in different places, so which "
                         "opening got furthest is a question about the set rather than "
@@ -1076,6 +1136,10 @@ def build_parser() -> argparse.ArgumentParser:
                         "every segment pays that whether or not it fails. Past the limit "
                         "the smallest kept search makes way for a bigger one, so what is "
                         "lost is the searches that died early -- raise it to see those. "
+                        "No kind of search is lost whole: a segment runs the Cartesian "
+                        "tree and, under --joint-tree, the joint tree, both go in the one "
+                        "file, and the limit may not evict the last pair of either, so a "
+                        "search that ran is never missing from the view. "
                         "0 keeps every search offered (default: %(default)g)")
     p.add_argument("--treeview-max-poses", type=int, default=1500, metavar="N",
                    help="how many of a tree's nodes get the robot's pose baked into the "
@@ -1151,6 +1215,7 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     from weldpath.penalty import ClearancePenalty, GunPreference, SteppedPenalty
     from weldpath import profile as profile_mod
     from weldpath.cartesian import CartesianBudget
+    from weldpath.jointtree import JointBudget
     from weldpath.planning import OmplBudget, Relocation
     from weldpath.toolpath import ToolpathPlanner
 
@@ -1203,6 +1268,15 @@ def _run(args: argparse.Namespace, directory: str) -> int:
     if args.cartesian_gun_openings < 1:
         print("error: --cartesian-gun-openings must be at least 1: the tree plans at one "
               "gun opening or another", file=sys.stderr)
+        return 2
+    if args.cartesian_wide_box_mm < 0.0:
+        # Refused rather than read as 0.  A negative figure draws the box *inside* the
+        # fixture, which is either an inverted box or one holding nothing reachable, and
+        # the escalation would quietly treat it as switched off -- the same number meaning
+        # two things.
+        print("error: --cartesian-wide-box-mm cannot be negative: it is how far clear of "
+              "the panels and tooling the box stands, and 0 is how to leave it out",
+              file=sys.stderr)
         return 2
     if args.gun_opening_weight < 1.0:
         print("error: --gun-opening-weight must be at least 1: below 1 it would pay a "
@@ -1324,6 +1398,10 @@ def _run(args: argparse.Namespace, directory: str) -> int:
         # blocked, and the answer does not depend on the toolpath.  The export, if one was
         # asked for, has already happened inside build().
         from weldpath import probe
+        # It reads the environment's own state, and collision checking no longer moves
+        # that -- so the pose it reports at is said here rather than being whatever the
+        # build happened to leave behind, which is what it used to be.
+        cell.sync_env(man.start_q(cell.joint_names))
         probe.report(cell.env, man, args.probe_point, log=print)
         return 0
 
@@ -1339,8 +1417,16 @@ def _run(args: argparse.Namespace, directory: str) -> int:
                                   gun_openings=args.cartesian_gun_openings,
                                   extend_mm=args.cartesian_extend_mm,
                                   margin_mm=args.cartesian_margin_mm,
+                                  wide_box_mm=args.cartesian_wide_box_mm,
                                   tilt_deg=args.cartesian_tilt_deg,
                                   recut=args.cartesian_recut),
+        # ``None`` unless asked for, which is what ``_Sampler`` reads to decide whether to
+        # call OMPL at all -- so the flag being off leaves that path byte for byte as it
+        # was rather than routing through a branch that happens to pick OMPL.
+        joint=(JointBudget(extend_rad=args.joint_tree_extend_rad,
+                           margin_rad=(args.joint_tree_margin_rad
+                                       if args.joint_tree_margin_rad > 0.0 else None))
+               if args.joint_tree else None),
         fallback_runs=args.fallback_runs,
         segment_seconds=args.segment_minutes * 60.0,
         fallback_mm=args.fallback_distance_mm,

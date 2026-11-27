@@ -440,10 +440,20 @@ sake.
 ### What a second of budget buys
 
 Every budget here is wall clock, so a run can only be made better two ways: by getting more
-out of a second, or by not spending one once there is nothing left to buy. Profiled on a
-5186-shell cell with the search budgets cut short, 513 s of a 681 s run was one call — the
-contact test over the collision scene — against 112 s inside the sampling planner and 2.5 s
-of inverse kinematics. Outside the sampler, that call is the whole of the question.
+out of a second, or by not spending one once there is nothing left to buy. A profile of a
+5186-shell cell with the search budgets cut short used to be quoted here as 513 s of a 681 s
+run inside the contact test, against 112 s inside the sampling planner and 2.5 s of inverse
+kinematics. The inverse-kinematics figure holds. The contact-test one does not: timed apart
+over 1795 real states, **97% of a check was pushing the state into the environment and 2.9%
+was the contact test itself**, and pushing a state at the environment is not forward
+kinematics — the same joint vector through the state solver that environment owns is 500
+times quicker, and answers bit-identically.
+
+That fixed cost is gone, and with it the reason a check cost the same wherever the robot
+stood. Bullet's culling is in fact very good: the contact test is 0.013 ms with the robot
+150 mm clear against 4.7 ms with it 5 mm off a panel. So a check is now 0.13 ms a state
+rather than 3.61, and what a search spends depends on where it is looking — near the parts
+is about 30x dearer than open air, where the flat cost used to level the two.
 
 **The contact test is remembered per state.** The passes re-ask it by construction: a
 station on a straight tool move is tested as the inverse kinematics' answer and again as an
@@ -711,8 +721,17 @@ to search; none of them says why a particular transit could not be solved, and t
 only say that OMPL returned no solution. So when a segment fails, `--treeview` writes the
 search into the study directory, beside the manifest it was read from, as a page that opens
 on a double click — no server, no install, nothing fetched. It shows the cell as the planner collided against it, the
-Cartesian trees the segment built, each node coloured by how much clearance the robot had
+trees the segment built, each node coloured by how much clearance the robot had
 there, and the robot itself — arm and gun — wherever a node is clicked.
+
+**Both searches are shown, and the viewer says which is which.** A segment can run the
+Cartesian tree on the direct transit and the joint tree (`--joint-tree`) in the sampling
+planner's slot, and the two are worth reading side by side: the same endpoints, the same
+cell, failing in different places. The kind is named against every search in the panel,
+because the same drawn edge means different things — a Cartesian edge is a straight tool
+move, checked pose by pose, while a joint edge is a chord in joint space, which bows
+through the cell and bows where the arm swung. Both are drawn through the stations the
+search actually validated and never as a line between two nodes.
 
 **Every search goes into the one file.** A segment runs the tree many times — successive
 seeds until the solve budget is spent, once per gun opening, and again per leg of a detour,
@@ -725,6 +744,14 @@ many are held; it is a memory limit, since a kept search's nodes stay alive unti
 segment ends and every segment pays that whether or not it fails. Past it the smallest kept
 search makes way for a bigger one, so what is lost is the searches that died early — the
 file says how many were dropped, and raising the limit is how to see them.
+
+**The limit cannot lose a search whole.** The Cartesian tree and the joint tree both go
+into the one file for the segment, and the two do not run to the same size: a joint search
+that solved goes in at a handful of nodes where a Cartesian pair runs to hundreds. Under a
+size rule alone a segment with a full set of big Cartesian pairs would turn away every
+joint pair offered, and the file would say the joint tree never ran when it ran and solved.
+So the limit may not evict the last pair of a kind, and a kind nobody is holding goes in
+whatever its size. The panel says how many of each are in the file.
 
 The two trees of each search grow towards each other from the start and the goal, so what
 the picture is for is the gap between them: which one got how far, and where they stopped
@@ -1178,11 +1205,49 @@ is what now calls a direction exhausted; a step in contact resets that run, sinc
 starts inside a pocket and is expected to begin blocked.
 
 This matters beyond the pose itself, because the fallback decides where the Cartesian tree
-may look: the extraction's sampling box is the locator-to-fallback box inflated by 150 mm, so
-a fallback across the retreat axis leaves the search almost no room in the one direction that
-gets the gun out. On the failed leg only 23.7% of samples had any component along the retreat
-axis and 0.85% fell within one extend of the locator, and the tree rooted at the weld reached
-26–60 nodes against 794–1071 for the one in open air.
+may look: the extraction's sampling box is the locator-to-fallback box inflated by
+`--cartesian-margin-mm`, so a fallback across the retreat axis leaves the search almost no
+room in the one direction that gets the gun out. On the failed leg, at the 200 mm margin then
+in force, only 26.8% of samples had any component along the retreat axis and 0.18% fell
+within one extend of the locator, and the tree rooted at the weld reached 26–60 nodes against
+794–1071 for the one in open air.
+
+The margin is now 300 mm. What it really bounds is how far the tool may be backed out of a
+pocket: 200 mm let that box reach 266.6 mm from the weld along its own retreat axis, and 300
+reaches 370.9 mm, so a pocket deeper than the box is a leg no budget can solve. The cost is
+volume — 1.18 to 2.03 m³, taking the share of samples within one extend of the locator from
+0.18% to 0.10% — and that cost is only real where the near region still has something to
+give. On this leg it did not: the start tree's nodes sit a median 6.7 mm apart and the goal
+tree's 26.7 mm, against an extend of 80 mm, so both had already covered their own regions far
+finer than one extend and samples landing there bought nothing.
+
+The box is a hard wall and not a preference, which is why that figure decides an extraction.
+A steer travels at most one extend from a node the tree already has, so every node it ever
+grows lies in the convex hull of the two endpoints and the box — and the box contains them,
+so the hull is the box. Nothing can walk the tool further out of a pocket than the margin
+allows, however long the search is given.
+
+So there is a **second box**, drawn round the panels and tooling rather than round the leg,
+each face `--cartesian-wide-box-mm` (300) clear of that geometry. Only the detour's
+extractions ask for it, and only a seed that follows a failure at the same gun opening gets
+it: an ordinary extraction comes out of its pocket on the first seed and pays nothing, and a
+failed seed is the only evidence there is that the near box is the wrong shape. It is
+unioned with the endpoint box rather than replacing it — a box round a fixture need not
+contain the leg's own ends, and a search whose samples never come near the place it has to
+reach is worse off than one with no extra room at all. The premise is that a long detour is
+sometimes the only way round and its shape cannot be guessed beforehand, which is exactly
+what a box drawn round the straight line forbids; measured on the failed leg, 2.03 m³ against
+9.12 m³, and on another cell the fixture box is 9.34 m³ with every locator inside it.
+
+Two things it is not. It is not a reach model — much of it lies beyond the arm — and that is
+affordable only because a sample is a direction and not a destination: the steer moves one
+extend from a node it already has, so a target the arm could never stand at costs one steer
+and no more than any other. And it is not free of dilution; it takes the share of samples
+landing within one extend of the locator from 0.10% to 0.026%. That is normally the whole
+argument against a wider box and it is not one here, the near region being saturated
+already. Measuring the fixture costs a pass over the statics' prepared hulls — 1.8 s on a
+7051-shell cell, 4.8 s on a 128 MB one — paid once per run and only where a seed has
+actually failed. `--cartesian-wide-box-mm 0` leaves the second box out.
 
 `--fallback-poses` is how many of the two ends get a pose. A transit has two ends and each
 has one fallback, so 2 is every pose there is and anything higher is read as 2; the cap is
@@ -1687,6 +1752,8 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--cartesian-solve-seconds` | 120 | time at one gun opening before the tree gives that opening up as having no route, spent on every transit the band is on for; 0 disables the tree. `--cartesian-seconds` still works |
 | `--cartesian-process-seconds` | 40 | how long one opening is searched after its first route there, from new seeds, keeping the cheapest |
 | `--cartesian-gun-openings` | 3 | least gun openings the tree attempts per transit, capped by `--min-gun-openings`. Multiplies the two figures above |
+| `--cartesian-margin-mm` | 300 | how far outside the box its two endpoints span the tree samples. A hard wall on how far the tool may be put from the straight line, so on an extraction it bounds how deep a pocket can be backed out of |
+| `--cartesian-wide-box-mm` | 300 | how far clear of the panels and tooling a second, wider box stands, offered to a detour's extraction legs after a seed has failed and unioned with the box above. 0 leaves it out |
 | `--cartesian-recut` | true | cut a Cartesian-tree route where it leaves the band and replan the parts outside it with phases one and two |
 | `--phase-two-max-runs` | 2 | OMPL runs for a gap the recut has to join, stopping at the first solution. No longer a stage of a transit |
 | `--phase-two-solve-seconds` | 240 | how long one of those runs may search |
@@ -1698,7 +1765,7 @@ A selection; `python main.py --help` lists every flag with its current default.
 | `--gun-opening-weight` | 1.5 | what a second counts as with the gun at full travel, against 1x shut; multiplies a route's whole penalised cost, so candidates found at different openings compete on it. 1 switches it off |
 | `--retune-gun-openings` | 4 | openings each finished leg is re-priced at, after every other pass, validated along the whole leg and never re-planned. 0 leaves it at the opening it was found at |
 | `--treeview` | on | write a failed segment's search into the study directory as a page that can be opened and looked at |
-| `--treeview-searches` | 12 | how many of a segment's tree searches the view keeps, all of them filterable separately in the viewer. A memory limit; past it the smallest kept search makes way. 0 keeps every one |
+| `--treeview-searches` | 12 | how many of a segment's tree searches the view keeps, all of them filterable separately in the viewer. A memory limit; past it the smallest kept search makes way, except that the last search of a kind is never evicted, so the Cartesian tree and the joint tree are both always in the file. 0 keeps every one |
 | `--treeview-max-poses` | 1500 | how many nodes get the robot's pose baked in, those being most of the file's size. A total over every tree in the file, split between them by node count |
 | `--fallback-poses` | 2 | how many of a transit's two ends get a fallback pose of their own, the detour being `w1 -> f1 -> f2 -> w2`. 2 is every pose there is; 0 looks for none, so a transit with no direct route fails rather than detouring |
 | `--fallback-distance-mm` | 100 | room a fallback pose must leave around the robot and gun |

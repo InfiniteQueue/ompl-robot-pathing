@@ -33,6 +33,14 @@ Two things this module holds to, both learned the hard way elsewhere in the plan
   Scattered seeds are still tried, so other configurations remain reachable, but only by
   starting a new edge from a node that already sits in one -- never by flipping halfway
   along a line the robot will drive without stopping.
+
+  The consequence is worth stating plainly, because it bounds what this search can ever
+  answer: **the configuration each half starts in is the one it dies in.**  Every node is
+  joined to its root by a chain of stations none of which moved a joint more than
+  ``jump_rad``, so a tree cannot walk from one inverse-kinematics branch to another, and
+  two endpoints that need a wrist turned between them have no route here at any budget.
+  ``branch_refusals`` is how the search notices that it is in that case rather than
+  spending the clock on it -- see ``plan_cartesian``.
 """
 from __future__ import annotations
 
@@ -68,6 +76,12 @@ class CartesianBudget:
     are refused whole the moment any station on them fails, wasting the inverse kinematics
     already spent on the stations before it.
 
+    ``wide_box_mm`` is not used unless a caller asks for it, and only one does: the
+    extraction legs of a detour, where the tree is the sole solver.  It is how far clear
+    of the panels and tooling the wider sampling box stands, and the box itself is drawn
+    round that geometry rather than round the leg's own two endpoints -- see
+    ``planning._cartesian_solutions``, which swaps it in once a seed has failed.
+
     ``recut`` is the one setting here that is not about the search.  The tree has to reach
     the far endpoint, so it returns straight tool moves over the whole transit including
     the part of it that runs nowhere near a panel, where a straight-line route was never
@@ -78,16 +92,19 @@ class CartesianBudget:
     process_seconds: float = 20.0   # wall clock on better routes, once one is found
     gun_openings: int = 3           # least openings attempted, where that many exist
     max_iters: int = 4000           # sample budget, whichever runs out first
-    extend_mm: float = 120.0        # furthest one extend drives the tool
+    extend_mm: float = 80.0         # furthest one extend drives the tool
     extend_deg: float = 25.0        # ...and furthest it turns the tool, whichever binds
-    margin_mm: float = 150.0        # how far outside the endpoints sampling may stray
-    tilt_deg: float = 30.0          # how far off the endpoint slerp an orientation is drawn
+    margin_mm: float = 300.0        # how far outside the endpoints sampling may stray
+    tilt_deg: float = 45.0          # how far off the endpoint slerp an orientation is drawn
     goal_bias: float = 0.10         # share of samples aimed at the far tree's root
     jump_rad: float = 0.50          # largest per-joint step allowed between two stations
     orient_weight_mm_per_rad: float = 200.0     # a radian of turn as this much tool travel
     branch_seeds: int = 8           # scattered seeds tried when the continuing one fails
+    branch_refusals: int = 16       # coincident meetings refused before the case is given up
     recut: bool = True              # re-plan the stretches outside the band with OMPL
     seed: int = 0
+    box: tuple | None = None        # a wider box to sample in as well; see ``_sample``
+    wide_box_mm: float = 300.0      # how far clear of the fixture that wider box stands
 
     @property
     def enabled(self) -> bool:
@@ -250,9 +267,27 @@ def _sample(rng: np.random.Generator, pa: np.ndarray, pb: np.ndarray,
     perturbed by at most ``tilt_deg``, because a tool that arrives at a weld square to the
     panel is square to it most of the way in, and sampling SO(3) freely would spend nearly
     the whole budget on orientations no route uses.
+
+    **The box is a hard wall on where the tool may be put, not merely on where samples
+    land.**  A steer travels at most ``extend_mm`` from an existing node towards the
+    sample, so every node of the tree lies in the convex hull of the two endpoints and
+    this box -- and the box contains them, so the hull is the box.  Nothing can walk the
+    tool further out of a pocket than ``margin_mm``, however long the search runs, which
+    is what makes that figure the setting an extraction stands or falls on rather than a
+    preference about detours.
+
+    ``budget.box`` is a second, wider box offered by the caller, and what is sampled is
+    the **union** of the two.  Replacing the endpoint box outright would be the obvious
+    reading of "a wider box", and it is wrong in one case that matters: a box drawn round
+    the fixture need not contain an endpoint, and a search whose samples never come near
+    the place it has to reach is worse off than one with no extra room at all.  A union
+    can only add.
     """
     lo = np.minimum(pa[:3, 3], pb[:3, 3]) - budget.margin_mm
     hi = np.maximum(pa[:3, 3], pb[:3, 3]) + budget.margin_mm
+    if budget.box is not None:
+        lo = np.minimum(lo, np.asarray(budget.box[0], dtype=float))
+        hi = np.maximum(hi, np.asarray(budget.box[1], dtype=float))
     out = interpolate_pose(pa, pb, float(rng.uniform(0.0, 1.0)))
     out[:3, 3] = rng.uniform(lo, hi)
     out[:3, :3] = out[:3, :3] @ _random_rotation(rng, np.radians(budget.tilt_deg))
@@ -278,8 +313,8 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     they already work under the linear profile.
 
     ``label`` names this search in the failure view and is used for nothing else -- see
-    :mod:`weldpath.treetrace`, which keeps the biggest pair of trees a segment builds in
-    case the segment ends up with no route at all.
+    :mod:`weldpath.treetrace`, which keeps the trees a segment builds, these and the joint
+    tree's alike, in case the segment ends up with no route at all.
     """
     budget = budget or CartesianBudget()
     rng = np.random.default_rng(budget.seed)
@@ -296,6 +331,8 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     forward = True                          # whether `a` is still the start tree
 
     iters = 0
+    met = refused = 0       # arrivals at one pose, and those refused on the branch test
+    worst = 0.0             # furthest apart two such arrivals were, on any one joint
     while iters < budget.max_iters and time.perf_counter() < deadline:
         iters += 1
         target = (b.nodes[0].pose if rng.uniform() < budget.goal_bias
@@ -331,24 +368,55 @@ def plan_cartesian(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
             # state: `link` ended wherever the inverse kinematics landed, and the far
             # tree's node is its own solution for that pose.  Closing that gap is a joint
             # move at a standstill, so it is checked as one.
+            met += 1
             far = b.nodes[j].q
-            if float(np.max(np.abs(cursor - far))) > budget.jump_rad:
+            apart = float(np.max(np.abs(cursor - far)))
+            if apart > budget.jump_rad:
+                refused += 1
+                worst = max(worst, apart)
                 break                       # met in space, on different branches
             if cell.segment_collides(cursor, far, max_step=max_step):
                 break
             route = _join(a, cursor_index, b, j, forward)
-            treetrace.offer(label, start, goal)
+            treetrace.offer(label, start, goal, "cartesian")
             if log:
                 log(f"      cartesian tree: joined after {iters} samples, "
                     f"{len(start.nodes) + len(goal.nodes)} nodes, {len(route)} states")
             return _checked(cell, route, max_step, qa, qb)
 
+        # Every meeting so far has been at one pose with the two halves in different
+        # configurations, and enough of them to be the case rather than the luck of where
+        # the connect aimed.  That is not a search that needs longer: the two trees are in
+        # branches neither can leave -- see the note on this module -- so every remaining
+        # second would buy another arrival refused on the same test.  Ended here rather
+        # than predicted beforehand, because this is the tree's own evidence at poses it
+        # really reached, where a test on the endpoints alone can only guess: a transit
+        # whose J1 honestly sweeps two radians looks identical to one needing a wrist
+        # turned, and refusing that one its tree would cost a route to save a minute.
+        #
+        # Conservative in the one way that matters: a single meeting the branch test
+        # *passed* -- refused by the collision check instead, so ``refused`` falls behind
+        # ``met`` -- means the two halves can hold one configuration between them after
+        # all, and then the problem is geometry and the clock is worth spending.
+        if refused >= budget.branch_refusals and refused == met:
+            treetrace.offer(label, start, goal)
+            raise PlanningError(
+                f"cartesian tree: the two halves met at one tool pose {met} times and "
+                f"arrived in a different configuration every time, up to {worst:.3f} rad "
+                f"apart on one joint against the {budget.jump_rad:g} rad a straight move "
+                f"may change; a tool-line edge cannot turn a wrist, so this pair has no "
+                f"route here at any budget ({iters} samples, "
+                f"{len(start.nodes)} and {len(goal.nodes)} nodes)")
+
         a, b, forward = b, a, not forward
 
-    treetrace.offer(label, start, goal)
+    treetrace.offer(label, start, goal, "cartesian")
     raise PlanningError(
         f"cartesian tree: no straight-line route after {iters} samples and "
-        f"{budget.seconds:g}s ({len(start.nodes)} and {len(goal.nodes)} nodes)")
+        f"{budget.seconds:g}s ({len(start.nodes)} and {len(goal.nodes)} nodes)"
+        + (f"; the two halves met at one pose {met} time"
+           f"{'' if met == 1 else 's'} and were refused on the branch test every time"
+           if met and refused == met else ""))
 
 
 def _join(a: _Tree, ia: int, b: _Tree, ib: int, forward: bool) -> list[np.ndarray]:

@@ -2247,6 +2247,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                    direct_clearance: float = 0.0,
                    finish_attempts: int = DEFAULT_FINISH_ATTEMPTS,
                    cartesian: "CartesianBudget | None" = None,
+                   joint: "JointBudget | None" = None,
                    relocate: "Relocation | None" = None,
                    deadline: "Deadline | None" = None,
                    record: list | None = None,
@@ -2360,7 +2361,8 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
                                      shortcut_seconds=shortcut_seconds,
                                      polish_seconds=polish_seconds,
                                      zone=zone, direct_clearance=direct_clearance,
-                                     cartesian=cartesian, relocate=relocate,
+                                     cartesian=cartesian, joint=joint,
+                                     relocate=relocate,
                                      openings=direct, gun=gun,
                                      stand_off=stand_off,
                                      finish_attempts=finish_attempts,
@@ -2396,7 +2398,7 @@ def plan_freespace(cell: Cell, qa: np.ndarray, qb: np.ndarray, *,
     cfg = _LegSettings(ompl=reduced, segment_length=segment_length,
                        check_step=check_step, continuous_check=continuous_check,
                        direct_clearance=direct_clearance, zone=zone,
-                       cartesian=cartesian, relocate=relocate, gun=gun,
+                       cartesian=cartesian, joint=joint, relocate=relocate, gun=gun,
                        stand_off=stand_off, finish_attempts=finish_attempts,
                        deadline=deadline)
     # Into a list of its own and handed on only once every leg is in hand, for the reason
@@ -2430,6 +2432,10 @@ class _LegSettings:
     direct_clearance: float
     zone: "LinearZone | None"
     cartesian: "CartesianBudget | None"
+    # Which planner the detour's traverse leg uses.  The two extractions have no sampling
+    # planner at all -- the Cartesian tree is their only solver -- so this reaches one leg
+    # of three, which is the same reach it has on a direct transit.
+    joint: "JointBudget | None"
     relocate: "Relocation | None"
     gun: "GunPreference | None"
     stand_off: "StandOff | None"
@@ -2477,6 +2483,16 @@ def _tree_leg(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, opening: float | No
     worth having because this is paid per leg per gun opening tried.  ``gun_openings`` is
     moot here for the same reason it is not passed: this leg is pinned to one opening and
     the detour is what walks the others, a leg at a time.
+
+    **This is the one caller that asks for the wide sampling box**, and the reasoning is
+    the mirror of ``process_seconds``.  There is nothing to choose about getting out of a
+    pocket, but there is everything to lose by not getting out: a transit's tree search
+    failing costs a candidate, where this one failing at every opening ends the detour and
+    so the segment.  A long detour round the fixture is exactly what that case needs and
+    exactly what the endpoint box forbids, the box being a hard wall on where the tool may
+    be put -- so the leg with no fallback is the leg that should be allowed to look
+    further.  See ``_cartesian_solutions``, which escalates to it only after a seed has
+    failed, so a leg that comes out of its pocket at the first attempt pays nothing.
     """
     if cfg.cartesian is None or not cfg.cartesian.enabled:
         # Guarded rather than assumed: _plan_detour hands these legs to every solver when
@@ -2486,7 +2502,8 @@ def _tree_leg(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, opening: float | No
     found = _cartesian_solutions(cell, qa, qb,
                                  replace(cfg.cartesian, process_seconds=0.0),
                                  cfg.check_step, [opening], log,
-                                 deadline=cfg.deadline, zone=cfg.zone, gun=cfg.gun)
+                                 deadline=cfg.deadline, zone=cfg.zone, gun=cfg.gun,
+                                 wide_box_mm=cfg.cartesian.wide_box_mm)
     if not found:
         raise PlanningError(f"the cartesian tree found no route for {what}")
 
@@ -2527,10 +2544,37 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
     question, and the openings phase two would have walked are walked here per leg anyway.
 
     **Each leg has its own solver.**  A locator to its own fallback goes to the Cartesian
-    tree alone -- see ``_tree_leg`` -- and the leg between the two fallbacks, which runs
-    through open air, gets everything ``_plan_direct`` has: the straight chord, phase one
-    dealt round the openings, and the tree ranked against them.  The two ends of the route
-    are extractions and the middle is a traverse, and those want different solvers.
+    tree alone -- see ``_tree_leg`` -- and the traverse between the two fallbacks goes to
+    the joint solver, whichever search occupies that slot, on **phase two's** budget: the
+    straight chord first, then the sampling runs ``--phase-two-max-runs`` and
+    ``--phase-two-solve-seconds`` describe.  Phase two's job is what this function took
+    over, so phase two's figures are the ones its legs spend; phase one's runs buy a choice
+    between homotopy classes dealt round the gun openings, and a leg with one opening pinned
+    has no such choice to make.  The two ends of the route are extractions and the middle is
+    a traverse, and those want different solvers.
+
+    **The traverse does not get the Cartesian tree, and that is the point of the split.**
+    Two reasons, and the second is the one that decides it:
+
+    * The tree's edge is a straight tool move, which earns its cost in the corridor beside
+      a panel and nowhere else -- which is why ``_plan_direct`` gates it on the band at
+      all.  A fallback pose is found by backing a locator out until it stands clear of the
+      parts, so the traverse between two of them is open air by construction.  There is no
+      corridor there to thread.
+    * **A tool-line edge cannot turn a wrist.**  Every station of one is an inverse
+      kinematics solve, refused past ``jump_rad`` however the solution was found, so the
+      tree cannot cross from one inverse-kinematics branch to another -- the branch each of
+      its two halves starts in is the branch it dies in.  A fallback pose is seeded from
+      its locator's own solution and so inherits that locator's branch, and the two
+      locators of a transit need not agree.  A joint edge has no such rule: it is already a
+      joint path, and it turns a wrist as readily as it swings an elbow.
+
+    Measured on Path 4's ``73052-11-R_2t -> 73052-06-R_2t``, whose two welds placed on
+    opposite wrist branches: the tree's two halves met at the *same tool pose* 1824 times
+    over and were refused at every one of them, J4 and J6 half a turn apart with the arm
+    within 0.03 rad of itself, at eight gun openings and 120 s each.  The two extraction
+    legs, whose ends share a branch, joined after 1 and 11 samples.  Sixteen minutes of
+    that segment went on asking the one solver that could not answer.
 
     **Each leg chooses its own gun opening, and a solved leg is never re-solved.**  The
     legs out of the locators are settled first, both because they are the constrained ones
@@ -2570,7 +2614,32 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
         own[-1] = True
     if not tree:
         log("      the cartesian tree is switched off, so the legs out of the locators "
-            "are planned with every solver, like the one between the poses")
+            "go to the joint solver too, like the traverse between the poses")
+
+    # The traverse spends **phase two's** budget, not phase one's.  The detour took phase
+    # two's job when it replaced it and went on spending phase one's runs, which was never
+    # the figure governing this leg: phase one's runs buy a choice between homotopy classes
+    # and are dealt round the gun openings, and a detour leg has one opening pinned and no
+    # choice to make -- it needs a route to exist.  That is phase two's question, and
+    # ``OmplBudget`` already says what the budget for it is for: "a transit that beat phase
+    # one is usually one where restarting the tree is the problem, so the time that helps is
+    # a longer single search rather than another shake of the sampler".
+    #
+    # It also decouples the leg from a phase one turned down to nothing, which left the one
+    # solver that can cross an inverse-kinematics branch not merely unpreferred but unbuilt.
+    traverse_ompl = replace(cfg.ompl,
+                            phase_one_runs=cfg.ompl.phase_two_max_runs,
+                            phase_one_seconds=cfg.ompl.phase_two_seconds)
+
+    # The tree is kept only where even that leaves nothing to search with.  Both budgets at
+    # zero means there is no joint solver to hand the leg to, and the straight chord on its
+    # own is a worse answer than the wrong solver.
+    traverse = None
+    if traverse_ompl.phase_one_runs <= 0:
+        traverse = cfg.cartesian
+        if traverse is not None and traverse.enabled:
+            log("      no sampling runs in phase two's budget either, so the traverse "
+                "between the poses keeps the cartesian tree for want of a joint solver")
 
     options = list(openings.all)
     if options and options[0] is None:
@@ -2589,12 +2658,16 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
                 f"change there, so the legs either side of it fly at one opening")
         lock[i] = lock[i - 1] + (0 if frozen else 1)
 
-    solvers = ("the legs out of the locators by the cartesian tree alone" if any(own)
-               else "every leg with every solver")
+    jointly = JOINTED if cfg.joint is not None else SAMPLED
+    middle = STEERED if (traverse is not None and traverse.enabled) else jointly
+    solvers = (f"the legs out of the locators by the cartesian tree, the rest by {middle}"
+               if any(own) else f"every leg by {middle}")
+    # Phase two's figures, since those are the ones the traverse now spends -- a line
+    # quoting phase one's would not describe any leg of this.
+    runs = traverse_ompl.phase_one_runs
     log(f"      detour: {n} legs through {', '.join(names[1:-1])} over "
-        f"{_openings_note(options)}, {solvers}, at up to "
-        f"{cfg.ompl.phase_one_runs} sampling run"
-        f"{'' if cfg.ompl.phase_one_runs == 1 else 's'} per leg")
+        f"{_openings_note(options)}, {solvers}, at up to {runs} sampling run"
+        f"{'' if runs == 1 else 's'} of {traverse_ompl.phase_one_seconds:g}s per leg")
 
     solved: list[list[Run] | None] = [None] * n
     raws: list[list[np.ndarray]] = [[] for _ in range(n)]
@@ -2627,12 +2700,13 @@ def _plan_detour(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, poses: list,
                 else:
                     with cell.gun_opening(opening):
                         runs, _ = _plan_direct(
-                            cell, points[i], points[i + 1], ompl=cfg.ompl,
+                            cell, points[i], points[i + 1], ompl=traverse_ompl,
                             segment_length=cfg.segment_length,
                             check_step=cfg.check_step,
                             continuous_check=cfg.continuous_check,
                             shortcut_seconds=0.0, polish_seconds=0.0,
-                            zone=cfg.zone, cartesian=cfg.cartesian,
+                            zone=cfg.zone, cartesian=traverse,
+                            joint=cfg.joint,
                             direct_clearance=cfg.direct_clearance,
                             relocate=cfg.relocate,
                             finish_attempts=cfg.finish_attempts,
@@ -2807,11 +2881,15 @@ class GunOpenings:
     phase-one budget went to one opening, and the next was reached only once that one had
     failed outright, by which time most of what the transit had to spend was gone.
 
-    ``extra`` holds openings ``main`` does not, and is what phase two walks.  Phase one
-    has already had runs at everything in ``main``; what phase two adds is a longer search
-    per run, and spending it where three short ones just failed is the narrower of the two
-    bets available.  So it is spent somewhere new, and an empty ``extra`` -- the gun ran
-    out of distinct openings, or none were asked for -- means phase two has nothing to do.
+    ``extra`` holds openings ``main`` does not, and **it is the detour's, not phase
+    two's.**  It was phase two's while that was a stage of a transit: phase one had
+    already had runs at everything in ``main``, and a longer search was the narrower bet
+    spent somewhere new.  Phase two is no longer a stage -- ``_plan_detour`` runs where it
+    used to -- and what walks both lists now is the detour, an opening at a time per leg.
+    Holding some back is still worth doing for the reason it always was, which is that a
+    wider rotation spread thin leaves no opening enough phase-one runs to choose a route
+    with.  An empty ``extra`` -- the gun ran out of distinct openings, or none were asked
+    for -- costs the detour its widest choice and nothing else.
 
     Both lists hold only openings the leg's own poses are clear at; see ``_opening_lists``.
 
@@ -2963,8 +3041,14 @@ def _opening_lists(cell: Cell, named: list[float] | None,
     if log:
         note = ", ".join(f"{v:g}" for v in out.main) or "none"
         extra = ", ".join(f"{v:g}" for v in out.extra)
+        # Said "for phase two" until the reading of a log made the point: phase two has
+        # not been a stage of a transit since ``_plan_detour`` replaced it, so that line
+        # named a stage no run has, and the openings it describes are walked by the
+        # detour.  A log line is where a stale name does the most damage -- it is what a
+        # reader reasons about the program from.
         log(f"      gun openings: {note} mm for phase one"
-            + (f", then {extra} mm for phase two" if extra else ", none left for phase two")
+            + (f", then {extra} mm held back for the detour" if extra
+               else ", none held back for the detour")
             + (f" ({len(tried) - len(kept)} screened out)"
                if len(tried) > len(kept) else ""))
     return out
@@ -3023,6 +3107,7 @@ def _route_fault(cell: Cell, path: list[np.ndarray], check_step: float) -> str |
 # Which search a solution came from.  Reporting only: they are ranked on cost alone.
 SAMPLED = "the sampling planner"
 STEERED = "the cartesian tree"
+JOINTED = "the joint tree"       # the sampling planner's slot, run by weldpath.jointtree
 
 
 @dataclass
@@ -3200,8 +3285,29 @@ class _Sampler:
     gun: "GunPreference | None" = None
     deadline: Deadline = field(default_factory=Deadline)
     continuous_check: bool = False
+    # Set, every run here is the joint-space tree instead of OMPL -- ``--joint-tree``.
+    # It sits on the sampler rather than beside it because what is being swapped is the
+    # *solver for a pair of endpoints*, and every caller that wants one comes through
+    # here: phase one, phase two, and the recut's gap joins.  Both budgets travel
+    # together so a run can say which it used, and ``OmplBudget``'s run counts and
+    # per-run seconds still bound the search -- it is the same question asked the same
+    # number of times, by a different planner.
+    joint: "JointBudget | None" = None
     log: object = print
     message: str = ""
+    # **How many runs this sampler has spent on the joint tree, which is its seed.**  That
+    # tree is deterministic in its seed and nothing was varying it, so every run of a phase
+    # came back byte for byte the same: measured on one Path 4 leg, four runs of
+    # ``phase_one`` at one opening returned the same 13-state route at the same cost to
+    # four decimals, where six different seeds gave five distinct routes and one failure.
+    # The repeat costs both halves of what a phase is for -- ``_cheapest`` has no choice to
+    # rank, and a leg the first seed cannot solve is failed again once per run, at the full
+    # per-run clock each time.  A counter rather than the run index because ``phase_one``,
+    # ``phase_two`` and the recut's gap joins all reach ``_run`` and only two of them have
+    # an index to offer; it is reset per sampler, so a transit is still reproducible.
+    # OMPL needs none of this: its generator is its own and these bindings do not reach it,
+    # which is why its runs already differ.
+    joint_runs: int = 0
 
     def phase_one(self, qa: np.ndarray, qb: np.ndarray,
                   label: str = "phase 1",
@@ -3293,13 +3399,17 @@ class _Sampler:
     def _run(self, qa: np.ndarray, qb: np.ndarray, planning_time: float,
              label: str, opening: float | None = None) -> _Solution | None:
         """One sampling-planner solve, scored and reported.  ``None`` when it did not solve."""
+        if self.joint is not None:
+            return self._run_joint(qa, qb, planning_time, label, opening)
         with self.cell.gun_opening(opening):
             # The gun is not an inverse-kinematics variable but it is very much a state
             # one, and the planner reads the state the environment is holding rather than
             # anything in the program it is handed.  Loading a pose here is what puts this
             # run's opening in front of it; before, the run inherited whatever the last
-            # collision query happened to have left there.
-            self.cell.set_state(qa)
+            # collision query happened to have left there.  ``sync_env`` rather than
+            # ``set_state`` because collision checking no longer moves the environment
+            # at all, and this is one of the few places that has to.
+            self.cell.sync_env(qa)
             profiles = ProfileDictionary()
             profiles.addProfile(OMPL_NAMESPACE, "DEFAULT",
                                 _ompl_profile(self.segment_length, planning_time,
@@ -3329,6 +3439,67 @@ class _Sampler:
                  f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
         return _Solution(cost, plain, raw, opening)
 
+    def _run_joint(self, qa: np.ndarray, qb: np.ndarray, planning_time: float,
+                   label: str, opening: float | None) -> _Solution | None:
+        """:meth:`_run` through the joint-space tree -- ``--joint-tree``.
+
+        The same question, the same budget and the same scoring, so a run of this is
+        comparable with a run of OMPL on the figures in the log.  Three differences are
+        deliberate and worth knowing when reading those figures:
+
+        * **No ``sync_env``.**  That exists because OMPL is handed ``cell.env`` and reads
+          the gun opening off the state the environment is holding.  This search reads the
+          cell, which the ``gun_opening`` block above has already set, so moving the
+          environment would be 2.6-4.6 ms of bookkeeping nobody then queries.
+        * **``_route_fault`` is still asked**, although the tree validated every edge with
+          exactly that call and so cannot fail it.  Keeping it means the two solvers are
+          judged by one test rather than on trust, and a refusal here would be a real
+          bookkeeping bug rather than a resolution disagreement.  It is nearly free: the
+          states are one check step apart and the cell remembers a contact test per state.
+        * **The route arrives dense**, every station the search validated, where OMPL
+          returns four points typical.  ``_densify_marked`` hands a stretch already inside
+          the spacing straight through, so this costs nothing downstream -- it is the same
+          footing a Cartesian-tree route arrives on.
+        """
+        from .jointtree import plan_joint      # deferred: jointtree.py reads this module
+        t0 = time.time()
+        note = _gun_note(opening)
+        # The configured seed is the *first* run's, so a single-run phase reproduces what
+        # ``--joint-tree`` would give on its own and a multi-run phase walks on from there.
+        seed = self.joint.seed + self.joint_runs
+        self.joint_runs += 1
+        # **It goes in every line this run prints.**  The search is deterministic in its
+        # seed, so that is the one number saying whether two runs asked the same question,
+        # and while nothing printed it four identical runs read as a planner with nothing
+        # to offer rather than as a caller that had forgotten to vary anything.  It is also
+        # what a reader needs to reproduce one run of a phase on its own.
+        at = f"{note}, seed {seed}"
+        with self.cell.gun_opening(opening):
+            try:
+                route = plan_joint(self.cell, qa, qb, max_step=self.check_step,
+                                   label=f"{label}{note}",
+                                   budget=replace(self.joint, seconds=planning_time,
+                                                  seed=seed))
+            except PlanningError as exc:
+                self.message = str(exc)
+                self.log(f"      {label}{at}: {self.message} "
+                         f"({time.time() - t0:.1f}s)")
+                return None
+            dt = time.time() - t0
+            fault = _route_fault(self.cell, route, self.check_step)
+            if fault is not None:
+                self.message = (f"the joint tree returned a route that is not clear under "
+                                f"this cell's own check ({fault}), which is a bug rather "
+                                f"than a resolution disagreement -- it validated every "
+                                f"edge with that same call")
+                self.log(f"      {label}{at}: {self.message} ({dt:.1f}s)")
+                return None
+            cost, plain = _path_cost(self.cell, route, self.check_step, zone=self.zone,
+                                     gun=self.gun, opening=opening)
+        self.log(f"      {label}{at}: solved in {dt:.1f}s ({len(route)} states, "
+                 f"cost {cost:.2f} s against {plain:.2f} s unpenalised)")
+        return _Solution(cost, plain, route, opening, JOINTED)
+
 
 def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget,
                  segment_length: float, check_step: float,
@@ -3337,6 +3508,7 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
                  zone: LinearZone | None = None,
                  direct_clearance: float = 0.0,
                  cartesian: "CartesianBudget | None" = None,
+                 joint: "JointBudget | None" = None,
                  relocate: "Relocation | None" = None,
                  openings: "GunOpenings | None" = None,
                  gun: "GunPreference | None" = None,
@@ -3436,7 +3608,8 @@ def _plan_direct(cell: Cell, qa: np.ndarray, qb: np.ndarray, *, ompl: OmplBudget
     # anyway, dealing them round the openings makes the same choice over a wider set.
     sampler = _Sampler(cell=cell, ompl=ompl, segment_length=segment_length,
                        check_step=check_step, zone=zone, openings=openings, gun=gun,
-                       deadline=deadline, continuous_check=continuous_check, log=log)
+                       deadline=deadline, continuous_check=continuous_check,
+                       joint=joint, log=log)
     candidates = sampler.phase_one(qa, qb)
 
     tree = cartesian if (cartesian is not None and cartesian.enabled
@@ -3572,12 +3745,44 @@ def _recut_solution(cell: Cell, best: _Solution, *, zone: "LinearZone",
     return _Solution(cost, plain, route, best.opening, best.source)
 
 
+def _wide_box(cell: Cell, clear_mm: float, log) -> tuple | None:
+    """The panels and tooling, inflated ``clear_mm`` on every face, or ``None``.
+
+    A sampling box for a search the endpoint box has already failed -- see
+    ``cartesian._sample``, which unions it with that box rather than replacing it.  What
+    it buys is room for a detour nobody could have predicted the shape of: the endpoint
+    box is drawn round the straight line between the two ends and is the right guess
+    almost always, and where it is wrong it is wrong by excluding the only way round.
+
+    Drawn round the fixture rather than taken as a looser margin because the fixture is
+    what a detour has to get round, and because that bounds it: the cell is a known size,
+    where a margin large enough to cover an unknown detour has no natural figure.  Note
+    what it does *not* do -- it is not a reach model, and much of this box is beyond the
+    arm.  That is affordable only because a sample is a direction and not a destination; a
+    steer moves ``extend_mm`` from a node it already has, so a target the arm could never
+    stand at still costs one steer and no more than any other.
+
+    ``None`` where the cell has no static geometry to measure, which is a cell with
+    nothing to detour round.
+    """
+    box = cell.statics_bounds()
+    if box is None:
+        return None
+    lo, hi = box[0] - float(clear_mm), box[1] + float(clear_mm)
+    if log:
+        log(f"      widening the sampling box to the panels and tooling "
+            f"{clear_mm:g} mm clear: {np.round(hi - lo, 0)} mm "
+            f"= {float(np.prod(hi - lo)) / 1e9:.2f} m^3")
+    return (lo, hi)
+
+
 def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                          budget: "CartesianBudget", check_step: float,
                          rotation: list, log,
                          deadline: "Deadline | None" = None,
                          zone: "LinearZone | None" = None,
-                         gun: "GunPreference | None" = None) -> list[_Solution]:
+                         gun: "GunPreference | None" = None,
+                         wide_box_mm: float = 0.0) -> list[_Solution]:
     """Cartesian-tree routes for one transit, each scored as phase one scores its own.
 
     **The budgets are per gun opening.**  Each opening in turn is searched from
@@ -3608,6 +3813,14 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
 
     Called on every transit, not only on the ones phase one failed, so these budgets are
     now spent whether or not a route is already in hand -- see ``_plan_direct``.
+
+    **``wide_box_mm`` turns the sampling box into two, and only the detour's extractions
+    ask for it.**  Where it is set, a seed that follows a failure at the same opening
+    samples the panels and tooling inflated by that figure as well as the endpoint box --
+    see ``_wide_box``.  It is an argument rather than read off the budget so that the
+    decision stays at the call site: a direct transit has other solvers and a route from
+    one of them to fall back on, while an extraction has neither, which is what makes a
+    wider search worth its dilution there and not here.
     """
     rotation = list(rotation) or [None]
     deadline = deadline or Deadline()
@@ -3620,9 +3833,11 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
         f"linear space and {budget.process_seconds:g}s more on better ones")
     found: list[_Solution] = []
     run = 0
+    wide: tuple | None = None
     for opening in rotation[:wanted]:
         began = time.time()
         solved: float | None = None
+        seeds = 0
         while True:
             left = deadline.clamp((began + budget.seconds if solved is None else
                                    solved + budget.process_seconds) - time.time())
@@ -3634,10 +3849,31 @@ def _cartesian_solutions(cell: Cell, qa: np.ndarray, qb: np.ndarray,
                     return found
                 break
             run += 1
-            got = _cartesian_route(cell, qa, qb, budget, seconds=left, zone=zone, gun=gun,
+            seeds += 1
+            use = budget
+            if wide_box_mm > 0.0 and seeds > 1 and solved is None:
+                # The first seed at an opening gets the endpoint box, and only a seed
+                # following a failure gets the wide one.  Escalation rather than a setting
+                # because the two boxes are right in different cases and nothing can tell
+                # which case a leg is beforehand: the endpoint box is the tighter search
+                # and solves an ordinary extraction in a fraction of a second, while a
+                # pocket deeper than it is a leg it cannot solve at all however long it
+                # runs -- the box being a hard wall on where the tool may be put.  A
+                # failed seed is the evidence, and it is the only evidence there is.
+                #
+                # Not offered once the opening has solved.  The seeds after that are
+                # looking for a *better* route, and the box that produced one is not the
+                # thing to change about the search that found it.
+                if wide is None:
+                    wide = _wide_box(cell, wide_box_mm, log)
+                if wide is not None:
+                    use = replace(budget, box=wide)
+            got = _cartesian_route(cell, qa, qb, use, seconds=left, zone=zone, gun=gun,
                                    seed=budget.seed + run - 1, opening=opening,
                                    check_step=check_step,
-                                   label=f"cartesian tree run {run}", log=log)
+                                   label=f"cartesian tree run {run}"
+                                         + (" (wide box)" if use is not budget else ""),
+                                   log=log)
             if got is not None:
                 found.append(got)
                 if solved is None:
